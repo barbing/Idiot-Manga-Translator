@@ -26,8 +26,5 @@ Test Manga/
 AGENTS.md
 tmp_run.py
 
-# Models: keep comic-text-detector only
-models/**
-!models/comic-text-detector/
-!models/comic-text-detector/**
-
+# Models (kept local; not tracked)
+models/
