@@ -58,9 +58,10 @@ python -m app.main
 - The app auto-scans `models/**.gguf` and lists them in **GGUF Model**.
 - Example: `models/sakura/sakura-14b-qwen3-v1.5-q6k.gguf`
 
-### ComicTextDetector Model (Included)
-- The repository includes `models/comic-text-detector` to avoid manual searching.
-- Other large models (GGUF, OCR weights) are intentionally not tracked.
+### ComicTextDetector Model (Local)
+- Models are not tracked in the repository to keep size small.
+- Place the ComicTextDetector model files under `models/comic-text-detector/`.
+  (See the ComicTextDetector release page linked in the app error message.)
 
 ## Test Manga
 You can use your own sample folder (e.g., `Test Manga/`) for validation.  
