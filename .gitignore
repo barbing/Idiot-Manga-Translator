@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.log
+
+# Virtual env / tooling
+.venv/
+venv/
+.env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# App outputs / local data
+output/
+*.sqlite
+
+# Local test data (not for repo)
+Test Manga/
+AGENTS.md
+tmp_run.py
+
+# Models: keep comic-text-detector only
+models/**
+!models/comic-text-detector/
+!models/comic-text-detector/**
+

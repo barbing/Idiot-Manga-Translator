@@ -1,0 +1,33 @@
+# Core GUI
+PySide6
+
+# Imaging / rendering
+Pillow
+opencv-python
+numpy==1.26.4
+
+# OCR / detection
+manga-ocr
+paddleocr
+# CPU-only PaddlePaddle (GPU users can install paddlepaddle-gpu via conda)
+paddlepaddle
+
+# Translation backends
+requests
+llama-cpp-python
+
+# ComicTextDetector (ONNX path)
+onnxruntime
+
+# HuggingFace stack (manga-ocr / inpainting)
+transformers
+huggingface-hub>=0.19.3,<1.0
+
+# Optional AI inpainting (only needed for inpainting mode = "ai")
+# diffusers
+# accelerate
+# safetensors
+
+# Optional GPU stack (recommend via conda for Windows)
+# torch
+# torchvision
