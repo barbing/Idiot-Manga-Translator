@@ -63,10 +63,6 @@ python -m app.main
 - Place the ComicTextDetector model files under `models/comic-text-detector/`.
   (See the ComicTextDetector release page linked in the app error message.)
 
-## Test Manga
-You can use your own sample folder (e.g., `Test Manga/`) for validation.  
-Note: local test data is not tracked in the repo.
-
 ## Troubleshooting
 ### App finishes instantly / no output
 On Windows, OpenCV cannot read non-ASCII file paths with `cv2.imread`.
