@@ -8,6 +8,31 @@ from app.io.project import load_project, save_project
 from app.render.renderer import render_translations
 
 
+class ResizableLabel(QtWidgets.QLabel):
+    """QLabel that scales its pixmap to fill the available space."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self._pixmap = None
+
+    def setPixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._pixmap = pixmap
+        super().setPixmap(self._scaled_pixmap())
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        if self._pixmap:
+            super().setPixmap(self._scaled_pixmap())
+
+    def _scaled_pixmap(self) -> QtGui.QPixmap:
+        if not self._pixmap or self._pixmap.isNull():
+            return self._pixmap
+        return self._pixmap.scaled(
+            self.size(), 
+            QtCore.Qt.KeepAspectRatio, 
+            QtCore.Qt.SmoothTransformation
+        )
+
 class PageReviewDialog(QtWidgets.QDialog):
     def __init__(
         self,
@@ -35,14 +60,14 @@ class PageReviewDialog(QtWidgets.QDialog):
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
-        layout.addWidget(split, 3)
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
+        layout.addWidget(split, 10)
 
         left = QtWidgets.QWidget(split)
         left_layout = QtWidgets.QVBoxLayout(left)
         self.original_label = QtWidgets.QLabel("Original")
         self.original_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.original_view = QtWidgets.QLabel()
-        self.original_view.setAlignment(QtCore.Qt.AlignCenter)
+        self.original_view = ResizableLabel()
         left_layout.addWidget(self.original_label)
         left_layout.addWidget(self.original_view, 1)
 
@@ -50,8 +75,7 @@ class PageReviewDialog(QtWidgets.QDialog):
         right_layout = QtWidgets.QVBoxLayout(right)
         self.translated_label = QtWidgets.QLabel("Translated")
         self.translated_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.translated_view = QtWidgets.QLabel()
-        self.translated_view.setAlignment(QtCore.Qt.AlignCenter)
+        self.translated_view = ResizableLabel()
         right_layout.addWidget(self.translated_label)
         right_layout.addWidget(self.translated_view, 1)
 
@@ -69,8 +93,8 @@ class PageReviewDialog(QtWidgets.QDialog):
         self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.table.setMinimumHeight(420)
-        layout.addWidget(self.table, 3)
+        self.table.setMinimumHeight(150)
+        layout.addWidget(self.table, 2)
 
         footer = QtWidgets.QHBoxLayout()
         self.save_btn = QtWidgets.QPushButton("Save to JSON")
@@ -91,10 +115,10 @@ class PageReviewDialog(QtWidgets.QDialog):
         output_path = self._page.get("output_path", "")
         if image_path and os.path.isfile(image_path):
             pixmap = QtGui.QPixmap(image_path)
-            self.original_view.setPixmap(pixmap.scaledToWidth(420, QtCore.Qt.SmoothTransformation))
+            self.original_view.setPixmap(pixmap)
         if output_path and os.path.isfile(output_path):
             pixmap = QtGui.QPixmap(output_path)
-            self.translated_view.setPixmap(pixmap.scaledToWidth(420, QtCore.Qt.SmoothTransformation))
+            self.translated_view.setPixmap(pixmap)
         self._populate_table()
 
     def _populate_table(self) -> None:
@@ -158,7 +182,7 @@ class PageReviewDialog(QtWidgets.QDialog):
         )
         if os.path.isfile(output_path):
             pixmap = QtGui.QPixmap(output_path)
-            self.translated_view.setPixmap(pixmap.scaledToWidth(420, QtCore.Qt.SmoothTransformation))
+            self.translated_view.setPixmap(pixmap)
 
 
 def _default_output_path(image_path: str, suffix: str) -> str:

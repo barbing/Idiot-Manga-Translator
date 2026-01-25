@@ -24,10 +24,9 @@ onnxruntime
 transformers
 huggingface-hub>=0.19.3,<1.0
 
-# Optional AI inpainting (only needed for inpainting mode = "ai")
-# diffusers
-# accelerate
-# safetensors
+# AI Inpainting
+simple-lama-inpainting
+torch
 
 # Optional GPU stack (recommend via conda for Windows)
 # torch

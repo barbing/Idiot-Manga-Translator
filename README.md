@@ -25,7 +25,8 @@ pip install -r requirements.txt
 
 Notes:
 - For GPU acceleration, prefer installing PyTorch/Paddle GPU builds via conda.
-- AI inpainting (diffusers) is optional; see `requirements.txt` comments.
+- For GPU acceleration, prefer installing PyTorch/Paddle GPU builds via conda.
+- AI inpainting uses LaMa (models downloaded automatically on first use).
 
 ## Run the App
 ```powershell
