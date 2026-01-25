@@ -25,6 +25,7 @@ class PipelineStatus(QtCore.QObject):
     queue_item = QtCore.Signal(int, str)
     total_time_changed = QtCore.Signal(str)
     page_time_changed = QtCore.Signal(str)
+    page_ready = QtCore.Signal(int, dict)
 
 
 @dataclass
@@ -53,6 +54,7 @@ class PipelineSettings:
     gguf_n_threads: int
     gguf_n_batch: int
     fast_mode: bool
+    auto_glossary: bool
 
 
 class PipelineWorker(QtCore.QThread):
@@ -64,6 +66,7 @@ class PipelineWorker(QtCore.QThread):
     queue_item = QtCore.Signal(int, str)
     total_time_changed = QtCore.Signal(str)
     page_time_changed = QtCore.Signal(str)
+    page_ready = QtCore.Signal(int, dict)
 
     def __init__(self, settings: PipelineSettings, parent=None) -> None:
         super().__init__(parent)
@@ -103,17 +106,36 @@ class PipelineWorker(QtCore.QThread):
         font_detector = None
         try:
             if self._settings.ocr_engine == "MangaOCR":
+                worker_error = None
                 try:
                     ocr_engine = MangaOcrEngine(self._settings.use_gpu)
                 except Exception as exc:
-                    try:
-                        from app.ocr.manga_ocr_worker import MangaOcrWorker
-                        self.message.emit("MangaOCR in-process failed; using worker process.")
-                        ocr_engine = MangaOcrWorker(use_gpu=self._settings.use_gpu)
-                    except Exception as inner_exc:
-                        self.message.emit(_friendly_model_error(inner_exc))
-                        self.message.emit(f"MangaOCR failed: {inner_exc}")
-                        return
+                    if _is_torch_missing(exc):
+                        worker_error = exc
+                        ocr_engine = None
+                    else:
+                        try:
+                            from app.ocr.manga_ocr_worker import MangaOcrWorker
+                            self.message.emit("MangaOCR in-process failed; using worker process.")
+                            ocr_engine = MangaOcrWorker(use_gpu=self._settings.use_gpu)
+                        except Exception as inner_exc:
+                            worker_error = inner_exc
+                            ocr_engine = None
+                    if ocr_engine is None:
+                        if _is_torch_missing(exc) or _is_torch_missing(worker_error):
+                            self.message.emit(
+                                "MangaOCR unavailable (PyTorch not installed). Falling back to PaddleOCR."
+                            )
+                        else:
+                            self.message.emit(_friendly_model_error(worker_error or exc))
+                            self.message.emit("MangaOCR failed; falling back to PaddleOCR.")
+                        try:
+                            from app.ocr.paddle_ocr_recognizer import PaddleOcrRecognizer
+                            ocr_engine = PaddleOcrRecognizer(self._settings.use_gpu)
+                            self._settings.ocr_engine = "PaddleOCR"
+                        except Exception as fallback_exc:
+                            self.message.emit(_friendly_model_error(fallback_exc))
+                            return
             else:
                 try:
                     from app.ocr.paddle_ocr_recognizer import PaddleOcrRecognizer
@@ -139,6 +161,16 @@ class PipelineWorker(QtCore.QThread):
             except Exception as exc:
                 self.message.emit(_friendly_model_error(exc))
                 return
+            background_detector = None
+            if not self._settings.filter_background:
+                if self._settings.detector_engine == "PaddleOCR":
+                    background_detector = detector
+                else:
+                    try:
+                        background_detector = PaddleTextDetector(self._settings.use_gpu)
+                    except Exception as exc:
+                        self.message.emit(_friendly_model_error(exc))
+                        background_detector = None
 
             try:
                 if self._settings.translator_backend == "GGUF":
@@ -196,6 +228,9 @@ class PipelineWorker(QtCore.QThread):
                 if self._settings.translator_backend == "GGUF"
                 else self._settings.ollama_model
             )
+            auto_glossary_state = None
+            if self._settings.auto_glossary:
+                auto_glossary_state = {"counts": {}, "map": {}}
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
                     self.message.emit("Stopped")
@@ -224,6 +259,8 @@ class PipelineWorker(QtCore.QThread):
                         self._settings.filter_strength,
                         font_detector,
                         translation_cache,
+                        background_detector,
+                        auto_glossary_state,
                     )
                 except Exception as exc:
                     page_elapsed = time.time() - page_start
@@ -247,7 +284,9 @@ class PipelineWorker(QtCore.QThread):
                     continue
 
                 page_id = os.path.splitext(name)[0]
-                pages.append(build_page_record(source_path, page_id, regions))
+                page_record = build_page_record(source_path, page_id, regions, output_path)
+                pages.append(page_record)
+                self.page_ready.emit(index - 1, page_record)
 
                 page_elapsed = time.time() - page_start
                 self.page_time_changed.emit(f"Page: {_format_seconds(page_elapsed)}")
@@ -304,6 +343,7 @@ class PipelineController(QtCore.QObject):
         self._worker.message.connect(self.status.message.emit)
         self._worker.queue_reset.connect(self.status.queue_reset.emit)
         self._worker.queue_item.connect(self.status.queue_item.emit)
+        self._worker.page_ready.connect(self.status.page_ready.emit)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
         self.status.message.emit("Started")
@@ -374,6 +414,11 @@ def _friendly_model_error(exc: Exception) -> str:
             "Torch failed to load (DLL dependency error). Restart the app after installing conda PyTorch. "
             "If it persists, reboot Windows to refresh DLL search paths."
         )
+    if "no module named 'torch'" in lowered:
+        return (
+            "PyTorch is not installed in the current environment. Install it or switch OCR Engine to PaddleOCR. "
+            "Suggested: pip install -U torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
+        )
     if "manga-ocr" in lowered or "manga_ocr" in lowered:
         return f"MangaOCR failed to load: {text}"
     if "comictextdetector" in lowered or "comic-text-detector" in lowered or "utils.general" in lowered:
@@ -403,6 +448,12 @@ def _friendly_model_error(exc: Exception) -> str:
     return f"Failed to initialize models: {text}"
 
 
+def _is_torch_missing(exc: Exception | None) -> bool:
+    if exc is None:
+        return False
+    return "no module named 'torch'" in str(exc).lower()
+
+
 def _load_style_guide(path: str):
     if path and os.path.isfile(path):
         try:
@@ -427,20 +478,86 @@ def _process_page(
     filter_strength: str,
     font_detector,
     translation_cache: dict[str, str],
+    background_detector,
+    auto_glossary_state,
 ) -> list:
-
-    detections = detector.detect(image_path)
     image_size = _get_image_size(image_path)
+    detections = _detect_with_scale(detector, image_path, image_size)
     merge = getattr(detector, "merge_mode", "auto") != "none"
     groups = _merge_detections(detections, image_size, merge=merge)
     if not groups:
         groups = [{"bbox": _polygon_to_bbox(p), "polygons": [p], "conf": float(c or 0.0)} for p, c in detections]
+    bubble_boxes = [g["bbox"] for g in groups]
+    if background_detector is not None:
+        bg_detections = _detect_with_scale(background_detector, image_path, image_size)
+        for polygon, conf in bg_detections:
+            try:
+                bbox = _polygon_to_bbox(polygon)
+            except Exception:
+                continue
+            if any(_overlap_ratio(bbox, bb) > 0.2 for bb in bubble_boxes):
+                continue
+            groups.append(
+                {
+                    "bbox": bbox,
+                    "polygons": [polygon],
+                    "conf": float(conf or 0.0),
+                    "bg_text": True,
+                }
+            )
     regions = []
     pending_texts: dict[str, list[str]] = {}
+    glossary_texts: list[str] = []
     for idx, group in enumerate(groups):
         bbox = group["bbox"]
         polygons = group["polygons"]
         det_conf = group["conf"]
+        is_bg_group = bool(group.get("bg_text"))
+        if is_bg_group:
+            crop = _crop_image(image_path, bbox)
+            if crop is None:
+                continue
+            ocr_text = _clean_ocr_text(ocr_engine.recognize(crop))
+            if not ocr_text:
+                continue
+            glossary_texts.append(ocr_text)
+            if _should_skip_text(ocr_text, bbox, image_size):
+                regions.append(
+                    _region_record(
+                        idx,
+                        polygons,
+                        bbox,
+                        ocr_text,
+                        "",
+                        det_conf,
+                        bg_text=True,
+                        needs_review=True,
+                        ignore=True,
+                        font_name=font_name,
+                        region_type="background_text",
+                    )
+                )
+                continue
+            region = _region_record(
+                idx,
+                polygons,
+                bbox,
+                ocr_text,
+                "",
+                det_conf,
+                bg_text=True,
+                needs_review=False,
+                ignore=False,
+                font_name=font_name,
+                region_type="background_text",
+            )
+            regions.append(region)
+            cached = translation_cache.get(ocr_text)
+            if cached is not None:
+                region["translation"] = cached
+            else:
+                pending_texts.setdefault(ocr_text, []).append(region["region_id"])
+            continue
         bg_text, needs_review = _classify_region(
             bbox,
             image_size,
@@ -449,20 +566,36 @@ def _process_page(
             filter_strength,
         )
         if bg_text:
-            regions.append(
-                _region_record(
-                    idx,
-                    polygons,
-                    bbox,
-                    "",
-                    "",
-                    det_conf,
-                    bg_text=True,
-                    needs_review=needs_review,
-                    ignore=filter_background,
-                    font_name=font_name,
-                )
+            crop = _crop_image(image_path, bbox)
+            if crop is None:
+                continue
+            ocr_text = _clean_ocr_text(ocr_engine.recognize(crop))
+            if not ocr_text:
+                continue
+            glossary_texts.append(ocr_text)
+            skip_text = _should_skip_text(ocr_text, bbox, image_size)
+            ignore = bool(filter_background and skip_text)
+            region = _region_record(
+                idx,
+                polygons,
+                bbox,
+                ocr_text,
+                "",
+                det_conf,
+                bg_text=True,
+                needs_review=needs_review or skip_text,
+                ignore=ignore,
+                font_name=font_name,
+                region_type="background_text",
             )
+            regions.append(region)
+            if ignore:
+                continue
+            cached = translation_cache.get(ocr_text)
+            if cached is not None:
+                region["translation"] = cached
+            else:
+                pending_texts.setdefault(ocr_text, []).append(region["region_id"])
             continue
         crop = _crop_image(image_path, bbox)
         if crop is None:
@@ -470,6 +603,7 @@ def _process_page(
         ocr_text = _clean_ocr_text(ocr_engine.recognize(crop))
         if not ocr_text:
             continue
+        glossary_texts.append(ocr_text)
         if _should_skip_text(ocr_text, bbox, image_size):
             regions.append(
                 _region_record(
@@ -483,6 +617,7 @@ def _process_page(
                     needs_review=True,
                     ignore=True,
                     font_name=font_name,
+                    region_type="background_text",
                 )
             )
             continue
@@ -503,6 +638,7 @@ def _process_page(
             needs_review=needs_review,
             ignore=False,
             font_name=font_name,
+            region_type="speech_bubble",
         )
         if detected_font:
             if target_lang == "Simplified Chinese" and not _is_font_allowed_for_cn(detected_font):
@@ -518,6 +654,17 @@ def _process_page(
         else:
             pending_texts.setdefault(ocr_text, []).append(region["region_id"])
 
+    active_style_guide = style_guide
+    if auto_glossary_state is not None and glossary_texts:
+        active_style_guide = _apply_auto_glossary(
+            style_guide,
+            auto_glossary_state,
+            glossary_texts,
+            ollama,
+            model,
+            source_lang,
+            target_lang,
+        )
     if pending_texts:
         items = []
         id_to_text: dict[str, str] = {}
@@ -530,7 +677,7 @@ def _process_page(
             model,
             source_lang,
             target_lang,
-            style_guide,
+            active_style_guide,
             items,
         )
         text_to_translation: dict[str, str] = {}
@@ -546,7 +693,7 @@ def _process_page(
                     model,
                     source_lang,
                     target_lang,
-                    style_guide,
+                    active_style_guide,
                     text,
                 )
         for text, region_ids in pending_texts.items():
@@ -833,6 +980,101 @@ def _clean_translation(text: str) -> str:
         cleaned = cleaned.split("Return only the translation", 1)[0].strip()
     cleaned = cleaned.strip("<> ")
     return cleaned
+
+
+def _extract_terms(text: str) -> list[str]:
+    if not text:
+        return []
+    candidates = re.findall(r"[一-龯]{2,}|[ァ-ヴー]{2,}", text)
+    results: list[str] = []
+    seen = set()
+    for term in candidates:
+        term = term.strip("…．。！？，, ")
+        if not term:
+            continue
+        if len(term) < 2 or len(term) > 12:
+            continue
+        if term in seen:
+            continue
+        seen.add(term)
+        results.append(term)
+    return results
+
+
+def _apply_auto_glossary(
+    base_style: dict,
+    state: dict,
+    texts: list[str],
+    ollama,
+    model: str,
+    source_lang: str,
+    target_lang: str,
+) -> dict:
+    if not state or not texts:
+        return base_style
+    counts = state.setdefault("counts", {})
+    glossary_map = state.setdefault("map", {})
+    for text in texts:
+        for term in _extract_terms(text):
+            counts[term] = counts.get(term, 0) + 1
+    candidates = [term for term, count in counts.items() if count >= 2 and term not in glossary_map]
+    if candidates:
+        candidates = candidates[:12]
+        items = []
+        id_to_term = {}
+        for idx, term in enumerate(candidates):
+            item_id = f"g{idx:03d}"
+            items.append({"id": item_id, "text": term})
+            id_to_term[item_id] = term
+        translations = _batch_translate(
+            ollama,
+            model,
+            source_lang,
+            target_lang,
+            base_style,
+            items,
+        )
+        if translations:
+            for item_id, translation in translations.items():
+                term = id_to_term.get(item_id)
+                if not term:
+                    continue
+                translation = _clean_translation(translation)
+                if translation and _language_ok(target_lang, translation):
+                    glossary_map[term] = translation
+        else:
+            for term in candidates:
+                translation = _translate_single(
+                    ollama,
+                    model,
+                    source_lang,
+                    target_lang,
+                    base_style,
+                    term,
+                )
+                translation = _clean_translation(translation)
+                if translation and _language_ok(target_lang, translation):
+                    glossary_map[term] = translation
+    return _merge_glossary(base_style, glossary_map)
+
+
+def _merge_glossary(style_guide: dict, glossary_map: dict) -> dict:
+    if not glossary_map:
+        return style_guide
+    merged = dict(style_guide or {})
+    glossary = list(merged.get("glossary", []) or [])
+    existing = {}
+    for entry in glossary:
+        if isinstance(entry, dict):
+            key = str(entry.get("source", "")).strip()
+            if key:
+                existing[key] = entry
+    for source, target in glossary_map.items():
+        if source in existing:
+            continue
+        glossary.append({"source": source, "target": target, "priority": "hard", "auto": True})
+    merged["glossary"] = glossary
+    return merged
 
 
 def _batch_translate(
@@ -1173,12 +1415,13 @@ def _region_record(
     needs_review: bool,
     ignore: bool,
     font_name: str,
+    region_type: str = "speech_bubble",
 ) -> dict:
     return {
         "region_id": f"r{idx:03d}",
         "bbox": bbox,
         "polygon": polygon,
-        "type": "speech_bubble",
+        "type": region_type,
         "ocr_text": ocr_text,
         "translation": translation,
         "confidence": {"det": det_conf, "ocr": 1.0, "trans": 1.0},
@@ -1205,6 +1448,58 @@ def _get_image_size(image_path: str) -> tuple[int, int]:
             return img.size
     except Exception:
         return (0, 0)
+
+
+def _read_image_cv(image_path: str):
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+    image = cv2.imread(image_path)
+    if image is None:
+        try:
+            data = np.fromfile(image_path, dtype=np.uint8)
+            if data.size:
+                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        except Exception:
+            image = None
+    return image
+
+
+def _scale_polygon(polygon: list, scale: float) -> list:
+    scaled = []
+    for point in polygon:
+        if point is None or len(point) < 2:
+            continue
+        scaled.append([float(point[0]) * scale, float(point[1]) * scale])
+    return scaled
+
+
+def _detect_with_scale(detector, image_path: str, image_size: tuple[int, int], target_long: int = 1280):
+    image = _read_image_cv(image_path)
+    if image is None or not hasattr(detector, "detect_image"):
+        return detector.detect(image_path)
+    try:
+        import cv2
+    except Exception:
+        return detector.detect(image_path)
+    h, w = image.shape[:2]
+    long_edge = max(w, h)
+    scale = 1.0
+    if long_edge > target_long:
+        scale = target_long / float(long_edge)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    detections = detector.detect_image(image)
+    if scale != 1.0:
+        inv = 1.0 / scale
+        scaled = []
+        for polygon, conf in detections:
+            scaled.append((_scale_polygon(polygon, inv), conf))
+        return scaled
+    return detections
 
 
 def _classify_region(

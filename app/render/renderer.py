@@ -6,11 +6,12 @@ import re
 from typing import Dict, List, Tuple
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageStat
 except ImportError:  # pragma: no cover - optional dependency
     Image = None
     ImageDraw = None
     ImageFont = None
+    ImageStat = None
 
 try:
     import cv2
@@ -34,13 +35,16 @@ def render_translations(
         img = img.convert("RGB")
         working = img
         img_w, img_h = img.size
-        render_regions: List[Tuple[str, Tuple[int, int, int, int], str]] = []
+        render_regions: List[Tuple[str, Tuple[int, int, int, int], str, Tuple[int, int, int] | None]] = []
+        background_boxes: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int] | None]] = []
         text_mask = None
         bubble_text_mask = None
+        bubble_area_mask = None
         other_text_mask = None
         if cv2 is not None and np is not None:
             text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
             bubble_text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+            bubble_area_mask = np.zeros((img_h, img_w), dtype=np.uint8)
             other_text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
         img_np = np.array(img) if cv2 is not None and np is not None else None
 
@@ -50,8 +54,10 @@ def render_translations(
             raw_text = str(region.get("translation", "")).strip()
             text = _normalize_text(raw_text)
             flags = region.get("flags", {}) or {}
-            if not text or flags.get("bg_text") or flags.get("ignore"):
+            if not text or flags.get("ignore"):
                 continue
+            region_type = str(region.get("type", "") or "")
+            is_background = region_type == "background_text" or bool(flags.get("bg_text"))
             bbox = region.get("bbox", [0, 0, 0, 0])
             polygon = region.get("polygon")
             poly_bounds = _polygon_bounds(polygon)
@@ -71,7 +77,18 @@ def render_translations(
             ty1 = min(img_h, y + h + text_pad)
             base_box = (x, y, x + w, y + h)
             render_box = (tx0, ty0, tx1, ty1)
-            if img_np is not None and text_mask is not None:
+            forced_color = None
+            if img_np is not None:
+                stats = _box_luma_stats(img_np, base_box)
+                if stats:
+                    mean, p20, p80 = stats
+                    if p80 < 95:
+                        forced_color = (255, 255, 255)
+                        if region_type != "speech_bubble" and not is_background:
+                            is_background = True
+                    elif p20 > 175:
+                        forced_color = (0, 0, 0)
+            if img_np is not None and text_mask is not None and not is_background:
                 region_mask, bubble_box, bubble_mask = _region_masks(
                     img_np,
                     (mx0, my0, mx1, my1),
@@ -84,6 +101,8 @@ def render_translations(
                     text_mask = cv2.bitwise_or(text_mask, region_mask)
                     if bubble_mask is not None and bubble_text_mask is not None:
                         bubble_text_mask = cv2.bitwise_or(bubble_text_mask, region_mask)
+                        if bubble_area_mask is not None:
+                            bubble_area_mask = cv2.bitwise_or(bubble_area_mask, bubble_mask)
                     elif other_text_mask is not None:
                         other_text_mask = cv2.bitwise_or(other_text_mask, region_mask)
                 if bubble_box is not None:
@@ -98,21 +117,52 @@ def render_translations(
                     render_box = base_box
             else:
                 render_box = base_box
-            render_box = _shrink_box(render_box, max(2, int(min(w, h) * 0.03)))
+            if is_background:
+                pad = max(1, int(min(w, h) * 0.02))
+                render_box = _shrink_box(render_box, pad)
+                bg_pad = min(28, max(4, int(min(w, h) * 0.18)))
+                fill_color = _estimate_box_fill(img_np, base_box) if img_np is not None else None
+                expanded_box = None
+                if img_np is not None:
+                    stats = _box_luma_stats(img_np, base_box)
+                    if stats:
+                        _mean, _p20, _p80 = stats
+                        if _p80 < 95:
+                            expanded_box = _expand_dark_box(img_np, base_box)
+                if expanded_box is not None:
+                    ex0, ey0, ex1, ey1 = expanded_box
+                    render_box = _intersect_box(render_box, expanded_box) or expanded_box
+                    background_boxes.append(((ex0, ey0, ex1, ey1), fill_color))
+                else:
+                    background_boxes.append(
+                        (
+                            (
+                                max(0, x - bg_pad),
+                                max(0, y - bg_pad),
+                                min(img_w, x + w + bg_pad),
+                                min(img_h, y + h + bg_pad),
+                            ),
+                            fill_color,
+                        )
+                    )
+            else:
+                render_box = _shrink_box(render_box, max(2, int(min(w, h) * 0.03)))
             render = region.get("render") or {}
             if not isinstance(render, dict):
                 render = {}
             region_font = render.get("font") or font_name
             if _has_cjk(text) and _is_cjk_unsupported_font(region_font):
                 region_font = font_name
-            render_regions.append((text, render_box, region_font))
+            render_regions.append((text, render_box, region_font, forced_color))
 
         if render_regions:
-            if bubble_text_mask is not None and bubble_text_mask.any():
+            if background_boxes:
+                working = _apply_background_fill(working, background_boxes)
+            if bubble_area_mask is not None and bubble_text_mask is not None and bubble_area_mask.any():
                 if cv2 is not None and np is not None:
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                    bubble_text_mask = cv2.erode(bubble_text_mask, kernel, iterations=1)
-                working = _apply_white_mask(working, bubble_text_mask)
+                    bubble_area_mask = cv2.morphologyEx(bubble_area_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+                working = _apply_bubble_fill(working, bubble_area_mask, bubble_text_mask, img_np)
             if other_text_mask is not None and other_text_mask.any():
                 working = _apply_text_removal(working, other_text_mask, inpaint_mode, use_gpu)
 
@@ -120,10 +170,10 @@ def render_translations(
         median_height = 0
         preferred_size = None
         if render_regions:
-            heights = sorted(max(1, box[3] - box[1]) for _, box, _ in render_regions)
+            heights = sorted(max(1, box[3] - box[1]) for _, box, _, _ in render_regions)
             median_height = heights[len(heights) // 2]
             preferred_size = max(12, int(median_height * 0.33))
-        for text, box, region_font in render_regions:
+        for text, box, region_font, forced_color in render_regions:
             x0, y0, x1, y1 = box
             w = max(1, x1 - x0)
             h = max(1, y1 - y0)
@@ -152,12 +202,13 @@ def render_translations(
                         best_height = test_height
                         break
             offset_y = y0 + max(0, (h - best_height) // 2)
+            fill_color = forced_color or _resolve_text_color(working, box)
             for line in best_lines:
                 bbox = best_font.getbbox(line)
                 line_width = bbox[2] - bbox[0]
                 line_height = bbox[3] - bbox[1]
                 offset_x = x0 + max(0, (w - line_width) // 2) - bbox[0]
-                draw.text((offset_x, offset_y - bbox[1]), line, fill=(0, 0, 0), font=best_font)
+                draw.text((offset_x, offset_y - bbox[1]), line, fill=fill_color, font=best_font)
                 offset_y += line_height
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         working.save(output_path)
@@ -171,6 +222,9 @@ def _apply_text_removal(image, text_mask, mode: str, use_gpu: bool):
         bubble_fill = _white_bubble_fill(image, text_mask)
         if bubble_fill is not None:
             return bubble_fill
+        uniform_fill = _apply_uniform_fill(image, text_mask)
+        if uniform_fill is not None:
+            return uniform_fill
     if mode == "ai":
         if cv2 is not None and np is not None:
             total = text_mask.size
@@ -205,6 +259,222 @@ def _apply_text_removal(image, text_mask, mode: str, use_gpu: bool):
     return _apply_white_mask(image, text_mask)
 
 
+def _apply_background_fill(
+    image,
+    boxes: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int] | None]],
+):
+    if cv2 is None or np is None or not boxes:
+        return image
+    img_np = np.array(image)
+    h, w = img_np.shape[:2]
+    for box, fill_color in boxes:
+        x0, y0, x1, y1 = [int(v) for v in box]
+        x0 = max(0, min(x0, w - 1))
+        y0 = max(0, min(y0, h - 1))
+        x1 = max(x0 + 1, min(x1, w))
+        y1 = max(y0 + 1, min(y1, h))
+        if fill_color is None:
+            samples = _sample_box_border(img_np, x0, y0, x1, y1, pad=3)
+            if samples.size < 3:
+                samples = img_np[y0:y1, x0:x1].reshape(-1, 3)
+            if samples.size < 3:
+                continue
+            median = np.median(samples, axis=0)
+            fill_color = tuple(int(v) for v in median.tolist())
+        img_np[y0:y1, x0:x1] = np.array(fill_color, dtype=np.uint8)
+    return Image.fromarray(img_np)
+
+
+def _box_luma_stats(img_np, box: Tuple[int, int, int, int]):
+    if cv2 is None or np is None:
+        return None
+    x0, y0, x1, y1 = [int(v) for v in box]
+    h, w = img_np.shape[:2]
+    x0 = max(0, min(x0, w - 1))
+    y0 = max(0, min(y0, h - 1))
+    x1 = max(x0 + 1, min(x1, w))
+    y1 = max(y0 + 1, min(y1, h))
+    crop = img_np[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    if gray.size == 0:
+        return None
+    mean = float(gray.mean())
+    p20 = float(np.percentile(gray, 20))
+    p80 = float(np.percentile(gray, 80))
+    return mean, p20, p80
+
+
+def _estimate_box_fill(img_np, box: Tuple[int, int, int, int]):
+    stats = _box_luma_stats(img_np, box)
+    if stats is None:
+        return None
+    mean, p20, p80 = stats
+    x0, y0, x1, y1 = [int(v) for v in box]
+    h, w = img_np.shape[:2]
+    x0 = max(0, min(x0, w - 1))
+    y0 = max(0, min(y0, h - 1))
+    x1 = max(x0 + 1, min(x1, w))
+    y1 = max(y0 + 1, min(y1, h))
+    crop = img_np[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    pixels = crop.reshape(-1, 3)
+    gray_flat = gray.reshape(-1)
+    if p80 < 95:
+        mask = gray_flat <= np.percentile(gray_flat, 50)
+    elif p20 > 175:
+        mask = gray_flat >= np.percentile(gray_flat, 50)
+    else:
+        mask = slice(None)
+    sample = pixels[mask] if not isinstance(mask, slice) else pixels
+    if sample.size < 3:
+        sample = pixels
+    median = np.median(sample.reshape(-1, 3), axis=0)
+    return tuple(int(v) for v in median.tolist())
+
+def _sample_box_border(img_np, x0: int, y0: int, x1: int, y1: int, pad: int = 3):
+    h, w = img_np.shape[:2]
+    pad = max(1, pad)
+    ix0 = min(max(x0 + pad, 0), w)
+    iy0 = min(max(y0 + pad, 0), h)
+    ix1 = max(min(x1 - pad, w), ix0 + 1)
+    iy1 = max(min(y1 - pad, h), iy0 + 1)
+    outer = np.zeros((h, w), dtype=np.uint8)
+    inner = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(outer, (x0, y0), (x1 - 1, y1 - 1), 255, thickness=-1)
+    cv2.rectangle(inner, (ix0, iy0), (ix1 - 1, iy1 - 1), 255, thickness=-1)
+    border = cv2.subtract(outer, inner)
+    return img_np[border > 0].reshape(-1, 3)
+
+
+def _expand_dark_box(img_np, box: Tuple[int, int, int, int]):
+    if cv2 is None or np is None:
+        return None
+    x0, y0, x1, y1 = [int(v) for v in box]
+    h, w = img_np.shape[:2]
+    x0 = max(0, min(x0, w - 1))
+    y0 = max(0, min(y0, h - 1))
+    x1 = max(x0 + 1, min(x1, w))
+    y1 = max(y0 + 1, min(y1, h))
+    pad = int(max(x1 - x0, y1 - y0) * 1.5)
+    rx0 = max(0, x0 - pad)
+    ry0 = max(0, y0 - pad)
+    rx1 = min(w, x1 + pad)
+    ry1 = min(h, y1 + pad)
+    roi = img_np[ry0:ry1, rx0:rx1]
+    if roi.size == 0:
+        return None
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    thresh = 120
+    _, dark = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
+    num_labels, labels = cv2.connectedComponents(dark)
+    if num_labels <= 1:
+        return None
+    cy = int((y0 + y1) / 2) - ry0
+    cx = int((x0 + x1) / 2) - rx0
+    if cy < 0 or cx < 0 or cy >= labels.shape[0] or cx >= labels.shape[1]:
+        return None
+    label = labels[cy, cx]
+    if label == 0:
+        return None
+    ys, xs = np.where(labels == label)
+    if ys.size == 0 or xs.size == 0:
+        return None
+    bx0 = int(xs.min()) + rx0
+    by0 = int(ys.min()) + ry0
+    bx1 = int(xs.max()) + rx0
+    by1 = int(ys.max()) + ry0
+    base_area = max(1, (x1 - x0) * (y1 - y0))
+    expanded_area = max(1, (bx1 - bx0) * (by1 - by0))
+    if expanded_area > base_area * 8:
+        return None
+    return (bx0, by0, bx1, by1)
+
+
+def _apply_uniform_fill(image, text_mask):
+    if cv2 is None or np is None:
+        return None
+    if text_mask is None:
+        return None
+    if not np.any(text_mask):
+        return None
+    img_np = np.array(image)
+    num_labels, labels = cv2.connectedComponents(text_mask)
+    if num_labels <= 1:
+        return None
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    result = img_np.copy()
+    applied = False
+    for label in range(1, num_labels):
+        component = (labels == label).astype(np.uint8)
+        if component.sum() < 8:
+            continue
+        dilated = cv2.dilate(component, kernel, iterations=2)
+        border = cv2.subtract(dilated, component)
+        samples = img_np[border > 0]
+        if samples.size < 9:
+            continue
+        sample_arr = samples.reshape(-1, 3)
+        std = float(sample_arr.std(axis=0).mean())
+        if std > 18:
+            continue
+        median = np.median(sample_arr, axis=0)
+        result[component > 0] = median.astype(np.uint8)
+        applied = True
+    if applied:
+        return Image.fromarray(result)
+    return None
+
+
+def _apply_bubble_fill(image, bubble_mask, text_mask, reference_np):
+    if bubble_mask is None or text_mask is None:
+        return image
+    if cv2 is None or np is None:
+        return _apply_white_mask(image, text_mask)
+    result = np.array(image)
+    ref = reference_np if reference_np is not None else result
+    num_labels, labels = cv2.connectedComponents(bubble_mask)
+    if num_labels <= 1:
+        return _apply_white_mask(image, text_mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    text_binary = (text_mask > 0).astype(np.uint8)
+    for label in range(1, num_labels):
+        component = (labels == label).astype(np.uint8)
+        if component.sum() == 0:
+            continue
+        text_region = cv2.bitwise_and(component, text_binary)
+        if text_region.sum() == 0:
+            continue
+        ys, xs = np.where(text_region > 0)
+        if ys.size == 0 or xs.size == 0:
+            continue
+        tx0, ty0, tx1, ty1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+        pad = max(4, int(max(tx1 - tx0, ty1 - ty0) * 0.35))
+        bx0 = max(0, tx0 - pad)
+        by0 = max(0, ty0 - pad)
+        bx1 = min(component.shape[1] - 1, tx1 + pad)
+        by1 = min(component.shape[0] - 1, ty1 + pad)
+        local = np.zeros_like(component)
+        local[by0 : by1 + 1, bx0 : bx1 + 1] = component[by0 : by1 + 1, bx0 : bx1 + 1]
+        halo = cv2.dilate(text_region, kernel, iterations=1)
+        sample_mask = cv2.bitwise_and(local, cv2.bitwise_not(halo))
+        samples = ref[sample_mask > 0]
+        if samples.size < 12:
+            inner = cv2.erode(component, kernel, iterations=2)
+            if inner.sum() > 0:
+                samples = ref[inner > 0]
+        if samples.size < 3:
+            color = (255, 255, 255)
+        else:
+            median = np.median(samples.reshape(-1, 3), axis=0)
+            color = tuple(int(v) for v in median.tolist())
+        result[text_region > 0] = color
+    return Image.fromarray(result)
+
+
 def _apply_white_mask(image, text_mask):
     if cv2 is None or np is None:
         draw = ImageDraw.Draw(image)
@@ -212,6 +482,37 @@ def _apply_white_mask(image, text_mask):
     img_np = np.array(image)
     img_np[text_mask > 0] = (255, 255, 255)
     return Image.fromarray(img_np)
+
+
+def _resolve_text_color(image, box, default=(0, 0, 0)):
+    if ImageStat is None or image is None:
+        return default
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = max(x0 + 1, x1)
+    y1 = max(y0 + 1, y1)
+    try:
+        crop = image.crop((x0, y0, x1, y1))
+        stat = ImageStat.Stat(crop)
+        if not stat.mean or len(stat.mean) < 3:
+            return default
+        mean = stat.mean
+        lum = 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2]
+        try:
+            gray = crop.convert("L")
+            hist = gray.histogram()
+            total = max(1, sum(hist))
+            dark_pixels = sum(hist[:70]) / total
+            if dark_pixels > 0.35:
+                return (255, 255, 255)
+        except Exception:
+            pass
+        if lum < 110:
+            return (255, 255, 255)
+    except Exception:
+        return default
+    return default
 
 
 def _region_masks(
@@ -249,7 +550,69 @@ def _region_masks(
         text_mask = _rect_mask(text_mask.shape, bbox, x0, y0)
     text_mask = cv2.dilate(text_mask, kernel, iterations=1)
 
-    bubble_box, bubble_mask = _find_bubble_box(white, text_mask)
+    use_mask = white
+    text_pixels = int((text_mask > 0).sum())
+    if text_pixels:
+        _, dark = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel, iterations=1)
+        white_overlap = int(((white > 0) & (text_mask > 0)).sum())
+        dark_overlap = int(((dark > 0) & (text_mask > 0)).sum())
+        if dark_overlap > max(4, white_overlap * 1.2):
+            use_mask = dark
+    bubble_box, bubble_mask = _find_bubble_box(use_mask, text_mask)
+    if bubble_mask is not None:
+        bubble_pixels = gray[bubble_mask > 0]
+        if bubble_pixels.size > 0:
+            bubble_mean = float(bubble_pixels.mean())
+            if bubble_mean > 165:
+                threshold = min(140, bubble_mean - 35)
+                stroke = (gray < threshold).astype(np.uint8) * 255
+            elif bubble_mean < 90:
+                threshold = max(170, bubble_mean + 60)
+                stroke = (gray > threshold).astype(np.uint8) * 255
+            else:
+                stroke = None
+            if stroke is not None:
+                stroke = cv2.bitwise_and(stroke, bubble_mask)
+                stroke = cv2.morphologyEx(stroke, cv2.MORPH_CLOSE, kernel, iterations=1)
+                stroke = cv2.dilate(stroke, kernel, iterations=1)
+                text_mask = cv2.bitwise_or(text_mask, stroke)
+    adaptive_block = max(15, int(min(gray.shape[:2]) / 8) * 2 + 1)
+    base_limit = cv2.dilate(text_mask, kernel, iterations=1)
+    if bubble_mask is not None:
+        base_limit = cv2.bitwise_and(base_limit, bubble_mask)
+    try:
+        ink_dark = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            adaptive_block,
+            12,
+        )
+        ink_light = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY,
+            adaptive_block,
+            12,
+        )
+        dark_overlap = int(((ink_dark > 0) & (base_limit > 0)).sum())
+        light_overlap = int(((ink_light > 0) & (base_limit > 0)).sum())
+        if max(dark_overlap, light_overlap) > 5:
+            ink = ink_dark if dark_overlap >= light_overlap else ink_light
+            ink = cv2.bitwise_and(ink, base_limit)
+            ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel, iterations=1)
+            ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel, iterations=1)
+            ink = cv2.dilate(ink, kernel, iterations=1)
+            text_mask = cv2.bitwise_or(text_mask, ink)
+    except Exception:
+        pass
+    if bubble_mask is not None:
+        # Expand text removal slightly but keep it strictly inside the bubble area.
+        expanded = cv2.dilate(text_mask, kernel, iterations=1)
+        text_mask = cv2.bitwise_and(expanded, bubble_mask)
     full_mask = np.zeros((img_np.shape[0], img_np.shape[1]), dtype=np.uint8)
     full_mask[y0:y1, x0:x1] = text_mask
     if bubble_box:
@@ -298,6 +661,7 @@ def _find_bubble_box(white_mask, text_mask):
             best_label = label
     if best_label == 0:
         return None, None
+    text_pixels = int((text_mask > 0).sum())
     ys, xs = np.where(labels == best_label)
     if ys.size == 0 or xs.size == 0:
         return None, None
@@ -305,6 +669,8 @@ def _find_bubble_box(white_mask, text_mask):
     area = (x1 - x0) * (y1 - y0)
     total_area = white_mask.shape[0] * white_mask.shape[1]
     if total_area > 0 and area / total_area > 0.6:
+        return None, None
+    if text_pixels and area > max(text_pixels * 25, 16000):
         return None, None
     bubble_mask = (labels == best_label).astype(np.uint8) * 255
     return (x0, y0, x1, y1), bubble_mask

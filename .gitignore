@@ -28,3 +28,6 @@ tmp_run.py
 
 # Models (kept local; not tracked)
 models/
+
+# Documentation
+TECHNICAL.md

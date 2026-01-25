@@ -1,5 +1,6 @@
 # Core GUI
 PySide6
+qtawesome
 
 # Imaging / rendering
 Pillow

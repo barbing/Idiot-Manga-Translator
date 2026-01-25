@@ -21,11 +21,12 @@ def read_image_size(path: str) -> Tuple[int, int]:
         return 0, 0
 
 
-def build_page_record(image_path: str, page_id: str, regions: list) -> Dict[str, object]:
+def build_page_record(image_path: str, page_id: str, regions: list, output_path: str = "") -> Dict[str, object]:
     width, height = read_image_size(image_path)
     return {
         "page_id": page_id,
         "image_path": image_path,
+        "output_path": output_path,
         "width": width,
         "height": height,
         "regions": regions,

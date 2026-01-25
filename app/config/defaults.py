@@ -16,7 +16,7 @@ class AppDefaults:
     font_detection: str = "heuristic"
     detector_engine: str = "ComicTextDetector"
     ocr_engine: str = "MangaOCR"
-    filter_strength: str = "aggressive"
+    filter_strength: str = "normal"
     inpaint_mode: str = "ai"
     translator_backend: str = "Ollama"
     gguf_model_path: str = ""
@@ -26,6 +26,7 @@ class AppDefaults:
     gguf_n_threads: int = 8
     gguf_n_batch: int = 256
     fast_mode: bool = False
+    auto_glossary: bool = True
 
 
 def get_defaults() -> AppDefaults:

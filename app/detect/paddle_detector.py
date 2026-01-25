@@ -37,23 +37,12 @@ class PaddleTextDetector:
         )
 
     def detect(self, image_path: str) -> List[Tuple[List[List[float]], float]]:
-        try:
-            import cv2
-        except ImportError as exc:
-            raise RuntimeError("opencv-python is required for detection.") from exc
-        try:
-            import numpy as np
-        except Exception:
-            np = None
+        image = _read_image(image_path)
+        if image is None:
+            return []
+        return self.detect_image(image)
 
-        image = cv2.imread(image_path)
-        if image is None and np is not None:
-            try:
-                data = np.fromfile(image_path, dtype=np.uint8)
-                if data.size:
-                    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-            except Exception:
-                image = None
+    def detect_image(self, image) -> List[Tuple[List[List[float]], float]]:
         if image is None:
             return []
         dt_boxes, _ = self._detector.text_detector(image)
@@ -67,3 +56,20 @@ class PaddleTextDetector:
                 polygon = item
             output.append((polygon, 1.0))
         return output
+
+
+def _read_image(image_path: str):
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+    image = cv2.imread(image_path)
+    if image is None:
+        try:
+            data = np.fromfile(image_path, dtype=np.uint8)
+            if data.size:
+                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        except Exception:
+            image = None
+    return image
