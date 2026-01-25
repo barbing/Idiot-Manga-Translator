@@ -103,15 +103,19 @@ class ComicTextDetector:
             act="leaky",
         )
 
-    def detect(self, image_path: str) -> List[Tuple[List[List[float]], float]]:
+    def detect(self, image_path: str, input_size: int = 1024) -> List[Tuple[List[List[float]], float]]:
         image = _read_image(image_path)
         if image is None:
             return []
-        return self.detect_image(image)
+        return self.detect_image(image, input_size)
 
-    def detect_image(self, image) -> List[Tuple[List[List[float]], float]]:
+    def detect_image(self, image, input_size: int = 1024) -> List[Tuple[List[List[float]], float]]:
         if image is None:
             return []
+        # Update input size if changed
+        if input_size != self._detector.input_size:
+             self._detector.input_size = (input_size, input_size)
+             
         _, _, blk_list = self._detector(
             image,
             refine_mode=self._refine_mode,

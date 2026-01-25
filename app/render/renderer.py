@@ -28,6 +28,7 @@ def render_translations(
     font_name: str,
     inpaint_mode: str = "fast",
     use_gpu: bool = True,
+    model_id: str = "dreMaz/AnimeMangaInpainting",
 ) -> None:
     if Image is None:
         raise RuntimeError("Pillow is not installed.")
@@ -156,15 +157,36 @@ def render_translations(
             render_regions.append((text, render_box, region_font, forced_color))
 
         if render_regions:
-            if background_boxes:
-                working = _apply_background_fill(working, background_boxes)
+            # Combine background boxes into a single mask for inpainting
+            if background_boxes and cv2 is not None and np is not None:
+                 if text_mask is None:
+                     text_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                 
+                 bg_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                 for box, _ in background_boxes:
+                     bx0, by0, bx1, by1 = [int(v) for v in box]
+                     # Ensure we don't draw outside bounds
+                     bx0 = max(0, min(bx0, img_w))
+                     by0 = max(0, min(by0, img_h))
+                     bx1 = max(bx0, min(bx1, img_w))
+                     by1 = max(by0, min(by1, img_h))
+                     cv2.rectangle(bg_mask, (bx0, by0), (bx1, by1), 255, thickness=-1)
+                 
+                 # Combine with existing text mask
+                 text_mask = cv2.bitwise_or(text_mask, bg_mask)
+                 # Also update bubble_text_mask if we want them treated similarly, 
+                 # but usually background text is distinct. 
+                 # However, to ensure they are removed, we add to text_mask which is used by _apply_text_removal.
+
             if bubble_area_mask is not None and bubble_text_mask is not None and bubble_area_mask.any():
                 if cv2 is not None and np is not None:
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
                     bubble_area_mask = cv2.morphologyEx(bubble_area_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
                 working = _apply_bubble_fill(working, bubble_area_mask, bubble_text_mask, img_np)
-            if other_text_mask is not None and other_text_mask.any():
-                working = _apply_text_removal(working, other_text_mask, inpaint_mode, use_gpu)
+            
+            # Now apply text removal for everything (including background text which is now in text_mask)
+            if text_mask is not None and text_mask.any():
+                working = _apply_text_removal(working, text_mask, inpaint_mode, use_gpu, model_id=model_id)
 
         draw = ImageDraw.Draw(working)
         median_height = 0
@@ -211,52 +233,71 @@ def render_translations(
                 draw.text((offset_x, offset_y - bbox[1]), line, fill=fill_color, font=best_font)
                 offset_y += line_height
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        working.save(output_path)
+        # Save with high quality to prevent JPEG compression artifacts
+        ext = os.path.splitext(output_path)[1].lower()
+        if ext in (".jpg", ".jpeg"):
+            working.save(output_path, quality=95, optimize=True)
+        else:
+            working.save(output_path)
 
 
-def _apply_text_removal(image, text_mask, mode: str, use_gpu: bool):
+def _apply_text_removal(image, text_mask, mode: str, use_gpu: bool, model_id: str = "dreMaz/AnimeMangaInpainting"):
     if text_mask is None:
         return image
     mode = (mode or "fast").lower()
-    if cv2 is not None and np is not None:
-        bubble_fill = _white_bubble_fill(image, text_mask)
-        if bubble_fill is not None:
-            return bubble_fill
-        uniform_fill = _apply_uniform_fill(image, text_mask)
-        if uniform_fill is not None:
-            return uniform_fill
-    if mode == "ai":
-        if cv2 is not None and np is not None:
-            total = text_mask.size
-            ratio = float((text_mask > 0).sum()) / max(1, total)
-            if ratio > 0.03:
-                mode = "fast"
-            else:
-                img_np = np.array(image)
-                gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-                masked = gray[text_mask > 0]
-                if masked.size > 0:
-                    white_ratio = float((masked > 200).mean())
-                    if white_ratio > 0.7:
-                        mode = "fast"
-        if not use_gpu:
-            mode = "fast"
+    
+    if cv2 is None or np is None:
+        print("[TextRemoval] No CV2/numpy, using simple white mask")
+        return _apply_white_mask(image, text_mask)
+    
+    # Always try white bubble fill first (cleanest option)
+    bubble_fill = _white_bubble_fill(image, text_mask)
+    if bubble_fill is not None:
+        print("[TextRemoval] Used WHITE BUBBLE FILL")
+        return bubble_fill
+    
+    # Try uniform fill for simple backgrounds (handles most cases)
+    uniform_fill = _apply_uniform_fill(image, text_mask)
+    if uniform_fill is not None:
+        print("[TextRemoval] Used UNIFORM FILL")
+        return uniform_fill
+    
+    # For remaining complex areas: use AI inpainting if enabled, otherwise CV2
+    if mode == "ai" and use_gpu:
         try:
+            print(f"[TextRemoval] Using AI INPAINT with model: {model_id}")
             from app.render.inpaint_ai import ai_inpaint
-            return ai_inpaint(image, text_mask, use_gpu=use_gpu)
-        except Exception:
-            mode = "fast"
-    if mode == "fast" and cv2 is not None and np is not None:
-        img_np = np.array(image)
-        kernel_size = max(3, int(max(text_mask.shape) * 0.0015))
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        mask = cv2.dilate(text_mask, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        inpainted = cv2.inpaint(img_bgr, mask, 3, cv2.INPAINT_TELEA)
-        rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(rgb)
-    return _apply_white_mask(image, text_mask)
+            result = ai_inpaint(image, text_mask, use_gpu=use_gpu, model_id=model_id)
+            print("[TextRemoval] AI INPAINT Success")
+            return result
+        except Exception as e:
+            print(f"[TextRemoval] AI INPAINT failed: {e}, falling back to CV2")
+    
+    print("[TextRemoval] Used CV2 INPAINT (fallback)")
+    # CV2 inpainting with moderate dilation for complex areas
+    img_np = np.array(image)
+    kernel_size = max(5, int(max(text_mask.shape) * 0.004))
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    dilated = cv2.dilate(text_mask, kernel, iterations=2)
+    dilated = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=1)
+    
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    inpainted = cv2.inpaint(img_bgr, dilated, 5, cv2.INPAINT_NS)
+    rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
+
+def _process_fast_inpaint(image, mask):
+    if cv2 is None or np is None:
+        return image
+    img_np = np.array(image)
+    kernel_size = max(3, int(max(mask.shape) * 0.0015))
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    dilated = cv2.dilate(mask, kernel, iterations=1)
+    dilated = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=1)
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    inpainted = cv2.inpaint(img_bgr, dilated, 3, cv2.INPAINT_TELEA)
+    rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
 
 
 def _apply_background_fill(
@@ -405,26 +446,50 @@ def _apply_uniform_fill(image, text_mask):
     num_labels, labels = cv2.connectedComponents(text_mask)
     if num_labels <= 1:
         return None
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     result = img_np.copy()
     applied = False
+    skipped_complex = False  # Track if we skipped any complex backgrounds
     for label in range(1, num_labels):
         component = (labels == label).astype(np.uint8)
         if component.sum() < 8:
             continue
-        dilated = cv2.dilate(component, kernel, iterations=2)
-        border = cv2.subtract(dilated, component)
-        samples = img_np[border > 0]
+        
+        # First, sample border to determine background complexity
+        sample_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        sample_dilated = cv2.dilate(component, sample_kernel, iterations=2)
+        sample_border = cv2.subtract(sample_dilated, component)
+        samples = img_np[sample_border > 0]
+        
         if samples.size < 9:
+            # Not enough samples - skip, let AI handle it
+            skipped_complex = True
             continue
+        
         sample_arr = samples.reshape(-1, 3)
         std = float(sample_arr.std(axis=0).mean())
-        if std > 18:
-            continue
         median = np.median(sample_arr, axis=0)
-        result[component > 0] = median.astype(np.uint8)
-        applied = True
-    if applied:
+        
+        # ONLY handle uniform backgrounds - skip complex ones for AI
+        if std <= 15:
+            # Very uniform (white bubble): moderate dilation to preserve borders
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            dilated = cv2.dilate(component, kernel, iterations=2)
+            result[dilated > 0] = median.astype(np.uint8)
+            applied = True
+        elif std <= 30:
+            # Moderately uniform: minimal dilation
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            dilated = cv2.dilate(component, kernel, iterations=1)
+            result[dilated > 0] = median.astype(np.uint8)
+            applied = True
+        else:
+            # Complex background (artwork): SKIP - let AI handle it
+            skipped_complex = True
+            continue
+    
+    # Only return if we processed some regions AND didn't skip any complex ones
+    # If we skipped complex regions, return None so AI inpainting handles everything
+    if applied and not skipped_complex:
         return Image.fromarray(result)
     return None
 
@@ -480,7 +545,12 @@ def _apply_white_mask(image, text_mask):
         draw = ImageDraw.Draw(image)
         return image
     img_np = np.array(image)
-    img_np[text_mask > 0] = (255, 255, 255)
+    # Aggressively dilate mask to ensure complete text coverage
+    kernel_size = max(7, int(max(text_mask.shape) * 0.006))
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    dilated = cv2.dilate(text_mask, kernel, iterations=4)
+    dilated = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=2)
+    img_np[dilated > 0] = (255, 255, 255)
     return Image.fromarray(img_np)
 
 
@@ -493,23 +563,38 @@ def _resolve_text_color(image, box, default=(0, 0, 0)):
     x1 = max(x0 + 1, x1)
     y1 = max(y0 + 1, y1)
     try:
-        crop = image.crop((x0, y0, x1, y1))
-        stat = ImageStat.Stat(crop)
+        # Sample a larger area to include the bubble rim/background
+        pad = max(10, int(min(x1 - x0, y1 - y0) * 0.15))
+        bx0 = max(0, x0 - pad)
+        by0 = max(0, y0 - pad)
+        bx1 = min(image.width, x1 + pad)
+        by1 = min(image.height, y1 + pad)
+        
+        crop = image.crop((bx0, by0, bx1, by1))
+        
+        # Mask out the center (text area) to only checking the rim
+        mask = Image.new("L", crop.size, 255)
+        draw = ImageDraw.Draw(mask)
+        # Inner box relative to crop
+        ix0 = x0 - bx0
+        iy0 = y0 - by0
+        ix1 = x1 - bx0
+        iy1 = y1 - by0
+        draw.rectangle((ix0, iy0, ix1, iy1), fill=0)
+        
+        stat = ImageStat.Stat(crop, mask)
         if not stat.mean or len(stat.mean) < 3:
             return default
+            
         mean = stat.mean
         lum = 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2]
-        try:
-            gray = crop.convert("L")
-            hist = gray.histogram()
-            total = max(1, sum(hist))
-            dark_pixels = sum(hist[:70]) / total
-            if dark_pixels > 0.35:
-                return (255, 255, 255)
-        except Exception:
-            pass
-        if lum < 110:
-            return (255, 255, 255)
+        
+        # If background is bright, use black text. If dark, use white.
+        if lum > 140:
+             return (0, 0, 0)
+        elif lum < 100:
+             return (255, 255, 255)
+             
     except Exception:
         return default
     return default

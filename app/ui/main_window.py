@@ -523,8 +523,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.detector_engine = QtWidgets.QComboBox()
         self.detector_engine.addItems(["PaddleOCR", "ComicTextDetector"])
         self.detector_engine.setCurrentText(self._defaults.detector_engine)
+        
+        self.detector_input_size = QtWidgets.QComboBox()
+        self.detector_input_size.addItems(["640", "1024", "1280"])
+        self.detector_input_size.setCurrentText("640")
+        
+        det_layout = self._hbox(self.detector_engine, self.detector_input_size)
+    
         layout.addWidget(QtWidgets.QLabel("Text Detector"), 0, 0)
-        layout.addWidget(self.detector_engine, 1, 0)
+        layout.addWidget(det_layout, 1, 0)
         self.ocr_engine = QtWidgets.QComboBox()
         self.ocr_engine.addItems(["PaddleOCR", "MangaOCR"])
         self.ocr_engine.setCurrentText(self._defaults.ocr_engine)
@@ -614,7 +621,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_gguf_n_batch.setValue(self._defaults.gguf_n_batch)
 
         layout.addWidget(QtWidgets.QLabel("Text Detector"), 0, 0)
-        layout.addWidget(self.settings_detector_engine, 1, 0)
+        
+        self.settings_detector_input_size = QtWidgets.QComboBox()
+        self.settings_detector_input_size.addItems(["640", "1024", "1280"])
+        self.settings_detector_input_size.setCurrentText("640")
+        
+        det_row = self._hbox(self.settings_detector_engine, self.settings_detector_input_size)
+        layout.addWidget(det_row, 1, 0)
         layout.addWidget(QtWidgets.QLabel("OCR Engine"), 0, 1)
         layout.addWidget(self.settings_ocr_engine, 1, 1)
         layout.addWidget(QtWidgets.QLabel("Translator"), 2, 0)
@@ -663,7 +676,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.inpaint_mode.addItems(["fast", "ai", "off"])
         self.inpaint_mode.setCurrentText(self._defaults.inpaint_mode)
         layout.addRow("Inpainting", self.inpaint_mode)
+        
+        # New: AI Model ID - read from defaults
+        self.inpaint_model_id = QtWidgets.QLineEdit(self._defaults.inpaint_model)
+        layout.addRow("AI Model ID", self.inpaint_model_id)
+        
         return group
+
 
     def _group_performance(self) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox("Performance")
@@ -755,6 +774,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sync_models_to_settings(self) -> None:
         self.settings_detector_engine.setCurrentText(self.detector_engine.currentText())
+        self.settings_detector_input_size.setCurrentText(self.detector_input_size.currentText())
         self.settings_ocr_engine.setCurrentText(self.ocr_engine.currentText())
         self.settings_translator_backend.setCurrentText(self.translator_backend.currentText())
         self._set_combo_text(self.settings_ollama_model, self.ollama_model.currentText())
@@ -767,6 +787,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sync_settings_to_models(self) -> None:
         self.detector_engine.setCurrentText(self.settings_detector_engine.currentText())
+        self.detector_input_size.setCurrentText(self.settings_detector_input_size.currentText())
         self.ocr_engine.setCurrentText(self.settings_ocr_engine.currentText())
         self.translator_backend.setCurrentText(self.settings_translator_backend.currentText())
         self._set_combo_text(self.ollama_model, self.settings_ollama_model.currentText())
@@ -870,8 +891,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_models()
         self._refresh_gguf_models()
+        self._refresh_import_preview()
         self._sync_models_to_settings()
         self._sync_paths_to_settings()
+        self._load_saved_settings()
 
     def _apply_theme(self, theme: str) -> None:
         app = QtWidgets.QApplication.instance()
@@ -1069,7 +1092,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._page_cache = {}
         self._thumb_cache = {}
         for row_index, name in enumerate(items):
-            item = QtWidgets.QListWidgetItem(name)
+            item = QtWidgets.QListWidgetItem("") # Hide text overlay
             item.setData(QtCore.Qt.UserRole, {"path": os.path.join(self.import_dir.text().strip(), name), "status": "pending"})
             item.setSizeHint(QtCore.QSize(140, 210))
             item.setTextAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom)
@@ -1137,19 +1160,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_btn.setEnabled(False)
 
     def _refresh_item_text(self, item: QtWidgets.QListWidgetItem) -> None:
-        data = item.data(QtCore.Qt.UserRole) or {}
-        path = data.get("path", "")
-        name = os.path.basename(path) if path else item.text().split("\n")[0]
-        status = data.get("status", "pending")
-        confidence = data.get("confidence")
-        label = name
-        if confidence is not None:
-            label = f"{label}\n{int(confidence * 100)}% confident"
-        if status.startswith("error"):
-            label = f"{label}\nerror"
-        elif status.startswith("pending"):
-            label = f"{label}\npending"
-        item.setText(label)
+        # Status is now indicated by border/icon, and name is hidden for cleaner UI.
+        item.setText("")
         item.setTextAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom)
 
     def _load_thumbnail(self, path: str, size: QtCore.QSize | None = None) -> QtGui.QPixmap | None:
@@ -1479,6 +1491,8 @@ class MainWindow(QtWidgets.QMainWindow):
             gguf_n_batch=self.gguf_n_batch.value(),
             fast_mode=self.fast_mode.isChecked(),
             auto_glossary=self.auto_glossary.isChecked(),
+            detector_input_size=int(self.detector_input_size.currentText()),
+            inpaint_model_id=self.inpaint_model_id.text().strip(),
         )
         self._pipeline.start(settings)
         return True
@@ -1543,6 +1557,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.font_name.currentText().strip(),
                     inpaint_mode=self.inpaint_mode.currentText(),
                     use_gpu=self.use_gpu.isChecked(),
+                    model_id=self.inpaint_model_id.text().strip(),
                 )
                 self._update_queue_item(idx - 1, "done")
             except Exception as exc:
@@ -1574,3 +1589,82 @@ class MainWindow(QtWidgets.QMainWindow):
             or "PyTorch DLL load failed" in message
         ):
             QtWidgets.QMessageBox.critical(self, "Dependency Error", message)
+
+    def closeEvent(self, event) -> None:
+        self._save_settings()
+        super().closeEvent(event)
+
+    def _save_settings(self) -> None:
+        settings = QtCore.QSettings("MangaTranslator", "Pro")
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        
+        # Paths
+        settings.setValue("import_dir", self.import_dir.text())
+        settings.setValue("export_dir", self.export_dir.text())
+        settings.setValue("json_path", self.json_path.text())
+        
+        # Models & Params
+        settings.setValue("source_lang", self.source_lang.currentText())
+        settings.setValue("target_lang", self.target_lang.currentText())
+        settings.setValue("detector_engine", self.detector_engine.currentText())
+        settings.setValue("detector_input_size", self.detector_input_size.currentText())
+        settings.setValue("ocr_engine", self.ocr_engine.currentText())
+        settings.setValue("translator_backend", self.translator_backend.currentText())
+        settings.setValue("inpaint_mode", self.inpaint_mode.currentText())
+        settings.setValue("filter_strength", self.filter_strength.currentText())
+        settings.setValue("use_gpu", self.use_gpu.isChecked())
+        settings.setValue("fast_mode", self.fast_mode.isChecked())
+        settings.setValue("auto_glossary", self.auto_glossary.isChecked())
+        settings.setValue("font_name", self.font_name.currentText())
+        
+        # GGUF
+        settings.setValue("gguf_model_path", self._selected_gguf_model_path())
+        settings.setValue("gguf_n_gpu_layers", self.gguf_n_gpu_layers.value())
+
+    def _load_saved_settings(self) -> None:
+        settings = QtCore.QSettings("MangaTranslator", "Pro")
+        geo = settings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
+        state = settings.value("windowState")
+        if state:
+            self.restoreState(state)
+
+        def _restore(widget, key, type_func=str):
+            val = settings.value(key)
+            if val is not None:
+                val = type_func(val)
+                if isinstance(widget, QtWidgets.QComboBox):
+                    widget.setCurrentText(val)
+                elif isinstance(widget, QtWidgets.QLineEdit):
+                    widget.setText(val)
+                elif isinstance(widget, QtWidgets.QCheckBox):
+                    widget.setChecked(val == "true" if isinstance(val, str) else bool(val))
+                elif isinstance(widget, QtWidgets.QSpinBox):
+                    widget.setValue(int(val))
+
+        _restore(self.import_dir, "import_dir")
+        _restore(self.export_dir, "export_dir")
+        _restore(self.json_path, "json_path")
+        _restore(self.source_lang, "source_lang")
+        _restore(self.target_lang, "target_lang")
+        
+        _restore(self.detector_engine, "detector_engine")
+        _restore(self.detector_input_size, "detector_input_size")
+        _restore(self.ocr_engine, "ocr_engine")
+        _restore(self.translator_backend, "translator_backend")
+        _restore(self.inpaint_mode, "inpaint_mode")
+        _restore(self.filter_strength, "filter_strength")
+        _restore(self.use_gpu, "use_gpu", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
+        _restore(self.fast_mode, "fast_mode", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
+        _restore(self.auto_glossary, "auto_glossary", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
+        _restore(self.font_name, "font_name")
+        _restore(self.gguf_n_gpu_layers, "gguf_n_gpu_layers", type_func=int)
+        
+        gguf_path = settings.value("gguf_model_path")
+        if gguf_path:
+            self._add_gguf_model(str(gguf_path))
+            
+        self._sync_models_to_settings()
+        self._sync_paths_to_settings()

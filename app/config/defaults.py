@@ -14,10 +14,15 @@ class AppDefaults:
     export_dir: str = ""
     font_name: str = "Microsoft YaHei"
     font_detection: str = "heuristic"
+    detector_input_size: int = 1024
     detector_engine: str = "ComicTextDetector"
     ocr_engine: str = "MangaOCR"
     filter_strength: str = "normal"
     inpaint_mode: str = "ai"
+    # Available models: 
+    # - "dreMaz/AnimeMangaInpainting" (default, anime-focused)
+    # - "runwayml/stable-diffusion-inpainting" (general, slower)
+    inpaint_model: str = "dreMaz/AnimeMangaInpainting"
     translator_backend: str = "Ollama"
     gguf_model_path: str = ""
     gguf_prompt_style: str = "sakura"

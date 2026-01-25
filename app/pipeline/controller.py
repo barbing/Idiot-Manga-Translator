@@ -55,6 +55,9 @@ class PipelineSettings:
     gguf_n_batch: int
     fast_mode: bool
     auto_glossary: bool
+    # New settings
+    detector_input_size: int
+    inpaint_model_id: str
 
 
 class PipelineWorker(QtCore.QThread):
@@ -260,7 +263,9 @@ class PipelineWorker(QtCore.QThread):
                         font_detector,
                         translation_cache,
                         background_detector,
+
                         auto_glossary_state,
+                        image_input_size=self._settings.detector_input_size,
                     )
                 except Exception as exc:
                     page_elapsed = time.time() - page_start
@@ -276,6 +281,7 @@ class PipelineWorker(QtCore.QThread):
                         self._settings.font_name,
                         inpaint_mode=self._settings.inpaint_mode,
                         use_gpu=self._settings.use_gpu,
+                        model_id=self._settings.inpaint_model_id,
                     )
                 except Exception as exc:
                     page_elapsed = time.time() - page_start
@@ -480,9 +486,18 @@ def _process_page(
     translation_cache: dict[str, str],
     background_detector,
     auto_glossary_state,
+    image_input_size: int = 1024,
 ) -> list:
     image_size = _get_image_size(image_path)
-    detections = _detect_with_scale(detector, image_path, image_size)
+    # Pass input_size if the detector supports it (ComicTextDetector)
+    if hasattr(detector, "detect"):
+        try:
+           detections = detector.detect(image_path, input_size=image_input_size)
+        except TypeError:
+           detections = _detect_with_scale(detector, image_path, image_size)
+    else:
+        detections = _detect_with_scale(detector, image_path, image_size)
+        
     merge = getattr(detector, "merge_mode", "auto") != "none"
     groups = _merge_detections(detections, image_size, merge=merge)
     if not groups:

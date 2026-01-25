@@ -87,6 +87,9 @@ class GGUFClient:
             self.gpu_offload = has_gpu and self._n_gpu_layers != 0
         except Exception:
             self.gpu_offload = False
+        if self._n_gpu_layers == -1:
+             self._n_gpu_layers = 100 if self.gpu_offload else 0
+             
         self._llama = _load_model(
             self._model_path,
             n_ctx=self._n_ctx,
@@ -97,6 +100,9 @@ class GGUFClient:
 
     def is_available(self) -> bool:
         return os.path.isfile(self._model_path)
+        
+    def is_gpu_enabled(self) -> bool:
+        return self.gpu_offload and self._n_gpu_layers > 0
 
     def generate(self, model: str, prompt: str, timeout: int = 600, options: Optional[dict] = None) -> str:
         opts = {"temperature": 0.2, "top_p": 0.95}
