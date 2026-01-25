@@ -25,6 +25,7 @@ output/
 Test Manga/
 AGENTS.md
 tmp_run.py
+verify_page_review.py
 
 # Models (kept local; not tracked)
 models/
