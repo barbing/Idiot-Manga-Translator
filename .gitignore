@@ -20,15 +20,13 @@ Thumbs.db
 # App outputs / local data
 output/
 *.sqlite
+logs/
 
 # Local test data (not for repo)
 Test Manga/
 AGENTS.md
 tmp_run.py
-verify_page_review.py
 
 # Models (kept local; not tracked)
 models/
-
-# Documentation
-TECHNICAL.md
+dist/

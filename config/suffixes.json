@@ -1,0 +1,4 @@
+{
+    "_comment": "User-defined suffixes. Add manga-specific suffixes here. They will be merged with built-in defaults.",
+    "_example": "Example: \"たそ\": {\"pattern\": \"taso\", \"hint\": \"可爱的称呼\"}"
+}

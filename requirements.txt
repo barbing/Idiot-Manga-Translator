@@ -28,6 +28,10 @@ huggingface-hub>=0.19.3,<1.0
 simple-lama-inpainting
 torch
 
+# Japanese NLP (MeCab for proper noun extraction / Auto-Glossary)
+fugashi>=1.3.0
+unidic-lite>=1.0.8
+
 # Optional GPU stack (recommend via conda for Windows)
-# torch
+# paddlepaddle-gpu
 # torchvision

@@ -41,6 +41,10 @@ def _preload_torch() -> None:
 
 
 def main() -> int:
+    # Initialize logging first thing
+    from app.utils.logger import setup_logger
+    setup_logger()
+    
     if sys.platform == "win32":
         try:
             import multiprocessing as mp
@@ -50,9 +54,15 @@ def main() -> int:
     _configure_dll_paths()
     _configure_paddle_env()
     _preload_torch()
-    from PySide6 import QtWidgets
+    from PySide6 import QtWidgets, QtGui
     from app.ui.main_window import MainWindow
     app = QtWidgets.QApplication(sys.argv)
+    
+    # Set global default font to prevent "Point size <= 0" errors
+    font = QtGui.QFont("Microsoft YaHei", 10)
+    font.setStyleStrategy(QtGui.QFont.PreferAntialias)
+    app.setFont(font)
+    
     window = MainWindow()
     window.show()
     return app.exec()

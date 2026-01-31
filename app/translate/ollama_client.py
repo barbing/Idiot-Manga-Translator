@@ -4,6 +4,9 @@ from __future__ import annotations
 import requests
 from typing import Optional
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434") -> None:
@@ -13,8 +16,12 @@ class OllamaClient:
         url = f"{self._base_url}/api/tags"
         try:
             response = requests.get(url, timeout=timeout)
-            return response.status_code == 200
-        except requests.RequestException:
+            available = response.status_code == 200
+            if not available:
+                logger.warning(f"Ollama check failed. Status: {response.status_code}")
+            return available
+        except requests.RequestException as e:
+            logger.warning(f"Ollama unavailable: {e}")
             return False
 
     def generate(self, model: str, prompt: str, timeout: int = 600, options: Optional[dict] = None) -> str:
@@ -26,4 +33,5 @@ class OllamaClient:
         response = requests.post(url, json=payload, timeout=timeout)
         response.raise_for_status()
         data = response.json()
+        logger.debug(f"Ollama generation success for model {model}")
         return str(data.get("response", "")).strip()

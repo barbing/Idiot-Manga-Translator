@@ -52,7 +52,13 @@ class MangaOcrEngine:
             from manga_ocr import MangaOcr
         except Exception as exc:
             raise RuntimeError(f"Failed to import manga-ocr: {exc}") from exc
-        self._engine = MangaOcr(force_cpu=not use_gpu)
+        
+        # Check for local model
+        model_path = os.path.join(os.getcwd(), "models", "manga-ocr")
+        if os.path.exists(os.path.join(model_path, "pytorch_model.bin")):
+            self._engine = MangaOcr(pretrained_model_name_or_path=model_path, force_cpu=not use_gpu)
+        else:
+            self._engine = MangaOcr(force_cpu=not use_gpu)
 
     def recognize(self, image) -> str:
         return self._engine(image)

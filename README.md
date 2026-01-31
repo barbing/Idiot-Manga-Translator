@@ -8,6 +8,10 @@ Desktop manga translation tool with GUI. Import a folder of manga images, transl
 - OCR engines: MangaOCR + PaddleOCR
 - Text detection: ComicTextDetector
 - Translators: Ollama (local models) and GGUF (llama.cpp)
+- Auto-Glossary (MeCab) for consistent noun translations
+- Hybrid Discovery (LLM) option for deeper glossary extraction
+- Deep Scan (Background Analysis) with separate backend/model
+- Per-model overrides (advanced generation settings)
 - Style guide JSON (glossary + prompts)
 - JSON project output for human edits + re-apply
 - Progress/ETA + per-page timing
@@ -25,7 +29,6 @@ pip install -r requirements.txt
 
 Notes:
 - For GPU acceleration, prefer installing PyTorch/Paddle GPU builds via conda.
-- For GPU acceleration, prefer installing PyTorch/Paddle GPU builds via conda.
 - AI inpainting uses LaMa (models downloaded automatically on first use).
 
 ## Run the App
@@ -40,14 +43,19 @@ python -m app.main
 4. Choose **Translator** (Ollama or GGUF).
 5. Choose **OCR Engine** (MangaOCR recommended).
 6. Press **Start**.
+7. (Optional) Enable **Auto Glossary** for consistent names.
+8. (Optional) Enable **Hybrid Discovery (LLM)** for deeper noun extraction.
 
 ## Output
 - Rendered images in the export folder.
 - `project.json` with regions, OCR text, translations, render params, and flags.
+- `style_guide.json` (when Auto-Glossary is enabled) saved to the export folder.
 
 ## Re-apply Edited JSON
 1. Manually edit `project.json`.
 2. Click **Import JSON (Re-apply)** to render your edits without re-translation.
+3. If Auto-Glossary finds new name translations after the run, use the
+   **Consistency Check** dialog to re-translate affected pages.
 
 ## Models
 ### Ollama
@@ -65,6 +73,10 @@ python -m app.main
   (See the ComicTextDetector release page linked in the app error message.)
 
 ## Troubleshooting
+### Ollama warnings
+If Ollama is selected but not running, the UI will show a warning. Start it with
+`ollama serve` or switch to GGUF.
+
 ### App finishes instantly / no output
 On Windows, OpenCV cannot read non-ASCII file paths with `cv2.imread`.
 Use ASCII-only paths or the updated detectors (this repo already includes

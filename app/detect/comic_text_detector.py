@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 import sys
 from typing import List, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _repo_root() -> str:
@@ -25,8 +28,10 @@ def _select_model_path(model_dir: str, use_gpu: bool) -> str:
     onnx_path = os.path.join(model_dir, "comictextdetector.pt.onnx")
     pt_path = os.path.join(model_dir, "comictextdetector.pt")
     if use_gpu and os.path.isfile(pt_path):
+        logger.info(f"Selected GPU model: {pt_path}")
         return pt_path
     if os.path.isfile(onnx_path):
+        logger.info(f"Selected ONNX model: {onnx_path}")
         return onnx_path
     if os.path.isfile(pt_path):
         return pt_path
@@ -102,6 +107,7 @@ class ComicTextDetector:
             device=device,
             act="leaky",
         )
+        logger.info(f"ComicTextDetector initialized. GPU={use_gpu}, Device={device}")
 
     def detect(self, image_path: str, input_size: int = 1024) -> List[Tuple[List[List[float]], float]]:
         image = _read_image(image_path)
