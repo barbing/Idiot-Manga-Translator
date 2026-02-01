@@ -1,6 +1,9 @@
 # Manga Translator (Windows, Python)
 
-Desktop manga translation tool with GUI. Import a folder of manga images, translate Japanese text into Simplified Chinese or English, render translations inside bubbles, and export images plus a project JSON you can edit and re-apply.
+
+Manga Translation tool (Windows/GUI). Translates Japanese manga pages into English/Chinese with localized text rendering.
+
+![Screenshot](assets/screenshot.png)
 
 ## Key Features
 - Windows desktop GUI (PySide6)

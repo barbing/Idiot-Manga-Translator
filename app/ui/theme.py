@@ -217,7 +217,7 @@ QProgressBar {
   background-color: #0f172a;
 }
 QProgressBar::chunk {
-  background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0ea5e9, stop:1 #38bdf8);
+  background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #a855f7, stop:1 #22d3ee);
   border-radius: 4px;
 }
 QScrollBar:vertical {
