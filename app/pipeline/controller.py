@@ -733,7 +733,7 @@ def _list_images(folder: str) -> List[str]:
         _, ext = os.path.splitext(entry)
         if ext.lower() in allowed:
             names.append(entry)
-    names.sort()
+    names.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('(\d+)', s)])
     return names
 
 

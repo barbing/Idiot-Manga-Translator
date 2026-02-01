@@ -16,6 +16,7 @@ from app.ui.dialogs.download_dialog import DownloadDialog
 import glob
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -1717,7 +1718,7 @@ class MainWindow(QtWidgets.QMainWindow):
             _, ext = os.path.splitext(entry)
             if ext.lower() in allowed:
                 names.append(entry)
-        names.sort()
+        names.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('(\d+)', s)])
         return names
 
     def _models_dir(self) -> str:
