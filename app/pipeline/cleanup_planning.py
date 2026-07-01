@@ -1544,6 +1544,50 @@ def run_cleanup_runtime_contract(
         runtime_obligations,
         image,
     )
+    model_required_obligation_count = sum(
+        1
+        for _job, obligation_mask, obligation_plan in runtime_obligations
+        if _model_required_for_plan(obligation_plan, obligation_mask)
+    )
+    warmup_min_plans = 4
+    try:
+        warmup_min_plans = max(
+            1,
+            int(os.environ.get("MT_CLEANUP_INPAINT_WARMUP_MIN_PLANS", warmup_min_plans)),
+        )
+    except Exception:
+        warmup_min_plans = 4
+    if use_gpu and model_required_obligation_count >= warmup_min_plans:
+        warmup_started = time.time()
+        _page014_timeout_checkpoint(
+            "cleanup_runtime_model_warmup",
+            "start",
+            page_id=page_id,
+            model_required_obligation_count=model_required_obligation_count,
+            warmup_min_plans=warmup_min_plans,
+        )
+        try:
+            from app.pipeline.cleanup_inpainting import warm_cleanup_inpaint_model
+
+            warmup_record = warm_cleanup_inpaint_model(use_gpu=use_gpu, model_id=model_id)
+        except Exception as exc:
+            warmup_record = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        _page014_timeout_checkpoint(
+            "cleanup_runtime_model_warmup",
+            "end",
+            page_id=page_id,
+            model_required_obligation_count=model_required_obligation_count,
+            warmup_status=str(warmup_record.get("status") if isinstance(warmup_record, Mapping) else ""),
+            warmup_elapsed_ms=(
+                warmup_record.get("elapsed_ms")
+                if isinstance(warmup_record, Mapping)
+                else None
+            ),
+            elapsed_ms=round((time.time() - warmup_started) * 1000.0, 3),
+        )
 
     for job, cleanup_mask, formal_plan in runtime_obligations:
         job_started = time.time()

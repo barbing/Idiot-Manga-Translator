@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from functools import lru_cache
 
@@ -30,6 +31,8 @@ FIXED_CLEANUP_INPAINT_MODEL_RELATIVE_PATH = (
     CLEANUP_INPAINT_MODEL_FILE,
 )
 FIXED_CLEANUP_INPAINT_SELECTION_POLICY = "fixed_cleanup_iopaint_model"
+_WARMED_LAMA_MODEL_KEYS: set[tuple[str, str]] = set()
+_WARMUP_LOCK = threading.Lock()
 
 
 def _page014_timeout_diag_enabled() -> bool:
@@ -89,6 +92,8 @@ def clear_model_cache() -> None:
     """Clear the cleanup inpainting model cache."""
 
     _load_lama_model.cache_clear()
+    with _WARMUP_LOCK:
+        _WARMED_LAMA_MODEL_KEYS.clear()
 
 
 def _repo_root() -> str:
@@ -154,6 +159,122 @@ def _load_lama_model(device: str, model_path: str = ""):
     print("[Cleanup Inpaint] SimpleLama model loaded successfully")
     _page014_timeout_checkpoint("cleanup_inpaint_model", "load_end", device=device, model_path=model_path)
     return lama
+
+
+def _warmup_disabled() -> bool:
+    value = str(os.environ.get("MT_CLEANUP_INPAINT_WARMUP", "") or "").strip().lower()
+    return value in {"0", "false", "off", "no", "disabled"}
+
+
+def warm_cleanup_inpaint_model(
+    *,
+    use_gpu: bool = True,
+    model_id: str = FIXED_CLEANUP_INPAINT_MODEL_ID,
+) -> dict[str, object]:
+    """Load and warm the cleanup-owned LaMa model once per process.
+
+    The warmup is deliberately model-local. It does not alter cleanup masks,
+    proof, commit policy, or backend selection; it only pays the first CUDA/JIT
+    setup cost on a tiny synthetic crop instead of a real parent cleanup crop.
+    """
+
+    started = time.time()
+    if _warmup_disabled():
+        return {
+            "status": "disabled",
+            "elapsed_ms": 0.0,
+        }
+    if Image is None:
+        return {
+            "status": "skipped",
+            "reason": "pillow_unavailable",
+            "elapsed_ms": 0.0,
+        }
+
+    device = "cuda" if use_gpu else "cpu"
+    model_info = resolve_cleanup_inpaint_model(model_id)
+    actual_model_path = str(model_info.get("actual_model_path") or "")
+    key = (device, actual_model_path)
+    with _WARMUP_LOCK:
+        if key in _WARMED_LAMA_MODEL_KEYS:
+            return {
+                "status": "already_warmed",
+                "device": device,
+                "elapsed_ms": 0.0,
+            }
+
+    load_started = time.time()
+    try:
+        lama = _load_lama_model(device, actual_model_path)
+    except Exception as exc:
+        elapsed_ms = round((time.time() - started) * 1000.0, 3)
+        _page014_timeout_checkpoint(
+            "cleanup_inpaint_model_warmup",
+            "error",
+            device=device,
+            model_id=model_id,
+            error=f"{type(exc).__name__}: {exc}",
+            elapsed_ms=elapsed_ms,
+        )
+        return {
+            "status": "error",
+            "device": device,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_ms": elapsed_ms,
+        }
+    load_elapsed_ms = round((time.time() - load_started) * 1000.0, 3)
+
+    infer_started = time.time()
+    try:
+        warm_image = Image.new("RGB", (256, 256), (255, 255, 255))
+        warm_mask = Image.new("L", (256, 256), 0)
+        warm_mask.paste(255, (96, 96, 160, 160))
+        _ = lama(warm_image, warm_mask)
+        if device == "cuda":
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+    except Exception as exc:
+        elapsed_ms = round((time.time() - started) * 1000.0, 3)
+        _page014_timeout_checkpoint(
+            "cleanup_inpaint_model_warmup",
+            "error",
+            device=device,
+            model_id=model_id,
+            error=f"{type(exc).__name__}: {exc}",
+            elapsed_ms=elapsed_ms,
+        )
+        return {
+            "status": "error",
+            "device": device,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_ms": elapsed_ms,
+        }
+
+    infer_elapsed_ms = round((time.time() - infer_started) * 1000.0, 3)
+    elapsed_ms = round((time.time() - started) * 1000.0, 3)
+    with _WARMUP_LOCK:
+        _WARMED_LAMA_MODEL_KEYS.add(key)
+    _page014_timeout_checkpoint(
+        "cleanup_inpaint_model_warmup",
+        "end",
+        device=device,
+        model_id=model_id,
+        load_elapsed_ms=load_elapsed_ms,
+        inference_elapsed_ms=infer_elapsed_ms,
+        elapsed_ms=elapsed_ms,
+    )
+    return {
+        "status": "warmed",
+        "device": device,
+        "load_elapsed_ms": load_elapsed_ms,
+        "inference_elapsed_ms": infer_elapsed_ms,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def ai_inpaint_cleanup(
