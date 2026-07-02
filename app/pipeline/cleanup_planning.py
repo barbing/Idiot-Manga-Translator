@@ -1450,6 +1450,7 @@ def run_cleanup_runtime_contract(
     artifact_dir: str | None = None,
     inpaint_mode: str = "fast",
     runtime_class: CleanupClass | None = None,
+    prewarmed_cleanup_model: bool = False,
 ) -> CleanupRuntimeContractResult:
     """Run Phase 5 cleanup-owned runtime proof without renderer consumption."""
 
@@ -1590,7 +1591,16 @@ def run_cleanup_runtime_contract(
         )
     except Exception:
         warmup_min_plans = 4
-    if use_gpu and model_required_obligation_count >= warmup_min_plans:
+    if prewarmed_cleanup_model:
+        _page014_timeout_checkpoint(
+            "cleanup_runtime_model_warmup",
+            "skipped",
+            page_id=page_id,
+            reason="prewarmed_before_page_loop",
+            model_required_obligation_count=model_required_obligation_count,
+            warmup_min_plans=warmup_min_plans,
+        )
+    elif use_gpu and model_required_obligation_count >= warmup_min_plans:
         warmup_started = time.time()
         _page014_timeout_checkpoint(
             "cleanup_runtime_model_warmup",
@@ -1600,7 +1610,7 @@ def run_cleanup_runtime_contract(
             warmup_min_plans=warmup_min_plans,
         )
         try:
-            from app.pipeline.cleanup_inpainting import warm_cleanup_inpaint_model
+            from app.inpaint.simple_lama_engine import warm_cleanup_inpaint_model
 
             warmup_record = warm_cleanup_inpaint_model(use_gpu=use_gpu, model_id=model_id)
         except Exception as exc:
@@ -3173,6 +3183,13 @@ def execute_cleanup_runtime_plan(
             "model_inpaint_mask_standardization": str(
                 debug_info.get("model_inpaint_mask_standardization") or ""
             ),
+            "backend_elapsed_ms": debug_info.get("backend_elapsed_ms"),
+            "model_call_elapsed_ms": debug_info.get("model_call_elapsed_ms"),
+            "model_load_elapsed_ms": debug_info.get("model_load_elapsed_ms"),
+            "backend_crop_width": debug_info.get("backend_crop_width"),
+            "backend_crop_height": debug_info.get("backend_crop_height"),
+            "backend_crop_area": debug_info.get("backend_crop_area"),
+            "backend_mask_bbox": debug_info.get("backend_mask_bbox"),
         },
         runtime_ms=runtime_ms,
         fallback_status=execution_status,
@@ -6416,6 +6433,7 @@ def _execute_cleanup_attempt(
         attempt_index=attempt_index,
         strategy=strategy,
     )
+    proof_started = time.time()
     proof = prove_cleanup_result(
         source_image=source_image,
         before_image=proof_before,
@@ -6424,6 +6442,12 @@ def _execute_cleanup_attempt(
         cleanup_mask=cleanup_mask,
         proof_context=proof_context,
     )
+    proof_elapsed_ms = round((time.time() - proof_started) * 1000.0, 3)
+    result.backend_parameters["proof_elapsed_ms"] = proof_elapsed_ms
+    try:
+        proof.metrics["proof_elapsed_ms"] = proof_elapsed_ms
+    except Exception:
+        pass
     _page014_timeout_checkpoint(
         "cleanup_attempt_execute",
         "end",

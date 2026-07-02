@@ -122,6 +122,114 @@ def _cleanup_perf_contract_checkpoint(stage: str, event: str, **fields: Any) -> 
         return
 
 
+def _numeric_or_zero(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _compact_enum_value(value: Any) -> str:
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value or "")
+
+
+def _attach_cleanup_runtime_perf_summary(
+    debug_context: dict[str, Any] | None,
+    cleanup_runtime_contract_result: Any,
+    *,
+    runtime_elapsed_seconds: float,
+) -> None:
+    if not isinstance(debug_context, dict) or cleanup_runtime_contract_result is None:
+        return
+
+    proof_by_result_id = {
+        str(getattr(proof, "cleanup_result_id", "") or ""): proof
+        for proof in getattr(cleanup_runtime_contract_result, "proof_records", []) or []
+        if str(getattr(proof, "cleanup_result_id", "") or "")
+    }
+    job_records: list[dict[str, Any]] = []
+    backend_elapsed_ms = 0.0
+    model_call_elapsed_ms = 0.0
+    proof_elapsed_ms = 0.0
+    crop_area_pixels = 0
+    ai_backend_calls = 0
+
+    for result in getattr(cleanup_runtime_contract_result, "result_records", []) or []:
+        params = getattr(result, "backend_parameters", {}) or {}
+        proof = proof_by_result_id.get(str(getattr(result, "cleanup_result_id", "") or ""))
+        proof_metrics = getattr(proof, "metrics", {}) or {}
+        backend_ms = _numeric_or_zero(params.get("backend_elapsed_ms"))
+        model_ms = _numeric_or_zero(params.get("model_call_elapsed_ms"))
+        proof_ms = _numeric_or_zero(params.get("proof_elapsed_ms") or proof_metrics.get("proof_elapsed_ms"))
+        runtime_ms = _numeric_or_zero(getattr(result, "runtime_ms", 0.0))
+        backend_kind = str(getattr(result, "backend_kind", "") or params.get("backend_kind") or "")
+        model_attempted = bool(getattr(result, "model_invocation_attempted", False) or params.get("model_invocation_attempted"))
+        crop_width = int(getattr(result, "crop_width", None) or params.get("backend_crop_width") or 0)
+        crop_height = int(getattr(result, "crop_height", None) or params.get("backend_crop_height") or 0)
+        crop_area = int(params.get("backend_crop_area") or getattr(result, "crop_area", None) or (crop_width * crop_height) or 0)
+        if backend_kind == "model_inpaint" or model_attempted:
+            ai_backend_calls += 1
+            crop_area_pixels += max(0, crop_area)
+            backend_elapsed_ms += backend_ms if backend_ms > 0 else runtime_ms
+            model_call_elapsed_ms += model_ms
+        proof_elapsed_ms += proof_ms
+        job_records.append(
+            {
+                "cleanup_result_id": str(getattr(result, "cleanup_result_id", "") or ""),
+                "cleanup_plan_id": str(getattr(result, "cleanup_plan_id", "") or ""),
+                "cleanup_job_id": str(getattr(result, "cleanup_job_id", "") or ""),
+                "cleanup_mask_id": str(getattr(result, "cleanup_mask_id", "") or ""),
+                "parent_execution_bundle_id": str(getattr(result, "parent_execution_bundle_id", "") or ""),
+                "region_id": str(getattr(result, "region_id", "") or ""),
+                "backend_name": str(getattr(result, "backend_name", "") or getattr(result, "execution_backend", "") or ""),
+                "backend_kind": backend_kind,
+                "backend_method": str(getattr(result, "backend_method", "") or params.get("backend_method") or ""),
+                "model_invocation_attempted": model_attempted,
+                "model_invocation_succeeded": bool(getattr(result, "model_invocation_succeeded", False) or params.get("model_invocation_succeeded")),
+                "runtime_ms": round(runtime_ms, 3),
+                "backend_elapsed_ms": round(backend_ms, 3),
+                "model_call_elapsed_ms": round(model_ms, 3),
+                "proof_elapsed_ms": round(proof_ms, 3),
+                "crop_bbox": list(getattr(result, "crop_bbox", None) or getattr(result, "operation_bbox", None) or []),
+                "crop_width": crop_width,
+                "crop_height": crop_height,
+                "crop_area": crop_area,
+                "mask_pixels": int((getattr(result, "mask_stats", {}) or {}).get("pixels", 0) or 0),
+                "proof_status": _compact_enum_value(getattr(proof, "proof_status", "")) if proof else "",
+                "execution_status": str(getattr(result, "execution_status", "") or ""),
+                "failure_reason": str(getattr(result, "failure_reason", "") or ""),
+            }
+        )
+
+    runtime_elapsed_ms = max(0.0, float(runtime_elapsed_seconds or 0.0) * 1000.0)
+    debug_context["cleanup_job_timings"] = job_records
+    debug_context["cleanup_runtime_summary"] = {
+        "result_count": len(getattr(cleanup_runtime_contract_result, "result_records", []) or []),
+        "proof_count": len(getattr(cleanup_runtime_contract_result, "proof_records", []) or []),
+        "ai_backend_calls": ai_backend_calls,
+        "ai_backend_crop_area_pixels": crop_area_pixels,
+        "backend_elapsed_ms": round(backend_elapsed_ms, 3),
+        "model_call_elapsed_ms": round(model_call_elapsed_ms, 3),
+        "proof_elapsed_ms": round(proof_elapsed_ms, 3),
+        "runtime_elapsed_ms": round(runtime_elapsed_ms, 3),
+        "runtime_overhead_ms": round(max(0.0, runtime_elapsed_ms - backend_elapsed_ms - proof_elapsed_ms), 3),
+    }
+    debug_context.setdefault("counts", {})["cleanup_result_records"] = len(job_records)
+    debug_context.setdefault("counts", {})["cleanup_proof_records"] = len(getattr(cleanup_runtime_contract_result, "proof_records", []) or [])
+    debug_context.setdefault("counts", {})["cleanup_ai_backend_calls"] = ai_backend_calls
+    debug_context.setdefault("counts", {})["inpaint_calls"] = ai_backend_calls
+    timing = debug_context.setdefault("timing", {})
+    timing["cleanup_backend_time"] = round(backend_elapsed_ms / 1000.0, 6)
+    timing["cleanup_model_call_time"] = round(model_call_elapsed_ms / 1000.0, 6)
+    timing["cleanup_proof_time"] = round(proof_elapsed_ms / 1000.0, 6)
+    timing["cleanup_runtime_overhead_time"] = round(
+        max(0.0, runtime_elapsed_ms - backend_elapsed_ms - proof_elapsed_ms) / 1000.0,
+        6,
+    )
+
+
 def _cleanup_mask_region_records_with_protection(
     regions: Iterable[dict[str, Any]] | None,
     debug_context: dict[str, Any] | None,
@@ -665,6 +773,55 @@ class PipelineWorker(QtCore.QThread):
             if self._settings.prescan_only:
                 self.message.emit("Pre-Scan only mode complete.")
                 return
+            cleanup_model_prewarmed = False
+            cleanup_model_warmup_record: dict[str, Any] = {}
+            cleanup_model_warmup_elapsed = 0.0
+            if self._settings.use_gpu and str(self._settings.inpaint_mode or "").strip().lower() != "off":
+                warmup_started = time.time()
+                try:
+                    from app.inpaint.simple_lama_engine import warm_cleanup_inpaint_model
+
+                    cleanup_model_warmup_record = warm_cleanup_inpaint_model(
+                        use_gpu=self._settings.use_gpu,
+                        model_id=self._settings.inpaint_model_id,
+                    )
+                except Exception as exc:
+                    cleanup_model_warmup_record = {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                cleanup_model_warmup_elapsed = time.time() - warmup_started
+                cleanup_model_warmup_record = {
+                    "stage": "pre_page_loop_cleanup_model_warmup",
+                    "elapsed_ms": round(cleanup_model_warmup_elapsed * 1000.0, 3),
+                    **cleanup_model_warmup_record,
+                }
+                cleanup_model_prewarmed = str(cleanup_model_warmup_record.get("status") or "") in {
+                    "warmed",
+                    "already_warmed",
+                }
+                _page014_timeout_checkpoint(
+                    "cleanup_model_pre_page_warmup",
+                    "end",
+                    status=str(cleanup_model_warmup_record.get("status") or ""),
+                    elapsed_ms=cleanup_model_warmup_record.get("elapsed_ms"),
+                )
+                if perf_telemetry_is_enabled and perf_telemetry_output_root:
+                    try:
+                        os.makedirs(perf_telemetry_output_root, exist_ok=True)
+                        with open(
+                            os.path.join(perf_telemetry_output_root, "cleanup_model_warmup.json"),
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
+                            json.dump(cleanup_model_warmup_record, handle, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                if cleanup_model_prewarmed:
+                    self.message.emit(
+                        "Cleanup model warmup completed before first page "
+                        f"({cleanup_model_warmup_record.get('elapsed_ms')} ms)."
+                    )
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
                     self.message.emit("Stopped")
@@ -687,6 +844,13 @@ class PipelineWorker(QtCore.QThread):
                     )
                 elif perf_telemetry_is_enabled:
                     debug_context = new_perf_page_context(name, source_path, output_path, perf_telemetry_output_root)
+                if debug_context is not None and cleanup_model_warmup_record:
+                    debug_context["cleanup_model_warmup"] = cleanup_model_warmup_record
+                    set_timing(
+                        debug_context,
+                        "cleanup_model_pre_page_warmup_time",
+                        cleanup_model_warmup_elapsed if index == 1 else 0.0,
+                    )
 
                 try:
                     _page014_timeout_checkpoint(
@@ -1060,6 +1224,7 @@ class PipelineWorker(QtCore.QThread):
                             model_id=self._settings.inpaint_model_id,
                             artifact_dir=runtime_artifact_dir,
                             inpaint_mode=self._settings.inpaint_mode,
+                            prewarmed_cleanup_model=cleanup_model_prewarmed,
                         )
                         cleanup_runtime_elapsed = time.time() - cleanup_runtime_start
                         _page014_timeout_checkpoint(
@@ -1073,6 +1238,11 @@ class PipelineWorker(QtCore.QThread):
                         )
                         if debug_context is not None:
                             set_timing(debug_context, "cleanup_runtime_contract_time", cleanup_runtime_elapsed)
+                            _attach_cleanup_runtime_perf_summary(
+                                debug_context,
+                                cleanup_runtime_contract_result,
+                                runtime_elapsed_seconds=cleanup_runtime_elapsed,
+                            )
                         render_eligibility_contract_result = _apply_cleanup_runtime_render_blocks(
                             render_eligibility_contract_result,
                             cleanup_runtime_contract_result,

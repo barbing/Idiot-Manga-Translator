@@ -207,6 +207,11 @@ def new_perf_page_context(page_name: str, source_path: str, output_path: str, ro
             "cleanup_mask_build_time": 0.0,
             "cleanup_plan_build_time": 0.0,
             "cleanup_runtime_contract_time": 0.0,
+            "cleanup_backend_time": 0.0,
+            "cleanup_model_call_time": 0.0,
+            "cleanup_proof_time": 0.0,
+            "cleanup_runtime_overhead_time": 0.0,
+            "cleanup_model_pre_page_warmup_time": 0.0,
             "cleanup_upstream_commit_time": 0.0,
             "render_eligibility_contract_time": 0.0,
             "mask_generation_time": 0.0,
@@ -226,6 +231,9 @@ def new_perf_page_context(page_name: str, source_path: str, output_path: str, ro
             "translated_regions": 0,
             "skipped_regions": 0,
             "inpaint_calls": 0,
+            "cleanup_ai_backend_calls": 0,
+            "cleanup_result_records": 0,
+            "cleanup_proof_records": 0,
         },
     }
 
@@ -440,6 +448,9 @@ def write_perf_timing_artifact(context: dict[str, Any] | None, regions: list[dic
         "output_sha256": _sha256_file(context.get("output_path") or ""),
         "timing": _json_safe(context.get("timing") or {}),
         "counts": _json_safe(context.get("counts") or {}),
+        "cleanup_runtime_summary": _json_safe(context.get("cleanup_runtime_summary") or {}),
+        "cleanup_job_timings": _json_safe(context.get("cleanup_job_timings") or []),
+        "cleanup_model_warmup": _json_safe(context.get("cleanup_model_warmup") or {}),
         "watch_regions": _perf_watch_regions(context, regions),
     }
     timing_path = os.path.join(root_dir, f"{page_id}_timing.json")

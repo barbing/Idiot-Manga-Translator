@@ -7,7 +7,6 @@ switch models by arbitrary path or stale candidate metadata.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -16,9 +15,10 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from app.pipeline.cleanup_inpainting import (
+from app.inpaint.simple_lama_engine import (
     FIXED_CLEANUP_INPAINT_MODEL_NAME,
     FIXED_CLEANUP_INPAINT_MODEL_RELATIVE_PATH,
+    run_simple_lama_model_crop,
 )
 
 @dataclass(frozen=True)
@@ -77,9 +77,6 @@ class BackendCandidateExecution:
             "mask_ratio": self.mask_ratio,
             "errors": list(self.errors or []),
         }
-
-
-_SIMPLE_LAMA_CACHE: dict[tuple[str, str], tuple[Any, float]] = {}
 
 
 def inventory_local_cleanup_backends(
@@ -239,30 +236,12 @@ def _run_simple_lama_crop(
     model_path: str,
     use_gpu: bool,
 ) -> tuple[Image.Image, float]:
-    import torch
-    from app.third_party.simple_lama_inpainting import SimpleLama
-
-    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-    key = (str(Path(model_path).resolve()), device)
-    cached = _SIMPLE_LAMA_CACHE.get(key)
-    if cached is None:
-        start = perf_counter()
-        old_value = os.environ.get("LAMA_MODEL")
-        os.environ["LAMA_MODEL"] = key[0]
-        try:
-            lama = SimpleLama(device=torch.device(device))
-        finally:
-            if old_value is None:
-                os.environ.pop("LAMA_MODEL", None)
-            else:
-                os.environ["LAMA_MODEL"] = old_value
-        load_time_ms = (perf_counter() - start) * 1000.0
-        _SIMPLE_LAMA_CACHE[key] = (lama, load_time_ms)
-    else:
-        lama, _cached_load_time = cached
-        load_time_ms = 0.0
-    result = lama(crop_img.convert("RGB"), crop_mask.convert("L"))
-    return result.convert("RGB"), load_time_ms
+    return run_simple_lama_model_crop(
+        crop_img=crop_img,
+        crop_mask=crop_mask,
+        model_path=str(Path(model_path).resolve()),
+        use_gpu=use_gpu,
+    )
 
 
 def _crop_inputs(

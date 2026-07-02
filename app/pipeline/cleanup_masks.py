@@ -181,6 +181,7 @@ class _ComponentOwnershipProjection:
     labels: np.ndarray | None
     components: list[dict[str, Any]]
     component_label_by_id: dict[str, int]
+    component_mask_slices_by_id: dict[str, tuple[list[int], np.ndarray]] = field(default_factory=dict)
 
 
 def _segmentation_foreground_mask(segmentation: TextForegroundSegmentationMask | Any | None) -> tuple[np.ndarray | None, dict[str, Any]]:
@@ -1660,6 +1661,7 @@ def _component_projection_from_authorization_map(
     records = list(payload.get("components") or payload.get("component_authorizations") or [])
     components: list[dict[str, Any]] = []
     label_by_id: dict[str, int] = {}
+    mask_slices_by_id: dict[str, tuple[list[int], np.ndarray]] = {}
     used_labels: set[int] = set()
     for index, record in enumerate(records):
         if not isinstance(record, Mapping):
@@ -1676,6 +1678,16 @@ def _component_projection_from_authorization_map(
         component_id = str(record.get("component_id") or f"tauthcomp_{_safe_id(page_id)}_{index:04d}")
         bbox = _valid_bbox(record.get("component_bbox")) or _component_bbox_from_label(labels, label)
         pixel_count = int(record.get("component_pixel_count") or int(np.count_nonzero(labels == label)))
+        clipped_bbox = None
+        if bbox is not None:
+            height, width = labels.shape[:2]
+            sx0, sy0, sx1, sy1 = _clip_bbox_to_size(bbox, width, height)
+            if sx1 > sx0 and sy1 > sy0:
+                clipped_bbox = [sx0, sy0, sx1, sy1]
+                mask_slices_by_id[component_id] = (
+                    clipped_bbox,
+                    (labels[sy0:sy1, sx0:sx1] == label).astype(np.uint8),
+                )
         authorization_state = str(
             record.get("final_mask_authorization_state")
             or record.get("authorization_state")
@@ -1726,7 +1738,7 @@ def _component_projection_from_authorization_map(
                 "explicit_authority_source": str(record.get("explicit_authority_source") or ""),
                 "protected_region_ids": [str(item) for item in record.get("protection_region_ids") or [] if str(item)],
                 "protected_reason": ",".join(str(item) for item in record.get("reason_codes") or [] if str(item)),
-                "bbox": bbox,
+                "bbox": clipped_bbox or bbox,
                 "pixel_count": pixel_count,
                 "centroid": list(record.get("centroid") or []),
                 "owner_overlap_pixels": int(record.get("overlap_pixels") or 0),
@@ -1748,7 +1760,12 @@ def _component_projection_from_authorization_map(
             }
         )
         label_by_id[component_id] = int(label)
-    return _ComponentOwnershipProjection(labels=labels.astype(np.int32), components=components, component_label_by_id=label_by_id)
+    return _ComponentOwnershipProjection(
+        labels=labels.astype(np.int32),
+        components=components,
+        component_label_by_id=label_by_id,
+        component_mask_slices_by_id=mask_slices_by_id,
+    )
 
 
 def _connected_component_labels(binary: np.ndarray) -> tuple[np.ndarray, int]:
@@ -2090,10 +2107,31 @@ def _component_mask_from_ids(
 ) -> np.ndarray | None:
     if component_projection.labels is None or not component_ids:
         return None
-    labels = [component_projection.component_label_by_id[item] for item in component_ids if item in component_projection.component_label_by_id]
-    if not labels:
+    output = np.zeros_like(component_projection.labels, dtype=np.uint8)
+    missing_labels: list[int] = []
+    used = False
+    for component_id in component_ids:
+        component_id = str(component_id)
+        cached = component_projection.component_mask_slices_by_id.get(component_id)
+        if cached is not None:
+            bbox, mask_slice = cached
+            valid = _valid_bbox(bbox)
+            if valid is None:
+                continue
+            x0, y0, x1, y1 = valid
+            if x1 <= x0 or y1 <= y0:
+                continue
+            output[y0:y1, x0:x1] = np.maximum(output[y0:y1, x0:x1], mask_slice.astype(np.uint8))
+            used = True
+            continue
+        if component_id in component_projection.component_label_by_id:
+            missing_labels.append(component_projection.component_label_by_id[component_id])
+    if missing_labels:
+        output[np.isin(component_projection.labels, missing_labels)] = 1
+        used = True
+    if not used:
         return None
-    return np.isin(component_projection.labels, labels).astype(np.uint8)
+    return output
 
 
 def _component_projected_execution_allowed_area(

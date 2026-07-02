@@ -1,0 +1,2 @@
+"""Standalone inpainting backend adapters."""
+

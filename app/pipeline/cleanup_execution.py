@@ -1,7 +1,8 @@
 """Cleanup-owned execution primitives.
 
 This module executes selected cleanup plans without choosing routes or text
-admission. AI inpainting ownership lives under app.pipeline, not app.render.
+admission. AI model execution is delegated to standalone inpainting backends;
+cleanup retains mask/proof/commit ownership.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from app.pipeline.debug_artifacts import mask_stats
 from app.pipeline.debug_runtime import diagnostic_enabled, write_diagnostic_checkpoint
-from app.pipeline.cleanup_inpainting import (
+from app.inpaint.simple_lama_engine import (
     FIXED_CLEANUP_INPAINT_MODEL_ID,
     FIXED_CLEANUP_INPAINT_MODEL_RELATIVE_PATH,
     resolve_cleanup_inpaint_model,
@@ -235,7 +236,7 @@ def apply_text_removal(
                 mask_pixels=mask_pixels,
                 image_area=image_area,
             )
-            from app.pipeline.cleanup_inpainting import ai_inpaint_cleanup
+            from app.inpaint.simple_lama_engine import ai_inpaint_cleanup
             ai_mask = (np.asarray(text_mask) > 0).astype(np.uint8) * 255
             result = ai_inpaint_cleanup(
                 image,
@@ -313,6 +314,98 @@ def apply_text_removal(
         elapsed_ms=round((time.time() - started) * 1000.0, 3),
     )
     return _result(Image.fromarray(rgb), debug_info)
+
+
+def _apply_crop_local_ai_backend(
+    crop_img: Any,
+    crop_mask: Any,
+    *,
+    local_mode: str,
+    use_gpu: bool,
+    model_id: str,
+    debug_info: dict[str, object] | None,
+    model_required: bool,
+    cleanup_tag: str | None = None,
+) -> Any | None:
+    if str(local_mode or "").lower() != "ai" or not (use_gpu or model_required):
+        return None
+    if cv2 is None or np is None:
+        return None
+    cleanup_tag_normalized = str(
+        cleanup_tag or (debug_info or {}).get("cleanup_tag") or ""
+    ).strip().lower()
+    if cleanup_tag_normalized in {
+        "background_narration_inpaint_first",
+        "background_narration_root_inpaint",
+        "background_narration_glyph_local",
+        "authorized_ai_inpaint",
+        "authorized_ai_inpaint_full_mask",
+        "mask_faithful_root_inpaint",
+        "cleanup_effectiveness_retry",
+        "deterministic_local_fill",
+        "minimal_erasure",
+    }:
+        if debug_info is not None:
+            debug_info["crop_local_backend_skipped"] = True
+            debug_info["crop_local_backend_skip_reason"] = (
+                "cleanup_tag_requires_context_rich_backend"
+            )
+        return None
+    model_info = _cleanup_inpaint_model_info(model_id)
+    if debug_info is not None:
+        debug_info["model_invocation_attempted"] = True
+        debug_info["requested_model_id"] = model_id
+        debug_info["actual_model_name"] = model_info["actual_model_name"]
+        debug_info["actual_model_path"] = model_info["actual_model_path"]
+    try:
+        from app.inpaint.simple_lama_engine import ai_inpaint_cleanup_crop
+
+        cleaned, backend_meta = ai_inpaint_cleanup_crop(
+            crop_img,
+            (np.asarray(crop_mask) > 0).astype(np.uint8) * 255,
+            use_gpu=use_gpu,
+            model_id=model_id,
+            mask_prepared=bool((debug_info or {}).get("model_inpaint_mask_prepared")),
+        )
+        _set_cleanup_backend(
+            debug_info,
+            "cleanup_ai_inpaint",
+            backend_detail=model_id,
+            backend_kind="model_inpaint",
+            backend_method="cleanup_owned_simple_lama_crop_local_inpaint",
+            requested_model_id=model_id,
+            actual_model_name=model_info["actual_model_name"],
+            actual_model_path=model_info["actual_model_path"],
+            model_invocation_attempted=True,
+            model_invocation_succeeded=True,
+            backend_elapsed_ms=(backend_meta or {}).get("elapsed_ms"),
+            model_call_elapsed_ms=(backend_meta or {}).get("model_call_elapsed_ms"),
+            model_load_elapsed_ms=(backend_meta or {}).get("load_elapsed_ms"),
+            backend_crop_width=(backend_meta or {}).get("crop_width"),
+            backend_crop_height=(backend_meta or {}).get("crop_height"),
+            backend_crop_area=(backend_meta or {}).get("crop_area"),
+            backend_mask_bbox=(backend_meta or {}).get("mask_bbox"),
+        )
+        return cleaned
+    except Exception as exc:
+        if model_required:
+            reason = f"model_required_backend_failed:{type(exc).__name__}: {exc}"
+            _set_cleanup_backend(
+                debug_info,
+                "model_required_backend_error",
+                backend_detail=reason,
+                backend_kind="backend_error",
+                backend_method="cleanup_owned_simple_lama_crop_local_inpaint",
+                requested_model_id=model_id,
+                actual_model_name=model_info["actual_model_name"],
+                actual_model_path=model_info["actual_model_path"],
+                model_invocation_attempted=True,
+                model_invocation_succeeded=False,
+                fallback_reason=reason,
+                errors=[reason],
+            )
+            return crop_img
+        return None
 
 
 def apply_local_text_removal(
@@ -486,14 +579,25 @@ def apply_local_text_removal(
             repair_backend = backend
         if cleaned is None:
             nested_debug: dict[str, object] = {"model_required": model_required}
-            cleaned = apply_text_removal(
+            cleaned = _apply_crop_local_ai_backend(
                 crop_img,
                 crop_mask,
-                local_mode,
-                use_gpu,
+                local_mode=local_mode,
+                use_gpu=use_gpu,
                 model_id=model_id,
                 debug_info=nested_debug,
-            ).cleaned_image
+                model_required=model_required,
+                cleanup_tag=cleanup_tag_normalized,
+            )
+            if cleaned is None:
+                cleaned = apply_text_removal(
+                    crop_img,
+                    crop_mask,
+                    local_mode,
+                    use_gpu,
+                    model_id=model_id,
+                    debug_info=nested_debug,
+                ).cleaned_image
             backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
             repair_backend = backend
             _merge_nested_backend_debug(debug_info, nested_debug)
@@ -591,6 +695,40 @@ def apply_local_text_removal(
         backend = "speech_strong_local_fill"
         if cleaned is None:
             nested_debug = {"model_required": model_required}
+            cleaned = _apply_crop_local_ai_backend(
+                crop_img,
+                crop_mask,
+                local_mode=local_mode,
+                use_gpu=use_gpu,
+                model_id=model_id,
+                debug_info=nested_debug,
+                model_required=model_required,
+                cleanup_tag=cleanup_tag_normalized,
+            )
+            if cleaned is None:
+                cleaned = apply_text_removal(
+                    crop_img,
+                    crop_mask,
+                    local_mode,
+                    use_gpu,
+                    model_id=model_id,
+                    debug_info=nested_debug,
+                ).cleaned_image
+            backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
+            _merge_nested_backend_debug(debug_info, nested_debug)
+    elif force_strong_local:
+        nested_debug = {"cleanup_tag": cleanup_tag_normalized, "model_required": model_required}
+        cleaned = _apply_crop_local_ai_backend(
+            crop_img,
+            crop_mask,
+            local_mode=local_mode,
+            use_gpu=use_gpu,
+            model_id=model_id,
+            debug_info=nested_debug,
+            model_required=model_required,
+            cleanup_tag=cleanup_tag_normalized,
+        )
+        if cleaned is None:
             cleaned = apply_text_removal(
                 crop_img,
                 crop_mask,
@@ -599,18 +737,6 @@ def apply_local_text_removal(
                 model_id=model_id,
                 debug_info=nested_debug,
             ).cleaned_image
-            backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
-            _merge_nested_backend_debug(debug_info, nested_debug)
-    elif force_strong_local:
-        nested_debug = {"cleanup_tag": cleanup_tag_normalized, "model_required": model_required}
-        cleaned = apply_text_removal(
-            crop_img,
-            crop_mask,
-            local_mode,
-            use_gpu,
-            model_id=model_id,
-            debug_info=nested_debug,
-        ).cleaned_image
         backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
         _merge_nested_backend_debug(debug_info, nested_debug)
     elif side_caption_local:
@@ -721,14 +847,25 @@ def apply_local_text_removal(
         backend = "conservative_local_inpaint"
     else:
         nested_debug = {"model_required": model_required}
-        cleaned = apply_text_removal(
+        cleaned = _apply_crop_local_ai_backend(
             crop_img,
             crop_mask,
-            local_mode,
-            use_gpu,
+            local_mode=local_mode,
+            use_gpu=use_gpu,
             model_id=model_id,
             debug_info=nested_debug,
-        ).cleaned_image
+            model_required=model_required,
+            cleanup_tag=cleanup_tag_normalized,
+        )
+        if cleaned is None:
+            cleaned = apply_text_removal(
+                crop_img,
+                crop_mask,
+                local_mode,
+                use_gpu,
+                model_id=model_id,
+                debug_info=nested_debug,
+            ).cleaned_image
         backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
         _merge_nested_backend_debug(debug_info, nested_debug)
     if debug_info is not None:
@@ -888,6 +1025,13 @@ def _merge_nested_backend_debug(debug_info: dict | None, nested_debug: Mapping[s
         "model_invocation_succeeded",
         "fallback_reason",
         "errors",
+        "backend_elapsed_ms",
+        "model_call_elapsed_ms",
+        "model_load_elapsed_ms",
+        "backend_crop_width",
+        "backend_crop_height",
+        "backend_crop_area",
+        "backend_mask_bbox",
     ):
         if key in nested_debug:
             debug_info[key] = nested_debug.get(key)
