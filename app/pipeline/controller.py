@@ -5979,12 +5979,43 @@ def _root_internal_aggregate_confidence(candidates: list[dict[str, Any]]) -> flo
     return sum(values) / len(values)
 
 
+def _root_reconstruction_authorization_allows(root: Any) -> bool:
+    if bool(getattr(root, "must_not_mutate", False)):
+        return False
+    auth = str(
+        getattr(root, "semantic_authorization_state", "")
+        or getattr(root, "cleanup_authorization", "")
+        or ""
+    ).strip()
+    if auth in {
+        "cleanup_translate_speech",
+        "cleanup_translate_background",
+        "cleanup_translate_caption",
+    }:
+        return bool(getattr(root, "authorization_explicit", False))
+    if auth in {
+        "review_unknown_not_cleanup",
+        "outside_cleanup_scope",
+        "ambiguous_component_owner",
+        "protect_sfx_decorative",
+        "protect_art_or_non_text",
+    }:
+        return False
+    if auth:
+        return False
+    if bool(getattr(root, "human_review_required", False)):
+        return False
+    return True
+
+
 def _root_reconstruction_should_attempt(root, parents: list[Any], children: list[Any]) -> bool:
     root_type = str(getattr(root, "root_type", "") or "")
     route = str(getattr(root, "route_policy", "") or "")
     if root_type not in {"speech_bubble", "caption_background"}:
         return False
     if route not in {"translate_speech", "translate_caption"}:
+        return False
+    if not _root_reconstruction_authorization_allows(root):
         return False
     if str(getattr(root, "root_source_coherence_status", "") or "") in {"blocked_preserve"}:
         return False
@@ -8732,6 +8763,34 @@ def _process_page(
                             "ocr_text": ocr_text,
                             "ocr_confidence": float(ocr_conf or 0.0),
                             "rejection_reason": rejection_reason,
+                            "would_change_behavior": False,
+                        }
+                    )
+                continue
+            if not route_authority:
+                _record_text_area_fallback_decision(
+                    debug_context,
+                    page_id,
+                    bbox,
+                    text_area_assignment,
+                    "caption_container_scoped_ocr_rejected_without_route_authority",
+                )
+                if debug_context is not None:
+                    debug_context.setdefault("caption_container_recovery_candidates", []).append(
+                        {
+                            "page_id": page_id,
+                            "text_area_container_id": text_area_assignment.get("text_area_container_id"),
+                            "bbox": bbox,
+                            "status": "rejected_without_route_authority",
+                            "detection_source": group.get("text_area_detection_source"),
+                            "caption_component_id": group.get("caption_component_id"),
+                            "caption_component_role": group.get("caption_component_role"),
+                            "caption_component_source_polarity": group.get("caption_component_source_polarity"),
+                            "caption_component_v4_candidate_id": group.get("caption_component_v4_candidate_id"),
+                            "caption_component_v4_reading_order": group.get("caption_component_v4_reading_order") or [],
+                            "ocr_text": ocr_text,
+                            "ocr_confidence": float(ocr_conf or 0.0),
+                            "rejection_reason": "text_area_assignment_not_translation_authorized",
                             "would_change_behavior": False,
                         }
                     )

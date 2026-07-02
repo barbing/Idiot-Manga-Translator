@@ -46,6 +46,19 @@ ROLE_BACKGROUND = "background"
 ROLE_REVIEW = "review"
 GRAPH_CAPTION_BACKGROUND_KINDS = {"caption", "background", "caption_background", "background_narration"}
 
+EXECUTABLE_CLEANUP_AUTHORIZATIONS = {
+    "cleanup_translate_speech",
+    "cleanup_translate_background",
+    "cleanup_translate_caption",
+}
+NON_EXECUTABLE_AUTHORIZATIONS = {
+    "review_unknown_not_cleanup",
+    "outside_cleanup_scope",
+    "ambiguous_component_owner",
+    "protect_sfx_decorative",
+    "protect_art_or_non_text",
+}
+
 STATE_PARENT_ANCHOR = "parent_anchor"
 STATE_PARENT_CHILD = "parent_child"
 STATE_STANDALONE_PARENT = "standalone_parent"
@@ -151,6 +164,11 @@ class TextAreaRootBlock:
     root_visual_separation_score: float = 0.0
     root_overmerge_risk: bool = False
     root_overmerge_rejection_reason: str = ""
+    cleanup_authorization: str = ""
+    semantic_authorization_state: str = ""
+    authorization_explicit: bool = False
+    must_not_mutate: bool = False
+    human_review_required: bool = False
     root_source_erasure_uncovered_component_bboxes: list[list[int]] = field(default_factory=list)
     root_source_erasure_complete: bool = True
     root_source_erasure_blocker_reason: str = ""
@@ -3946,6 +3964,69 @@ def _xywh_center_inside(inner: list[int], outer: list[int]) -> bool:
     return ox <= cx <= ox + max(0, ow) and oy <= cy <= oy + max(0, oh)
 
 
+def _container_authorization_state(container: dict[str, Any]) -> str:
+    return str(
+        container.get("semantic_authorization_state")
+        or container.get("cleanup_authorization")
+        or ""
+    ).strip()
+
+
+def _container_allows_legacy_root_materialization(container: dict[str, Any]) -> bool:
+    if bool(container.get("must_not_mutate")):
+        return False
+
+    auth = _container_authorization_state(container)
+    explicit = bool(container.get("authorization_explicit"))
+    if auth in EXECUTABLE_CLEANUP_AUTHORIZATIONS:
+        return explicit
+    if auth in NON_EXECUTABLE_AUTHORIZATIONS:
+        return False
+    if auth:
+        return False
+
+    route = str(container.get("route_intent") or "")
+    container_type = str(container.get("container_type") or "")
+    if route not in {ROUTE_TRANSLATE_SPEECH, ROUTE_TRANSLATE_CAPTION}:
+        return False
+    if container_type not in {ROOT_SPEECH, ROOT_CAPTION, "speech", "caption", "caption_background"}:
+        return False
+    return not bool(container.get("human_review_required"))
+
+
+def _region_has_text_area_authority_fields(region: dict[str, Any]) -> bool:
+    return any(str(key).startswith("text_area_") for key in region.keys())
+
+
+def _region_authorization_state(region: dict[str, Any]) -> str:
+    return str(
+        region.get("text_area_semantic_authorization_state")
+        or region.get("semantic_authorization_state")
+        or region.get("text_area_cleanup_authorization")
+        or region.get("cleanup_authorization")
+        or ""
+    ).strip()
+
+
+def _region_allows_standalone_root_materialization(region: dict[str, Any]) -> bool:
+    if not _region_has_text_area_authority_fields(region):
+        return True
+    if bool(region.get("text_area_must_not_mutate") or region.get("must_not_mutate")):
+        return False
+    auth = _region_authorization_state(region)
+    explicit = bool(region.get("text_area_authorization_explicit") or region.get("authorization_explicit"))
+    if auth in EXECUTABLE_CLEANUP_AUTHORIZATIONS:
+        return explicit
+    if auth in NON_EXECUTABLE_AUTHORIZATIONS:
+        return False
+    if auth:
+        return False
+    route = str(region.get("text_area_route_intent") or "").strip()
+    if route in {"translate_speech", "translate_caption_background", "translate_caption"}:
+        return False
+    return True
+
+
 def _build_roots(
     page_id: str,
     plan: dict[str, Any],
@@ -4020,6 +4101,8 @@ def _build_roots(
                 for reason in container.get("evidence_reason_codes") or []:
                     _append_unique(root.reason_codes, str(reason))
                 continue
+        if not _container_allows_legacy_root_materialization(container):
+            continue
         root_type = _root_type(container)
         root = TextAreaRootBlock(
             root_id=_root_id(page_id, cid),
@@ -4036,6 +4119,11 @@ def _build_roots(
             confidence_tier=container.get("confidence_tier"),
             fallback_reason=container.get("fallback_reason"),
             review_reason=container.get("fallback_reason") if root_type in {ROOT_UNKNOWN, ROOT_REVIEW} else None,
+            cleanup_authorization=str(container.get("cleanup_authorization") or ""),
+            semantic_authorization_state=str(container.get("semantic_authorization_state") or ""),
+            authorization_explicit=bool(container.get("authorization_explicit")),
+            must_not_mutate=bool(container.get("must_not_mutate")),
+            human_review_required=bool(container.get("human_review_required")),
         )
         roots[root.root_id] = root
         index += 1
@@ -4370,19 +4458,29 @@ def _root_for_region(
     if root:
         return root
     root_id = _root_id(page_id, f"region_{region.get('region_id') or len(roots_by_key)}")
-    root_type = _root_type_for_region(region)
+    allowed = _region_allows_standalone_root_materialization(region)
+    root_type = _root_type_for_region(region) if allowed else ROOT_REVIEW
     root = TextAreaRootBlock(
         root_id=root_id,
         page_id=page_id,
         root_type=root_type,
         text_area_container_ids=[container_id] if container_id else [],
         bbox=_bbox(region.get("text_area_container_bbox") or region.get("bbox")),
-        route_policy=_route_policy_for_region(region),
-        ocr_eligible=not bool((region.get("flags") or {}).get("ignore")),
+        route_policy=_route_policy_for_region(region) if allowed else ROUTE_REVIEW,
+        ocr_eligible=allowed and not bool((region.get("flags") or {}).get("ignore")),
         ctd_scope_eligible=False,
         fallback_reason=region.get("text_area_fallback_reason"),
         review_reason=region.get("skip_reason"),
         reason_codes=[str(value) for value in (region.get("text_area_reason_codes") or []) if str(value)],
+        cleanup_authorization=str(region.get("text_area_cleanup_authorization") or region.get("cleanup_authorization") or ""),
+        semantic_authorization_state=str(
+            region.get("text_area_semantic_authorization_state")
+            or region.get("semantic_authorization_state")
+            or ""
+        ),
+        authorization_explicit=bool(region.get("text_area_authorization_explicit") or region.get("authorization_explicit")),
+        must_not_mutate=bool(region.get("text_area_must_not_mutate") or region.get("must_not_mutate")),
+        human_review_required=not allowed,
     )
     roots_by_key[root_id] = root
     return root
@@ -4392,6 +4490,8 @@ def _child_final_state(region: dict[str, Any], status: str, has_block: bool, has
     flags = region.get("flags") or {}
     route = str(region.get("text_area_route_intent") or "")
     container_type = str(region.get("text_area_container_type") or "")
+    if not _region_allows_standalone_root_materialization(region):
+        return STATE_UNRESOLVED_REVIEW_ONLY
     if container_type == ROOT_SFX or route == "preserve_sfx_decorative":
         return STATE_BLOCKED_BY_ROOT_POLICY
     if _route_owned_ocr_blocker(region):
