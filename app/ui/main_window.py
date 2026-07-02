@@ -142,9 +142,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _ai_inpaint_runtime_available(self) -> bool:
         try:
-            return (
-                importlib.util.find_spec("app.third_party.simple_lama_inpainting") is not None
-                or importlib.util.find_spec("simple_lama_inpainting") is not None
+            return all(
+                importlib.util.find_spec(module_name) is not None
+                for module_name in ("torch", "numpy", "PIL", "cv2")
             )
         except Exception:
             return False

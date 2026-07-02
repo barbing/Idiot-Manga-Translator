@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Project-owned SimpleLama inpainting backend.
+"""Project-owned cleanup inpainting backend.
 
-This module owns fixed SimpleLama model resolution, loading, warmup, and
-inference. Cleanup modules decide whether a cleanup job may call the backend;
-this backend does not own semantic authorization, cleanup proof, or commit
-policy.
+This module owns fixed Anime Manga Big LaMA model resolution, loading, warmup,
+and inference orchestration. Cleanup modules decide whether a cleanup job may
+call the backend; this backend does not own semantic authorization, cleanup
+proof, or commit policy.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import time
 from functools import lru_cache
 
 from app.config.defaults import CLEANUP_INPAINT_MODEL_FILE, IOPAINT_ANIME_MANGA_BIG_LAMA
+from app.inpaint.torchscript_lama_runner import TorchScriptLamaRunner, resolve_lama_device_name
 from app.pipeline.debug_runtime import diagnostic_enabled, write_diagnostic_checkpoint
 
 try:
@@ -129,38 +130,18 @@ def resolve_cleanup_inpaint_model(model_id: str = FIXED_CLEANUP_INPAINT_MODEL_ID
 def _load_lama_model(device: str, model_path: str = ""):
     """Load the LaMa model for cleanup-owned inpainting."""
 
-    import torch
-
-    try:
-        from app.third_party.simple_lama_inpainting import SimpleLama
-    except ImportError:
-        try:
-            from simple_lama_inpainting import SimpleLama
-        except ImportError as exc:
-            raise RuntimeError(
-                "AI inpainting runtime is unavailable. "
-                "The vendored SimpleLama wrapper could not be imported."
-            ) from exc
-
+    effective_device = resolve_lama_device_name(device)
     if not model_path:
         raise RuntimeError("fixed cleanup inpaint model path required")
     if not os.path.exists(model_path):
         raise RuntimeError(f"fixed cleanup inpaint model missing: {model_path}")
 
-    print(f"[Cleanup Inpaint] Loading SimpleLama model on {device}: {model_path}")
-    _page014_timeout_checkpoint("cleanup_inpaint_model", "load_start", device=device, model_path=model_path)
-    old_model_path = os.environ.get("LAMA_MODEL")
-    os.environ["LAMA_MODEL"] = model_path
-    try:
-        lama = SimpleLama(device=torch.device(device))
-    finally:
-        if old_model_path is None:
-            os.environ.pop("LAMA_MODEL", None)
-        else:
-            os.environ["LAMA_MODEL"] = old_model_path
-    print("[Cleanup Inpaint] SimpleLama model loaded successfully")
-    _page014_timeout_checkpoint("cleanup_inpaint_model", "load_end", device=device, model_path=model_path)
-    return lama
+    print(f"[Cleanup Inpaint] Loading TorchScript LaMA model on {effective_device}: {model_path}")
+    _page014_timeout_checkpoint("cleanup_inpaint_model", "load_start", device=effective_device, model_path=model_path)
+    runner = TorchScriptLamaRunner(model_path=model_path, device=effective_device)
+    print("[Cleanup Inpaint] TorchScript LaMA model loaded successfully")
+    _page014_timeout_checkpoint("cleanup_inpaint_model", "load_end", device=effective_device, model_path=model_path)
+    return runner
 
 
 def _warmup_disabled() -> bool:
@@ -193,7 +174,7 @@ def warm_cleanup_inpaint_model(
             "elapsed_ms": 0.0,
         }
 
-    device = "cuda" if use_gpu else "cpu"
+    device = resolve_lama_device_name(use_gpu=use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = str(model_info.get("actual_model_path") or "")
     key = (device, actual_model_path)
@@ -349,7 +330,7 @@ def ai_inpaint_cleanup_crop(
     model_input_img = crop_img.crop((cx0, cy0, cx1, cy1))
     model_input_mask = mask_image.crop((cx0, cy0, cx1, cy1))
 
-    device = "cuda" if use_gpu else "cpu"
+    device = resolve_lama_device_name(use_gpu=use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = model_info.get("actual_model_path", "")
 
@@ -437,9 +418,7 @@ def run_simple_lama_model_crop(
     the cleanup convenience wrappers above.
     """
 
-    import torch
-
-    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    device = resolve_lama_device_name(use_gpu=use_gpu)
     load_started = time.time()
     lama = _load_lama_model(device, str(model_path or ""))
     load_time_ms = round((time.time() - load_started) * 1000.0, 3)
@@ -491,7 +470,7 @@ def ai_inpaint_cleanup(
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         dilated_mask = cv2.dilate(mask, kernel, iterations=2)
 
-    device = "cuda" if use_gpu else "cpu"
+    device = resolve_lama_device_name(use_gpu=use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = model_info.get("actual_model_path", "")
 

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Compatibility adapter for the standalone SimpleLama backend.
+"""Compatibility adapter for the standalone cleanup inpainting backend.
 
-Cleanup contracts live in ``app.pipeline``. SimpleLama model resolution,
-loading, warmup, and inference live in ``app.inpaint.simple_lama_engine`` so the
-cleanup pipeline does not embed a model-processing engine.
+Cleanup contracts live in ``app.pipeline``. Fixed model resolution, loading,
+warmup, and inference live in ``app.inpaint.simple_lama_engine`` so the cleanup
+pipeline does not embed a model-processing engine.
 """
 
 from __future__ import annotations
