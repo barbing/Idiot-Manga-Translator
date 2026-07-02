@@ -624,15 +624,44 @@ def prove_cleanup_result(
         else:
             before_np = np.asarray(before_image.convert("RGB") if hasattr(before_image, "convert") else before_image)
             before_gray = _gray(before_np)
-        cleaned_image = cleanup_result.cleaned_image
-        cleaned_np = np.asarray(cleaned_image.convert("RGB") if hasattr(cleaned_image, "convert") else cleaned_image)
-        foreground = _binary_mask(getattr(cleanup_result, "commit_foreground_mask", None), source_np.shape[:2])
+        page_shape = source_np.shape[:2]
+        proof_denominator_area = int(page_shape[0] * page_shape[1])
+        crop_bbox = _cleanup_result_crop_bbox(cleanup_result)
+        cleaned_crop = _cleaned_crop_payload_for_result(cleanup_result)
+        crop_local = (
+            str(getattr(cleanup_result, "result_space", "") or "") == "crop"
+            and cleaned_crop is not None
+            and _crop_shape_matches(cleaned_crop, crop_bbox)
+        )
+        if crop_local:
+            x0, y0, x1, y1 = crop_bbox or [0, 0, 0, 0]
+            cleaned_np = np.asarray(
+                cleaned_crop.convert("RGB") if hasattr(cleaned_crop, "convert") else cleaned_crop
+            )
+            source_np = source_np[y0:y1, x0:x1]
+            source_gray = source_gray[y0:y1, x0:x1]
+            before_np = before_np[y0:y1, x0:x1]
+            before_gray = before_gray[y0:y1, x0:x1]
+            mask_shape = source_np.shape[:2]
+        else:
+            cleaned_image = cleanup_result.cleaned_image or _load_cleanup_image(cleanup_result.cleaned_image_ref)
+            cleaned_np = np.asarray(cleaned_image.convert("RGB") if hasattr(cleaned_image, "convert") else cleaned_image)
+            mask_shape = source_np.shape[:2]
+        foreground = _binary_mask(getattr(cleanup_result, "commit_foreground_mask", None), page_shape)
         if foreground is None or not np.any(foreground):
-            foreground = _binary_mask(cleanup_mask.foreground_mask, source_np.shape[:2])
-        erase = _binary_mask(getattr(cleanup_result, "commit_mask", None), source_np.shape[:2])
+            foreground = _binary_mask(cleanup_mask.foreground_mask, page_shape)
+        erase = _binary_mask(getattr(cleanup_result, "commit_mask", None), page_shape)
         if erase is None or not np.any(erase):
-            erase = _binary_mask(cleanup_mask.erase_mask, source_np.shape[:2])
-        allowed = _bbox_to_mask(cleanup_mask.allowed_area, source_np.shape[:2])
+            erase = _binary_mask(cleanup_mask.erase_mask, page_shape)
+        allowed = _bbox_to_mask(cleanup_mask.allowed_area, page_shape)
+        if crop_local and crop_bbox is not None:
+            x0, y0, x1, y1 = crop_bbox
+            if foreground is not None:
+                foreground = foreground[y0:y1, x0:x1]
+            if erase is not None:
+                erase = erase[y0:y1, x0:x1]
+            if allowed is not None:
+                allowed = allowed[y0:y1, x0:x1]
         if foreground is None or not np.any(foreground):
             return _proof(
                 cleanup_result,
@@ -651,7 +680,7 @@ def prove_cleanup_result(
             )
         allowed_present = allowed is not None and np.any(allowed > 0)
         if allowed is None:
-            allowed = np.zeros(source_np.shape[:2], dtype=np.uint8)
+            allowed = np.zeros(mask_shape, dtype=np.uint8)
 
         foreground_pixels = int(np.count_nonzero(foreground))
         erase_foreground_overlap = int(np.count_nonzero((erase > 0) & (foreground > 0)))
@@ -688,6 +717,8 @@ def prove_cleanup_result(
         params = cleanup_plan.backend_parameters or {}
         proof_scope = _proof_scope_metadata(cleanup_plan, cleanup_mask)
         erasure_box = proof_scope.get("proof_residual_measurement_bbox")
+        if crop_local:
+            erasure_box = _page_bbox_to_crop_bbox(erasure_box, crop_bbox)
         visual_residual: Any | None = None
         visual_residual_dark_pixels = 0
         visual_residual_pixels = 0
@@ -718,10 +749,10 @@ def prove_cleanup_result(
 
         outside_allowed = changed & ~(allowed > 0)
         changed_outside_allowed_pixels = int(np.count_nonzero(outside_allowed))
-        changed_outside_allowed_ratio = changed_outside_allowed_pixels / max(1, int(source_np.shape[0] * source_np.shape[1]))
+        changed_outside_allowed_ratio = changed_outside_allowed_pixels / max(1, proof_denominator_area)
         outside_accepted_erase = changed & ~(erase > 0)
         changed_outside_accepted_mask_pixels = int(np.count_nonzero(outside_accepted_erase))
-        changed_outside_accepted_mask_ratio = changed_outside_accepted_mask_pixels / max(1, int(source_np.shape[0] * source_np.shape[1]))
+        changed_outside_accepted_mask_ratio = changed_outside_accepted_mask_pixels / max(1, proof_denominator_area)
         accepted_changed = changed & (erase > 0)
         outside_erase_inside_allowed = changed & (allowed > 0) & ~(erase > 0)
         outside_erase_inside_allowed_pixels = int(np.count_nonzero(outside_erase_inside_allowed))
@@ -1169,6 +1200,8 @@ def prove_cleanup_result(
             "outside_accepted_mask_boundary_residual_ratio": round(outside_boundary_residual_ratio, 4),
             "outside_accepted_mask_boundary_residual_pixel_limit": outside_boundary_residual_pixel_limit,
             "outside_accepted_mask_boundary_residual_remaining": outside_boundary_residual_remaining,
+            "cleanup_result_space": "crop" if crop_local else "page",
+            "cleanup_result_crop_bbox": list(crop_bbox or []),
             "proof_scope": proof_scope.get("proof_scope"),
             "proof_scope_bbox": proof_scope.get("proof_scope_bbox"),
             "proof_scope_uses_parent_expected_bbox": proof_scope.get(
@@ -2135,8 +2168,12 @@ def commit_cleanup_runtime_results_to_working_image(
                 base = dict(entry.get("base") or {})
                 region_id = str(base.get("region_id") or "")
                 result_id = str(base.get("cleanup_result_id") or "")
-                cleaned_image = cleanup_result.cleaned_image or _load_cleanup_image(cleanup_result.cleaned_image_ref)
-                if cleaned_image is None:
+                cleaned_payload = _cleaned_crop_payload_for_result(cleanup_result)
+                if cleaned_payload is None:
+                    cleaned_payload = cleanup_result.cleaned_image
+                if cleaned_payload is None:
+                    cleaned_payload = _load_cleanup_image(cleanup_result.cleaned_image_ref)
+                if cleaned_payload is None:
                     root_failure = "runtime_cleaned_image_missing"
                     entry["failure_reason"] = root_failure
                     break
@@ -2145,7 +2182,7 @@ def commit_cleanup_runtime_results_to_working_image(
                     committed_pixels, commit_mask = _commit_runtime_result_pixels(
                         working_np=root_working_np,
                         source_np=source_np,
-                        cleaned_image=cleaned_image,
+                        cleaned_image=cleaned_payload,
                         operation_bbox=cleanup_result.operation_bbox,
                         accepted_mask=accepted_commit_mask,
                     )
@@ -2644,16 +2681,23 @@ def _commit_runtime_result_pixels(
     if np is None:
         return 0, None
     cleaned_np = np.asarray(cleaned_image.convert("RGB") if hasattr(cleaned_image, "convert") else cleaned_image)
-    if cleaned_np.shape != source_np.shape or working_np.shape != source_np.shape:
+    if working_np.shape != source_np.shape:
         return 0, None
     accepted = None
     if accepted_mask is not None:
         accepted = np.asarray(accepted_mask) > 0
         if accepted.shape[:2] != source_np.shape[:2]:
             return 0, None
-    box = _mask_page_bbox(accepted) if accepted is not None else None
+    operation_box = _valid_bbox(operation_bbox)
+    box = None
+    if cleaned_np.shape != source_np.shape and operation_box is not None:
+        ox0, oy0, ox1, oy1 = operation_box
+        if tuple(cleaned_np.shape[:2]) == (oy1 - oy0, ox1 - ox0):
+            box = operation_box
     if box is None:
-        box = _valid_bbox(operation_bbox)
+        box = _mask_page_bbox(accepted) if accepted is not None else None
+    if box is None:
+        box = operation_box
     if box is None:
         return 0, None
     height, width = source_np.shape[:2]
@@ -2665,7 +2709,12 @@ def _commit_runtime_result_pixels(
     if x1 <= x0 or y1 <= y0:
         return 0, None
     before_crop = source_np[y0:y1, x0:x1]
-    cleaned_crop = cleaned_np[y0:y1, x0:x1]
+    if cleaned_np.shape == source_np.shape:
+        cleaned_crop = cleaned_np[y0:y1, x0:x1]
+    elif tuple(cleaned_np.shape[:2]) == (y1 - y0, x1 - x0):
+        cleaned_crop = cleaned_np
+    else:
+        return 0, None
     diff = np.abs(cleaned_crop.astype(np.int16) - before_crop.astype(np.int16))
     changed = np.any(diff > 8, axis=2) if diff.ndim == 3 else diff > 8
     if accepted is not None:
@@ -2902,17 +2951,44 @@ def execute_cleanup_runtime_plan(
         cleanup_tag=cleanup_tag,
         foreground_mask=backend_foreground_mask,
         debug_info=debug_info,
+        return_full_image=False,
     )
-    raw_cleaned_image = execution.cleaned_image or image
-    raw_backend_output_hash = _hash_image(raw_cleaned_image)
-    cleaned_image = _clip_cleaned_candidate_to_authorized_mask(
-        before=image,
-        candidate=raw_cleaned_image,
-        accepted_mask=commit_mask,
-    )
-    final_clipped_output_hash = _hash_image(cleaned_image)
+    operation_bbox = _valid_bbox(execution.crop_bbox) or _valid_bbox(cleanup_mask.erase_mask_bbox)
+    raw_cleaned_crop = execution.cleaned_crop
+    if raw_cleaned_crop is None and execution.cleaned_image is not None and operation_bbox is not None:
+        raw_cleaned_crop = _crop_payload_from_page_image(execution.cleaned_image, operation_bbox)
+    result_space = "crop" if raw_cleaned_crop is not None and operation_bbox is not None else "page"
+    cleaned_crop = None
+    raw_cleaned_image = None
+    cleaned_image = None
+    if result_space == "crop":
+        cleaned_crop = _clip_cleaned_crop_to_authorized_mask(
+            before=image,
+            candidate_crop=raw_cleaned_crop,
+            crop_bbox=operation_bbox,
+            accepted_mask=commit_mask,
+        )
+        raw_backend_output_hash = _hash_image(raw_cleaned_crop)
+        final_clipped_output_hash = _hash_image(cleaned_crop)
+    else:
+        raw_cleaned_image = execution.cleaned_image or image
+        raw_backend_output_hash = _hash_image(raw_cleaned_image)
+        cleaned_image = _clip_cleaned_candidate_to_authorized_mask(
+            before=image,
+            candidate=raw_cleaned_image,
+            accepted_mask=commit_mask,
+        )
+        final_clipped_output_hash = _hash_image(cleaned_image)
     runtime_ms = (time.time() - started) * 1000.0
-    changed_pixels = _changed_pixel_count(image, cleaned_image)
+    if result_space == "crop":
+        changed_pixels = _changed_pixel_count_crop(
+            before=image,
+            cleaned_crop=cleaned_crop,
+            crop_bbox=operation_bbox,
+            accepted_mask=commit_mask,
+        )
+    else:
+        changed_pixels = _changed_pixel_count(image, cleaned_image)
     pixel_changed = changed_pixels > 0
     backend = str(execution.backend or debug_info.get("backend") or "unknown")
     backend_kind = str(execution.backend_kind or debug_info.get("backend_kind") or _backend_kind_for_name(backend))
@@ -2940,6 +3016,20 @@ def execute_cleanup_runtime_plan(
     else:
         execution_status = "completed" if pixel_changed else "completed_no_pixel_change"
         failure_reason = "" if pixel_changed else "no_pixels_changed"
+    raw_artifact_image = raw_cleaned_image
+    cleaned_artifact_image = cleaned_image
+    if artifact_dir and result_space == "crop":
+        raw_artifact_image = _materialize_cleaned_crop_on_page(
+            before=image,
+            cleaned_crop=raw_cleaned_crop,
+            crop_bbox=operation_bbox,
+        )
+        cleaned_artifact_image = _materialize_cleaned_crop_on_page(
+            before=image,
+            cleaned_crop=cleaned_crop,
+            crop_bbox=operation_bbox,
+            accepted_mask=commit_mask,
+        )
     refs = _write_runtime_artifacts(
         artifact_dir=artifact_dir,
         page_id=page_id,
@@ -2948,8 +3038,8 @@ def execute_cleanup_runtime_plan(
         cleanup_mask=cleanup_mask,
         before=image,
         backend_input_mask=backend_erase_mask,
-        raw_cleaned=raw_cleaned_image,
-        cleaned=cleaned_image,
+        raw_cleaned=raw_artifact_image if raw_artifact_image is not None else image,
+        cleaned=cleaned_artifact_image if cleaned_artifact_image is not None else image,
         commit_mask=commit_mask,
     )
     _page014_timeout_checkpoint(
@@ -2974,7 +3064,7 @@ def execute_cleanup_runtime_plan(
         cleanup_plan_id=str(cleanup_plan.cleanup_plan_id),
         cleanup_job_id=str(cleanup_plan.cleanup_job_id),
         cleanup_mask_id=str(cleanup_plan.cleanup_mask_id),
-        operation_bbox=_valid_bbox(execution.crop_bbox) or _valid_bbox(cleanup_mask.erase_mask_bbox),
+        operation_bbox=operation_bbox,
         page=page_id,
         region_id=canonical_region_id,
         parent_execution_bundle_id=str(identity.get("parent_execution_bundle_id") or ""),
@@ -3010,6 +3100,10 @@ def execute_cleanup_runtime_plan(
         input_mask_hash=input_mask_hash,
         raw_backend_output_hash=raw_backend_output_hash,
         final_clipped_output_hash=final_clipped_output_hash,
+        result_space=result_space,
+        crop_bbox=operation_bbox if result_space == "crop" else None,
+        crop_width=(operation_bbox[2] - operation_bbox[0]) if result_space == "crop" and operation_bbox else None,
+        crop_height=(operation_bbox[3] - operation_bbox[1]) if result_space == "crop" and operation_bbox else None,
         fallback_reason=fallback_reason,
         backend_parameters={
             "backend_detail": execution.backend_detail,
@@ -3031,6 +3125,7 @@ def execute_cleanup_runtime_plan(
             "input_mask_hash": input_mask_hash,
             "raw_backend_output_hash": raw_backend_output_hash,
             "final_clipped_output_hash": final_clipped_output_hash,
+            "result_space": result_space,
             "fallback_reason": fallback_reason,
             "model_backend_contract_failure": model_contract_failure,
             "text_block_root_id": str(params.get("text_block_root_id") or ""),
@@ -3042,6 +3137,7 @@ def execute_cleanup_runtime_plan(
             "effective_inpaint_mode": execution.effective_inpaint_mode,
             "crop_bbox": execution.crop_bbox,
             "crop_area": execution.crop_area,
+            "crop_result_contract": result_space == "crop",
             "mask_ratio": execution.mask_ratio,
             "foreground_mask_pixels": getattr(cleanup_mask, "foreground_mask_pixels", None),
             "erase_mask_pixels": getattr(cleanup_mask, "erase_mask_pixels", None),
@@ -3084,7 +3180,7 @@ def execute_cleanup_runtime_plan(
         commit_mask=commit_mask,
         commit_foreground_mask=commit_foreground_mask,
         cleaned_image=cleaned_image,
-        cleaned_crop=execution.cleaned_image,
+        cleaned_crop=cleaned_crop,
     )
 
 
@@ -3846,6 +3942,186 @@ def _hash_mask(mask: Any) -> str:
     except Exception:
         return ""
     return _hash_array(arr)
+
+
+def _cleanup_result_crop_bbox(cleanup_result: CleanupResult) -> list[int] | None:
+    return (
+        _valid_bbox(getattr(cleanup_result, "crop_bbox", None))
+        or _valid_bbox(getattr(cleanup_result, "operation_bbox", None))
+    )
+
+
+def _image_to_rgb_array(image: Any) -> Any | None:
+    if np is None or image is None:
+        return None
+    try:
+        return np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
+    except Exception:
+        return None
+
+
+def _crop_payload_from_page_image(page_image: Any, crop_bbox: Sequence[int] | None) -> Any | None:
+    if Image is None:
+        return None
+    box = _valid_bbox(crop_bbox)
+    if box is None or page_image is None:
+        return None
+    try:
+        if hasattr(page_image, "crop"):
+            return page_image.crop(tuple(box))
+        arr = _image_to_rgb_array(page_image)
+        if arr is None:
+            return None
+        x0, y0, x1, y1 = box
+        return Image.fromarray(np.asarray(arr[y0:y1, x0:x1]).astype("uint8"), mode="RGB")
+    except Exception:
+        return None
+
+
+def _cleaned_crop_payload_for_result(cleanup_result: CleanupResult) -> Any | None:
+    crop = getattr(cleanup_result, "cleaned_crop", None)
+    if crop is not None:
+        return crop
+    return _load_cleanup_image(getattr(cleanup_result, "cleaned_crop_ref", None))
+
+
+def _crop_shape_matches(cleaned_crop: Any, crop_bbox: Sequence[int] | None) -> bool:
+    box = _valid_bbox(crop_bbox)
+    arr = _image_to_rgb_array(cleaned_crop)
+    if box is None or arr is None:
+        return False
+    x0, y0, x1, y1 = box
+    return tuple(arr.shape[:2]) == (int(y1 - y0), int(x1 - x0))
+
+
+def _clip_cleaned_crop_to_authorized_mask(
+    *,
+    before: Any,
+    candidate_crop: Any,
+    crop_bbox: Sequence[int],
+    accepted_mask: Any,
+) -> Any:
+    if np is None or Image is None or accepted_mask is None:
+        return candidate_crop
+    box = _valid_bbox(crop_bbox)
+    if box is None:
+        return candidate_crop
+    try:
+        x0, y0, x1, y1 = box
+        before_np = _image_to_rgb_array(before)
+        candidate_np = _image_to_rgb_array(candidate_crop)
+        accepted = np.asarray(accepted_mask) > 0
+        if (
+            before_np is None
+            or candidate_np is None
+            or accepted.shape[:2] != before_np.shape[:2]
+            or tuple(candidate_np.shape[:2]) != (y1 - y0, x1 - x0)
+        ):
+            return candidate_crop
+        clipped = before_np[y0:y1, x0:x1].copy()
+        accepted_crop = accepted[y0:y1, x0:x1]
+        clipped[accepted_crop] = candidate_np[accepted_crop]
+        return Image.fromarray(np.clip(clipped, 0, 255).astype(np.uint8), mode="RGB")
+    except Exception:
+        return candidate_crop
+
+
+def _materialize_cleaned_crop_on_page(
+    *,
+    before: Any,
+    cleaned_crop: Any,
+    crop_bbox: Sequence[int] | None,
+    accepted_mask: Any | None = None,
+) -> Any | None:
+    if np is None or Image is None:
+        return None
+    box = _valid_bbox(crop_bbox)
+    before_np = _image_to_rgb_array(before)
+    crop_np = _image_to_rgb_array(cleaned_crop)
+    if box is None or before_np is None or crop_np is None:
+        return None
+    x0, y0, x1, y1 = box
+    if tuple(crop_np.shape[:2]) != (y1 - y0, x1 - x0):
+        return None
+    page_np = before_np.copy()
+    if accepted_mask is None:
+        page_np[y0:y1, x0:x1] = crop_np
+    else:
+        try:
+            accepted = np.asarray(accepted_mask) > 0
+            if accepted.shape[:2] != before_np.shape[:2]:
+                return None
+            accepted_crop = accepted[y0:y1, x0:x1]
+            target = page_np[y0:y1, x0:x1]
+            target[accepted_crop] = crop_np[accepted_crop]
+            page_np[y0:y1, x0:x1] = target
+        except Exception:
+            return None
+    return Image.fromarray(np.clip(page_np, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def _cleanup_result_page_payload(cleanup_result: CleanupResult, before_image: Any) -> Any | None:
+    cleaned_image = cleanup_result.cleaned_image
+    if cleaned_image is None:
+        cleaned_image = _load_cleanup_image(cleanup_result.cleaned_image_ref)
+    if cleaned_image is not None:
+        return cleaned_image
+    cleaned_crop = _cleaned_crop_payload_for_result(cleanup_result)
+    if cleaned_crop is None:
+        return None
+    return _materialize_cleaned_crop_on_page(
+        before=before_image,
+        cleaned_crop=cleaned_crop,
+        crop_bbox=_cleanup_result_crop_bbox(cleanup_result),
+        accepted_mask=getattr(cleanup_result, "commit_mask", None),
+    )
+
+
+def _changed_pixel_count_crop(
+    *,
+    before: Any,
+    cleaned_crop: Any,
+    crop_bbox: Sequence[int] | None,
+    accepted_mask: Any | None = None,
+) -> int:
+    if np is None:
+        return 0
+    box = _valid_bbox(crop_bbox)
+    before_np = _image_to_rgb_array(before)
+    crop_np = _image_to_rgb_array(cleaned_crop)
+    if box is None or before_np is None or crop_np is None:
+        return 0
+    x0, y0, x1, y1 = box
+    if tuple(crop_np.shape[:2]) != (y1 - y0, x1 - x0):
+        return 0
+    before_crop = before_np[y0:y1, x0:x1]
+    diff = np.abs(crop_np.astype(np.int16) - before_crop.astype(np.int16))
+    changed = np.any(diff > 8, axis=2) if diff.ndim == 3 else diff > 8
+    if accepted_mask is not None:
+        try:
+            accepted = np.asarray(accepted_mask) > 0
+            if accepted.shape[:2] == before_np.shape[:2]:
+                changed = changed & accepted[y0:y1, x0:x1]
+        except Exception:
+            pass
+    return int(np.count_nonzero(changed))
+
+
+def _page_bbox_to_crop_bbox(
+    bbox: Sequence[int] | None,
+    crop_bbox: Sequence[int] | None,
+) -> list[int] | None:
+    box = _valid_bbox(bbox)
+    crop = _valid_bbox(crop_bbox)
+    if box is None or crop is None:
+        return None
+    x0 = max(box[0], crop[0])
+    y0 = max(box[1], crop[1])
+    x1 = min(box[2], crop[2])
+    y1 = min(box[3], crop[3])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0 - crop[0], y0 - crop[1], x1 - crop[0], y1 - crop[1]]
 
 
 def _hash_array(arr: Any) -> str:
@@ -5108,7 +5384,7 @@ def _partition_parent_cleanup_result(
     for child_result, child_proof, child_status in selected_child_records:
         if child_proof.proof_status != ProofStatus.PASSED or not bool(child_result.pixel_changed):
             continue
-        cleaned_image = child_result.cleaned_image or _load_cleanup_image(child_result.cleaned_image_ref)
+        cleaned_image = _cleanup_result_page_payload(child_result, image)
         if cleaned_image is None:
             merge_failure = "partition_child_cleaned_image_missing"
             continue
@@ -5664,11 +5940,7 @@ def _run_adaptive_cleanup_attempts(
             # that residual change back into the primary candidate. This keeps
             # any texture or line-art recovery produced by the first attempt
             # instead of replacing it with a source-image white glyph fill.
-            residual_image = (
-                last_result.cleaned_image
-                or _load_cleanup_image(last_result.cleaned_image_ref)
-                or source_image
-            )
+            residual_image = _cleanup_result_page_payload(last_result, source_image) or source_image
             residual_result, residual_proof = _execute_cleanup_attempt(
                 image=residual_image,
                 proof_before=residual_image,
@@ -5950,11 +6222,7 @@ def _run_adaptive_cleanup_attempts(
                     strategy="authorized_ai_residual_retry",
                     retry_reason=ai_proof.failure_reason or "source_residual_remaining_after_ai",
                 )
-                residual_image = (
-                    ai_result.cleaned_image
-                    or _load_cleanup_image(ai_result.cleaned_image_ref)
-                    or source_image
-                )
+                residual_image = _cleanup_result_page_payload(ai_result, source_image) or source_image
                 residual_result, residual_proof = _execute_cleanup_attempt(
                     image=residual_image,
                     proof_before=residual_image,
@@ -6183,15 +6451,11 @@ def _combined_residual_retry_result(
     page_id: str,
     region_id: str,
 ) -> CleanupResult:
-    residual_image = residual_result.cleaned_image or _load_cleanup_image(residual_result.cleaned_image_ref)
+    residual_image = _cleanup_result_page_payload(residual_result, base_image)
     primary_image = (
-        primary_result.cleaned_image
-        if primary_result is not None and primary_result.cleaned_image is not None
-        else (
-            _load_cleanup_image(primary_result.cleaned_image_ref)
-            if primary_result is not None
-            else None
-        )
+        _cleanup_result_page_payload(primary_result, base_image)
+        if primary_result is not None
+        else None
     )
     if residual_image is None:
         residual_image = base_image
@@ -6259,6 +6523,7 @@ def _combined_residual_retry_result(
         runtime_ms=residual_result.runtime_ms,
         fallback_status=residual_result.fallback_status,
         errors=list(residual_result.errors or []),
+        result_space="page",
         cleaned_image_ref="",
         cleaned_crop_ref="",
         cleaned_image=cleaned_image,

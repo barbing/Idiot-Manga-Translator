@@ -102,6 +102,7 @@ class CleanupExecutionResult:
     effective_inpaint_mode: str | None = None
     crop_bbox: list[int] | None = None
     crop_area: int | None = None
+    cleaned_crop: Any = field(default=None, repr=False, compare=False)
     mask_ratio: float | None = None
     errors: list[str] = field(default_factory=list)
     fallback_status: str | None = None
@@ -323,6 +324,7 @@ def apply_local_text_removal(
     cleanup_tag: str | None = None,
     foreground_mask: Any | None = None,
     debug_info: dict | None = None,
+    return_full_image: bool = True,
 ) -> CleanupExecutionResult:
     started = time.time()
     cleanup_tag_normalized = str(cleanup_tag or "").strip().lower()
@@ -766,8 +768,10 @@ def apply_local_text_removal(
                 debug_info["backend"] = backend
                 debug_info["backend_detail"] = "authorized_mask_median_noop_repair"
                 debug_info["noop_repair_applied"] = True
-    patched = image.copy()
-    patched.paste(cleaned, (x0, y0))
+    patched = None
+    if return_full_image:
+        patched = image.copy()
+        patched.paste(cleaned, (x0, y0))
     _page014_timeout_checkpoint(
         "cleanup_apply_local_text_removal",
         "end",
@@ -778,7 +782,7 @@ def apply_local_text_removal(
         mask_pixels=int(mask_pixels),
         elapsed_ms=round((time.time() - started) * 1000.0, 3),
     )
-    return _result(patched, debug_info)
+    return _result(patched, debug_info, cleaned_crop=cleaned)
 
 
 def apply_bubble_fill(image: Any, bubble_mask: Any, text_mask: Any, reference_np: Any) -> CleanupExecutionResult:
@@ -837,7 +841,7 @@ def apply_bubble_fill(image: Any, bubble_mask: Any, text_mask: Any, reference_np
     return CleanupExecutionResult(cleaned_image=Image.fromarray(result), backend="bubble_fill")
 
 
-def _result(image: Any, debug_info: dict | None) -> CleanupExecutionResult:
+def _result(image: Any, debug_info: dict | None, cleaned_crop: Any = None) -> CleanupExecutionResult:
     debug_info = debug_info or {}
     return CleanupExecutionResult(
         cleaned_image=image,
@@ -853,6 +857,7 @@ def _result(image: Any, debug_info: dict | None) -> CleanupExecutionResult:
         effective_inpaint_mode=debug_info.get("effective_inpaint_mode"),
         crop_bbox=debug_info.get("crop_bbox"),
         crop_area=debug_info.get("crop_area"),
+        cleaned_crop=cleaned_crop,
         mask_ratio=debug_info.get("mask_ratio"),
         errors=list(debug_info.get("errors") or []),
         fallback_status=debug_info.get("fallback_status"),

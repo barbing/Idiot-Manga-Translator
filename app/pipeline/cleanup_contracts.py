@@ -348,6 +348,10 @@ class CleanupResult:
     raw_backend_output_ref: str | None = None
     final_clipped_output_ref: str | None = None
     runtime_ms: float | None = None
+    result_space: str = "page"
+    crop_bbox: list[int] | None = None
+    crop_width: int | None = None
+    crop_height: int | None = None
     fallback_status: str = ""
     errors: list[str] = field(default_factory=list)
     cleaned_image_ref: str | None = None
