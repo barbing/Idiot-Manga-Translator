@@ -6,6 +6,9 @@ qtawesome
 Pillow
 opencv-python
 numpy==1.26.4
+regex
+uharfbuzz
+python-bidi
 
 # OCR / detection
 manga-ocr
