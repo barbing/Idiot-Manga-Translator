@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict
 from PySide6 import QtCore, QtGui, QtWidgets
 from app.io.project import default_project_dict, load_project, save_project
+from app.pipeline.cleaned_page_base import resolve_cleaned_page_base_for_rerender
 from app.pipeline.parent_execution_bundle import parent_execution_bundles_from_audit_records
 from app.render.renderer import render_parent_execution_bundles, render_translations
 
@@ -163,6 +164,10 @@ class PageReviewDialog(QtWidgets.QDialog):
         for page in data.get("pages", []):
             if page.get("image_path") == self._page.get("image_path"):
                 page["regions"] = self._page.get("regions", [])
+                if "cleaned_page_base" in self._page:
+                    page["cleaned_page_base"] = self._page.get("cleaned_page_base")
+                if "cleaned_page_base_rerender_status" in self._page:
+                    page["cleaned_page_base_rerender_status"] = self._page.get("cleaned_page_base_rerender_status")
                 updated = True
                 break
         if not updated:
@@ -171,16 +176,18 @@ class PageReviewDialog(QtWidgets.QDialog):
 
     def _rerender(self) -> None:
         self._apply_table()
-        image_path = self._page.get("image_path", "")
-        output_path = self._page.get("output_path") or _default_output_path(image_path, self._output_suffix)
-        if not image_path or not output_path:
+        source_image_path = self._page.get("image_path", "")
+        render_image_path, cleaned_page_base_status = resolve_cleaned_page_base_for_rerender(self._page)
+        self._page["cleaned_page_base_rerender_status"] = cleaned_page_base_status
+        output_path = self._page.get("output_path") or _default_output_path(source_image_path, self._output_suffix)
+        if not render_image_path or not output_path:
             return
         parent_execution_bundles = parent_execution_bundles_from_audit_records(
             self._page.get("parent_execution_bundles") or []
         )
         if parent_execution_bundles:
             render_parent_execution_bundles(
-                image_path,
+                render_image_path,
                 output_path,
                 parent_execution_bundles,
                 self._font_name,
@@ -189,7 +196,7 @@ class PageReviewDialog(QtWidgets.QDialog):
             )
         else:
             render_translations(
-                image_path,
+                render_image_path,
                 output_path,
                 self._page.get("regions", []),
                 self._font_name,

@@ -580,6 +580,7 @@ class PipelineWorker(QtCore.QThread):
         start_time = time.time()
         from app.translate.ollama_client import DeepSeekClient, OllamaClient
         from app.render.renderer import render_parent_execution_bundles, render_translations
+        from app.pipeline.cleaned_page_base import persist_cleaned_page_base
         from app.pipeline.cleanup_contracts import build_cleanup_job_candidates_for_parent_bundles
         from app.pipeline.cleanup_masks import build_cleanup_masks
         from app.pipeline.parent_font_detection import apply_parent_font_detection
@@ -1040,6 +1041,7 @@ class PipelineWorker(QtCore.QThread):
                 cleanup_upstream_commit_result = None
                 render_eligibility_contract_result = None
                 render_input_path = source_path
+                cleaned_page_base_record = {}
                 cleanup_upstream_temp_path = ""
                 try:
                     cleanup_contract_start = time.time()
@@ -1273,19 +1275,38 @@ class PipelineWorker(QtCore.QThread):
                             cleanup_upstream_commit_result,
                             debug_context,
                         )
-                        if cleanup_upstream_commit_result.commit_records:
-                            committed_ref = cleanup_upstream_commit_result.committed_image_ref
-                            if committed_ref and os.path.isfile(committed_ref):
-                                render_input_path = committed_ref
-                            else:
-                                with tempfile.NamedTemporaryFile(
-                                    prefix=f"phase5_upstream_{page_id}_",
-                                    suffix=".png",
-                                    delete=False,
-                                ) as temp_file:
-                                    cleanup_upstream_temp_path = temp_file.name
-                                cleanup_upstream_commit_result.cleaned_image.save(cleanup_upstream_temp_path)
-                                render_input_path = cleanup_upstream_temp_path
+                        cleanup_required_for_cleaned_base = bool(
+                            getattr(cleanup_job_contract_result, "jobs", []) or []
+                        ) or bool(getattr(cleanup_mask_contract_result, "masks", []) or []) or bool(
+                            getattr(cleanup_plan_contract_result, "plans", []) or []
+                        ) or bool(getattr(cleanup_runtime_contract_result, "status_records", []) or []) or any(
+                            bool(getattr(bundle, "cleanup_required", False))
+                            for bundle in parent_execution_bundles or []
+                        )
+                        cleaned_page_base_record = persist_cleaned_page_base(
+                            page_id=page_id,
+                            source_path=source_path,
+                            export_dir=self._settings.export_dir,
+                            cleanup_upstream_commit_result=cleanup_upstream_commit_result,
+                            parent_execution_bundles=parent_execution_bundles,
+                            cleanup_required=cleanup_required_for_cleaned_base,
+                        )
+                        cleaned_base_path = str(cleaned_page_base_record.get("image_path") or "")
+                        if bool(cleaned_page_base_record.get("valid")) and cleaned_base_path and os.path.isfile(cleaned_base_path):
+                            render_input_path = cleaned_base_path
+                        elif cleanup_upstream_commit_result.commit_records:
+                            with tempfile.NamedTemporaryFile(
+                                prefix=f"phase5_upstream_{page_id}_",
+                                suffix=".png",
+                                delete=False,
+                            ) as temp_file:
+                                cleanup_upstream_temp_path = temp_file.name
+                            cleanup_upstream_commit_result.cleaned_image.save(cleanup_upstream_temp_path)
+                            render_input_path = cleanup_upstream_temp_path
+                            cleaned_page_base_record["runtime_render_input_fallback_path"] = cleanup_upstream_temp_path
+                            cleaned_page_base_record["runtime_render_input_fallback_reason"] = "cleaned_page_base_cache_unavailable"
+                        if debug_context is not None:
+                            debug_context["cleaned_page_base"] = dict(cleaned_page_base_record)
                         if debug_context is not None and not debug_context.get("perf_telemetry_only"):
                             runtime_audit = cleanup_runtime_contract_result.to_audit_dict()
                             commit_audit = cleanup_upstream_commit_result.to_audit_dict()
@@ -1605,6 +1626,8 @@ class PipelineWorker(QtCore.QThread):
                     output_path,
                     page_class=page_class,
                 )
+                if cleaned_page_base_record:
+                    page_record["cleaned_page_base"] = cleaned_page_base_record
                 if parent_execution_bundles:
                     page_record["source_regions"] = regions
                     page_record["parent_execution_bundles"] = [
