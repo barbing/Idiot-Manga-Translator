@@ -344,7 +344,11 @@ def _arbitrate_parent_styles(
             continue
         active.append((bundle, record))
 
-    cohort_profiles = _style_cohort_profiles(active)
+    cohort_profiles = _style_cohort_profiles(
+        active,
+        default_font_name=default_font_name,
+        models_dir=models_dir,
+    )
     for bundle, record in active:
         cohort = cohort_profiles.get(_style_cohort_key(record), {})
         decision = _style_decision_for_record(record, cohort, active)
@@ -468,6 +472,10 @@ def _style_for_bundle(
         ),
         cohort_glyph_size_px=_float(arbitration.get("cohort_measured_glyph_size_px")),
         font_size_arbitration_decision=str(arbitration.get("font_size_arbitration_decision") or ""),
+        measured_glyph_size_source=str(arbitration.get("measured_glyph_size_source") or ""),
+        measured_glyph_dominant_component_count=int(
+            arbitration.get("measured_glyph_dominant_component_count") or 0
+        ),
         font_family=font_path,
     )
     style.update(_normalize_layout_hints_to_visual_cohort(layout_hints, arbitration=arbitration))
@@ -509,7 +517,12 @@ def _style_for_bundle(
     return {key: value for key, value in style.items() if value not in (None, "", [])}
 
 
-def _style_cohort_profiles(active: Sequence[tuple[Any, Mapping[str, Any]]]) -> dict[tuple[str, str], dict[str, Any]]:
+def _style_cohort_profiles(
+    active: Sequence[tuple[Any, Mapping[str, Any]]],
+    *,
+    default_font_name: str = "",
+    models_dir: str | None = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
     grouped: dict[tuple[str, str], list[tuple[Any, Mapping[str, Any]]]] = {}
     for bundle, record in active:
         grouped.setdefault(_style_cohort_key(record), []).append((bundle, record))
@@ -548,6 +561,15 @@ def _style_cohort_profiles(active: Sequence[tuple[Any, Mapping[str, Any]]]) -> d
 
         style_class = _style_class_for_surface(surface_bucket)
         cohort_id = "style_cohort:{}:{}".format(surface_bucket, orientation)
+        canonical_font_family = (
+            resolve_noto_cjk_sc_font_file(base_dir=models_dir, serif=canonical_serif, weight=canonical_weight)
+            or default_font_name
+        )
+        font_size_profile = _cohort_font_size_profile(
+            members,
+            surface_bucket=surface_bucket,
+            canonical_font_family=canonical_font_family,
+        )
         profiles[key] = {
             "cohort_id": cohort_id,
             "member_parent_ids": [str(record.get("parent_id") or "") for record in records if record.get("parent_id")],
@@ -563,6 +585,7 @@ def _style_cohort_profiles(active: Sequence[tuple[Any, Mapping[str, Any]]]) -> d
             "median_measured_glyph_size_px": _median(_float(record.get("measured_glyph_size_px")) for record in usable),
             "usable_evidence_count": len(usable),
             "serif_ratio": round(float(serif_ratio), 4),
+            **font_size_profile,
         }
     return profiles
 
@@ -698,6 +721,7 @@ def _cohort_font_size_profile(
     members: Sequence[tuple[Any, Mapping[str, Any]]],
     *,
     surface_bucket: str,
+    canonical_font_family: str = "",
 ) -> dict[str, Any]:
     raw_hints: list[int] = []
     for bundle, record in members:
@@ -707,16 +731,22 @@ def _cohort_font_size_profile(
             continue
         detection = record.get("detection") if isinstance(record.get("detection"), Mapping) else {}
         source_orientation = _style_source_orientation(bundle, detection)
+        dominant_component_count = int(record.get("measured_glyph_dominant_component_count") or 0)
         hints = _layout_hints_for_bundle(
             bundle,
             detection=detection if detection else None,
             surface_bucket=surface_bucket,
             source_orientation=source_orientation,
             measured_glyph_size_px=_float(record.get("measured_glyph_size_px")),
-            font_family="",
+            measured_glyph_size_source=str(record.get("measured_glyph_size_source") or ""),
+            measured_glyph_dominant_component_count=dominant_component_count,
+            font_family=canonical_font_family,
         )
         raw_hint = int(hints.get("font_size_hint") or 0)
-        if raw_hint > 0 and str(hints.get("font_size_source") or "") == "measured_source_glyph_geometry":
+        if raw_hint > 0 and str(hints.get("font_size_source") or "") in {
+            "measured_source_glyph_geometry",
+            "model_scale_corrected_source_glyph_geometry",
+        }:
             raw_hints.append(raw_hint)
     if len(raw_hints) < MIN_COHORT_SIZE_NORMALIZATION_MEMBERS:
         return {}
@@ -811,23 +841,16 @@ def _normalize_layout_hints_to_visual_cohort(
     if not hints:
         return hints
     canonical = int(arbitration.get("cohort_font_size_hint") or 0)
+    hint_source = str(hints.get("font_size_source") or "")
     if (
         canonical <= 0
         or bool(arbitration.get("preserved_exception"))
-        or str(hints.get("font_size_source") or "") != "measured_source_glyph_geometry"
+        or hint_source not in {"measured_source_glyph_geometry", "model_scale_corrected_source_glyph_geometry"}
     ):
         return hints
     raw_hint = int(hints.get("font_size_hint") or 0)
     raw_min = int(hints.get("font_size_min") or 0)
     raw_max = int(hints.get("font_size_max") or 0)
-    if raw_hint > 0 and abs(raw_hint - canonical) / max(1.0, float(canonical)) > 0.18:
-        hints["font_size_normalization"] = "measured_glyph_preserved"
-        hints["font_size_normalization_source"] = "visual_cohort_outlier_preserved"
-        spacing = dict(hints.get("spacing_profile") or {})
-        spacing["font_size_normalization"] = "measured_glyph_preserved"
-        spacing["font_size_normalization_source"] = "visual_cohort_outlier_preserved"
-        hints["spacing_profile"] = spacing
-        return hints
     cohort_min = int(arbitration.get("cohort_font_size_min") or 0)
     cohort_max = int(arbitration.get("cohort_font_size_max") or 0)
     min_size = min(value for value in (raw_min, cohort_min, canonical) if value > 0)
@@ -1109,6 +1132,8 @@ def _layout_hints_for_bundle(
     measured_glyph_size_px: float = 0.0,
     cohort_glyph_size_px: float = 0.0,
     font_size_arbitration_decision: str = "",
+    measured_glyph_size_source: str = "",
+    measured_glyph_dominant_component_count: int = 0,
     font_family: str = "",
 ) -> dict[str, Any]:
     bbox = _best_style_bbox(bundle)
@@ -1127,6 +1152,12 @@ def _layout_hints_for_bundle(
         0.0,
         0.65,
     )
+    model_scale_hint = _model_scale_font_size_hint(
+        bbox,
+        size_ratio=size_ratio,
+        vertical=vertical,
+        contrast_surface=contrast_surface,
+    )
 
     glyph_size_basis = _float(measured_glyph_size_px)
     font_size_source = "measured_source_glyph_geometry"
@@ -1137,9 +1168,22 @@ def _layout_hints_for_bundle(
         font_size_source = "cohort_source_glyph_geometry_fallback"
 
     measured_hint = _font_size_hint_from_glyph_pixels(font_family, glyph_size_basis)
+    font_size_reason_codes: list[str] = []
+    model_scale_correction = ""
     if measured_hint > 0:
         hint = measured_hint
         readable_min = 18 if contrast_surface else 16
+        corrected = _model_scale_corrected_font_size_hint(
+            measured_hint,
+            model_scale_hint,
+            measured_glyph_size_source=measured_glyph_size_source,
+            measured_glyph_dominant_component_count=measured_glyph_dominant_component_count,
+        )
+        if corrected:
+            hint = int(corrected["font_size_hint"])
+            font_size_source = "model_scale_corrected_source_glyph_geometry"
+            model_scale_correction = str(corrected["correction"])
+            font_size_reason_codes.append(model_scale_correction)
         line_height = max(
             1.10 if contrast_surface else 1.06,
             1.06 + min(line_spacing_ratio, 0.50) * 0.14,
@@ -1197,6 +1241,9 @@ def _layout_hints_for_bundle(
         "font_size_min": min_size,
         "font_size_max": max_size,
         "font_size_source": font_size_source,
+        "font_size_reason_codes": font_size_reason_codes,
+        "model_scale_font_size_hint": model_scale_hint,
+        "model_scale_font_size_correction": model_scale_correction,
         "line_height": round(float(line_height), 3),
         "spacing_profile": {
             "source": "yuzumarker" if detection else "parent_geometry_fallback",
@@ -1206,6 +1253,9 @@ def _layout_hints_for_bundle(
             "font_size_min": min_size,
             "font_size_max": max_size,
             "font_size_source": font_size_source,
+            "font_size_reason_codes": list(font_size_reason_codes),
+            "model_scale_font_size_hint": model_scale_hint,
+            "model_scale_font_size_correction": model_scale_correction,
             "line_height": round(float(line_height), 3),
             "minimum_readable_font_size": readable_min,
             "source_text_size_ratio": round(float(size_ratio), 4),
@@ -1215,6 +1265,62 @@ def _layout_hints_for_bundle(
             "glyph_size_basis_px": round(float(glyph_size_basis), 3),
         },
     }
+
+
+def _model_scale_font_size_hint(
+    bbox: Sequence[int] | None,
+    *,
+    size_ratio: float,
+    vertical: bool,
+    contrast_surface: bool,
+) -> int:
+    bbox_values = _bbox(bbox)
+    if not bbox_values or size_ratio <= 0:
+        return 0
+    _x, _y, width, height = bbox_values
+    short_side = float(max(1, min(width, height)))
+    ratio = _clamp_float(size_ratio, 0.0, 0.80)
+    if vertical:
+        short_side_hint = short_side * ratio * (0.88 if not contrast_surface else 0.86)
+        height_hint = float(height) * (0.075 + min(ratio, 0.50) * 0.12)
+        compact_hint = 0.0
+        if short_side <= 120 and ratio >= 0.25:
+            compact_hint = short_side * ratio * (0.96 if not contrast_surface else 0.90)
+        return int(round(max(short_side_hint, height_hint, compact_hint)))
+
+    short_side_hint = float(height) * ratio * (0.92 if not contrast_surface else 0.88)
+    width_hint = float(width) * (0.055 + min(ratio, 0.50) * 0.12)
+    return int(round(max(short_side_hint, width_hint)))
+
+
+def _model_scale_corrected_font_size_hint(
+    measured_hint: int,
+    model_scale_hint: int,
+    *,
+    measured_glyph_size_source: str,
+    measured_glyph_dominant_component_count: int,
+) -> dict[str, Any]:
+    measured = int(measured_hint or 0)
+    model_hint = int(model_scale_hint or 0)
+    if measured <= 0 or model_hint <= 0:
+        return {}
+    source = str(measured_glyph_size_source or "")
+    dominant_count = int(measured_glyph_dominant_component_count or 0)
+    if source == "source_glyph_merged_outline_column_width" and model_hint < measured * 0.96:
+        return {
+            "font_size_hint": max(1, model_hint),
+            "correction": "merged_outline_width_capped_by_model_scale",
+        }
+    if (
+        source == "source_glyph_dominant_component_cluster"
+        and 0 < dominant_count < MIN_DOMINANT_COMPONENTS_FOR_LOW_SIZE_OUTLIER
+        and model_hint > measured * 1.12
+    ):
+        return {
+            "font_size_hint": model_hint,
+            "correction": "sparse_source_glyph_measurement_corrected_by_model_scale",
+        }
+    return {}
 
 
 def _source_glyph_size_metrics(crop: Any | None, *, surface_bucket: str) -> dict[str, Any]:
