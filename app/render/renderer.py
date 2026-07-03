@@ -21,7 +21,8 @@ from app.pipeline.debug_artifacts import (
 )
 from app.pipeline import cleanup_execution
 from app.pipeline import source_glyph_masks as source_glyph_mask_stage
-from app.pipeline.parent_execution_bundle import parent_execution_region_records
+from app.render.compositor import RendererCompositor
+from app.render.render_layer_adapter import build_render_layer_plans_from_parent_bundles, render_layer_plan_audit
 
 _TOP_ROW_CAPTION_REASONS = {
     "top_row_background_caption_candidate",
@@ -1084,20 +1085,123 @@ def render_parent_execution_bundles(
         debug_context=debug_context,
         perf_telemetry_context=perf_telemetry_context,
     )
-    records = parent_execution_region_records(parent_execution_bundles)
-    render_translations(
-        image_path,
-        output_path,
-        records,
-        font_name,
-        inpaint_mode=inpaint_mode,
-        use_gpu=use_gpu,
-        model_id=model_id,
+    render_eligibility_by_region = _render_eligibility_by_region(render_eligibility)
+    compositor_bundles = _renderer_stage5_renderable_parent_bundles(
+        parent_execution_bundles,
+        render_eligibility_by_region=render_eligibility_by_region,
         debug_context=debug_context,
-        source_glyph_masks=source_glyph_masks,
-        render_eligibility=render_eligibility,
         perf_telemetry_context=perf_telemetry_context,
     )
+    page_id = _renderer_stage5_page_id(compositor_bundles, parent_execution_bundles, debug_context, image_path)
+    cleaned_page_base = _renderer_stage5_cleaned_page_base_ref(image_path, debug_context)
+    plans = build_render_layer_plans_from_parent_bundles(
+        page_id=page_id,
+        parent_execution_bundles=compositor_bundles,
+        cleaned_page_base=cleaned_page_base,
+    )
+    compositor_result = RendererCompositor().compose(image_path, output_path, plans)
+    audit = compositor_result.to_audit_dict()
+    if debug_context is not None:
+        debug_context["render_layer_audit"] = render_layer_plan_audit(plans)
+        debug_context["renderer_compositor"] = audit
+        debug_context["stage5_renderer_compositor_active"] = True
+        debug_context["legacy_render_translations_bypassed_for_parent_bundles"] = True
+    for layer in audit.get("layers", []) or []:
+        if not isinstance(layer, dict):
+            continue
+        _renderer_perf_mark_region(
+            debug_context,
+            perf_telemetry_context,
+            str(layer.get("bundle_id") or layer.get("parent_id") or ""),
+            renderer_compositor_version=layer.get("renderer_compositor_version"),
+            renderer_input_authority="parent_execution_bundle",
+            render_layer_id=layer.get("layer_id"),
+            text_block_root_id=layer.get("root_id"),
+            parent_logical_text_unit_id=layer.get("parent_id"),
+            parent_execution_bundle_id=layer.get("bundle_id"),
+            drawing_authority=layer.get("drawing_authority"),
+            legacy_region_rendering_used=False,
+            renderer_cleanup_mutation_applied=False,
+            cleanup_applied=False,
+            typeset_fit_status=layer.get("fit_status"),
+            typeset_full_text_placed=layer.get("full_text_placed"),
+            selected_font_face=layer.get("selected_font_face"),
+            selected_font_size=layer.get("selected_font_size"),
+            rendered_glyph_count=layer.get("drawn_glyph_count"),
+            glyph_text_matches_layout=layer.get("glyph_text_matches_layout"),
+        )
+
+
+def _renderer_stage5_renderable_parent_bundles(
+    parent_execution_bundles: list[Any],
+    *,
+    render_eligibility_by_region: dict[str, object],
+    debug_context: dict | None,
+    perf_telemetry_context: dict | None,
+) -> list[Any]:
+    output: list[Any] = []
+    for bundle in parent_execution_bundles or []:
+        bundle_id = str(getattr(bundle, "bundle_id", "") or getattr(bundle, "parent_id", "") or "")
+        parent_id = str(getattr(bundle, "parent_id", "") or "")
+        decision = render_eligibility_by_region.get(bundle_id) or render_eligibility_by_region.get(parent_id)
+        status = _render_eligibility_status(decision)
+        if status.startswith("suppressed_"):
+            _renderer_perf_mark_region(
+                debug_context,
+                perf_telemetry_context,
+                bundle_id or parent_id,
+                renderer_input_authority="parent_execution_bundle",
+                render_suppressed_by_upstream_eligibility=True,
+                render_eligibility_status=status,
+                render_eligibility_reason=_render_eligibility_value(decision, "reason"),
+                legacy_region_rendering_used=False,
+                renderer_cleanup_mutation_applied=False,
+                cleanup_applied=False,
+            )
+            continue
+        output.append(bundle)
+    return output
+
+
+def _renderer_stage5_page_id(
+    compositor_bundles: list[Any],
+    all_bundles: list[Any],
+    debug_context: dict | None,
+    image_path: str,
+) -> str:
+    for source in (
+        compositor_bundles,
+        all_bundles,
+    ):
+        for bundle in source or []:
+            page_id = str(getattr(bundle, "page_id", "") or "")
+            if page_id:
+                return page_id
+    if isinstance(debug_context, dict):
+        page_id = str(debug_context.get("page_id") or debug_context.get("page") or "")
+        if page_id:
+            return page_id
+    stem = os.path.splitext(os.path.basename(str(image_path or "")))[0]
+    return stem or "unknown_page"
+
+
+def _renderer_stage5_cleaned_page_base_ref(image_path: str, debug_context: dict | None) -> dict[str, object]:
+    existing = None
+    if isinstance(debug_context, dict):
+        existing = debug_context.get("cleaned_page_base") or debug_context.get("cleaned_page_base_ref")
+    if isinstance(existing, dict):
+        ref = dict(existing)
+        ref.setdefault("image_path", image_path)
+        ref.setdefault("valid", os.path.isfile(str(ref.get("image_path") or "")))
+        ref.setdefault("stage", "cleaned_page_base")
+        return ref
+    return {
+        "cleaned_page_base_version": "cleaned_page_base_runtime_ref_v1",
+        "image_path": image_path,
+        "valid": os.path.isfile(str(image_path or "")),
+        "stage": "cleaned_page_base",
+        "source": "render_parent_execution_bundles_input",
+    }
 
 
 def _stamp_parent_bundle_renderer_audit_ids(
