@@ -1056,6 +1056,17 @@ def _best_vertical_partition(
     def units_between(start: int, end: int) -> float:
         return max(0.0, prefix_units[end] - prefix_units[start])
 
+    def front_loaded_column_penalty(breaks: Sequence[int]) -> float:
+        cursor = 0
+        row_units: list[float] = []
+        for end in breaks:
+            row_units.append(units_between(cursor, end))
+            cursor = end
+        penalty = 0.0
+        for previous, current in zip(row_units, row_units[1:]):
+            penalty += max(0.0, float(current) - float(previous))
+        return penalty
+
     dp: dict[tuple[int, int], tuple[float, list[int]]] = {(0, 0): (0.0, [])}
     for col in range(columns):
         next_dp: dict[tuple[int, int], tuple[float, list[int]]] = {}
@@ -1081,7 +1092,14 @@ def _best_vertical_partition(
                 key = (col + 1, end)
                 prior = next_dp.get(key)
                 new_breaks = breaks + [end]
-                if prior is None or total < prior[0]:
+                if (
+                    prior is None
+                    or total < prior[0]
+                    or (
+                        abs(float(total) - float(prior[0])) <= 1e-9
+                        and front_loaded_column_penalty(new_breaks) < front_loaded_column_penalty(prior[1])
+                    )
+                ):
                     next_dp[key] = (total, new_breaks)
         dp = next_dp
         if not dp:
@@ -1111,10 +1129,14 @@ def _best_vertical_partition(
             for split in split_points
         )
         score += non_phrase_extra_break_penalty * 2.0
+    rtl_frontload_penalty = front_loaded_column_penalty(breaks)
+    if rtl_frontload_penalty:
+        score += float(rtl_frontload_penalty) * 0.35
     meta = {
         "split_points": split_points,
         "column_lengths": [len(group) for group in groups],
         "column_row_units": [round(float(_vertical_items_row_units(group)), 3) for group in groups],
+        "right_to_left_frontload_penalty": round(float(rtl_frontload_penalty), 3),
         "break_penalties": [
             {
                 "split_after": split,

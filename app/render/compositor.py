@@ -558,7 +558,6 @@ def _visual_slot_scored_plan(
             candidate_plan,
             layout,
             report,
-            geometry=geometry,
             source_box=source_box,
             occupied_bounds=occupied_bounds,
         )
@@ -649,6 +648,7 @@ def _visual_slot_candidates(
     anchor = geometry.get("anchor")
     if (
         np is not None
+        and not source_box
         and safe_mask is not None
         and local_component_box
         and isinstance(anchor, Sequence)
@@ -663,7 +663,7 @@ def _visual_slot_candidates(
         add("source_footprint_padded_box", _source_padded_box(source_box, container, original_plan))
         add("source_footprint_wide_box", _source_padded_box(source_box, container, original_plan, scale=1.8))
     if component is not None:
-        _ = component  # evidence exists; mask scoring is applied later.
+        _ = component  # Evidence exists; CleanedPage pixels are not layout authority.
     return records
 
 
@@ -672,7 +672,6 @@ def _score_visual_slot(
     layout: TypesetLayout,
     report: FitReport,
     *,
-    geometry: Mapping[str, Any],
     source_box: Sequence[int],
     occupied_bounds: Sequence[Mapping[str, Any]],
 ) -> tuple[float, dict[str, Any]]:
@@ -692,13 +691,6 @@ def _score_visual_slot(
     if target and not _box_inside_tolerant(measured, target, tolerance=1):
         score += 250.0
         meta["measured_outside_target"] = True
-
-    inside_ratio = _layout_mask_inside_ratio(layout, geometry)
-    if inside_ratio is not None:
-        mask_penalty = (1.0 - inside_ratio) * 220.0
-        score += mask_penalty
-        meta["speech_mask_inside_ratio"] = round(float(inside_ratio), 4)
-        meta["speech_mask_penalty"] = round(float(mask_penalty), 4)
 
     if source_box:
         measured_center = _center_box(measured)
@@ -1093,43 +1085,6 @@ def _source_padded_box(
     pad_y = max(6, int(round(float(font_size) * 0.55 * float(scale))), int(round(float(sh) * 0.08 * float(scale))))
     padded = [sx - pad_x, sy - pad_y, sw + pad_x * 2, sh + pad_y * 2]
     return _intersect_box(padded, bounds) or _intersect_box(padded, source) or list(source)
-
-
-def _layout_mask_inside_ratio(layout: TypesetLayout, geometry: Mapping[str, Any]) -> float | None:
-    if np is None:
-        return None
-    mask = geometry.get("safe_mask")
-    if mask is None or not hasattr(mask, "shape") or int(mask.sum()) <= 0:
-        mask = geometry.get("component")
-    if mask is None or not hasattr(mask, "shape") or int(mask.sum()) <= 0:
-        return None
-    candidate = _bbox_from_value(geometry.get("candidate_box"))
-    if not candidate:
-        return None
-    samples = 0
-    inside = 0
-    height, width = mask.shape[:2]
-    for glyph in layout.glyphs or []:
-        box = _bbox_from_value(_glyph_to_dict(glyph).get("bbox"))
-        if not box:
-            continue
-        gx, gy, gw, gh = box
-        points = (
-            (gx + gw / 2.0, gy + gh / 2.0),
-            (gx + gw * 0.25, gy + gh * 0.25),
-            (gx + gw * 0.75, gy + gh * 0.25),
-            (gx + gw * 0.25, gy + gh * 0.75),
-            (gx + gw * 0.75, gy + gh * 0.75),
-        )
-        for px, py in points:
-            lx = int(round(float(px) - float(candidate[0])))
-            ly = int(round(float(py) - float(candidate[1])))
-            samples += 1
-            if 0 <= lx < width and 0 <= ly < height and bool(mask[ly, lx]):
-                inside += 1
-    if samples <= 0:
-        return None
-    return float(inside) / float(samples)
 
 
 def _same_box(first: Sequence[int], second: Sequence[int]) -> bool:
