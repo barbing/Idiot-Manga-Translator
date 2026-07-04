@@ -1137,6 +1137,10 @@ def _best_vertical_partition(
         "column_lengths": [len(group) for group in groups],
         "column_row_units": [round(float(_vertical_items_row_units(group)), 3) for group in groups],
         "right_to_left_frontload_penalty": round(float(rtl_frontload_penalty), 3),
+        "vertical_break_quality_rules": [
+            "terminal_cjk_widow_before_punctuation_tail",
+        ],
+        "segment_quality_adjustments": _vertical_partition_quality_adjustments(groups),
         "break_penalties": [
             {
                 "split_after": split,
@@ -1232,6 +1236,7 @@ def _vertical_segment_score(items: Sequence[dict[str, Any]], start: int, end: in
         return 1000.0
     segment_units = _vertical_items_row_units(segment)
     score = abs(float(segment_units) - ideal) * 1.1
+    score += sum(float(item["penalty"]) for item in _vertical_segment_quality_adjustments(segment))
     if start > 0:
         first = str(segment[0].get("text") or "")
         if _item_must_not_start_vertical_column(segment[0]):
@@ -1266,6 +1271,62 @@ def _vertical_break_penalty(items: Sequence[dict[str, Any]], split: int) -> floa
     if _vertical_item_is_cjk(prev_text) and _vertical_item_is_cjk(next_text):
         return 4.5
     return 0.0
+
+
+def _vertical_partition_quality_adjustments(groups: Sequence[Sequence[dict[str, Any]]]) -> list[dict[str, Any]]:
+    adjustments: list[dict[str, Any]] = []
+    start = 0
+    for column_index, group in enumerate(groups or []):
+        group_adjustments = _vertical_segment_quality_adjustments(group)
+        for item in group_adjustments:
+            record = dict(item)
+            record["column_index"] = int(column_index)
+            record["start"] = int(start)
+            record["end"] = int(start + len(group))
+            record["text"] = "".join(str(value.get("text") or "") for value in group)
+            adjustments.append(record)
+        start += len(group)
+    return adjustments
+
+
+def _vertical_segment_quality_adjustments(segment: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    values = list(segment or [])
+    if _vertical_segment_has_terminal_cjk_widow_before_punctuation_tail(values):
+        return [
+            {
+                "reason": "terminal_cjk_widow_before_punctuation_tail",
+                "penalty": 12.0,
+            }
+        ]
+    return []
+
+
+def _vertical_segment_has_terminal_cjk_widow_before_punctuation_tail(segment: Sequence[dict[str, Any]]) -> bool:
+    values = [item for item in (segment or []) if str(item.get("text") or "")]
+    if len(values) < 2:
+        return False
+    content: list[dict[str, Any]] = []
+    trailing_punctuation = 0
+    seen_tail = False
+    for item in reversed(values):
+        text = str(item.get("text") or "")
+        if _vertical_item_is_sequence_punctuation(text) or _vertical_item_is_continuation_punctuation(text):
+            trailing_punctuation += 1
+            seen_tail = True
+            continue
+        content = list(values[: len(values) - trailing_punctuation])
+        break
+    if not seen_tail or not content:
+        return False
+    lexical = [
+        item for item in content
+        if not _vertical_item_is_sequence_punctuation(str(item.get("text") or ""))
+        and not _vertical_item_is_continuation_punctuation(str(item.get("text") or ""))
+        and not _vertical_item_is_open_punctuation(str(item.get("text") or ""))
+    ]
+    if len(lexical) != 1:
+        return False
+    return _vertical_item_is_cjk(str(lexical[0].get("text") or ""))
 
 
 def _item_must_not_start_vertical_column(item: dict[str, Any]) -> bool:
