@@ -16,6 +16,7 @@ from app.render.text_shaper import HarfBuzzShaper, ShapedRun
 from app.render.typesetting_contracts import FitReport, GlyphPlacement, RenderLayerPlan, TypesetLayout, bbox_from_value
 from app.render.typesetting_text import (
     BreakOpportunity,
+    VERTICAL_CENTERED_PUNCTUATION_CHARS,
     InlineTextRun,
     classify_grapheme,
     compute_break_opportunities,
@@ -51,7 +52,16 @@ _VERTICAL_NO_COLUMN_START = {
     "？",
     "︕",
     "︖",
+    "‼",
+    "⁇",
+    "⁉",
+    "⁈",
     "︙",
+    "︐",
+    "︑",
+    "︒",
+    "︓",
+    "︔",
 }
 
 
@@ -1160,11 +1170,33 @@ def _vertical_item_is_continuation_punctuation(text: str) -> bool:
 
 
 def _vertical_item_is_sequence_punctuation(text: str) -> bool:
-    return str(text or "")[:1] in {"︙", "︱", "…", "-", "—", "―", "─"}
+    return str(text or "")[:1] in {"︙", "︱", "…", "-", "—", "―", "─", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
 
 
 def _vertical_item_is_strong_phrase_end(text: str) -> bool:
-    return str(text or "")[:1] in {"︙", "︱", "。", "，", "、", "！", "？", "︕", "︖", "!", "?", "～", "〜", "~"}
+    return str(text or "")[:1] in {
+        "︙",
+        "︱",
+        "。",
+        "，",
+        "、",
+        "︐",
+        "︑",
+        "︒",
+        "！",
+        "？",
+        "︕",
+        "︖",
+        "‼",
+        "⁇",
+        "⁉",
+        "⁈",
+        "!",
+        "?",
+        "～",
+        "〜",
+        "~",
+    }
 
 
 def _vertical_item_is_weak_column_start(text: str) -> bool:
@@ -1176,6 +1208,11 @@ def _vertical_item_is_cjk(text: str) -> bool:
         return False
     kind = classify_grapheme(str(text)[0])
     return kind == "cjk"
+
+
+def _vertical_item_is_centered_punctuation(text: str) -> bool:
+    value = str(text or "")
+    return value in VERTICAL_CENTERED_PUNCTUATION_CHARS
 
 
 def _vertical_segment_is_punctuation_only(items: Sequence[dict[str, Any]]) -> bool:
@@ -1254,23 +1291,20 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
             continue
         shaped = shaped_by_run.get(run.run_id)
         glyphs = list(shaped.glyphs if shaped else [])
-        if run.role in {"ellipsis_sequence", "dash_sequence"}:
-            clusters = grapheme_clusters(run.text)
-            for offset, cluster in enumerate(clusters):
-                glyph = glyphs[offset] if offset < len(glyphs) else (glyphs[0] if glyphs else None)
-                item_width, item_height, x_advance = _vertical_atomic_size(run, [glyph] if glyph else [], policy, font_size)
-                items.append(
-                    {
-                        "text": cluster,
-                        "run_id": run.run_id,
-                        "placement_mode": f"vertical_{run.role}",
-                        "shaped_glyph": glyph,
-                        "shaped_glyphs": [glyph] if glyph else [],
-                        "width": item_width,
-                        "height": item_height,
-                        "x_advance": x_advance,
-                    }
-                )
+        if run.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
+            item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
+            items.append(
+                {
+                    "text": run.text,
+                    "run_id": run.run_id,
+                    "placement_mode": f"vertical_{run.role}",
+                    "shaped_glyph": glyphs[0] if glyphs else None,
+                    "shaped_glyphs": glyphs,
+                    "width": item_width,
+                    "height": item_height,
+                    "x_advance": x_advance,
+                }
+            )
             continue
         if _vertical_run_is_atomic(run, policy):
             item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
@@ -1296,11 +1330,16 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
                 glyph_w = glyph_h if glyph_h > 0.0 else float(font_size)
             if glyph_h <= 0.0:
                 glyph_h = float(font_size)
+            placement_mode = "vertical_glyph"
+            if _vertical_item_is_centered_punctuation(cluster):
+                glyph_w = float(font_size)
+                glyph_h = float(font_size)
+                placement_mode = "vertical_punctuation"
             items.append(
                 {
                     "text": cluster,
                     "run_id": run.run_id,
-                    "placement_mode": "vertical_glyph",
+                    "placement_mode": placement_mode,
                     "shaped_glyph": glyph,
                     "shaped_glyphs": [glyph] if glyph else [],
                     "width": max(1.0, glyph_w),
@@ -1312,6 +1351,13 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
 
 
 def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: TypesettingPolicy, font_size: int) -> tuple[float, float, float]:
+    if run.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
+        count = max(1, len(grapheme_clusters(run.text)))
+        width = float(font_size)
+        height = float(font_size)
+        if count > 1:
+            height = max(height, min(float(font_size) * 1.15, float(font_size) * (0.58 * count)))
+        return max(1.0, width), max(1.0, height), width
     if not glyphs:
         count = max(1, len(grapheme_clusters(run.text)))
         return float(max(font_size, count)), float(font_size), 0.0
@@ -1333,7 +1379,7 @@ def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: Typ
 def _vertical_run_is_atomic(run: InlineTextRun, policy: TypesettingPolicy) -> bool:
     if run.script == "Latn":
         return True
-    if run.role in {"numeric_token", "complex_script", "symbol", "ellipsis_sequence", "dash_sequence"}:
+    if run.role in {"numeric_token", "complex_script", "symbol", "ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
         return True
     return False
 

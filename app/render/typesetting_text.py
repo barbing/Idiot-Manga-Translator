@@ -26,6 +26,35 @@ SYMBOL_CHARS = {"☆", "★", "♡", "❤", "♪"}
 LTR_COMPLEX_SCRIPTS = {"Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh", "Thai"}
 ELLIPSIS_CHARS = {"…", "︙"}
 DASH_CHARS = {"-", "ー", "―", "—", "─", "︱"}
+COMPACT_VERTICAL_PUNCTUATION_CHARS = {"!", "?", "！", "？", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
+VERTICAL_CENTERED_PUNCTUATION_CHARS = {
+    ",",
+    ".",
+    ":",
+    ";",
+    "，",
+    "、",
+    "。",
+    "：",
+    "；",
+    "︐",
+    "︑",
+    "︒",
+    "︓",
+    "︔",
+    "!",
+    "?",
+    "！",
+    "？",
+    "︕",
+    "︖",
+    "‼",
+    "⁇",
+    "⁉",
+    "⁈",
+    "︙",
+    "︱",
+}
 OPEN_PUNCTUATION = {"(", "（", "[", "［", "{", "｛", "「", "『", "【", "〈", "《", "“", "‘"}
 CLOSE_PUNCTUATION = {
     ")",
@@ -53,7 +82,16 @@ CLOSE_PUNCTUATION = {
     "？",
     "︕",
     "︖",
+    "‼",
+    "⁇",
+    "⁉",
+    "⁈",
     "︙",
+    "︐",
+    "︑",
+    "︒",
+    "︓",
+    "︔",
 }
 
 
@@ -130,7 +168,33 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
                 symbols.append({"symbol": cluster, "normalized": cluster, "supported": _symbol_supported(font_manager, face, cluster)})
         return value, punctuation, symbols, notes
 
-    replacements = ("……", "...", "!?", "?!", "——", "--", "…", "!", "?")
+    replacements = (
+        "……",
+        "...",
+        "！！",
+        "!!",
+        "？？",
+        "??",
+        "！？",
+        "!?",
+        "？！",
+        "?!",
+        "——",
+        "--",
+        "…",
+        "！",
+        "!",
+        "？",
+        "?",
+        "，",
+        ",",
+        "、",
+        "。",
+        "：",
+        ":",
+        "；",
+        ";",
+    )
     out: list[str] = []
     index = 0
     while index < len(value):
@@ -229,6 +293,10 @@ def segment_inline_runs(text: str, *, writing_mode: str, language_hint: str = ""
             while index + 1 < len(clusters) and classify_grapheme(clusters[index + 1]) == kind:
                 group.append(clusters[index + 1])
                 index += 1
+        elif _is_compact_vertical_punctuation_char(cluster):
+            while index + 1 < len(clusters) and _is_compact_vertical_punctuation_char(clusters[index + 1]):
+                group.append(clusters[index + 1])
+                index += 1
         elif kind in {"rtl", "complex"}:
             script = _script_for_run(text_value, kind)
             while index + 1 < len(clusters):
@@ -276,7 +344,7 @@ def compute_break_opportunities(runs: Sequence[InlineTextRun], *, writing_mode: 
         reason = "generic_run_boundary"
         strength = "normal"
         allowed = True
-        if after.text in CLOSE_PUNCTUATION or after.role in {"ellipsis_sequence", "dash_sequence"} and after.text[:1] in CLOSE_PUNCTUATION:
+        if after.text in CLOSE_PUNCTUATION or after.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"} and after.text[:1] in CLOSE_PUNCTUATION:
             reason = "kinsoku_rejected_before_closing_punctuation"
             strength = "forbidden"
             allowed = False
@@ -335,6 +403,15 @@ def _is_ellipsis_sequence(text: str) -> bool:
 
 def _is_dash_sequence(text: str) -> bool:
     return bool(text) and all(char in DASH_CHARS for char in text)
+
+
+def _is_compact_vertical_punctuation_char(text: str) -> bool:
+    return bool(text) and text in COMPACT_VERTICAL_PUNCTUATION_CHARS
+
+
+def _is_compact_vertical_punctuation_sequence(text: str) -> bool:
+    clusters = grapheme_clusters(text)
+    return len(clusters) > 1 and all(_is_compact_vertical_punctuation_char(cluster) for cluster in clusters)
 
 
 def _script_for_run(text: str, kind: str) -> str:
@@ -435,6 +512,8 @@ def _role_for_kind(kind: str, text: str) -> str:
         return "ellipsis_sequence"
     if kind == "dash":
         return "dash_sequence"
+    if _is_compact_vertical_punctuation_sequence(text):
+        return "punctuation_sequence"
     if kind == "symbol":
         return "symbol"
     if kind == "space":

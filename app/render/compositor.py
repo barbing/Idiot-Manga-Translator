@@ -24,6 +24,7 @@ from app.render.typesetting_contracts import (
     typeset_layouts_to_audit_dict,
 )
 from app.render.typesetting_engine import TypesettingEngine
+from app.render.typesetting_text import grapheme_clusters
 
 try:
     from PIL import Image, ImageDraw
@@ -211,6 +212,20 @@ def _draw_glyph(
     height = max(1, y1 - y0)
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
+    if _draw_compact_vertical_sequence(
+        draw,
+        text=text,
+        font=font,
+        fill=fill,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
+        glyph=glyph,
+        width=width,
+        height=height,
+        layout=layout,
+    ):
+        page.alpha_composite(layer, dest=(x0, y0))
+        return True
     try:
         text_bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
     except Exception:
@@ -222,6 +237,59 @@ def _draw_glyph(
     draw.text((tx, ty), text, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
     page.alpha_composite(layer, dest=(x0, y0))
     return True
+
+
+def _draw_compact_vertical_sequence(
+    draw,
+    *,
+    text: str,
+    font,
+    fill,
+    stroke_width: int,
+    stroke_fill,
+    glyph: Mapping[str, Any],
+    width: int,
+    height: int,
+    layout: TypesetLayout,
+) -> bool:
+    if str(layout.writing_mode or "").lower() != "vertical":
+        return False
+    metadata = glyph.get("metadata") if isinstance(glyph.get("metadata"), Mapping) else {}
+    mode = str(metadata.get("placement_mode") or "")
+    if mode not in {"vertical_ellipsis_sequence", "vertical_dash_sequence", "vertical_punctuation_sequence"}:
+        return False
+    clusters = [cluster for cluster in grapheme_clusters(text) if cluster]
+    if len(clusters) <= 1:
+        return False
+    boxes: list[tuple[str, tuple[int, int, int, int]]] = []
+    for cluster in clusters:
+        try:
+            box = draw.textbbox((0, 0), cluster, font=font, stroke_width=stroke_width)
+        except Exception:
+            box = font.getbbox(cluster)
+        boxes.append((cluster, box))
+    max_w = max(max(1, int(box[2] - box[0])) for _cluster, box in boxes)
+    max_h = max(max(1, int(box[3] - box[1])) for _cluster, box in boxes)
+    if len(clusters) == 1:
+        step = 0.0
+    else:
+        available_step = max(1.0, float(height - max_h)) / float(len(clusters) - 1)
+        if mode == "vertical_dash_sequence":
+            desired_step = max_h * 0.42
+        elif mode == "vertical_ellipsis_sequence":
+            desired_step = max_h * 0.50
+        else:
+            desired_step = max_h * 0.58
+        step = max(1.0, min(desired_step, available_step))
+    total_h = float(max_h) + step * float(len(clusters) - 1)
+    start_y = max(0.0, (float(height) - total_h) / 2.0)
+    for index, (cluster, box) in enumerate(boxes):
+        tw = max(1, int(box[2] - box[0]))
+        th = max(1, int(box[3] - box[1]))
+        tx = (float(width) - float(tw)) / 2.0 - float(box[0])
+        ty = start_y + float(index) * step + (float(max_h) - float(th)) / 2.0 - float(box[1])
+        draw.text((tx, ty), cluster, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
+    return max_w > 0
 
 
 def _layer_audit(
