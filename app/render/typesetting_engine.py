@@ -425,8 +425,9 @@ class TypesettingEngine:
         if w > max(natural_w * 2, natural_w + font_size) or h > max(natural_h * 2, natural_h + font_size):
             reason_codes.append("oversized_parent_bbox_not_used_as_fill_box")
         source_center: list[float] = []
-        if source_box and _box_inside(source_box, hard_bounds):
-            source_center = _center_of(source_box)
+        source_center_candidate = _center_of(source_box)
+        if source_box and source_center_candidate and _point_inside_box(source_center_candidate, hard_bounds):
+            source_center = source_center_candidate
             if source_box != target_box:
                 reason_codes.append("source_contract_bbox_used_as_layout_alignment_prior")
             else:
@@ -591,6 +592,21 @@ class TypesettingEngine:
                 }
             )
         measured = _union_bounds([item.bbox for item in placements]) or [x, y, min(w, required_w), min(h, int(rows * cell_h))]
+        alignment_center, alignment_source = _layout_alignment_center(plan, [x, y, w, h])
+        if alignment_center and measured:
+            dx, dy = _measured_alignment_shift(measured, alignment_center, [x, y, w, h])
+            if dx or dy:
+                placements = [_shift_glyph_placement(item, dx, dy) for item in placements]
+                columns = _shift_column_records(columns, dx, dy)
+                measured = _union_bounds([item.bbox for item in placements]) or measured
+            if columns:
+                for column in columns:
+                    column["layout_visual_alignment"] = {
+                        "source": alignment_source,
+                        "alignment_center": [round(float(alignment_center[0]), 3), round(float(alignment_center[1]), 3)],
+                        "shift": [int(dx), int(dy)],
+                        "measured_bounds": list(measured),
+                    }
         lines: list[dict[str, Any]] = []
         return placements, lines, columns, measured, fit_status, _unique(issues)
 
@@ -1343,6 +1359,98 @@ def _center_of(box: Sequence[int]) -> list[float]:
     if not bbox:
         return []
     return [float(bbox[0] + bbox[2] / 2), float(bbox[1] + bbox[3] / 2)]
+
+
+def _point_inside_box(point: Sequence[float], box: Sequence[int]) -> bool:
+    if (
+        not isinstance(point, Sequence)
+        or isinstance(point, (str, bytes, bytearray))
+        or len(point) < 2
+    ):
+        return False
+    bbox = bbox_from_value(box)
+    if not bbox:
+        return False
+    px, py = float(point[0]), float(point[1])
+    bx, by, bw, bh = bbox
+    return float(bx) <= px <= float(bx + bw) and float(by) <= py <= float(by + bh)
+
+
+def _point_from_value(value: Any) -> list[float]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or len(value) < 2
+    ):
+        return []
+    try:
+        return [float(value[0]), float(value[1])]
+    except (TypeError, ValueError):
+        return []
+
+
+def _layout_alignment_center(plan: RenderLayerPlan, box: Sequence[int]) -> tuple[list[float], str]:
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    explicit_center = _point_from_value(metadata.get("visual_alignment_center"))
+    if explicit_center and _point_inside_box(explicit_center, box):
+        return explicit_center, "visual_alignment_center"
+
+    source_box = bbox_from_value(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, dict) else [])
+    source_center = _center_of(source_box)
+    if source_center and _point_inside_box(source_center, box):
+        return source_center, "source_contract_bbox_center"
+    return [], ""
+
+
+def _measured_alignment_shift(measured: Sequence[int], center: Sequence[float], bounds: Sequence[int]) -> tuple[int, int]:
+    measured_box = bbox_from_value(measured)
+    bounds_box = bbox_from_value(bounds)
+    alignment_center = _point_from_value(center)
+    if not measured_box or not bounds_box or not alignment_center:
+        return 0, 0
+    mx, my = _center_of(measured_box)
+    dx = int(round(float(alignment_center[0]) - float(mx)))
+    dy = int(round(float(alignment_center[1]) - float(my)))
+    bx, by, bw, bh = bounds_box
+    shifted_x = measured_box[0] + dx
+    shifted_y = measured_box[1] + dy
+    if shifted_x < bx:
+        dx += bx - shifted_x
+    if shifted_x + measured_box[2] > bx + bw:
+        dx -= shifted_x + measured_box[2] - (bx + bw)
+    if shifted_y < by:
+        dy += by - shifted_y
+    if shifted_y + measured_box[3] > by + bh:
+        dy -= shifted_y + measured_box[3] - (by + bh)
+    return int(dx), int(dy)
+
+
+def _shift_glyph_placement(placement: GlyphPlacement, dx: int, dy: int) -> GlyphPlacement:
+    bbox = bbox_from_value(placement.bbox)
+    shifted_bbox = [bbox[0] + int(dx), bbox[1] + int(dy), bbox[2], bbox[3]] if bbox else list(placement.bbox)
+    position = list(placement.position or [])
+    if len(position) >= 2:
+        position = [float(position[0]) + float(dx), float(position[1]) + float(dy), *position[2:]]
+    metadata = dict(placement.metadata or {})
+    metadata["layout_visual_alignment_shift"] = [int(dx), int(dy)]
+    return replace(placement, bbox=shifted_bbox, position=position, metadata=metadata)
+
+
+def _shift_column_records(columns: Sequence[dict[str, Any]], dx: int, dy: int) -> list[dict[str, Any]]:
+    shifted: list[dict[str, Any]] = []
+    for column in columns:
+        item = dict(column)
+        for key in ("x", "raw_x"):
+            if key in item:
+                item[key] = int(item[key]) + int(dx)
+        for key in ("y", "raw_y"):
+            if key in item:
+                item[key] = int(item[key]) + int(dy)
+        centered = bbox_from_value(item.get("centered_block_box"))
+        if centered:
+            item["centered_block_box"] = [centered[0] + int(dx), centered[1] + int(dy), centered[2], centered[3]]
+        shifted.append(item)
+    return shifted
 
 
 def _chosen_breaks(lines: Sequence[dict[str, Any]], columns: Sequence[dict[str, Any]], writing_mode: str) -> list[dict[str, Any]]:
