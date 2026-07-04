@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.render.font_manager import FontManager
 from app.render.text_shaper import HarfBuzzShaper, ShapedRun
@@ -424,19 +424,30 @@ class TypesettingEngine:
                 reason_codes.append("source_column_capacity_reserved_for_vertical_layout_quality")
         if w > max(natural_w * 2, natural_w + font_size) or h > max(natural_h * 2, natural_h + font_size):
             reason_codes.append("oversized_parent_bbox_not_used_as_fill_box")
+        source_center: list[float] = []
         if source_box and _box_inside(source_box, hard_bounds):
+            source_center = _center_of(source_box)
             if source_box != target_box:
-                reason_codes.append("source_contract_bbox_kept_as_provenance_not_layout_box")
+                reason_codes.append("source_contract_bbox_used_as_layout_alignment_prior")
             else:
                 reason_codes.append("source_contract_bbox_equals_target_box")
         natural_w = min(max(1, natural_w), max(1, w))
         natural_h = min(max(1, natural_h), max(1, h))
-        intent = [
-            x + max(0, int(round((w - natural_w) / 2))),
-            y + max(0, int(round((h - natural_h) / 2))),
-            int(natural_w),
-            int(natural_h),
-        ]
+        if source_center:
+            intent = [
+                int(round(float(source_center[0]) - float(natural_w) / 2.0)),
+                int(round(float(source_center[1]) - float(natural_h) / 2.0)),
+                int(natural_w),
+                int(natural_h),
+            ]
+            reason_codes.append("layout_intent_centered_on_source_footprint")
+        else:
+            intent = [
+                x + max(0, int(round((w - natural_w) / 2))),
+                y + max(0, int(round((h - natural_h) / 2))),
+                int(natural_w),
+                int(natural_h),
+            ]
         intent = _clamp_box(intent, [hard_x, hard_y, hard_w, hard_h])
         return intent, {
             "hard_bounds": list(hard_bounds),
@@ -445,6 +456,7 @@ class TypesettingEngine:
             "layout_intent_evidence": evidence,
             "source_contract_bbox": list(source_box),
             "source_contract_bbox_is_layout_box": False,
+            "source_contract_bbox_is_alignment_prior": bool(source_center),
             "vertical_layout_profile": vertical_profile,
             "rejected_box_candidates": [],
         }, reason_codes
@@ -464,7 +476,7 @@ class TypesettingEngine:
         items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size)
         shaped_cell_h = _dominant_vertical_advance(shaped_runs)
         cell_h = max(1.0, shaped_cell_h * line_height)
-        cell_h = max(cell_h, max((float(item.get("height", 0.0)) for item in items), default=0.0))
+        cell_h = max(cell_h, max((_vertical_item_cell_height(item) for item in items), default=0.0))
         column_w = _vertical_column_pitch(font_size, max((float(item.get("width", 0.0)) for item in items), default=0.0))
         profile = _vertical_layout_profile(
             plan=plan,
@@ -478,13 +490,14 @@ class TypesettingEngine:
             cell_height=cell_h,
         )
         columns_needed = max(1, int(profile.get("desired_columns") or 1)) if items else 1
+        total_row_units = _vertical_items_row_units(items)
         max_rows = max(1, int(math.floor(h / cell_h)))
         max_columns = max(1, int(math.floor(w / column_w)))
         columns_needed = min(max(1, columns_needed), max(1, len(items)), max_columns)
-        rows = max(1, int(math.ceil(len(items) / columns_needed))) if items else 1
+        rows = max(1, int(math.ceil(total_row_units / columns_needed))) if items else 1
         while rows > max_rows and columns_needed < min(max_columns, max(1, len(items))):
             columns_needed += 1
-            rows = max(1, int(math.ceil(len(items) / columns_needed)))
+            rows = max(1, int(math.ceil(total_row_units / columns_needed)))
         column_groups, grouping_meta = _choose_vertical_column_groups(
             items,
             desired_columns=columns_needed,
@@ -492,7 +505,7 @@ class TypesettingEngine:
             max_rows=max_rows,
             profile=profile,
         )
-        rows = max((len(group) for group in column_groups), default=rows)
+        rows = max((int(math.ceil(_vertical_items_row_units(group))) for group in column_groups), default=rows)
         columns_needed = max(1, len(column_groups))
         required_w = int(math.ceil(columns_needed * column_w))
         required_h = int(math.ceil(rows * cell_h))
@@ -511,13 +524,16 @@ class TypesettingEngine:
         placements: list[GlyphPlacement] = []
         cursor = 0
         for col, group in enumerate(column_groups):
-            for row, item in enumerate(group):
-                index = cursor + row
+            row_cursor = 0.0
+            for item_index, item in enumerate(group):
+                index = cursor + item_index
+                row_units = _vertical_item_row_units(item)
                 item_w = int(max(1, min(float(item.get("width") or column_w), max(1, w))))
-                item_h = int(max(1, min(float(item.get("height") or cell_h), max(1, h))))
+                item_h = int(max(1, min(float(item.get("height") or (cell_h * row_units)), max(1, h))))
+                slot_h = max(1.0, cell_h * row_units)
                 raw_column_x = base_x + block_w - float((col + 1) * column_w)
                 raw_px = int(round(raw_column_x + max(0.0, (column_w - item_w) / 2.0)))
-                raw_py = int(round(base_y + row * cell_h))
+                raw_py = int(round(base_y + row_cursor * cell_h + max(0.0, (slot_h - float(item_h)) / 2.0)))
                 px = min(max(x, raw_px), x + w - item_w)
                 py = min(max(y, raw_py), y + h - item_h)
                 shaped_glyph = item.get("shaped_glyph")
@@ -529,12 +545,14 @@ class TypesettingEngine:
                         position=[float(px), float(py)],
                         font_family=shaped_runs[0].font_face_id if shaped_runs else "",
                         font_size=float(font_size),
-                        advance=cell_h,
+                        advance=slot_h,
                         writing_mode="vertical",
                         metadata={
                             "cluster_index": index,
                             "column": col,
-                            "row": row,
+                            "row": int(math.floor(row_cursor)),
+                            "row_units": float(row_units),
+                            "row_span": int(math.ceil(row_units)),
                             "run_id": item.get("run_id", ""),
                             "placement_mode": item.get("placement_mode", "vertical_glyph"),
                             "placement_source": "stage4_vertical_layout",
@@ -547,6 +565,7 @@ class TypesettingEngine:
                         },
                     )
                 )
+                row_cursor += row_units
             cursor += len(group)
         columns: list[dict[str, Any]] = []
         for idx in range(columns_needed):
@@ -949,16 +968,17 @@ def _choose_vertical_column_groups(
     desired = max(1, min(int(desired_columns or 1), len(values)))
     limit = max(1, min(int(max_columns or desired), len(values)))
     row_limit = max(1, int(max_rows or len(values)))
+    total_row_units = _vertical_items_row_units(values)
     source_columns = max(0, int(profile.get("source_columns") or 0)) if isinstance(profile, dict) else 0
     candidates = set(range(1, limit + 1))
     candidates.add(desired)
     if source_columns:
         candidates.add(min(limit, source_columns))
-    min_fit_columns = int(math.ceil(float(len(values)) / float(row_limit)))
+    min_fit_columns = int(math.ceil(float(total_row_units) / float(row_limit)))
     candidates.add(max(1, min(limit, min_fit_columns)))
     best: tuple[float, list[list[dict[str, Any]]], dict[str, Any]] | None = None
     for columns in sorted(value for value in candidates if 1 <= value <= limit):
-        if math.ceil(len(values) / columns) > row_limit:
+        if math.ceil(total_row_units / columns) > row_limit:
             continue
         result = _best_vertical_partition(
             values,
@@ -1009,9 +1029,17 @@ def _best_vertical_partition(
     count = len(values)
     if columns <= 0 or count <= 0 or columns > count:
         return None
-    if math.ceil(count / columns) > max_rows:
+    total_row_units = _vertical_items_row_units(values)
+    if math.ceil(total_row_units / columns) > max_rows:
         return None
-    ideal = float(count) / float(columns)
+    ideal = float(total_row_units) / float(columns)
+    prefix_units = [0.0]
+    for item in values:
+        prefix_units.append(prefix_units[-1] + _vertical_item_row_units(item))
+
+    def units_between(start: int, end: int) -> float:
+        return max(0.0, prefix_units[end] - prefix_units[start])
+
     dp: dict[tuple[int, int], tuple[float, list[int]]] = {(0, 0): (0.0, [])}
     for col in range(columns):
         next_dp: dict[tuple[int, int], tuple[float, list[int]]] = {}
@@ -1020,10 +1048,14 @@ def _best_vertical_partition(
                 continue
             remaining_cols = columns - col - 1
             min_end = start + 1
-            max_end = min(count - remaining_cols, start + max_rows)
+            max_end = min(count - remaining_cols, count)
             for end in range(min_end, max_end + 1):
+                segment_units = units_between(start, end)
+                if segment_units > float(max_rows):
+                    break
                 remaining = count - end
-                if remaining_cols and math.ceil(remaining / remaining_cols) > max_rows:
+                remaining_units = units_between(end, count)
+                if remaining_cols and math.ceil(remaining_units / remaining_cols) > max_rows:
                     continue
                 if remaining < remaining_cols:
                     continue
@@ -1055,7 +1087,7 @@ def _best_vertical_partition(
         if end < count:
             split_points.append(end)
         cursor = end
-    extra_columns = max(0, columns - max(1, desired_columns, int(math.ceil(float(count) / float(max(1, max_rows))))))
+    extra_columns = max(0, columns - max(1, desired_columns, int(math.ceil(float(total_row_units) / float(max(1, max_rows))))))
     non_phrase_extra_break_penalty = 0.0
     if penalize_non_phrase_extra_columns and extra_columns:
         non_phrase_extra_break_penalty = sum(
@@ -1066,6 +1098,7 @@ def _best_vertical_partition(
     meta = {
         "split_points": split_points,
         "column_lengths": [len(group) for group in groups],
+        "column_row_units": [round(float(_vertical_items_row_units(group)), 3) for group in groups],
         "break_penalties": [
             {
                 "split_after": split,
@@ -1095,6 +1128,29 @@ def _vertical_profile_needs_speech_column_conservation(profile: dict[str, Any]) 
     )
 
 
+def _vertical_item_row_units(item: Mapping[str, Any]) -> float:
+    try:
+        value = float(item.get("row_units", 1.0))
+    except Exception:
+        value = 1.0
+    return max(1.0, value)
+
+
+def _vertical_items_row_units(items: Sequence[Mapping[str, Any]]) -> float:
+    return sum(_vertical_item_row_units(item) for item in (items or []))
+
+
+def _vertical_item_cell_height(item: Mapping[str, Any]) -> float:
+    row_units = _vertical_item_row_units(item)
+    try:
+        height = float(item.get("height", 0.0))
+    except Exception:
+        height = 0.0
+    if height <= 0.0:
+        return 0.0
+    return height / row_units
+
+
 def _balanced_vertical_column_groups(items: Sequence[dict[str, Any]], columns_needed: int, max_rows: int) -> list[list[dict[str, Any]]]:
     values = list(items or [])
     if not values:
@@ -1105,9 +1161,30 @@ def _balanced_vertical_column_groups(items: Sequence[dict[str, Any]], columns_ne
     for col in range(columns):
         remaining_items = len(values) - cursor
         remaining_columns = max(1, columns - col)
-        take = max(1, int(math.ceil(remaining_items / remaining_columns))) if remaining_items > 0 else 0
+        if col == columns - 1:
+            take = remaining_items
+        else:
+            remaining_units = _vertical_items_row_units(values[cursor:])
+            target_units = min(float(max_rows), max(1.0, remaining_units / float(remaining_columns)))
+            take = 0
+            taken_units = 0.0
+            while cursor + take < len(values):
+                items_left_after = len(values) - (cursor + take + 1)
+                if items_left_after < remaining_columns - 1:
+                    break
+                next_units = _vertical_item_row_units(values[cursor + take])
+                if take > 0 and taken_units + next_units > target_units and taken_units >= 1.0:
+                    break
+                take += 1
+                taken_units += next_units
+                if taken_units >= target_units:
+                    break
+            if take <= 0 and remaining_items > 0:
+                take = 1
         groups.append(values[cursor: cursor + take])
         cursor += take
+    if cursor < len(values) and groups:
+        groups[-1].extend(values[cursor:])
     return [group for group in groups if group]
 
 
@@ -1115,7 +1192,8 @@ def _vertical_segment_score(items: Sequence[dict[str, Any]], start: int, end: in
     segment = list(items[start:end])
     if not segment:
         return 1000.0
-    score = abs(float(len(segment)) - ideal) * 1.1
+    segment_units = _vertical_items_row_units(segment)
+    score = abs(float(segment_units) - ideal) * 1.1
     if start > 0:
         first = str(segment[0].get("text") or "")
         if _item_must_not_start_vertical_column(segment[0]):
@@ -1293,6 +1371,7 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
         glyphs = list(shaped.glyphs if shaped else [])
         if run.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
             item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
+            row_units = _vertical_sequence_row_units(run)
             items.append(
                 {
                     "text": run.text,
@@ -1302,6 +1381,7 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
                     "shaped_glyphs": glyphs,
                     "width": item_width,
                     "height": item_height,
+                    "row_units": row_units,
                     "x_advance": x_advance,
                 }
             )
@@ -1317,6 +1397,7 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
                     "shaped_glyphs": glyphs,
                     "width": item_width,
                     "height": item_height,
+                    "row_units": 1.0,
                     "x_advance": x_advance,
                 }
             )
@@ -1344,10 +1425,17 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
                     "shaped_glyphs": [glyph] if glyph else [],
                     "width": max(1.0, glyph_w),
                     "height": max(1.0, glyph_h),
+                    "row_units": 1.0,
                     "x_advance": abs(float(glyph.x_advance)) if glyph else 0.0,
                 }
             )
     return items
+
+
+def _vertical_sequence_row_units(run: InlineTextRun) -> float:
+    if run.role == "dash_sequence":
+        return float(max(1, len(grapheme_clusters(run.text))))
+    return 1.0
 
 
 def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: TypesettingPolicy, font_size: int) -> tuple[float, float, float]:
@@ -1355,7 +1443,9 @@ def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: Typ
         count = max(1, len(grapheme_clusters(run.text)))
         width = float(font_size)
         height = float(font_size)
-        if count > 1:
+        if run.role == "dash_sequence" and count > 1:
+            height = float(font_size) * float(count)
+        elif count > 1:
             height = max(height, min(float(font_size) * 1.15, float(font_size) * (0.58 * count)))
         return max(1.0, width), max(1.0, height), width
     if not glyphs:
