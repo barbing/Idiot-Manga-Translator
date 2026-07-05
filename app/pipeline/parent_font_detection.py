@@ -392,6 +392,7 @@ def _arbitrate_parent_styles(
                 "style_arbitration_decision": decision.get("decision"),
                 "style_arbitration_reason_codes": decision.get("reason_codes"),
                 "style_arbitration_cohort_id": decision.get("cohort_id"),
+                "style_family_bucket": decision.get("style_family_bucket"),
                 "font_size_hint": style.get("font_size_hint"),
                 "raw_parent_font_size_hint": style.get("raw_parent_font_size_hint"),
                 "font_size_normalization": style.get("font_size_normalization"),
@@ -460,6 +461,7 @@ def _style_for_bundle(
         "style_arbitration_decision": arbitration.get("decision"),
         "style_arbitration_reason_codes": list(arbitration.get("reason_codes") or []),
         "style_arbitration_cohort_id": arbitration.get("cohort_id"),
+        "style_family_bucket": arbitration.get("style_family_bucket"),
         "style_arbitration_provider": STYLE_ARBITRATOR_PROVIDER,
     }
     layout_hints = _layout_hints_for_bundle(
@@ -522,14 +524,14 @@ def _style_cohort_profiles(
     *,
     default_font_name: str = "",
     models_dir: str | None = None,
-) -> dict[tuple[str, str], dict[str, Any]]:
-    grouped: dict[tuple[str, str], list[tuple[Any, Mapping[str, Any]]]] = {}
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[tuple[Any, Mapping[str, Any]]]] = {}
     for bundle, record in active:
         grouped.setdefault(_style_cohort_key(record), []).append((bundle, record))
 
-    profiles: dict[tuple[str, str], dict[str, Any]] = {}
+    profiles: dict[tuple[str, str, str], dict[str, Any]] = {}
     for key, members in grouped.items():
-        surface_bucket, orientation = key
+        surface_bucket, orientation, family_bucket = key
         records = [record for _bundle, record in members]
         usable = [
             record
@@ -560,7 +562,7 @@ def _style_cohort_profiles(
             canonical_weight = "bold"
 
         style_class = _style_class_for_surface(surface_bucket)
-        cohort_id = "style_cohort:{}:{}".format(surface_bucket, orientation)
+        cohort_id = "style_cohort:{}:{}:{}".format(surface_bucket, orientation, family_bucket)
         canonical_font_family = (
             resolve_noto_cjk_sc_font_file(base_dir=models_dir, serif=canonical_serif, weight=canonical_weight)
             or default_font_name
@@ -575,6 +577,7 @@ def _style_cohort_profiles(
             "member_parent_ids": [str(record.get("parent_id") or "") for record in records if record.get("parent_id")],
             "surface_bucket": surface_bucket,
             "orientation": orientation,
+            "style_family_bucket": family_bucket,
             "serif": canonical_serif,
             "weight": canonical_weight,
             "style_class": style_class,
@@ -691,6 +694,7 @@ def _style_decision(
         "cohort_size": len(list(cohort.get("member_parent_ids") or [])),
         "raw_style_class": str(record.get("raw_style_class") or ""),
         "canonical_style_class": str(cohort.get("canonical_style_class") or ""),
+        "style_family_bucket": str(cohort.get("style_family_bucket") or ""),
         "surface_bucket": str(surface_bucket or cohort.get("surface_bucket") or "dark_on_light"),
         "serif": bool(serif),
         "weight": str(weight or "regular"),
@@ -976,10 +980,34 @@ def _has_preservable_visual_evidence(record: Mapping[str, Any]) -> bool:
     return True
 
 
-def _style_cohort_key(record: Mapping[str, Any]) -> tuple[str, str]:
+def _style_cohort_key(record: Mapping[str, Any]) -> tuple[str, str, str]:
     surface_bucket = str(record.get("surface_bucket") or "dark_on_light")
     orientation = str(record.get("geometry_orientation") or "vertical")
-    return (surface_bucket, orientation)
+    return (surface_bucket, orientation, _style_family_cohort_bucket(record))
+
+
+def _style_family_cohort_bucket(record: Mapping[str, Any]) -> str:
+    family_bucket = _distinct_font_family_bucket(str(record.get("raw_font_label") or ""))
+    confidence = _float(record.get("raw_style_confidence"))
+    if family_bucket:
+        required_confidence = 0.15 if family_bucket == "decorative_design" else 0.45
+        if confidence >= required_confidence:
+            return family_bucket
+    raw_weight = str(record.get("raw_font_weight") or "regular")
+    if confidence >= 0.55 and raw_weight in {"bold", "black"}:
+        return f"emphasis_{raw_weight}"
+    return "general"
+
+
+def _distinct_font_family_bucket(label: str) -> str:
+    lowered = str(label or "").replace("\\", "/").lower()
+    if any(token in lowered for token in ("kyokasho", "kyoukasho")):
+        return "textbook"
+    if any(token in lowered for token in ("tsukuar", "maru", "rounded")):
+        return "rounded_gothic"
+    if any(token in lowered for token in ("ryuseki", "koin", "kantei", "popjoy")):
+        return "decorative_design"
+    return ""
 
 
 def _style_surface_bucket(bundle: Any, *, color_bucket: str) -> str:
