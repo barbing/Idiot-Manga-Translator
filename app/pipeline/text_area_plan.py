@@ -1197,7 +1197,101 @@ def _text_area_graph_physical_root_bbox(
         return [], []
     if image_size != (1, 1):
         root_bbox = _normalize_xywh(root_bbox, image_size)
+    typed_bbox, typed_reasons = _text_area_graph_typed_speech_root_bbox(
+        members,
+        root_bbox,
+        image_size=image_size,
+    )
+    if typed_bbox:
+        return typed_bbox, typed_reasons
     return root_bbox, []
+
+
+def _text_area_graph_typed_speech_root_bbox(
+    members: Sequence[TextAreaContainer | Mapping[str, Any]],
+    fallback_root_bbox: Sequence[Any],
+    *,
+    image_size: Tuple[int, int] = (1, 1),
+) -> Tuple[List[int], List[str]]:
+    if not members or not fallback_root_bbox:
+        return [], []
+    if any(_text_area_graph_semantic_role(member) != SEMANTIC_KIND_SPEECH for member in members):
+        return [], []
+
+    root_bbox = list(fallback_root_bbox)
+    if image_size != (1, 1):
+        root_bbox = _normalize_xywh(root_bbox, image_size)
+    root_area = _bbox_area_xywh(root_bbox)
+    if root_area <= 0:
+        return [], []
+
+    text_bboxes: List[List[int]] = []
+    bubble_bboxes: List[List[int]] = []
+    seen_text: set[Tuple[int, int, int, int]] = set()
+    seen_bubbles: set[Tuple[int, int, int, int]] = set()
+    for member in members:
+        role_evidence = _container_semantic_role_evidence(member)
+        for field_name in ("text_unit_evidence_bboxes", "model_evidence_bboxes"):
+            entries = role_evidence.get(field_name) or []
+            if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+                continue
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                class_name = str(entry.get("class_name") or "").strip().lower()
+                if class_name not in {"text_bubble", "bubble"}:
+                    continue
+                bbox = _text_evidence_bbox_xywh(entry, image_size)
+                x, y, w, h = _coerce_xywh(bbox)
+                if w <= 0 or h <= 0:
+                    continue
+                normalized = [x, y, w, h]
+                key = (x, y, w, h)
+                if class_name == "text_bubble":
+                    if key not in seen_text:
+                        seen_text.add(key)
+                        text_bboxes.append(normalized)
+                elif key not in seen_bubbles:
+                    seen_bubbles.add(key)
+                    bubble_bboxes.append(normalized)
+
+    if not text_bboxes or not bubble_bboxes:
+        return [], []
+
+    accepted_bubbles: List[List[int]] = []
+    for bubble_bbox in bubble_bboxes:
+        if _inside_ratio_xywh(bubble_bbox, root_bbox) < 0.60 and not _text_area_graph_bbox_center_inside_xywh(
+            bubble_bbox,
+            root_bbox,
+        ):
+            continue
+        owned_text = [
+            text_bbox
+            for text_bbox in text_bboxes
+            if _inside_ratio_xywh(text_bbox, bubble_bbox) >= 0.70
+            or _text_area_graph_bbox_center_inside_xywh(text_bbox, bubble_bbox)
+        ]
+        if owned_text:
+            accepted_bubbles.append(bubble_bbox)
+
+    if not accepted_bubbles:
+        return [], []
+
+    candidate = _text_area_graph_union_xywh(accepted_bubbles)
+    if image_size != (1, 1) and candidate:
+        candidate = _normalize_xywh(candidate, image_size)
+    candidate_area = _bbox_area_xywh(candidate)
+    if candidate_area <= 0 or candidate_area >= root_area * 0.96:
+        return [], []
+
+    for text_bbox in text_bboxes:
+        if _inside_ratio_xywh(text_bbox, candidate) < 0.70 and not _text_area_graph_bbox_center_inside_xywh(
+            text_bbox,
+            candidate,
+        ):
+            return [], []
+
+    return candidate, ["text_area_plan:physical_root_bbox_from_typed_bubble_evidence"]
 
 
 def _text_area_graph_sort_root_groups_for_reading_order(
