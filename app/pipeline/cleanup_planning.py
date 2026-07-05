@@ -7379,8 +7379,8 @@ def _mask_exclusion_reason(cleanup_mask: CleanupMask, image_size: tuple[int, int
         return "sourceglyph_executable_influence_detected"
     if bool(getattr(cleanup_mask, "segmentation_contract_override_detected", False)):
         return "segmentation_contract_override_detected"
-    if bool(getattr(cleanup_mask, "ready_but_sparse_violation", False)):
-        return "ready_but_sparse_violation"
+    # Sparse component coverage is a cleanup-quality warning. It must not
+    # prevent an otherwise executable parent mask from reaching the backend.
     rejection_reason = str(getattr(cleanup_mask, "rejection_reason", "") or "")
     if rejection_reason in {
         "effective_mask_incomplete_under_coverage",
@@ -7472,8 +7472,8 @@ def _runtime_structural_mask_error(cleanup_mask: CleanupMask) -> str:
         return "sourceglyph_executable_influence_detected"
     if bool(getattr(cleanup_mask, "segmentation_contract_override_detected", False)):
         return "segmentation_contract_override_detected"
-    if bool(getattr(cleanup_mask, "ready_but_sparse_violation", False)):
-        return "ready_but_sparse_violation"
+    # Sparse component coverage is recorded on the mask/plan for audit, but it
+    # is not a structural runtime defect.
     if int(cleanup_mask.erase_mask_pixels or 0) <= 0:
         return "erase_mask_empty"
     return ""
