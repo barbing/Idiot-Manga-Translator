@@ -228,8 +228,23 @@ class ComicTextDetector:
             refine_mode=self._refine_mode,
             keep_undetected_mask=keep_undetected_mask,
         )
+        mask_refined, refinement_recovery = _recover_line_continuation_refinement_gaps(
+            image,
+            mask,
+            mask_refined,
+            blk_list,
+        )
         detections = _detections_from_blocks(blk_list)
         height, width = _image_hw(image)
+        confidence = _confidence_stats(blk_list)
+        if _line_continuation_recovery_is_material(refinement_recovery):
+            confidence["line_continuation_refinement_recovery"] = refinement_recovery
+        result_provenance = {
+            "model_path": str(getattr(self, "_model_path", "") or ""),
+            **(provenance or {}),
+        }
+        if _line_continuation_recovery_is_material(refinement_recovery):
+            result_provenance["line_continuation_refinement_recovery"] = refinement_recovery
         return ComicTextSegmentationResult(
             detections=detections,
             raw_mask=mask,
@@ -242,8 +257,8 @@ class ComicTextDetector:
             text_pixel_count=_mask_text_pixels(mask_refined),
             connected_component_stats=_mask_component_stats(mask_refined),
             keep_undetected_mask=keep_undetected_mask,
-            confidence=_confidence_stats(blk_list),
-            provenance={"model_path": str(getattr(self, "_model_path", "") or ""), **(provenance or {})},
+            confidence=confidence,
+            provenance=result_provenance,
         )
 
 
@@ -351,6 +366,329 @@ def _confidence_stats(blk_list) -> dict[str, Any]:
         "max": max(scores),
         "mean": sum(scores) / float(len(scores)),
     }
+
+
+def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, blocks) -> tuple[Any, dict[str, Any]]:
+    """Recover CTD raw-mask text strokes that refinement dropped inside known text blocks.
+
+    ComicTextDetector raw masks sometimes contain long vertical punctuation strokes
+    that the vendored refinement step drops because it thresholds a tight line
+    window. This repair stays inside the detector contract: admitted pixels remain
+    attached to an existing CTD text block and only improve the refined foreground
+    mask consumed by TextAreaPlan/CleanupMask.
+    """
+
+    audit: dict[str, Any] = {
+        "components_considered": 0,
+        "components_recovered": 0,
+        "pixels_recovered": 0,
+    }
+    if image is None or raw_mask is None or refined_mask is None:
+        return refined_mask, audit
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        audit["status"] = "dependencies_unavailable"
+        return refined_mask, audit
+
+    raw_bool = _mask_bool(raw_mask, threshold=0)
+    refined_bool = _mask_bool(refined_mask, threshold=30)
+    if raw_bool is None or refined_bool is None or raw_bool.shape != refined_bool.shape:
+        audit["status"] = "mask_unavailable_or_mismatched"
+        return refined_mask, audit
+
+    residual = np.logical_and(raw_bool, np.logical_not(refined_bool))
+    if not np.any(residual):
+        return refined_mask, audit
+
+    height, width = raw_bool.shape
+    gray = _image_gray(image)
+    admitted = np.zeros_like(raw_bool, dtype=bool)
+    for block in blocks or []:
+        block_bbox = _coerce_bbox(getattr(block, "xyxy", None), width, height)
+        if block_bbox is None:
+            continue
+        line_bbox = _coerce_bbox(
+            _lines_bounds(getattr(block, "lines", []) or []),
+            width,
+            height,
+        ) or block_bbox
+        vertical = _block_is_vertical(block, block_bbox)
+        search_bbox = _line_continuation_search_bbox(
+            block_bbox,
+            line_bbox,
+            width,
+            height,
+            vertical,
+        )
+        x0, y0, x1, y1 = search_bbox
+        roi = residual[y0:y1, x0:x1]
+        if not np.any(roi):
+            continue
+        labels_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            roi.astype("uint8"),
+            connectivity=8,
+        )
+        for label in range(1, labels_count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < 18:
+                continue
+            comp_x = x0 + int(stats[label, cv2.CC_STAT_LEFT])
+            comp_y = y0 + int(stats[label, cv2.CC_STAT_TOP])
+            comp_w = int(stats[label, cv2.CC_STAT_WIDTH])
+            comp_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+            comp_bbox = (comp_x, comp_y, comp_x + comp_w, comp_y + comp_h)
+            local_x = int(stats[label, cv2.CC_STAT_LEFT])
+            local_y = int(stats[label, cv2.CC_STAT_TOP])
+            component = labels[local_y : local_y + comp_h, local_x : local_x + comp_w] == label
+            audit["components_considered"] += 1
+            if not _is_recoverable_line_continuation_component(
+                comp_bbox=comp_bbox,
+                area=area,
+                component=component,
+                search_bbox=search_bbox,
+                block_bbox=block_bbox,
+                line_bbox=line_bbox,
+                vertical=vertical,
+                gray=gray,
+            ):
+                continue
+            page_component = admitted[comp_y : comp_y + comp_h, comp_x : comp_x + comp_w]
+            page_component[component] = True
+            admitted[comp_y : comp_y + comp_h, comp_x : comp_x + comp_w] = page_component
+            audit["components_recovered"] += 1
+            audit["pixels_recovered"] += area
+
+    if not np.any(admitted):
+        return refined_mask, audit
+
+    try:
+        repaired = np.asarray(refined_mask).copy()
+        if repaired.ndim == 3:
+            repaired[admitted, :] = 255
+        elif repaired.ndim == 2:
+            repaired[admitted] = 255
+        else:
+            repaired = np.where(np.logical_or(refined_bool, admitted), 255, 0).astype("uint8")
+        return repaired, audit
+    except Exception as exc:
+        audit["status"] = f"repair_failed:{type(exc).__name__}"
+        return refined_mask, audit
+
+
+def _mask_bool(mask, *, threshold: int = 30) -> Any | None:
+    try:
+        import numpy as np
+
+        arr = np.asarray(mask)
+        if arr.ndim == 3:
+            return np.any(arr > threshold, axis=2)
+        if arr.ndim == 2:
+            return arr > threshold
+    except Exception:
+        return None
+    return None
+
+
+def _image_gray(image) -> Any | None:
+    try:
+        import cv2
+        import numpy as np
+
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            return arr.astype("uint8", copy=False)
+        if arr.ndim == 3:
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return None
+    return None
+
+
+def _coerce_bbox(bbox, width: int, height: int) -> tuple[int, int, int, int] | None:
+    if bbox is None or len(bbox) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+    except Exception:
+        return None
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    ix0 = max(0, min(width, int(x0)))
+    iy0 = max(0, min(height, int(y0)))
+    ix1 = max(0, min(width, int(x1)))
+    iy1 = max(0, min(height, int(y1)))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    return ix0, iy0, ix1, iy1
+
+
+def _block_is_vertical(block, block_bbox: tuple[int, int, int, int]) -> bool:
+    value = getattr(block, "vertical", None)
+    if value is not None:
+        return bool(value)
+    x0, y0, x1, y1 = block_bbox
+    return (y1 - y0) >= (x1 - x0)
+
+
+def _line_continuation_search_bbox(
+    block_bbox: tuple[int, int, int, int],
+    line_bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    vertical: bool,
+) -> tuple[int, int, int, int]:
+    bx0, by0, bx1, by1 = block_bbox
+    lx0, ly0, lx1, ly1 = line_bbox
+    block_w = max(1, bx1 - bx0)
+    block_h = max(1, by1 - by0)
+    line_w = max(1, lx1 - lx0)
+    line_h = max(1, ly1 - ly0)
+    if vertical:
+        cross_pad = max(3, min(20, int(max(block_w, line_w) * 0.45)))
+        axis_pad = max(10, min(96, int(max(block_h, line_h, line_w * 4) * 1.0)))
+    else:
+        cross_pad = max(3, min(20, int(max(block_h, line_h) * 0.45)))
+        axis_pad = max(10, min(96, int(max(block_w, line_w, line_h * 4) * 1.0)))
+    if vertical:
+        return (
+            max(0, min(bx0, lx0) - cross_pad),
+            max(0, min(by0, ly0) - axis_pad),
+            min(width, max(bx1, lx1) + cross_pad),
+            min(height, max(by1, ly1) + axis_pad),
+        )
+    return (
+        max(0, min(bx0, lx0) - axis_pad),
+        max(0, min(by0, ly0) - cross_pad),
+        min(width, max(bx1, lx1) + axis_pad),
+        min(height, max(by1, ly1) + cross_pad),
+    )
+
+
+def _is_recoverable_line_continuation_component(
+    *,
+    comp_bbox: tuple[int, int, int, int],
+    area: int,
+    component,
+    search_bbox: tuple[int, int, int, int],
+    block_bbox: tuple[int, int, int, int],
+    line_bbox: tuple[int, int, int, int],
+    vertical: bool,
+    gray,
+) -> bool:
+    cx0, cy0, cx1, cy1 = comp_bbox
+    _sx0, _sy0, _sx1, _sy1 = search_bbox
+    bx0, by0, bx1, by1 = block_bbox
+    lx0, ly0, lx1, ly1 = line_bbox
+    comp_w = max(1, cx1 - cx0)
+    comp_h = max(1, cy1 - cy0)
+    block_w = max(1, bx1 - bx0)
+    block_h = max(1, by1 - by0)
+    line_w = max(1, lx1 - lx0)
+    line_h = max(1, ly1 - ly0)
+    block_area = max(1, block_w * block_h)
+    if area > max(2200, int(block_area * 0.35)):
+        return False
+    if vertical:
+        axis_len = comp_h
+        cross_len = comp_w
+        if axis_len < max(12, int(cross_len * 2.2)):
+            return False
+        if cross_len > max(24, int(max(line_w, 6) * 1.35)):
+            return False
+        band_pad = max(3, min(14, int(max(line_w, block_w, 6) * 0.45)))
+        band0, band1 = lx0 - band_pad, lx1 + band_pad
+        overlap = max(0, min(cx1, band1) - max(cx0, band0))
+        if overlap <= 0 or overlap / float(cross_len) < 0.45:
+            return False
+        gap = max(ly0 - cy1, cy0 - ly1, 0)
+        if gap > max(10, min(72, int(max(block_h, line_h) * 0.65))):
+            return False
+        if axis_len > max(96, int(max(block_h, line_h) * 1.8)):
+            return False
+    else:
+        axis_len = comp_w
+        cross_len = comp_h
+        if axis_len < max(12, int(cross_len * 2.2)):
+            return False
+        if cross_len > max(24, int(max(line_h, 6) * 1.35)):
+            return False
+        band_pad = max(3, min(14, int(max(line_h, block_h, 6) * 0.45)))
+        band0, band1 = ly0 - band_pad, ly1 + band_pad
+        overlap = max(0, min(cy1, band1) - max(cy0, band0))
+        if overlap <= 0 or overlap / float(cross_len) < 0.45:
+            return False
+        gap = max(lx0 - cx1, cx0 - lx1, 0)
+        if gap > max(10, min(72, int(max(block_w, line_w) * 0.65))):
+            return False
+        if axis_len > max(96, int(max(block_w, line_w) * 1.8)):
+            return False
+    return _component_has_local_contrast(
+        component=component,
+        comp_bbox=comp_bbox,
+        gray=gray,
+    )
+
+
+def _component_has_local_contrast(*, component, comp_bbox: tuple[int, int, int, int], gray) -> bool:
+    if gray is None:
+        return True
+    try:
+        import numpy as np
+
+        gx0, gy0, gx1, gy1 = comp_bbox
+        px0 = max(0, gx0 - 4)
+        py0 = max(0, gy0 - 4)
+        px1 = min(gray.shape[1], gx1 + 4)
+        py1 = min(gray.shape[0], gy1 + 4)
+        crop = gray[py0:py1, px0:px1]
+        if crop.size == 0:
+            return True
+        local_component = np.zeros(crop.shape[:2], dtype=bool)
+        cx0 = max(0, gx0 - px0)
+        cy0 = max(0, gy0 - py0)
+        cx1 = min(local_component.shape[1], cx0 + component.shape[1])
+        cy1 = min(local_component.shape[0], cy0 + component.shape[0])
+        source_x0 = max(0, px0 - gx0)
+        source_y0 = max(0, py0 - gy0)
+        source_x1 = source_x0 + max(0, cx1 - cx0)
+        source_y1 = source_y0 + max(0, cy1 - cy0)
+        if cx1 <= cx0 or cy1 <= cy0 or source_x1 <= source_x0 or source_y1 <= source_y0:
+            return True
+        local_component[cy0:cy1, cx0:cx1] = component[source_y0:source_y1, source_x0:source_x1]
+        component_values = crop[local_component]
+        background_values = crop[~local_component]
+        if component_values.size == 0 or background_values.size == 0:
+            return True
+        comp_median = float(np.median(component_values))
+        bg_median = float(np.median(background_values))
+        comp_low = float(np.percentile(component_values, 20))
+        comp_high = float(np.percentile(component_values, 80))
+        bg_low = float(np.percentile(background_values, 20))
+        bg_high = float(np.percentile(background_values, 80))
+        contrast = max(
+            abs(comp_median - bg_median),
+            abs(comp_low - bg_high),
+            abs(comp_high - bg_low),
+        )
+        return contrast >= 10.0
+    except Exception:
+        return True
+
+
+def _line_continuation_recovery_is_material(audit: dict[str, Any] | None) -> bool:
+    if not audit:
+        return False
+    if audit.get("status"):
+        return True
+    return bool(
+        int(audit.get("components_considered", 0) or 0)
+        or int(audit.get("components_recovered", 0) or 0)
+        or int(audit.get("pixels_recovered", 0) or 0)
+    )
 
 
 def _ensure_utils_package(repo_root: str) -> None:

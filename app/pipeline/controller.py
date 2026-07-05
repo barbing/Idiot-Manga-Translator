@@ -82,6 +82,7 @@ class PageProcessingResult:
     execution_regions: list[dict[str, Any]]
     parent_execution_bundles: list[ParentExecutionBundle]
     page_class: str
+    text_area_plan: Any | None = None
 
 
 def _page014_timeout_diag_enabled() -> bool:
@@ -233,6 +234,7 @@ def _attach_cleanup_runtime_perf_summary(
 def _cleanup_mask_region_records_with_protection(
     regions: Iterable[dict[str, Any]] | None,
     debug_context: dict[str, Any] | None,
+    text_area_plan: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Expose canonical cleanup authorization/protection evidence to CleanupMask.
 
@@ -241,19 +243,41 @@ def _cleanup_mask_region_records_with_protection(
     strengthen weak pre-OCR authorization into cleanup ownership.
     """
 
-    if not isinstance(debug_context, dict):
-        return [dict(region) for region in (regions or []) if isinstance(region, dict)]
+    def iter_plan_sources() -> Iterable[tuple[str, dict[str, Any]]]:
+        plan_payloads: list[tuple[str, Any]] = []
+        if text_area_plan is not None:
+            payload = text_area_plan
+            if hasattr(payload, "to_dict"):
+                try:
+                    payload = payload.to_dict()
+                except Exception:
+                    payload = None
+            plan_payloads.append(("text_area_plan", payload))
+        if isinstance(debug_context, dict):
+            plan_payloads.extend(
+                (
+                    (plan_key, debug_context.get(plan_key))
+                    for plan_key in ("text_area_plan_pre_ocr", "text_area_plan")
+                )
+            )
+        seen_plan_ids: set[int] = set()
+        for plan_key, plan in plan_payloads:
+            if not isinstance(plan, dict):
+                continue
+            plan_identity = id(plan)
+            if plan_identity in seen_plan_ids:
+                continue
+            seen_plan_ids.add(plan_identity)
+            yield plan_key, plan
 
     auth_by_container: dict[str, dict[str, Any]] = {}
-    for plan_key in ("text_area_plan_pre_ocr", "text_area_plan"):
-        plan = debug_context.get(plan_key)
-        if isinstance(plan, dict):
-            for container in plan.get("containers") or []:
-                if not isinstance(container, dict):
-                    continue
-                container_id = str(container.get("container_id") or container.get("id") or "")
-                if container_id and container_id not in auth_by_container:
-                    auth_by_container[container_id] = container
+    for _plan_key, plan in iter_plan_sources():
+        for container in plan.get("containers") or []:
+            if not isinstance(container, dict):
+                continue
+            container_id = str(container.get("container_id") or container.get("id") or "")
+            if container_id and container_id not in auth_by_container:
+                auth_by_container[container_id] = container
 
     records: list[dict[str, Any]] = []
     for region in (regions or []):
@@ -364,21 +388,20 @@ def _cleanup_mask_region_records_with_protection(
         )
         seen_ids.add(record_id)
 
-    for plan_key in ("text_area_plan_pre_ocr", "text_area_plan"):
-        plan = debug_context.get(plan_key)
-        if isinstance(plan, dict):
-            for index, container in enumerate(plan.get("containers") or []):
-                if isinstance(container, dict):
-                    add_record(
-                        str(container.get("container_id") or container.get("id") or f"{plan_key}_container_{index:04d}"),
-                        container,
-                        plan_key,
-                    )
+    for plan_key, plan in iter_plan_sources():
+        for index, container in enumerate(plan.get("containers") or []):
+            if isinstance(container, dict):
+                add_record(
+                    str(container.get("container_id") or container.get("id") or f"{plan_key}_container_{index:04d}"),
+                    container,
+                    plan_key,
+                )
 
-    for key in ("blocked_text_area_candidates", "caption_localization_candidates"):
-        for index, candidate in enumerate(debug_context.get(key) or []):
-            if isinstance(candidate, dict):
-                add_record(str(candidate.get("candidate_id") or candidate.get("region_id") or f"{key}_{index:04d}"), candidate, key)
+    if isinstance(debug_context, dict):
+        for key in ("blocked_text_area_candidates", "caption_localization_candidates"):
+            for index, candidate in enumerate(debug_context.get(key) or []):
+                if isinstance(candidate, dict):
+                    add_record(str(candidate.get("candidate_id") or candidate.get("region_id") or f"{key}_{index:04d}"), candidate, key)
 
     return records
 
@@ -891,6 +914,7 @@ class PipelineWorker(QtCore.QThread):
                     execution_regions = page_result.execution_regions
                     parent_execution_bundles = page_result.parent_execution_bundles
                     page_class = page_result.page_class
+                    text_area_plan = page_result.text_area_plan
                     _page014_timeout_checkpoint(
                         "controller_process_page",
                         "end",
@@ -1093,12 +1117,16 @@ class PipelineWorker(QtCore.QThread):
                         job_count=len(getattr(cleanup_job_contract_result, "jobs", []) or []),
                         source_glyph_record_count=len(getattr(source_glyph_mask_result, "masks_by_region", {}) or {}),
                     )
-                    cleanup_mask_region_records = _cleanup_mask_region_records_with_protection(execution_regions, debug_context)
+                    cleanup_mask_region_records = _cleanup_mask_region_records_with_protection(
+                        execution_regions,
+                        debug_context,
+                        text_area_plan=text_area_plan,
+                    )
                     component_authorization_start = time.time()
                     component_authorization_map = build_text_area_component_authorization_map(
                         page_id=page_id,
                         text_foreground_segmentation=text_foreground_segmentation_mask,
-                        text_area_plan=(debug_context.get("text_area_plan") if isinstance(debug_context, dict) else None),
+                        text_area_plan=text_area_plan,
                         page_region_records=cleanup_mask_region_records,
                         cleanup_jobs=cleanup_job_contract_result.jobs,
                     )
@@ -8498,7 +8526,7 @@ def _process_page(
     text_filter = TextFilter(settings)
 
     if not image_path or not os.path.exists(image_path):
-        return PageProcessingResult([], [], [], "normal")
+        return PageProcessingResult([], [], [], "normal", None)
     image_load_start = time.time()
     image_size = _get_image_size(image_path)
     page_image = _load_image_for_crop(image_path)
@@ -10051,7 +10079,7 @@ def _process_page(
         while len(context_window) > 4:
             context_window.pop(0)
 
-    return PageProcessingResult(regions, execution_regions, parent_execution_bundles, page_class)
+    return PageProcessingResult(regions, execution_regions, parent_execution_bundles, page_class, text_area_plan)
 
 
 def _logical_text_region_blocks_independent_render(region: dict) -> bool:
