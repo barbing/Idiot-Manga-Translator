@@ -83,6 +83,7 @@ EFFECTIVE_MASK_NOT_READY = "effective_mask_not_ready"
 MASK_READY = "mask_ready"
 MASK_NOT_READY = "mask_not_ready"
 MASK_NOT_APPLICABLE = "mask_not_applicable"
+COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON = "component_final_mask_authority_withheld_until_projection_ready"
 
 COMPONENT_AUTHORIZATION_STATES = {
     AUTH_CLEANUP_TRANSLATE_SPEECH,
@@ -3929,9 +3930,7 @@ def _component_auth_record(
         projection_quality_state = PROJECTION_OUTSIDE_AUTHORIZED_AREA
         if PROJECTION_OUTSIDE_AUTHORIZED_AREA not in projection_quality_reasons:
             projection_quality_reasons.append(PROJECTION_OUTSIDE_AUTHORIZED_AREA)
-    final_mask_authorization_state = semantic_authorization_state
-
-    family = _component_auth_family(final_mask_authorization_state)
+    semantic_family = _component_auth_family(semantic_authorization_state)
     reason_codes = _component_auth_merged_values(semantic_units, "reason_codes")
     conflict_flags = _component_auth_merged_values(semantic_units, "conflict_flags")
     if not semantic_units and "no_upstream_text_area_authorization" not in reason_codes:
@@ -3939,31 +3938,47 @@ def _component_auth_record(
     for reason in ambiguity_reasons + projection_quality_reasons:
         if reason and reason not in reason_codes:
             reason_codes.append(reason)
-    component_id = f"tauthcomp_{_component_auth_safe_id(page_id)}_{component_index:04d}"
-    owning_candidates = cleanup_candidates if family == "cleanup" else []
-    protection_candidates = protected_candidates if family == "protected" else []
-    if semantic_authorization_state == AUTH_AMBIGUOUS_COMPONENT_OWNER:
-        owning_candidates = cleanup_candidates
-        protection_candidates = protected_candidates
     selected_cleanup_candidates = (
-        [selected] if selected and selected.get("family") == "cleanup" and family == "cleanup" else cleanup_candidates if family == "cleanup" else []
+        [selected]
+        if selected and selected.get("family") == "cleanup" and semantic_family == "cleanup"
+        else cleanup_candidates
+        if semantic_family == "cleanup"
+        else []
     )
     if (
-        family == "cleanup"
+        semantic_family == "cleanup"
         and not selected_cleanup_candidates
         and projection_candidate is not None
         and projection_candidate.get("family") == "cleanup"
     ):
         selected_cleanup_candidates = [projection_candidate]
     binding_state, binding_failure_reason, owner_cleanup_job_id, scope_cleanup_job_ids = _component_auth_job_binding(
-        final_mask_authorization_state,
+        semantic_authorization_state,
         selected_cleanup_candidates,
     )
     mask_readiness_state, mask_readiness_failure_reason = _component_auth_projection_ready_for_mask(
-        semantic_authorization_state=final_mask_authorization_state,
+        semantic_authorization_state=semantic_authorization_state,
         projection_quality_state=projection_quality_state,
         job_binding_state=binding_state,
     )
+    final_mask_authorization_state = semantic_authorization_state
+    if semantic_family == "cleanup" and mask_readiness_state != MASK_READY:
+        final_mask_authorization_state = AUTH_REVIEW_UNKNOWN_NOT_CLEANUP
+        owner_cleanup_job_id = ""
+        scope_cleanup_job_ids = []
+        binding_state = "not_applicable_projection_not_ready"
+        binding_failure_reason = ""
+        mask_readiness_state = MASK_NOT_APPLICABLE
+        mask_readiness_failure_reason = ""
+        if COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON not in reason_codes:
+            reason_codes.append(COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON)
+    family = _component_auth_family(final_mask_authorization_state)
+    component_id = f"tauthcomp_{_component_auth_safe_id(page_id)}_{component_index:04d}"
+    owning_candidates = cleanup_candidates if family == "cleanup" else []
+    protection_candidates = protected_candidates if family == "protected" else []
+    if semantic_authorization_state == AUTH_AMBIGUOUS_COMPONENT_OWNER:
+        owning_candidates = cleanup_candidates
+        protection_candidates = protected_candidates
     if binding_failure_reason and binding_failure_reason not in reason_codes:
         reason_codes.append(binding_failure_reason)
     if binding_state in {"missing_cleanup_job", "non_unique_cleanup_job"} and binding_state not in reason_codes:
@@ -4540,6 +4555,8 @@ def _component_auth_is_ogkalu_speech_text_anchor(record: TextAreaComponentAuthor
 
 
 def _component_auth_is_ogkalu_speech_text_completion_candidate(record: TextAreaComponentAuthorizationRecord) -> bool:
+    if COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON in set(record.reason_codes or []):
+        return False
     if _component_auth_family(record.authorization_state) == "cleanup":
         return False
     if record.authorization_state in {AUTH_AMBIGUOUS_COMPONENT_OWNER, AUTH_OUTSIDE_CLEANUP_SCOPE}:

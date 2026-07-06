@@ -3338,7 +3338,12 @@ def _write_component_authorization_overlay(
             if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
                 continue
             state = str(record.get("final_mask_authorization_state") or record.get("authorization_state") or "")
-            color_name = str(record.get("semantic_visual_color") or record.get("visual_debug_color") or "").lower()
+            final_color = str(record.get("visual_debug_color") or "").lower()
+            semantic_color = str(record.get("semantic_visual_color") or "").lower()
+            if mode == "auth":
+                color_name = final_color or semantic_color
+            else:
+                color_name = semantic_color or final_color
             if mode == "protected":
                 if not (
                     state.startswith("protect_")
