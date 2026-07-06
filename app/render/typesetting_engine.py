@@ -1347,13 +1347,14 @@ def _vertical_item_is_continuation_punctuation(text: str) -> bool:
 
 
 def _vertical_item_is_sequence_punctuation(text: str) -> bool:
-    return str(text or "")[:1] in {"︙", "︱", "…", "-", "—", "―", "─", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
+    return str(text or "")[:1] in {"︙", "︱", "︴", "…", "-", "—", "―", "─", "～", "〜", "~", "〰", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
 
 
 def _vertical_item_is_strong_phrase_end(text: str) -> bool:
     return str(text or "")[:1] in {
         "︙",
         "︱",
+        "︴",
         "。",
         "，",
         "、",
@@ -1373,6 +1374,7 @@ def _vertical_item_is_strong_phrase_end(text: str) -> bool:
         "～",
         "〜",
         "~",
+        "〰",
     }
 
 
@@ -1560,7 +1562,7 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
             continue
         shaped = shaped_by_run.get(run.run_id)
         glyphs = list(shaped.glyphs if shaped else [])
-        if run.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
+        if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
             item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
             row_units = _vertical_sequence_row_units(run)
             items.append(
@@ -1624,17 +1626,17 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
 
 
 def _vertical_sequence_row_units(run: InlineTextRun) -> float:
-    if run.role == "dash_sequence":
+    if run.role in {"dash_sequence", "wave_sequence"}:
         return float(max(1, len(grapheme_clusters(run.text))))
     return 1.0
 
 
 def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: TypesettingPolicy, font_size: int) -> tuple[float, float, float]:
-    if run.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
+    if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
         count = max(1, len(grapheme_clusters(run.text)))
         width = float(font_size)
         height = float(font_size)
-        if run.role == "dash_sequence" and count > 1:
+        if run.role in {"dash_sequence", "wave_sequence"} and count > 1:
             height = float(font_size) * float(count)
         elif count > 1:
             height = max(height, min(float(font_size) * 1.15, float(font_size) * (0.58 * count)))
@@ -1660,7 +1662,7 @@ def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: Typ
 def _vertical_run_is_atomic(run: InlineTextRun, policy: TypesettingPolicy) -> bool:
     if run.script == "Latn":
         return True
-    if run.role in {"numeric_token", "complex_script", "symbol", "ellipsis_sequence", "dash_sequence", "punctuation_sequence"}:
+    if run.role in {"numeric_token", "complex_script", "symbol", "ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
         return True
     return False
 

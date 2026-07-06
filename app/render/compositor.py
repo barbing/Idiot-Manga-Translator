@@ -8,6 +8,7 @@ regions, reinterpret parent identity, or make style decisions.
 from __future__ import annotations
 
 import os
+import math
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
@@ -285,11 +286,9 @@ def _draw_compact_vertical_sequence(
         return False
     metadata = glyph.get("metadata") if isinstance(glyph.get("metadata"), Mapping) else {}
     mode = str(metadata.get("placement_mode") or "")
-    if mode not in {"vertical_ellipsis_sequence", "vertical_dash_sequence", "vertical_punctuation_sequence"}:
+    if mode not in {"vertical_ellipsis_sequence", "vertical_dash_sequence", "vertical_wave_sequence", "vertical_punctuation_sequence"}:
         return False
     clusters = [cluster for cluster in grapheme_clusters(text) if cluster]
-    if len(clusters) <= 1:
-        return False
     if mode == "vertical_dash_sequence":
         return _draw_vertical_dash_line(
             layer,
@@ -300,6 +299,18 @@ def _draw_compact_vertical_sequence(
             width=width,
             height=height,
         )
+    if mode == "vertical_wave_sequence":
+        return _draw_vertical_wave_line(
+            layer,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+            width=width,
+            height=height,
+        )
+    if len(clusters) <= 1:
+        return False
     draw = ImageDraw.Draw(layer)
     boxes: list[tuple[str, tuple[int, int, int, int]]] = []
     for cluster in clusters:
@@ -407,6 +418,44 @@ def _draw_vertical_dash_line(
             width=max(line_width + stroke_width * 2, line_width),
         )
     draw.line((x, y0, x, y1), fill=fill, width=line_width)
+    return True
+
+
+def _draw_vertical_wave_line(
+    layer,
+    *,
+    font,
+    fill,
+    stroke_width: int,
+    stroke_fill,
+    width: int,
+    height: int,
+) -> bool:
+    if ImageDraw is None:
+        return False
+    font_size = int(getattr(font, "size", max(width, height)) or max(width, height))
+    line_width = max(2, int(round(float(font_size) * 0.08)))
+    amplitude = max(2.0, min(float(width) * 0.24, float(font_size) * 0.14))
+    pad_y = max(1, int(round(float(font_size) * 0.04)))
+    x_center = (float(width) - 1.0) / 2.0
+    y0 = max(0, pad_y)
+    y1 = min(height - 1, height - pad_y - 1)
+    if y1 <= y0:
+        return False
+    height_span = max(1.0, float(y1 - y0))
+    cycles = max(2.0, height_span / max(1.0, float(font_size)))
+    points: list[tuple[float, float]] = []
+    for y in range(int(y0), int(y1) + 1):
+        t = float(y - y0) / height_span
+        phase = t * math.tau * cycles
+        x = x_center + math.sin(phase) * amplitude
+        points.append((x, float(y)))
+    if len(points) < 2:
+        return False
+    draw = ImageDraw.Draw(layer)
+    if stroke_width > 0:
+        draw.line(points, fill=stroke_fill, width=max(line_width + stroke_width * 2, line_width), joint="curve")
+    draw.line(points, fill=fill, width=line_width, joint="curve")
     return True
 
 

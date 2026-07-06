@@ -1655,7 +1655,7 @@ def _source_body(text: Any) -> str:
 def _is_punctuation(ch: str) -> bool:
     if not ch or ch.isspace():
         return True
-    return ch in "。、，,.．・…!！?？ー-〜~♡♥♪「」『』（）()[]{}<>《》:：;；/\\|"
+    return ch in "。、，,.．・…!！?？ー-〜～~〰︴♡♥♪「」『』（）()[]{}<>《》:：;；/\\|"
 
 
 def _is_ellipsis_like_source(text: str) -> bool:

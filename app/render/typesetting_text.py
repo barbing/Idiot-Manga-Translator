@@ -26,6 +26,7 @@ SYMBOL_CHARS = {"☆", "★", "♡", "❤", "♪"}
 LTR_COMPLEX_SCRIPTS = {"Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh", "Thai"}
 ELLIPSIS_CHARS = {"…", "︙"}
 DASH_CHARS = {"-", "ー", "―", "—", "─", "︱"}
+WAVE_DASH_CHARS = {"~", "～", "〜", "〰", "︴"}
 COMPACT_VERTICAL_PUNCTUATION_CHARS = {"!", "?", "！", "？", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
 VERTICAL_CENTERED_PUNCTUATION_CHARS = {
     ",",
@@ -54,6 +55,7 @@ VERTICAL_CENTERED_PUNCTUATION_CHARS = {
     "⁈",
     "︙",
     "︱",
+    "︴",
 }
 OPEN_PUNCTUATION = {"(", "（", "[", "［", "{", "｛", "「", "『", "【", "〈", "《", "“", "‘"}
 CLOSE_PUNCTUATION = {
@@ -181,6 +183,14 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
         "?!",
         "——",
         "--",
+        "—",
+        "―",
+        "－",
+        "-",
+        "～",
+        "〜",
+        "〰",
+        "~",
         "…",
         "！",
         "!",
@@ -249,6 +259,8 @@ def classify_grapheme(text: str) -> str:
         return "ellipsis"
     if _is_dash_sequence(cluster):
         return "dash"
+    if _is_wave_sequence(cluster):
+        return "wave"
     if all(_is_latin_char(char) for char in cluster):
         return "latin"
     if all(char.isdigit() for char in cluster):
@@ -289,7 +301,7 @@ def segment_inline_runs(text: str, *, writing_mode: str, language_hint: str = ""
                     break
                 group.append(clusters[index + 1])
                 index += 1
-        elif kind in {"ellipsis", "dash"}:
+        elif kind in {"ellipsis", "dash", "wave"}:
             while index + 1 < len(clusters) and classify_grapheme(clusters[index + 1]) == kind:
                 group.append(clusters[index + 1])
                 index += 1
@@ -405,6 +417,10 @@ def _is_dash_sequence(text: str) -> bool:
     return bool(text) and all(char in DASH_CHARS for char in text)
 
 
+def _is_wave_sequence(text: str) -> bool:
+    return bool(text) and all(char in WAVE_DASH_CHARS for char in text)
+
+
 def _is_compact_vertical_punctuation_char(text: str) -> bool:
     return bool(text) and text in COMPACT_VERTICAL_PUNCTUATION_CHARS
 
@@ -426,7 +442,7 @@ def _script_for_run(text: str, kind: str) -> str:
             script = _script_for_char(char)
             if script in LTR_COMPLEX_SCRIPTS:
                 return script
-    if kind in {"symbol", "ellipsis", "dash", "punctuation", "open_punctuation", "close_punctuation", "space"}:
+    if kind in {"symbol", "ellipsis", "dash", "wave", "punctuation", "open_punctuation", "close_punctuation", "space"}:
         return "Zyyy"
     for char in text:
         script = _script_for_char(char)
@@ -512,6 +528,8 @@ def _role_for_kind(kind: str, text: str) -> str:
         return "ellipsis_sequence"
     if kind == "dash":
         return "dash_sequence"
+    if kind == "wave":
+        return "wave_sequence"
     if _is_compact_vertical_punctuation_sequence(text):
         return "punctuation_sequence"
     if kind == "symbol":

@@ -11162,8 +11162,7 @@ def _translation_assignments_from_parent_execution_bundles(
 
 
 def _parent_execution_bundle_is_translatable(bundle: ParentExecutionBundle) -> bool:
-    state = str(bundle.state or "").strip()
-    return bool(bundle.translation_required) or state == "punctuation_identity_parent"
+    return bool(bundle.translation_required)
 
 
 def _rebuild_translation_inputs_from_regions(regions: list[dict]) -> tuple[dict[str, list[str]], list[str]]:
@@ -18426,6 +18425,41 @@ def _is_punct_only(text: str) -> bool:
     return letters == 0
 
 
+_SLASH_LIKE_WAVE_OCR_MARK = "〳"
+_VERTICAL_KANA_REPEAT_FOLLOWERS = {"〵", "〴"}
+_WAVE_OCR_TERMINAL_FOLLOWERS = set("。．.、，,！!？?…︙ー-—―－～〜~〰︴」』）)]｝》】")
+
+
+def _normalize_slash_like_wave_ocr_marks(text: str) -> str:
+    if _SLASH_LIKE_WAVE_OCR_MARK not in text:
+        return text
+    chars = list(text)
+    for index, char in enumerate(chars):
+        if char != _SLASH_LIKE_WAVE_OCR_MARK:
+            continue
+        previous = _previous_nonspace(chars, index)
+        following = _next_nonspace(chars, index)
+        if following in _VERTICAL_KANA_REPEAT_FOLLOWERS:
+            continue
+        if previous and _is_cjk_char(previous) and (not following or following in _WAVE_OCR_TERMINAL_FOLLOWERS):
+            chars[index] = "〜"
+    return "".join(chars)
+
+
+def _previous_nonspace(chars: list[str], index: int) -> str:
+    for pos in range(index - 1, -1, -1):
+        if str(chars[pos]).strip():
+            return chars[pos]
+    return ""
+
+
+def _next_nonspace(chars: list[str], index: int) -> str:
+    for pos in range(index + 1, len(chars)):
+        if str(chars[pos]).strip():
+            return chars[pos]
+    return ""
+
+
 def _clean_ocr_text(text: str) -> str:
     cleaned = str(text or "").strip()
     if not cleaned:
@@ -18433,6 +18467,7 @@ def _clean_ocr_text(text: str) -> str:
     cleaned = cleaned.replace("□", "").replace("�", "")
     if _placeholder_ratio(cleaned) >= 0.2:
         cleaned = cleaned.replace("口", "")
+    cleaned = _normalize_slash_like_wave_ocr_marks(cleaned)
 
     # For CJK text, remove ALL spaces (Japanese/Chinese don't use word spaces)
     # Use _is_valid_japanese score which correctly includes punctuation

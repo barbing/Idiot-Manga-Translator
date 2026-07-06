@@ -2782,4 +2782,4 @@ def _is_punctuation(ch: str) -> bool:
         return True
     if ch.isspace():
         return True
-    return ch in "。、，,.．・…!！?？ー-〜~♡♥♪「」『』（）()[]{}<>《》:：;；/\\|"
+    return ch in "。、，,.．・…!！?？ー-〜～~〰︴♡♥♪「」『』（）()[]{}<>《》:：;；/\\|"

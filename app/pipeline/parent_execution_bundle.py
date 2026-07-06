@@ -827,15 +827,19 @@ def _bundle_from_finalized_parent(
     ocr_mmproj_path = str(primary_region.get("ocr_mmproj_path") or primary_render.get("ocr_mmproj_path") or "")
     ocr_endpoint = str(primary_region.get("ocr_endpoint") or primary_render.get("ocr_endpoint") or "")
     ocr_prompt_version = str(primary_region.get("ocr_prompt_version") or primary_render.get("ocr_prompt_version") or "")
+    state = str(getattr(parent, "state", "") or "")
+    source_text = str(getattr(parent, "source_text", "") or "")
+    translation_required = bool(getattr(parent, "translation_required", False))
+    translated_text = source_text if _is_punctuation_identity_parent(state, source_action, source_state) else ""
     return ParentExecutionBundle(
         page_id=page_id,
         bundle_id=parent_id,
         root_id=root_id,
         parent_id=parent_id,
         graph_parent_id=parent_id,
-        state=str(getattr(parent, "state", "") or ""),
+        state=state,
         role=role,
-        source_text=str(getattr(parent, "source_text", "") or ""),
+        source_text=source_text,
         source_quality_state=source_state,
         source_quality_action=source_action,
         source_contract_owner=source_contract_owner,
@@ -850,7 +854,7 @@ def _bundle_from_finalized_parent(
         ocr_endpoint=ocr_endpoint,
         ocr_prompt_version=ocr_prompt_version,
         source_quality_reason_codes=source_reason_codes,
-        translation_required=bool(getattr(parent, "translation_required", False)),
+        translation_required=translation_required,
         cleanup_required=bool(getattr(parent, "cleanup_required", False)),
         render_required=bool(getattr(parent, "render_required", False)),
         parent_bbox=list(parent_bbox),
@@ -876,6 +880,7 @@ def _bundle_from_finalized_parent(
         confidence=_float_or_none(getattr(parent_unit, "confidence", None)),
         reason_codes=_list_strings(getattr(parent, "reason_codes", [])),
         unresolved_reason=getattr(parent, "unresolved_reason", None),
+        translated_text=translated_text,
         render_style=_render_style_contract_from_source_regions(
             role,
             source_region_ids,
@@ -883,6 +888,14 @@ def _bundle_from_finalized_parent(
             semantic_class=_semantic_class_for_role(role),
             render_allowed_area=render_allowed,
         ),
+    )
+
+
+def _is_punctuation_identity_parent(state: str, source_action: str, source_state: str) -> bool:
+    return (
+        str(state or "") == "punctuation_identity_parent"
+        or str(source_action or "") == "identity_punctuation"
+        or str(source_state or "") == "punctuation_identity_source"
     )
 
 
