@@ -1225,16 +1225,15 @@ def _build_component_projected_text_mask(
         if parent_surface_clipping_accounts_for_loss:
             owned_ratio_reason = ""
         unsafe_reason = _segmentation_foreground_unsafe_reason(foreground, execution_allowed, job)
-        if coverage_reason or owned_ratio_reason or unsafe_reason or ambiguous_ids or unowned_ids:
+        hard_failure_reason = coverage_reason or owned_ratio_reason or unsafe_reason
+        if hard_failure_reason:
             status = "cleanup_mask_partial_owned_components"
-            failure_reason = (
-                coverage_reason
-                or owned_ratio_reason
-                or unsafe_reason
-                or ("effective_mask_not_ready" if ambiguous_ids else "")
-                or "cleanup_mask_partial_owned_components"
-            )
-            rejected = bool(coverage_reason or owned_ratio_reason or unsafe_reason or ambiguous_ids)
+            failure_reason = hard_failure_reason
+            rejected = True
+        elif ambiguous_ids or unowned_ids:
+            status = "cleanup_mask_ready_with_component_exclusions"
+            failure_reason = ""
+            rejected = False
 
     seed_pixels = int(np.count_nonzero(seed_foreground > 0)) if seed_foreground is not None else 0
     erase = None
@@ -1259,6 +1258,18 @@ def _build_component_projected_text_mask(
         )
     )
     projection_quality_reasons = list(projection.get("projection_quality_reasons", []) or [])
+    if (
+        ambiguous_ids
+        and status == "cleanup_mask_ready_with_component_exclusions"
+        and "component_projection_ambiguous_components_excluded" not in projection_quality_reasons
+    ):
+        projection_quality_reasons.append("component_projection_ambiguous_components_excluded")
+    if (
+        unowned_ids
+        and status == "cleanup_mask_ready_with_component_exclusions"
+        and "component_projection_unowned_components_excluded" not in projection_quality_reasons
+    ):
+        projection_quality_reasons.append("component_projection_unowned_components_excluded")
     if (
         foreground_outside_allowed_pixels > 0
         and "parent_execution_surface_clipped_owned_components" not in projection_quality_reasons
@@ -1958,11 +1969,7 @@ def _component_projection_for_job(
             if str(stage)
         }
     )
-    relevant = owned + [
-        item
-        for item in ambiguous
-        if item.get("ownership_state") == "projection_not_ready" and _component_authorized_for_job(item, job_id)
-    ]
+    relevant = owned
     protected_pixel_count = sum(_component_pixels_in_allowed(item, allowed) for item in protected)
     ambiguous_pixel_count = sum(_component_pixels_in_allowed(item, allowed) for item in ambiguous)
     return {
@@ -3311,7 +3318,10 @@ def _component_authorized_growth_exception_applies(effective: _EffectiveMaskBuil
         return False
     if int(audit.get("protected_component_pixels_removed") or 0) > 0:
         return False
-    if int(audit.get("ambiguous_component_pixels") or 0) > 0:
+    if (
+        int(audit.get("ambiguous_component_pixels") or 0) > 0
+        and str(audit.get("clean_mask_state") or "") != "cleanup_mask_ready_with_component_exclusions"
+    ):
         return False
     projection_state = str(audit.get("projection_quality_state") or "")
     if projection_state and projection_state != PROJECTION_READY_STATE:

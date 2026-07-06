@@ -19,6 +19,7 @@ from app.pipeline.debug_runtime import (
     page_debug_dir,
     perf_telemetry_enabled,
     perf_telemetry_root,
+    safe_trace_token,
     stage_artifact_dir,
     stage_artifact_path,
     write_image_path,
@@ -163,6 +164,294 @@ def write_debug_image_file(path: str, image: Any, *, quality: int | None = None)
         return path
     except Exception:
         return ""
+
+
+def write_cleanup_process_debug_artifacts(
+    context: dict[str, Any] | None,
+    *,
+    source_image_path: str = "",
+    image_size: Any = None,
+    text_foreground_segmentation: Any = None,
+    component_authorization_map: Any = None,
+    source_glyph_masks: Any = None,
+    cleanup_job_contracts: Any = None,
+    cleanup_mask_contracts: Any = None,
+    cleanup_plan_contracts: Any = None,
+    cleanup_runtime_contracts: Any = None,
+    cleanup_upstream_commit_result: Any = None,
+    cleaned_page_base: Any = None,
+) -> dict[str, Any]:
+    """Write a compact cleanup-process ladder for debug diagnosis.
+
+    This is intentionally a debug-only view. It records page-level masks and
+    overlays at each cleanup boundary while keeping per-parent details in JSON.
+    It does not change cleanup authorization, backend execution, proof, commit,
+    or rendering behavior.
+    """
+
+    if not context or context.get("perf_telemetry_only") or Image is None:
+        return {}
+    artifact_dir = debug_stage_artifact_dir(context, "cleanup_process", "cleanup_process")
+    if not artifact_dir:
+        return {}
+    size = (
+        _normalize_image_size(image_size)
+        or _normalize_image_size(getattr(text_foreground_segmentation, "image_size", None))
+        or _image_size_from_path(source_image_path)
+    )
+    if not size:
+        return {}
+    page_id = str(context.get("page_id") or "page").strip() or "page"
+    page_token = safe_trace_token(page_id, "page")
+    source_image_ref = _copy_or_write_debug_image(
+        os.path.join(artifact_dir, f"{page_token}_original.jpg"),
+        source_image_path,
+        None,
+    )
+
+    segmentation = {
+        "audit": _json_safe(
+            text_foreground_segmentation.to_audit_dict()
+            if hasattr(text_foreground_segmentation, "to_audit_dict")
+            else text_foreground_segmentation
+        ),
+        "raw_mask": _save_binary_mask_array(
+            os.path.join(artifact_dir, f"{page_token}_ctd_raw_mask.png"),
+            _binary_mask_array(getattr(text_foreground_segmentation, "raw_mask", None), size),
+        ),
+        "refined_mask": _save_binary_mask_array(
+            os.path.join(artifact_dir, f"{page_token}_ctd_refined_mask.png"),
+            _binary_mask_array(getattr(text_foreground_segmentation, "refined_mask", None), size),
+        ),
+    }
+    segmentation["raw_overlay"] = _save_mask_overlay_array(
+        os.path.join(artifact_dir, f"{page_token}_ctd_raw_overlay.jpg"),
+        source_image_path,
+        size,
+        _binary_mask_array(getattr(text_foreground_segmentation, "raw_mask", None), size),
+        (255, 150, 0),
+    )
+    segmentation["refined_overlay"] = _save_mask_overlay_array(
+        os.path.join(artifact_dir, f"{page_token}_ctd_refined_overlay.jpg"),
+        source_image_path,
+        size,
+        _binary_mask_array(getattr(text_foreground_segmentation, "refined_mask", None), size),
+        (30, 144, 255),
+    )
+    segmentation["raw_mask_stats"] = _mask_stats(
+        _binary_mask_array(getattr(text_foreground_segmentation, "raw_mask", None), size)
+    )
+    segmentation["refined_mask_stats"] = _mask_stats(
+        _binary_mask_array(getattr(text_foreground_segmentation, "refined_mask", None), size)
+    )
+
+    component_records = _component_authorization_records(component_authorization_map)
+    component_authorization = {
+        "audit_summary": _json_safe(_component_authorization_summary(component_authorization_map)),
+        "component_count": len(component_records),
+        "state_counts": _component_state_counts(component_records),
+        "authorization_overlay": _write_component_authorization_overlay(
+            os.path.join(artifact_dir, f"{page_token}_component_authorization_overlay.jpg"),
+            source_image_path,
+            size,
+            component_records,
+            mode="auth",
+        ),
+        "projection_overlay": _write_component_authorization_overlay(
+            os.path.join(artifact_dir, f"{page_token}_projection_quality_overlay.jpg"),
+            source_image_path,
+            size,
+            component_records,
+            mode="projection",
+        ),
+        "protected_overlay": _write_component_authorization_overlay(
+            os.path.join(artifact_dir, f"{page_token}_protected_component_overlay.jpg"),
+            source_image_path,
+            size,
+            component_records,
+            mode="protected",
+        ),
+        "components": _json_safe(component_records),
+    }
+
+    source_glyph_union = _union_source_glyph_masks(source_glyph_masks, size)
+    source_glyph_overlay_ref = _save_mask_overlay_array(
+        os.path.join(artifact_dir, f"{page_token}_source_glyph_overlay.jpg"),
+        source_image_path,
+        size,
+        source_glyph_union,
+        (30, 144, 255),
+    )
+    source_glyph = {
+        "summary": _json_safe(
+            source_glyph_masks.to_audit_dict()
+            if hasattr(source_glyph_masks, "to_audit_dict")
+            else source_glyph_masks
+        ),
+        "union_mask": _save_binary_mask_array(
+            os.path.join(artifact_dir, f"{page_token}_source_glyph_union.png"),
+            source_glyph_union,
+        ),
+        "union_overlay": source_glyph_overlay_ref,
+        "union_stats": _mask_stats(source_glyph_union),
+    }
+
+    masks = list(getattr(cleanup_mask_contracts, "masks", []) or [])
+    foreground_union = _empty_binary_mask(size)
+    erase_union = _empty_binary_mask(size)
+    records: list[dict[str, Any]] = []
+    for index, mask in enumerate(masks):
+        mask_id = str(getattr(mask, "cleanup_mask_id", "") or f"mask_{index:03d}")
+        foreground_arr = _binary_mask_array(getattr(mask, "foreground_mask", None), size)
+        erase_arr = _binary_mask_array(getattr(mask, "erase_mask", None), size)
+        foreground_union = _mask_union(foreground_union, foreground_arr)
+        erase_union = _mask_union(erase_union, erase_arr)
+        records.append(
+            {
+                "cleanup_mask_id": mask_id,
+                "cleanup_job_id": str(getattr(mask, "cleanup_job_id", "") or ""),
+                "parent_execution_bundle_id": str(getattr(mask, "parent_execution_bundle_id", "") or ""),
+                "parent_logical_text_unit_id": str(getattr(mask, "parent_logical_text_unit_id", "") or ""),
+                "text_block_root_id": str(getattr(mask, "text_block_root_id", "") or ""),
+                "target_region_ids": _json_safe(list(getattr(mask, "target_region_ids", []) or [])),
+                "mask_source": str(getattr(mask, "mask_source", "") or ""),
+                "mask_method": str(getattr(mask, "mask_method", "") or ""),
+                "clean_mask_state": str(getattr(mask, "clean_mask_state", "") or ""),
+                "clean_mask_failure_reason": str(getattr(mask, "clean_mask_failure_reason", "") or ""),
+                "foreground_metadata_pixels": getattr(mask, "foreground_mask_pixels", None),
+                "erase_metadata_pixels": getattr(mask, "erase_mask_pixels", None),
+                "foreground_metadata_bbox": _json_safe(getattr(mask, "foreground_mask_bbox", None)),
+                "erase_metadata_bbox": _json_safe(getattr(mask, "erase_mask_bbox", None)),
+                "foreground_mask": _mask_stats(foreground_arr),
+                "erase_mask": _mask_stats(erase_arr),
+                "cleanup_authorization": str(getattr(mask, "cleanup_authorization", "") or ""),
+                "semantic_authorization_state": str(getattr(mask, "semantic_authorization_state", "") or ""),
+                "projection_quality_state": str(getattr(mask, "projection_quality_state", "") or ""),
+                "projection_quality_reasons": _json_safe(list(getattr(mask, "projection_quality_reasons", []) or [])),
+                "owned_component_ids": _json_safe(list(getattr(mask, "owned_component_ids", []) or [])),
+                "protected_component_ids": _json_safe(list(getattr(mask, "protected_component_ids", []) or [])),
+                "ambiguous_component_ids": _json_safe(list(getattr(mask, "ambiguous_component_ids", []) or [])),
+                "unowned_component_ids": _json_safe(list(getattr(mask, "unowned_component_ids", []) or [])),
+                "component_ownership_status": str(getattr(mask, "component_ownership_status", "") or ""),
+                "clean_mask_foreground_ref": str(getattr(mask, "clean_mask_foreground_ref", "") or ""),
+                "clean_mask_erase_ref": str(getattr(mask, "clean_mask_erase_ref", "") or ""),
+                "component_ownership_overlay_ref": str(getattr(mask, "component_ownership_overlay_ref", "") or ""),
+                "rejected_component_overlay_ref": str(getattr(mask, "rejected_component_overlay_ref", "") or ""),
+            }
+        )
+    foreground_union_ref = os.path.join(artifact_dir, f"{page_token}_accepted_foreground_union.png")
+    erase_union_ref = os.path.join(artifact_dir, f"{page_token}_accepted_erase_union.png")
+    _save_binary_mask_array(foreground_union_ref, foreground_union)
+    _save_binary_mask_array(erase_union_ref, erase_union)
+
+    backend_input_ref_count = _runtime_mask_ref_count(cleanup_runtime_contracts, "backend_input_mask_ref")
+    runtime_backend_input_union = (
+        _union_runtime_mask_refs(
+            cleanup_runtime_contracts,
+            size,
+            ref_attr="backend_input_mask_ref",
+        )
+        if backend_input_ref_count
+        else _empty_binary_mask(size)
+    )
+    runtime_commit_union = _union_runtime_result_masks(cleanup_runtime_contracts, size)
+    runtime = {
+        "summary": _json_safe(
+            cleanup_runtime_contracts.to_audit_dict()
+            if hasattr(cleanup_runtime_contracts, "to_audit_dict")
+            else cleanup_runtime_contracts
+        ),
+        "backend_input_union": (
+            _save_binary_mask_array(
+                os.path.join(artifact_dir, f"{page_token}_runtime_backend_input_union.png"),
+                runtime_backend_input_union,
+            )
+            if backend_input_ref_count
+            else ""
+        ),
+        "backend_input_union_stats": _mask_stats(runtime_backend_input_union) if backend_input_ref_count else {"pixels": 0, "bbox": None},
+        "backend_input_union_status": (
+            "captured_from_runtime_refs"
+            if backend_input_ref_count
+            else "not_captured_without_cleanup_runtime_stage_per_job_refs"
+        ),
+        "result_commit_union": _save_binary_mask_array(
+            os.path.join(artifact_dir, f"{page_token}_runtime_result_commit_union.png"),
+            runtime_commit_union,
+        ),
+        "result_commit_union_stats": _mask_stats(runtime_commit_union),
+    }
+
+    commit_mask_ref = str(getattr(cleanup_upstream_commit_result, "commit_mask_ref", "") or "")
+    commit_cleaned_ref = str(getattr(cleanup_upstream_commit_result, "committed_image_ref", "") or "")
+    commit_diff_ref = str(getattr(cleanup_upstream_commit_result, "commit_diff_ref", "") or "")
+    commit_mask_copy = _copy_or_write_debug_image(
+        os.path.join(artifact_dir, f"{page_token}_upstream_commit_mask.png"),
+        commit_mask_ref,
+        None,
+    )
+    if not commit_mask_copy and _mask_stats(runtime_commit_union).get("pixels", 0):
+        commit_mask_copy = _save_binary_mask_array(
+            os.path.join(artifact_dir, f"{page_token}_upstream_commit_mask.png"),
+            runtime_commit_union,
+        )
+    cleaned_page_ref = _copy_or_write_debug_image(
+        os.path.join(artifact_dir, f"{page_token}_cleaned_page.png"),
+        commit_cleaned_ref,
+        getattr(cleanup_upstream_commit_result, "cleaned_image", None),
+    )
+    commit_diff_copy = _copy_or_write_debug_image(
+        os.path.join(artifact_dir, f"{page_token}_cleaned_diff.png"),
+        commit_diff_ref,
+        None,
+    )
+    if not commit_diff_copy and getattr(cleanup_upstream_commit_result, "cleaned_image", None) is not None:
+        commit_diff_copy = _write_image_difference(
+            os.path.join(artifact_dir, f"{page_token}_cleaned_diff.png"),
+            source_image_path,
+            getattr(cleanup_upstream_commit_result, "cleaned_image", None),
+        )
+
+    commit = {
+        "summary": _json_safe(
+            cleanup_upstream_commit_result.to_audit_dict()
+            if hasattr(cleanup_upstream_commit_result, "to_audit_dict")
+            else cleanup_upstream_commit_result
+        ),
+        "commit_mask": commit_mask_copy or commit_mask_ref,
+        "cleaned_page": cleaned_page_ref or commit_cleaned_ref,
+        "cleaned_diff": commit_diff_copy or commit_diff_ref,
+        "cleaned_page_base": _json_safe(cleaned_page_base or {}),
+    }
+
+    summary = {
+        "version": "cleanup_process_debug_v2",
+        "page_id": page_id,
+        "image_size": [int(size[0]), int(size[1])],
+        "source_image_ref": source_image_ref,
+        "mask_count": len(records),
+        "stage_contract": (
+            "This debug-only cleanup ladder records stage evidence. It does not authorize cleanup, "
+            "execute cleanup, weaken proof, commit pixels, or affect rendering."
+        ),
+        "segmentation": segmentation,
+        "component_authorization": component_authorization,
+        "source_glyph": source_glyph,
+        "cleanup_jobs": _compact_contract_summary(cleanup_job_contracts),
+        "cleanup_masks": _compact_contract_summary(cleanup_mask_contracts),
+        "cleanup_plans": _compact_contract_summary(cleanup_plan_contracts),
+        "accepted_foreground_union": _mask_stats(foreground_union),
+        "accepted_erase_union": _mask_stats(erase_union),
+        "accepted_foreground_union_ref": foreground_union_ref,
+        "accepted_erase_union_ref": erase_union_ref,
+        "runtime": runtime,
+        "commit": commit,
+        "masks": records,
+    }
+    summary_ref = os.path.join(artifact_dir, f"{page_token}_cleanup_process_summary.json")
+    _write_json_file(summary_ref, summary)
+    context["cleanup_process_artifacts"] = summary
+    return summary
 
 
 def write_pre_render_source_erasure_debug_image(working: Any, debug_context: dict[str, Any] | None) -> None:
@@ -2816,6 +3105,385 @@ def _overlay_font():
         return ImageFont.load_default()
     except Exception:
         return None
+
+
+def _normalize_image_size(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        width = int(round(float(value[0])))
+        height = int(round(float(value[1])))
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
+
+
+def _empty_binary_mask(size: tuple[int, int]) -> Any:
+    try:
+        import numpy as np
+
+        return np.zeros((int(size[1]), int(size[0])), dtype=np.uint8)
+    except Exception:
+        return None
+
+
+def _binary_mask_array(mask: Any, size: tuple[int, int]) -> Any:
+    try:
+        import numpy as np
+
+        if mask is None:
+            return np.zeros((int(size[1]), int(size[0])), dtype=np.uint8)
+        arr = np.asarray(mask)
+        if arr.ndim == 3:
+            arr = np.any(arr > 0, axis=2)
+        if arr.ndim != 2:
+            return np.zeros((int(size[1]), int(size[0])), dtype=np.uint8)
+        arr = (arr > 0).astype("uint8")
+        if arr.shape != (int(size[1]), int(size[0])):
+            if Image is None:
+                return np.zeros((int(size[1]), int(size[0])), dtype=np.uint8)
+            pil_mask = Image.fromarray(arr * 255, mode="L")
+            resample = getattr(getattr(Image, "Resampling", Image), "NEAREST", 0)
+            pil_mask = pil_mask.resize((int(size[0]), int(size[1])), resample)
+            arr = (np.asarray(pil_mask) > 0).astype("uint8")
+        return arr
+    except Exception:
+        return _empty_binary_mask(size)
+
+
+def _mask_union(left: Any, right: Any) -> Any:
+    try:
+        import numpy as np
+
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return np.maximum(left, right)
+    except Exception:
+        return left if left is not None else right
+
+
+def _save_binary_mask_array(path: str, arr: Any) -> str:
+    if not path or arr is None or Image is None:
+        return ""
+    try:
+        import numpy as np
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.fromarray((np.asarray(arr) > 0).astype("uint8") * 255, mode="L").save(path)
+        return path
+    except Exception:
+        return ""
+
+
+def _mask_stats(arr: Any) -> dict[str, Any]:
+    try:
+        import numpy as np
+
+        mask = np.asarray(arr) > 0
+        pixels = int(np.count_nonzero(mask))
+        if pixels <= 0:
+            return {"pixels": 0, "bbox": None}
+        ys, xs = np.nonzero(mask)
+        return {
+            "pixels": pixels,
+            "bbox": [
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max()) + 1,
+                int(ys.max()) + 1,
+            ],
+        }
+    except Exception:
+        return {"pixels": 0, "bbox": None}
+
+
+def _write_json_file(path: str, value: Any) -> str:
+    if not path:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(_json_safe(value), handle, ensure_ascii=False, indent=2)
+        return path
+    except Exception:
+        return ""
+
+
+def _image_size_from_path(path: str) -> tuple[int, int] | None:
+    if not path or Image is None or not os.path.isfile(path):
+        return None
+    try:
+        with Image.open(path) as image:
+            return image.size
+    except Exception:
+        return None
+
+
+def _copy_or_write_debug_image(path: str, source_path: str = "", image: Any = None) -> str:
+    if not path or Image is None:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if image is not None and hasattr(image, "save"):
+            image.save(path)
+            return path
+        if source_path and os.path.isfile(source_path):
+            with Image.open(source_path) as src:
+                src.save(path)
+            return path
+    except Exception:
+        return ""
+    return ""
+
+
+def _write_image_difference(path: str, source_path: str, cleaned_image: Any) -> str:
+    if not path or not source_path or Image is None or cleaned_image is None:
+        return ""
+    try:
+        from PIL import ImageChops
+
+        with Image.open(source_path) as source:
+            before = source.convert("RGB")
+        after = cleaned_image.convert("RGB") if hasattr(cleaned_image, "convert") else Image.fromarray(cleaned_image).convert("RGB")
+        if before.size != after.size:
+            after = after.resize(before.size)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ImageChops.difference(before, after).save(path)
+        return path
+    except Exception:
+        return ""
+
+
+def _component_authorization_records(component_authorization_map: Any) -> list[dict[str, Any]]:
+    if component_authorization_map is None:
+        return []
+    if hasattr(component_authorization_map, "components"):
+        raw_records = list(getattr(component_authorization_map, "components", []) or [])
+    elif isinstance(component_authorization_map, dict):
+        raw_records = list(component_authorization_map.get("components") or [])
+    else:
+        raw_records = []
+    records: list[dict[str, Any]] = []
+    for record in raw_records:
+        if hasattr(record, "to_dict"):
+            payload = record.to_dict()
+        elif isinstance(record, dict):
+            payload = dict(record)
+        else:
+            payload = dict(getattr(record, "__dict__", {}) or {})
+        records.append(payload)
+    return records
+
+
+def _component_authorization_summary(component_authorization_map: Any) -> dict[str, Any]:
+    if component_authorization_map is None:
+        return {}
+    if hasattr(component_authorization_map, "to_audit_dict"):
+        try:
+            payload = component_authorization_map.to_audit_dict()
+            if isinstance(payload, dict):
+                return dict(payload.get("summary") or {})
+        except Exception:
+            return {}
+    if isinstance(component_authorization_map, dict):
+        return dict(component_authorization_map.get("summary") or {})
+    return {}
+
+
+def _component_state_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        state = str(
+            record.get("final_mask_authorization_state")
+            or record.get("authorization_state")
+            or record.get("group_authorization_state")
+            or "unknown"
+        )
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+def _write_component_authorization_overlay(
+    path: str,
+    source_path: str,
+    size: tuple[int, int],
+    records: list[dict[str, Any]],
+    *,
+    mode: str,
+) -> str:
+    if not path or Image is None or ImageDraw is None:
+        return ""
+    try:
+        if source_path and os.path.isfile(source_path):
+            with Image.open(source_path) as image:
+                base = image.convert("RGBA")
+        else:
+            base = Image.new("RGBA", size, (255, 255, 255, 255))
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        colors = {
+            "green": (0, 210, 0, 120),
+            "red": (240, 0, 0, 130),
+            "orange": (255, 150, 0, 130),
+            "gray": (120, 120, 120, 110),
+            "grey": (120, 120, 120, 110),
+            "blue": (30, 144, 255, 120),
+        }
+        for record in records:
+            bbox = record.get("component_bbox") or record.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                continue
+            state = str(record.get("final_mask_authorization_state") or record.get("authorization_state") or "")
+            color_name = str(record.get("semantic_visual_color") or record.get("visual_debug_color") or "").lower()
+            if mode == "protected":
+                if not (
+                    state.startswith("protect_")
+                    or color_name in {"red", "orange"}
+                    or bool(record.get("must_not_mutate"))
+                ):
+                    continue
+            elif mode == "projection":
+                if state.startswith("cleanup_"):
+                    color_name = "green"
+                elif state.startswith("protect_"):
+                    color_name = "red"
+                elif "ambiguous" in state or bool(record.get("requires_visual_review")):
+                    color_name = "orange"
+                elif not color_name:
+                    color_name = "gray"
+            elif not color_name:
+                color_name = "gray"
+            x0, y0, x1, y1 = [int(round(float(item))) for item in bbox[:4]]
+            rgba = colors.get(color_name, colors["gray"])
+            draw.rectangle((x0, y0, x1, y1), fill=rgba, outline=rgba[:3] + (220,), width=2)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.alpha_composite(base, overlay).convert("RGB").save(path, quality=92)
+        return path
+    except Exception:
+        return ""
+
+
+def _save_mask_overlay_array(
+    path: str,
+    source_path: str,
+    size: tuple[int, int],
+    arr: Any,
+    color: tuple[int, int, int],
+) -> str:
+    if not path or arr is None or Image is None:
+        return ""
+    try:
+        import numpy as np
+
+        if source_path and os.path.isfile(source_path):
+            with Image.open(source_path) as image:
+                base = image.convert("RGBA")
+        else:
+            base = Image.new("RGBA", size, (255, 255, 255, 255))
+        mask = _binary_mask_array(arr, size)
+        overlay_arr = np.zeros((int(size[1]), int(size[0]), 4), dtype=np.uint8)
+        overlay_arr[mask > 0] = [int(color[0]), int(color[1]), int(color[2]), 125]
+        overlay = Image.fromarray(overlay_arr, mode="RGBA")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.alpha_composite(base, overlay).convert("RGB").save(path, quality=92)
+        return path
+    except Exception:
+        return ""
+
+
+def _union_source_glyph_masks(source_glyph_masks: Any, size: tuple[int, int]) -> Any:
+    union = _empty_binary_mask(size)
+    records = []
+    masks_by_region = getattr(source_glyph_masks, "masks_by_region", None)
+    if isinstance(masks_by_region, dict):
+        records = list(masks_by_region.values())
+    elif isinstance(source_glyph_masks, dict):
+        raw = source_glyph_masks.get("masks_by_region") or source_glyph_masks.get("source_glyph_masks") or []
+        records = list(raw.values()) if isinstance(raw, dict) else list(raw or [])
+    for record in records:
+        candidate = (
+            getattr(record, "erase_mask", None)
+            if not isinstance(record, dict)
+            else record.get("erase_mask")
+        )
+        if candidate is None:
+            candidate = (
+                getattr(record, "foreground_mask", None)
+                if not isinstance(record, dict)
+                else record.get("foreground_mask")
+            )
+        if candidate is None:
+            candidate = getattr(record, "mask", None) if not isinstance(record, dict) else record.get("mask")
+        union = _mask_union(union, _binary_mask_array(candidate, size))
+    return union
+
+
+def _union_runtime_mask_refs(cleanup_runtime_contracts: Any, size: tuple[int, int], *, ref_attr: str) -> Any:
+    union = _empty_binary_mask(size)
+    for result in list(getattr(cleanup_runtime_contracts, "result_records", []) or []):
+        ref = str(getattr(result, ref_attr, "") or "")
+        if not ref and isinstance(result, dict):
+            ref = str(result.get(ref_attr) or "")
+        union = _mask_union(union, _binary_mask_from_ref(ref, size))
+    return union
+
+
+def _runtime_mask_ref_count(cleanup_runtime_contracts: Any, ref_attr: str) -> int:
+    count = 0
+    for result in list(getattr(cleanup_runtime_contracts, "result_records", []) or []):
+        ref = str(getattr(result, ref_attr, "") or "")
+        if not ref and isinstance(result, dict):
+            ref = str(result.get(ref_attr) or "")
+        if ref:
+            count += 1
+    return count
+
+
+def _union_runtime_result_masks(cleanup_runtime_contracts: Any, size: tuple[int, int]) -> Any:
+    union = _empty_binary_mask(size)
+    for result in list(getattr(cleanup_runtime_contracts, "result_records", []) or []):
+        mask = getattr(result, "commit_mask", None)
+        if mask is None:
+            mask = getattr(result, "commit_foreground_mask", None)
+        union = _mask_union(union, _binary_mask_array(mask, size))
+    return union
+
+
+def _binary_mask_from_ref(path: str, size: tuple[int, int]) -> Any:
+    if not path or Image is None or not os.path.isfile(path):
+        return _empty_binary_mask(size)
+    try:
+        with Image.open(path) as image:
+            return _binary_mask_array(image.convert("L"), size)
+    except Exception:
+        return _empty_binary_mask(size)
+
+
+def _compact_contract_summary(contract: Any) -> dict[str, Any]:
+    if contract is None:
+        return {}
+    if hasattr(contract, "to_audit_dict"):
+        try:
+            payload = contract.to_audit_dict()
+        except Exception:
+            payload = {}
+    elif isinstance(contract, dict):
+        payload = contract
+    else:
+        payload = {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "version": payload.get("version"),
+        "page_id": payload.get("page_id"),
+        "summary": _json_safe(payload.get("summary") or {}),
+        "error_count": len(payload.get("errors") or []),
+        "errors": _json_safe(payload.get("errors") or []),
+    }
 
 
 def _bbox_xyxy(value: Any) -> tuple[int, int, int, int] | None:

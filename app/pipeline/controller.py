@@ -628,6 +628,7 @@ class PipelineWorker(QtCore.QThread):
             perf_telemetry_root,
             set_count,
             set_timing,
+            write_cleanup_process_debug_artifacts,
             write_perf_timing_artifact,
             write_page_artifacts,
         )
@@ -1165,6 +1166,17 @@ class PipelineWorker(QtCore.QThread):
                     cleanup_mask_module_elapsed = time.time() - cleanup_mask_module_start
                     if debug_context is not None:
                         set_timing(debug_context, "cleanup_mask_build_time", cleanup_mask_module_elapsed)
+                        if not debug_context.get("perf_telemetry_only"):
+                            write_cleanup_process_debug_artifacts(
+                                debug_context,
+                                source_image_path=source_path,
+                                image_size=source_image_size,
+                                text_foreground_segmentation=text_foreground_segmentation_mask,
+                                component_authorization_map=component_authorization_map,
+                                source_glyph_masks=source_glyph_mask_result,
+                                cleanup_job_contracts=cleanup_job_contract_result,
+                                cleanup_mask_contracts=cleanup_mask_contract_result,
+                            )
                     _page014_timeout_checkpoint(
                         "cleanup_mask_build",
                         "end",
@@ -1335,6 +1347,21 @@ class PipelineWorker(QtCore.QThread):
                             cleaned_page_base_record["runtime_render_input_fallback_reason"] = "cleaned_page_base_cache_unavailable"
                         if debug_context is not None:
                             debug_context["cleaned_page_base"] = dict(cleaned_page_base_record)
+                            if not debug_context.get("perf_telemetry_only"):
+                                write_cleanup_process_debug_artifacts(
+                                    debug_context,
+                                    source_image_path=source_path,
+                                    image_size=source_image_size,
+                                    text_foreground_segmentation=text_foreground_segmentation_mask,
+                                    component_authorization_map=component_authorization_map,
+                                    source_glyph_masks=source_glyph_mask_result,
+                                    cleanup_job_contracts=cleanup_job_contract_result,
+                                    cleanup_mask_contracts=cleanup_mask_contract_result,
+                                    cleanup_plan_contracts=cleanup_plan_contract_result,
+                                    cleanup_runtime_contracts=cleanup_runtime_contract_result,
+                                    cleanup_upstream_commit_result=cleanup_upstream_commit_result,
+                                    cleaned_page_base=cleaned_page_base_record,
+                                )
                         if debug_context is not None and not debug_context.get("perf_telemetry_only"):
                             runtime_audit = cleanup_runtime_contract_result.to_audit_dict()
                             commit_audit = cleanup_upstream_commit_result.to_audit_dict()
