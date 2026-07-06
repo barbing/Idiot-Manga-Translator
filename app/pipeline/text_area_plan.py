@@ -169,6 +169,8 @@ REVIEW_BLOCKING_COMPONENT_DEFECT_CODES = {
     "unowned_display_neighbor_conflicts_with_cleanup_authority",
 }
 
+SIDE_CAPTION_TEXT_CHAIN_SUPPORT_DEFECT = "side_caption_projection_without_text_chain_support"
+
 OGKALU_ONLY_SPEECH_AUTHORITY_REASON_TOKENS = (
     "typed_bright_ogkalu_bubble_speech_authority",
     "typed_ogkalu_text_bubble_speech_authority",
@@ -2729,6 +2731,7 @@ def build_text_area_component_authorization_map(
     _component_auth_apply_review_only_caption_guard(components)
     _component_auth_apply_cleanup_obligation_area_bindings(components, cleanup_job_areas)
     _component_auth_apply_terminal_authority_guards(components)
+    _component_auth_apply_side_caption_projection_guards(components)
     _component_auth_assign_groups(str(page_id), components)
     state_counts: Dict[str, int] = {}
     for record in components:
@@ -5179,6 +5182,235 @@ def _component_auth_apply_terminal_authority_guards(records: Sequence[TextAreaCo
             continue
         if record.job_binding_state in {"", "missing_cleanup_job", "non_unique_cleanup_job"}:
             _component_auth_bind_cleanup_job_from_candidates(record)
+
+
+def _component_auth_apply_side_caption_projection_guards(
+    records: Sequence[TextAreaComponentAuthorizationRecord],
+) -> None:
+    """Reject isolated CTD fragments inside broad deterministic side-caption scopes.
+
+    Deterministic side-caption authority is a weak background/caption authority:
+    it tells cleanup which caption text area is executable, but CTD can still
+    report nearby art or background edges inside that broad area. Those pixels
+    need structural support from the vertical text chain before they can remain
+    executable cleanup components.
+    """
+
+    groups: Dict[str, List[TextAreaComponentAuthorizationRecord]] = {}
+    for record in records:
+        if not _component_auth_is_side_caption_projection_guard_candidate(record):
+            continue
+        for key in _component_auth_side_caption_projection_group_keys(record):
+            groups.setdefault(key, []).append(record)
+
+    for group in groups.values():
+        columns = _component_auth_side_caption_supported_columns(group)
+        if not columns:
+            continue
+        for record in group:
+            if not _component_auth_is_side_caption_projection_guard_candidate(record):
+                continue
+            if _component_auth_side_caption_record_has_column_support(record, columns):
+                continue
+            if _component_auth_side_caption_record_has_local_glyph_support(record, group, columns):
+                continue
+            _component_auth_add_contract_diagnostic(
+                record,
+                SIDE_CAPTION_TEXT_CHAIN_SUPPORT_DEFECT,
+                warning=True,
+                defect=True,
+                visual_review=True,
+                candidate_conflict=True,
+            )
+            _component_auth_set_state(
+                record,
+                AUTH_REVIEW_UNKNOWN_NOT_CLEANUP,
+                reason=SIDE_CAPTION_TEXT_CHAIN_SUPPORT_DEFECT,
+            )
+            record.explicit_cleanup_authority = False
+            record.explicit_protected_authority = False
+
+
+def _component_auth_is_side_caption_projection_guard_candidate(
+    record: TextAreaComponentAuthorizationRecord,
+) -> bool:
+    if _component_auth_family(record.authorization_state) != "cleanup":
+        return False
+    if record.sourceglyph_overlap_pixels > 0:
+        return False
+    marker = _component_auth_record_marker(record)
+    if "det_side_caption_" not in marker and "vertical_side_caption" not in marker:
+        return False
+    if not _component_auth_is_weak_background_authority_record(record):
+        return False
+    if _component_auth_has_terminal_protected_projection(record):
+        return False
+    return True
+
+
+def _component_auth_side_caption_projection_group_keys(record: TextAreaComponentAuthorizationRecord) -> List[str]:
+    keys: List[str] = []
+    for source in (
+        record.owning_container_ids,
+        record.cleanup_owner_ids,
+        record.candidate_container_ids,
+        record.semantic_unit_ids,
+    ):
+        for item in source or []:
+            value = str(item or "")
+            if value.startswith("det_side_caption_") and value not in keys:
+                keys.append(value)
+    if keys:
+        return keys
+    if record.owner_cleanup_job_id:
+        return [f"cleanup_job:{record.owner_cleanup_job_id}"]
+    return []
+
+
+def _component_auth_side_caption_supported_columns(
+    records: Sequence[TextAreaComponentAuthorizationRecord],
+) -> List[Dict[str, float]]:
+    metrics = [
+        metric
+        for metric in (_component_auth_side_caption_metric(record) for record in records)
+        if metric is not None
+    ]
+    if len(metrics) < 4:
+        return []
+    seed_metrics = [
+        metric
+        for metric in metrics
+        if metric["pixels"] >= 80.0 and metric["width"] >= 3.0 and metric["height"] >= 8.0
+    ]
+    if len(seed_metrics) < 4:
+        return []
+
+    median_width = _component_auth_median([metric["width"] for metric in seed_metrics]) or 16.0
+    median_height = _component_auth_median([metric["height"] for metric in seed_metrics]) or 24.0
+    center_tolerance = max(10.0, min(18.0, median_width * 0.65))
+
+    raw_clusters: List[List[Dict[str, float]]] = []
+    for metric in sorted(seed_metrics, key=lambda item: item["cx"]):
+        selected: List[Dict[str, float]] | None = None
+        best_distance = float("inf")
+        for cluster in raw_clusters:
+            cluster_center = _component_auth_median([item["cx"] for item in cluster]) or metric["cx"]
+            distance = abs(metric["cx"] - cluster_center)
+            if distance <= center_tolerance and distance < best_distance:
+                selected = cluster
+                best_distance = distance
+        if selected is None:
+            raw_clusters.append([metric])
+        else:
+            selected.append(metric)
+
+    columns: List[Dict[str, float]] = []
+    for cluster in raw_clusters:
+        if len(cluster) < 3:
+            continue
+        y0 = min(item["y0"] for item in cluster)
+        y1 = max(item["y1"] for item in cluster)
+        y_span = y1 - y0
+        if y_span < max(48.0, median_height * 2.2):
+            continue
+        cluster_width = _component_auth_median([item["width"] for item in cluster]) or median_width
+        columns.append(
+            {
+                "cx": _component_auth_median([item["cx"] for item in cluster]) or cluster[0]["cx"],
+                "x_tolerance": max(12.0, min(22.0, cluster_width * 0.75)),
+                "y0": y0,
+                "y1": y1,
+                "y_pad": max(24.0, min(42.0, median_height * 1.35)),
+            }
+        )
+    return columns
+
+
+def _component_auth_side_caption_record_has_column_support(
+    record: TextAreaComponentAuthorizationRecord,
+    columns: Sequence[Mapping[str, float]],
+) -> bool:
+    metric = _component_auth_side_caption_metric(record)
+    if metric is None:
+        return False
+    for column in columns:
+        center = float(column.get("cx") or 0.0)
+        tolerance = float(column.get("x_tolerance") or 0.0)
+        y0 = float(column.get("y0") or 0.0) - float(column.get("y_pad") or 0.0)
+        y1 = float(column.get("y1") or 0.0) + float(column.get("y_pad") or 0.0)
+        if abs(metric["cx"] - center) > tolerance:
+            continue
+        if metric["y1"] < y0 or metric["y0"] > y1:
+            continue
+        return True
+    return False
+
+
+def _component_auth_side_caption_record_has_local_glyph_support(
+    record: TextAreaComponentAuthorizationRecord,
+    group: Sequence[TextAreaComponentAuthorizationRecord],
+    columns: Sequence[Mapping[str, float]],
+) -> bool:
+    metric = _component_auth_side_caption_metric(record)
+    if metric is None:
+        return False
+    if metric["pixels"] > 80.0 and metric["width"] > 10.0:
+        return False
+    for other in group:
+        if other is record:
+            continue
+        if not _component_auth_side_caption_record_has_column_support(other, columns):
+            continue
+        other_metric = _component_auth_side_caption_metric(other)
+        if other_metric is None:
+            continue
+        horizontal_gap = abs(metric["cx"] - other_metric["cx"])
+        vertical_gap = max(0.0, max(other_metric["y0"] - metric["y1"], metric["y0"] - other_metric["y1"]))
+        if horizontal_gap <= 18.0 and vertical_gap <= 24.0:
+            return True
+    return False
+
+
+def _component_auth_side_caption_metric(
+    record: TextAreaComponentAuthorizationRecord,
+) -> Dict[str, float] | None:
+    if len(record.component_bbox or []) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [float(item) for item in record.component_bbox[:4]]
+    except Exception:
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return {
+        "x0": x0,
+        "y0": y0,
+        "x1": x1,
+        "y1": y1,
+        "width": x1 - x0,
+        "height": y1 - y0,
+        "cx": (x0 + x1) * 0.5,
+        "cy": (y0 + y1) * 0.5,
+        "pixels": float(record.component_pixel_count or record.pixel_count or 0),
+    }
+
+
+def _component_auth_median(values: Sequence[float]) -> float:
+    clean: List[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except Exception:
+            continue
+        if math.isfinite(number):
+            clean.append(number)
+    clean.sort()
+    if not clean:
+        return 0.0
+    midpoint = len(clean) // 2
+    if len(clean) % 2:
+        return clean[midpoint]
+    return (clean[midpoint - 1] + clean[midpoint]) * 0.5
 
 
 def _component_auth_resolve_ambiguous_component(record: TextAreaComponentAuthorizationRecord) -> None:
