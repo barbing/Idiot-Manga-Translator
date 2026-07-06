@@ -160,6 +160,7 @@ WEAK_SIDE_BACKGROUND_AUTHORITY_REASON_TOKENS = (
 PROTECTED_BLOCKING_COMPONENT_DEFECT_CODES = {
     "sfx_group_conflicts_with_cleanup_authorization",
     "large_decorative_component_conflicts_with_cleanup_authority",
+    "parent_execution_cleanup_binding_blocked_by_protected_projection",
 }
 
 REVIEW_BLOCKING_COMPONENT_DEFECT_CODES = {
@@ -5140,6 +5141,12 @@ def _component_auth_apply_terminal_authority_guards(records: Sequence[TextAreaCo
             continue
         if _component_auth_family(record.authorization_state) != "cleanup":
             continue
+        if _component_auth_has_terminal_protected_projection(record):
+            _component_auth_fail_closed_to_protected_projection(
+                record,
+                reason="parent_execution_cleanup_binding_blocked_by_protected_projection",
+            )
+            continue
         defect_codes = set(record.component_contract_defect_codes or [])
         if defect_codes & PROTECTED_BLOCKING_COMPONENT_DEFECT_CODES:
             if _component_auth_cleanup_overrides_protected_conflict(record):
@@ -5184,6 +5191,13 @@ def _component_auth_resolve_ambiguous_component(record: TextAreaComponentAuthori
     bounded text-unit authority that is already job-bindable; otherwise
     protected conflicts fail closed as protected SFX/decorative.
     """
+
+    if _component_auth_has_terminal_protected_projection(record):
+        _component_auth_fail_closed_to_protected_projection(
+            record,
+            reason="parent_execution_cleanup_binding_blocked_by_protected_projection",
+        )
+        return
 
     if _component_auth_is_completed_ogkalu_speech_text_run_record(record):
         cleanup_state = _component_auth_cleanup_state_for_record(record)
@@ -5233,6 +5247,8 @@ def _component_auth_resolve_ambiguous_component(record: TextAreaComponentAuthori
 
 
 def _component_auth_cleanup_overrides_protected_conflict(record: TextAreaComponentAuthorizationRecord) -> bool:
+    if _component_auth_has_terminal_protected_projection(record):
+        return False
     if _component_auth_is_parent_execution_bound_cleanup_record(record):
         return True
     if not _component_auth_is_speech_record(record):
@@ -5247,6 +5263,51 @@ def _component_auth_cleanup_overrides_protected_conflict(record: TextAreaCompone
     ):
         return True
     return False
+
+
+def _component_auth_has_terminal_protected_projection(record: TextAreaComponentAuthorizationRecord) -> bool:
+    if not _component_auth_record_has_protected_conflict(record):
+        return False
+    if not _component_auth_has_decorative_evidence(record):
+        return False
+    semantic_kind = str(record.semantic_kind or "").lower()
+    route_intent = str(record.route_intent or "").lower()
+    source_stage = str(record.source_stage or "").lower()
+    confidence_tier = str(record.confidence_tier or "").lower()
+    if semantic_kind in {SEMANTIC_KIND_SFX, SEMANTIC_KIND_DECORATIVE, CONTAINER_SFX}:
+        return True
+    if route_intent == ROUTE_PRESERVE_SFX:
+        return True
+    if (
+        source_stage == "text_area_semantic_unit"
+        and "deterministic_large_sfx_visual_authority" in confidence_tier
+    ):
+        return True
+    return False
+
+
+def _component_auth_fail_closed_to_protected_projection(
+    record: TextAreaComponentAuthorizationRecord,
+    *,
+    reason: str,
+) -> None:
+    _component_auth_add_contract_diagnostic(
+        record,
+        reason,
+        defect=True,
+        visual_review=True,
+        candidate_conflict=True,
+    )
+    _component_auth_set_state(
+        record,
+        AUTH_PROTECT_SFX_DECORATIVE,
+        reason=reason,
+    )
+    record.explicit_cleanup_authority = False
+    record.explicit_protected_authority = True
+    if not record.protection_owner_ids:
+        record.protection_owner_ids = list(record.protection_container_ids or [])
+    record.protected_reason_codes = list(record.reason_codes)
 
 
 def _component_auth_is_parent_execution_bound_cleanup_record(record: TextAreaComponentAuthorizationRecord) -> bool:
