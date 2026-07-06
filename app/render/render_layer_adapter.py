@@ -6,6 +6,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 from app.pipeline.parent_execution_bundle import PARENT_EXECUTION_BUNDLE_VERSION
+from app.render.source_punctuation_hints import source_visual_punctuation_hints
 from app.render.typesetting_contracts import (
     RENDER_LAYER_PLAN_VERSION,
     RenderLayerPlan,
@@ -109,7 +110,7 @@ def render_layer_plan_from_parent_bundle(
         root_id=root_id,
         translated_text=translated_text,
         source_text_summary=_source_text_summary(str(_field(bundle, "source_text") or "")),
-        source_provenance_ref=_source_provenance_ref(bundle),
+        source_provenance_ref=_source_provenance_ref(bundle, cleaned_page_base),
         target_box=target_box,
         hard_bounds=hard_bounds,
         clipping_region_ref=_clipping_region_ref(bundle, execution_region, render_record),
@@ -620,11 +621,12 @@ def _source_text_summary(source_text: str) -> str:
     return text[:77] + "..."
 
 
-def _source_provenance_ref(bundle: Any) -> dict[str, Any]:
-    return {
+def _source_provenance_ref(bundle: Any, cleaned_page_base: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    source_bbox = bbox_from_value(_field(bundle, "source_contract_bbox", []))
+    record = {
         "source_contract_owner": str(_field(bundle, "source_contract_owner") or ""),
         "source_contract_region_id": str(_field(bundle, "source_contract_region_id") or ""),
-        "source_contract_bbox": bbox_from_value(_field(bundle, "source_contract_bbox", [])),
+        "source_contract_bbox": source_bbox,
         "source_contract_scope": str(_field(bundle, "source_contract_scope") or ""),
         "source_contract_stage": str(_field(bundle, "source_contract_stage") or ""),
         "source_contract_ocr_confidence": _field(bundle, "source_contract_ocr_confidence", None),
@@ -636,6 +638,17 @@ def _source_provenance_ref(bundle: Any) -> dict[str, Any]:
         "source_region_ids": copy_jsonish(_field(bundle, "source_region_ids", [])),
         "represented_child_ids": copy_jsonish(_field(bundle, "represented_child_ids", [])),
     }
+    source_image_path = ""
+    if isinstance(cleaned_page_base, Mapping):
+        source_image_path = str(cleaned_page_base.get("source_image_path") or "")
+    hints = source_visual_punctuation_hints(
+        source_text=str(_field(bundle, "source_text") or ""),
+        source_contract_bbox=source_bbox,
+        source_image_path=source_image_path,
+    )
+    if hints:
+        record["source_visual_punctuation_hints"] = hints
+    return record
 
 
 def _clipping_region_ref(

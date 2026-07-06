@@ -1187,21 +1187,33 @@ def _renderer_stage5_page_id(
 
 def _renderer_stage5_cleaned_page_base_ref(image_path: str, debug_context: dict | None) -> dict[str, object]:
     existing = None
+    source_image_path = ""
     if isinstance(debug_context, dict):
         existing = debug_context.get("cleaned_page_base") or debug_context.get("cleaned_page_base_ref")
+        source_image_path = str(
+            debug_context.get("source_image_path")
+            or debug_context.get("source_path")
+            or debug_context.get("original_image_path")
+            or ""
+        )
     if isinstance(existing, dict):
         ref = dict(existing)
         ref.setdefault("image_path", image_path)
         ref.setdefault("valid", os.path.isfile(str(ref.get("image_path") or "")))
         ref.setdefault("stage", "cleaned_page_base")
+        if source_image_path:
+            ref.setdefault("source_image_path", source_image_path)
         return ref
-    return {
+    ref = {
         "cleaned_page_base_version": "cleaned_page_base_runtime_ref_v1",
         "image_path": image_path,
         "valid": os.path.isfile(str(image_path or "")),
         "stage": "cleaned_page_base",
         "source": "render_parent_execution_bundles_input",
     }
+    if source_image_path:
+        ref["source_image_path"] = source_image_path
+    return ref
 
 
 def _stamp_parent_bundle_renderer_audit_ids(

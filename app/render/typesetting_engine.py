@@ -143,6 +143,7 @@ class TypesettingEngine:
                 writing_mode=writing_mode,
                 font_size=font_size,
                 text=normalized,
+                runs=runs,
                 shaped_runs=shaped_runs,
             )
             if writing_mode == "horizontal":
@@ -384,6 +385,7 @@ class TypesettingEngine:
         writing_mode: str,
         font_size: int,
         text: str,
+        runs: Sequence[InlineTextRun],
         shaped_runs: Sequence[ShapedRun],
     ) -> tuple[list[int], dict[str, Any], list[str]]:
         x, y, w, h = target_box
@@ -409,6 +411,18 @@ class TypesettingEngine:
                 shaped_runs,
                 desired_columns=int(vertical_profile.get("desired_columns") or 1),
             )
+            hinted_natural_h = _vertical_source_visual_hint_natural_height(
+                runs=runs,
+                shaped_runs=shaped_runs,
+                policy=self.policy,
+                font_size=font_size,
+                plan=plan,
+                desired_columns=int(vertical_profile.get("desired_columns") or 1),
+                line_height=_line_height(plan.resolved_render_style),
+            )
+            if hinted_natural_h > natural_h:
+                natural_h = hinted_natural_h
+                reason_codes.append("source_visual_punctuation_reserved_vertical_capacity")
             if vertical_profile.get("source_columns"):
                 reason_codes.append("source_column_structure_used_for_vertical_layout")
         else:
@@ -474,7 +488,7 @@ class TypesettingEngine:
     ) -> tuple[list[GlyphPlacement], list[dict[str, Any]], list[dict[str, Any]], list[int], str, list[str]]:
         x, y, w, h = box
         line_height = _line_height(style)
-        items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size)
+        items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size, plan)
         shaped_cell_h = _dominant_vertical_advance(shaped_runs)
         cell_h = max(1.0, shaped_cell_h * line_height)
         cell_h = max(cell_h, max((_vertical_item_cell_height(item) for item in items), default=0.0))
@@ -563,6 +577,7 @@ class TypesettingEngine:
                             "shaped_x_advance_total": float(item.get("x_advance", 0.0)),
                             "shaped_y_advance": float(shaped_glyph.y_advance) if shaped_glyph else 0.0,
                             "shaped_position_authority": bool(shaped_glyph),
+                            "source_visual_hint": dict(item.get("source_visual_hint") or {}),
                         },
                     )
                 )
@@ -597,7 +612,7 @@ class TypesettingEngine:
             dx, dy = _measured_alignment_shift(measured, alignment_center, [x, y, w, h])
             if dx or dy:
                 placements = [_shift_glyph_placement(item, dx, dy) for item in placements]
-                columns = _shift_column_records(columns, dx, dy)
+                columns = _shift_column_records(columns, dx, dy, [x, y, w, h])
                 measured = _union_bounds([item.bbox for item in placements]) or measured
             if columns:
                 for column in columns:
@@ -873,6 +888,29 @@ def _natural_box_size(
     if columns > 1 and _text_has_no_column_start_punctuation(text):
         rows += 1
     return int(max(1, math.ceil(columns * column_width))), int(max(1, math.ceil(rows * cell_height)))
+
+
+def _vertical_source_visual_hint_natural_height(
+    *,
+    runs: Sequence[InlineTextRun],
+    shaped_runs: Sequence[ShapedRun],
+    policy: TypesettingPolicy,
+    font_size: int,
+    plan: RenderLayerPlan,
+    desired_columns: int,
+    line_height: float,
+) -> int:
+    if not runs:
+        return 0
+    items = _vertical_layout_items(runs, shaped_runs, policy, font_size, plan)
+    if not any(item.get("source_visual_hint") for item in items):
+        return 0
+    shaped_cell_h = _dominant_vertical_advance(shaped_runs or [])
+    cell_h = max(1.0, shaped_cell_h * line_height)
+    cell_h = max(cell_h, max((_vertical_item_cell_height(item) for item in items), default=0.0))
+    columns = max(1, min(int(desired_columns or 1), len(items)))
+    rows = max(1, int(math.ceil(_vertical_items_row_units(items) / float(columns))))
+    return int(max(1, math.ceil(rows * cell_h)))
 
 
 def _vertical_layout_profile(
@@ -1521,7 +1559,12 @@ def _shift_glyph_placement(placement: GlyphPlacement, dx: int, dy: int) -> Glyph
     return replace(placement, bbox=shifted_bbox, position=position, metadata=metadata)
 
 
-def _shift_column_records(columns: Sequence[dict[str, Any]], dx: int, dy: int) -> list[dict[str, Any]]:
+def _shift_column_records(
+    columns: Sequence[dict[str, Any]],
+    dx: int,
+    dy: int,
+    bounds_box: Sequence[int] | None = None,
+) -> list[dict[str, Any]]:
     shifted: list[dict[str, Any]] = []
     for column in columns:
         item = dict(column)
@@ -1534,6 +1577,12 @@ def _shift_column_records(columns: Sequence[dict[str, Any]], dx: int, dy: int) -
         centered = bbox_from_value(item.get("centered_block_box"))
         if centered:
             item["centered_block_box"] = [centered[0] + int(dx), centered[1] + int(dy), centered[2], centered[3]]
+        if bounds_box:
+            display_box = bbox_from_value([item.get("x"), item.get("y"), item.get("width"), item.get("height")])
+            if display_box:
+                clipped = _clamp_box(display_box, bounds_box)
+                item["x"], item["y"], item["width"], item["height"] = clipped
+                item["clipped_to_hard_bounds"] = bool(item.get("clipped_to_hard_bounds")) or clipped != display_box
         shifted.append(item)
     return shifted
 
@@ -1550,13 +1599,21 @@ def _chosen_breaks(lines: Sequence[dict[str, Any]], columns: Sequence[dict[str, 
     ]
 
 
-def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[ShapedRun], policy: TypesettingPolicy, font_size: int) -> list[dict[str, Any]]:
+def _vertical_layout_items(
+    runs: Sequence[InlineTextRun],
+    shaped_runs: Sequence[ShapedRun],
+    policy: TypesettingPolicy,
+    font_size: int,
+    plan: RenderLayerPlan | None = None,
+) -> list[dict[str, Any]]:
     shaped_by_run = {
         str(run.metadata.get("run_id") or ""): run
         for run in shaped_runs
         if str(run.metadata.get("run_id") or "")
     }
     items: list[dict[str, Any]] = []
+    dash_hints = _source_visual_units_by_kind(plan, "dash")
+    dash_ordinal = 0
     for run in runs:
         if run.role == "space":
             continue
@@ -1565,6 +1622,14 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
         if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
             item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
             row_units = _vertical_sequence_row_units(run)
+            visual_hint: dict[str, Any] = {}
+            if run.role == "dash_sequence":
+                visual_hint = dict(dash_hints.get(dash_ordinal) or {})
+                dash_ordinal += 1
+                hinted_units = float(visual_hint.get("visual_units") or 0.0)
+                if hinted_units > row_units:
+                    row_units = min(4.5, max(row_units, hinted_units))
+                    item_height = max(float(item_height), float(font_size) * float(row_units))
             items.append(
                 {
                     "text": run.text,
@@ -1576,6 +1641,7 @@ def _vertical_layout_items(runs: Sequence[InlineTextRun], shaped_runs: Sequence[
                     "height": item_height,
                     "row_units": row_units,
                     "x_advance": x_advance,
+                    "source_visual_hint": visual_hint,
                 }
             )
             continue
@@ -1629,6 +1695,31 @@ def _vertical_sequence_row_units(run: InlineTextRun) -> float:
     if run.role in {"dash_sequence", "wave_sequence"}:
         return float(max(1, len(grapheme_clusters(run.text))))
     return 1.0
+
+
+def _source_visual_units_by_kind(plan: RenderLayerPlan | None, kind: str) -> dict[int, dict[str, Any]]:
+    if not isinstance(plan, RenderLayerPlan):
+        return {}
+    provenance = plan.source_provenance_ref if isinstance(plan.source_provenance_ref, Mapping) else {}
+    hint_record = provenance.get("source_visual_punctuation_hints") if isinstance(provenance, Mapping) else {}
+    hints = hint_record.get("hints") if isinstance(hint_record, Mapping) else []
+    result: dict[int, dict[str, Any]] = {}
+    if not isinstance(hints, Sequence) or isinstance(hints, (str, bytes, bytearray)):
+        return result
+    for item in hints:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("kind") or "") != kind:
+            continue
+        try:
+            ordinal = int(item.get("source_ordinal") or 0)
+            visual_units = float(item.get("visual_units") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if visual_units <= 1.0:
+            continue
+        result[ordinal] = dict(item)
+    return result
 
 
 def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: TypesettingPolicy, font_size: int) -> tuple[float, float, float]:
