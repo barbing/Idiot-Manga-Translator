@@ -84,6 +84,9 @@ MASK_READY = "mask_ready"
 MASK_NOT_READY = "mask_not_ready"
 MASK_NOT_APPLICABLE = "mask_not_applicable"
 COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON = "component_final_mask_authority_withheld_until_projection_ready"
+COMPONENT_PARENT_EXECUTION_BOUNDARY_REQUIRED_REASON = "component_cleanup_authority_requires_parent_execution_boundary"
+COMPONENT_PARENT_EXECUTION_BOUNDARY_PREFERRED_REASON = "component_cleanup_authority_prefers_parent_execution_boundary"
+COMPONENT_PARENT_EXECUTION_BOUNDARY_BLOCKED_REASON = "component_cleanup_authority_blocked_by_parent_execution_boundary"
 
 COMPONENT_AUTHORIZATION_STATES = {
     AUTH_CLEANUP_TRANSLATE_SPEECH,
@@ -3749,6 +3752,104 @@ def _component_auth_semantic_units(candidates: Sequence[Mapping[str, Any]]) -> L
     return values
 
 
+def _component_auth_candidate_is_parent_execution_scope(candidate: Mapping[str, Any]) -> bool:
+    source_kind = str(candidate.get("source_kind") or "").lower()
+    if source_kind == "parent_execution_bundle":
+        return True
+    origin = str(candidate.get("authorization_field_origin") or "").lower()
+    if "parent_execution_bundle" in origin:
+        return True
+    basis = str(candidate.get("authorization_basis") or "").lower()
+    if "parent_execution_bundle" in basis or "finalized_parent_execution_bundle" in basis:
+        return True
+    region_id = str(candidate.get("region_id") or "")
+    semantic_unit_id = str(candidate.get("semantic_unit_id") or "")
+    return (
+        region_id.startswith("tap_parent_")
+        or region_id.startswith("parent_")
+        or semantic_unit_id.startswith("parent_execution_region_")
+    )
+
+
+def _component_auth_cleanup_candidate_requires_parent_execution_boundary(candidate: Mapping[str, Any]) -> bool:
+    if candidate.get("family") != "cleanup" or not bool(candidate.get("explicit_cleanup_authority")):
+        return False
+    if _component_auth_candidate_is_parent_execution_scope(candidate):
+        return True
+    for key in ("cleanup_job_ids", "scope_cleanup_job_ids", "candidate_cleanup_job_ids"):
+        for job_id in candidate.get(key) or []:
+            text = str(job_id or "")
+            if "tap_parent_" in text or "parent_" in text:
+                return True
+    return False
+
+
+def _component_auth_parent_execution_candidate_supports_cleanup(candidate: Mapping[str, Any]) -> bool:
+    if not _component_auth_candidate_is_parent_execution_scope(candidate):
+        return False
+    overlap_pixels = int(candidate.get("overlap_pixels") or 0)
+    overlap_ratio = float(candidate.get("overlap_ratio") or 0.0)
+    centroid_inside = bool(candidate.get("centroid_inside"))
+    if overlap_pixels <= 0:
+        return False
+    if overlap_ratio >= 0.45:
+        return True
+    if centroid_inside and overlap_ratio >= 0.25:
+        return True
+    return False
+
+
+def _component_auth_parent_execution_boundary_filtered_units(
+    semantic_units: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    accepted_units = [dict(item) for item in semantic_units if bool(item.get("eligible"))]
+    cleanup_units = [
+        item
+        for item in accepted_units
+        if item.get("family") == "cleanup" and bool(item.get("explicit_cleanup_authority"))
+    ]
+    if not cleanup_units:
+        return accepted_units, []
+
+    parent_cleanup_units = [
+        item
+        for item in cleanup_units
+        if _component_auth_parent_execution_candidate_supports_cleanup(item)
+    ]
+    parent_boundary_required = any(
+        _component_auth_cleanup_candidate_requires_parent_execution_boundary(item)
+        for item in semantic_units
+    )
+    if parent_cleanup_units:
+        filtered: List[Dict[str, Any]] = []
+        for item in accepted_units:
+            if (
+                item.get("family") == "cleanup"
+                and bool(item.get("explicit_cleanup_authority"))
+                and not _component_auth_candidate_is_parent_execution_scope(item)
+                and _component_auth_cleanup_candidate_requires_parent_execution_boundary(item)
+            ):
+                continue
+            filtered.append(item)
+        if len(filtered) != len(accepted_units):
+            return filtered, [COMPONENT_PARENT_EXECUTION_BOUNDARY_PREFERRED_REASON]
+        return accepted_units, []
+
+    if parent_boundary_required:
+        filtered = [
+            item
+            for item in accepted_units
+            if not (
+                item.get("family") == "cleanup"
+                and bool(item.get("explicit_cleanup_authority"))
+                and _component_auth_cleanup_candidate_requires_parent_execution_boundary(item)
+            )
+        ]
+        return filtered, [COMPONENT_PARENT_EXECUTION_BOUNDARY_REQUIRED_REASON]
+
+    return accepted_units, []
+
+
 def _component_auth_projection_quality(
     *,
     semantic_units: Sequence[Mapping[str, Any]],
@@ -3813,7 +3914,9 @@ def _component_auth_record(
     candidates: Sequence[Mapping[str, Any]],
 ) -> TextAreaComponentAuthorizationRecord:
     semantic_units = _component_auth_semantic_units(candidates)
-    accepted_semantic_units = [item for item in semantic_units if bool(item.get("eligible"))]
+    accepted_semantic_units, parent_boundary_reason_codes = _component_auth_parent_execution_boundary_filtered_units(
+        semantic_units
+    )
     cleanup_candidates = [
         item
         for item in accepted_semantic_units
@@ -3936,6 +4039,9 @@ def _component_auth_record(
     if not semantic_units and "no_upstream_text_area_authorization" not in reason_codes:
         reason_codes.append("no_upstream_text_area_authorization")
     for reason in ambiguity_reasons + projection_quality_reasons:
+        if reason and reason not in reason_codes:
+            reason_codes.append(reason)
+    for reason in parent_boundary_reason_codes:
         if reason and reason not in reason_codes:
             reason_codes.append(reason)
     selected_cleanup_candidates = (
@@ -5145,6 +5251,34 @@ def _component_auth_record_cleanup_job_ids(record: TextAreaComponentAuthorizatio
     return output
 
 
+def _component_auth_record_requires_parent_execution_boundary(record: TextAreaComponentAuthorizationRecord) -> bool:
+    reasons = set(record.reason_codes or [])
+    if COMPONENT_PARENT_EXECUTION_BOUNDARY_REQUIRED_REASON in reasons:
+        return True
+    if COMPONENT_PARENT_EXECUTION_BOUNDARY_PREFERRED_REASON in reasons:
+        return True
+    return False
+
+
+def _component_auth_record_has_supported_parent_execution_boundary(record: TextAreaComponentAuthorizationRecord) -> bool:
+    source_marker = " ".join(
+        [
+            str(record.source_stage or ""),
+            str(record.authorization_field_origin or ""),
+            " ".join(record.owning_region_ids or []),
+        ]
+    ).lower()
+    if "parent_execution_bundle" not in source_marker and not any(
+        str(item or "").startswith("tap_parent_") or str(item or "").startswith("parent_")
+        for item in record.owning_region_ids or []
+    ):
+        return False
+    if int(record.overlap_pixels or 0) <= 0:
+        return False
+    ratio = float(record.overlap_ratio or 0.0)
+    return ratio >= 0.45
+
+
 def _component_auth_apply_terminal_authority_guards(records: Sequence[TextAreaComponentAuthorizationRecord]) -> None:
     """Resolve blocking contract defects before CleanupMask consumption.
 
@@ -5160,6 +5294,17 @@ def _component_auth_apply_terminal_authority_guards(records: Sequence[TextAreaCo
             _component_auth_resolve_ambiguous_component(record)
             continue
         if _component_auth_family(record.authorization_state) != "cleanup":
+            continue
+        if (
+            _component_auth_record_requires_parent_execution_boundary(record)
+            and not _component_auth_record_has_supported_parent_execution_boundary(record)
+        ):
+            _component_auth_set_state(
+                record,
+                AUTH_REVIEW_UNKNOWN_NOT_CLEANUP,
+                reason=COMPONENT_PARENT_EXECUTION_BOUNDARY_BLOCKED_REASON,
+            )
+            record.explicit_cleanup_authority = False
             continue
         if _component_auth_has_terminal_protected_projection(record):
             _component_auth_fail_closed_to_protected_projection(
