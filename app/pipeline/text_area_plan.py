@@ -5369,12 +5369,31 @@ def _component_auth_apply_side_caption_projection_guards(
         columns = _component_auth_side_caption_supported_columns(group)
         if not columns:
             continue
+        supported_record_ids = {
+            id(record)
+            for record in group
+            if _component_auth_is_side_caption_projection_guard_candidate(record)
+            and _component_auth_side_caption_record_has_column_support(record, columns)
+        }
+        changed = True
+        while changed:
+            changed = False
+            for record in group:
+                if id(record) in supported_record_ids:
+                    continue
+                if not _component_auth_is_side_caption_projection_guard_candidate(record):
+                    continue
+                if _component_auth_side_caption_record_has_supported_local_glyph_support(
+                    record,
+                    group,
+                    supported_record_ids,
+                ):
+                    supported_record_ids.add(id(record))
+                    changed = True
         for record in group:
             if not _component_auth_is_side_caption_projection_guard_candidate(record):
                 continue
-            if _component_auth_side_caption_record_has_column_support(record, columns):
-                continue
-            if _component_auth_side_caption_record_has_local_glyph_support(record, group, columns):
+            if id(record) in supported_record_ids:
                 continue
             _component_auth_add_contract_diagnostic(
                 record,
@@ -5508,10 +5527,10 @@ def _component_auth_side_caption_record_has_column_support(
     return False
 
 
-def _component_auth_side_caption_record_has_local_glyph_support(
+def _component_auth_side_caption_record_has_supported_local_glyph_support(
     record: TextAreaComponentAuthorizationRecord,
     group: Sequence[TextAreaComponentAuthorizationRecord],
-    columns: Sequence[Mapping[str, float]],
+    supported_record_ids: set[int],
 ) -> bool:
     metric = _component_auth_side_caption_metric(record)
     if metric is None:
@@ -5521,10 +5540,12 @@ def _component_auth_side_caption_record_has_local_glyph_support(
     for other in group:
         if other is record:
             continue
-        if not _component_auth_side_caption_record_has_column_support(other, columns):
+        if id(other) not in supported_record_ids:
             continue
         other_metric = _component_auth_side_caption_metric(other)
         if other_metric is None:
+            continue
+        if other_metric["pixels"] > 120.0 and other_metric["width"] > 14.0:
             continue
         horizontal_gap = abs(metric["cx"] - other_metric["cx"])
         vertical_gap = max(0.0, max(other_metric["y0"] - metric["y1"], metric["y0"] - other_metric["y1"]))
