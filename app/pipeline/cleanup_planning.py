@@ -2926,13 +2926,11 @@ def execute_cleanup_runtime_plan(
     commit_mask = commit_mask_source
     if model_required:
         model_backend_mask = _standardized_model_inpaint_support_mask(backend_erase_mask)
-        model_commit_mask = _standardized_model_inpaint_support_mask(commit_mask_source)
         if model_backend_mask is not None and np is not None and np.any(model_backend_mask > 0):
             backend_erase_mask = model_backend_mask
             debug_info["model_inpaint_mask_prepared"] = True
             debug_info["model_inpaint_mask_standardization"] = "cleanup_runtime_support_mask"
-        if model_commit_mask is not None and np is not None and np.any(model_commit_mask > 0):
-            commit_mask = model_commit_mask
+        debug_info["model_inpaint_commit_surface"] = "candidate_safe_core_plus_support"
     if backend_context_executable_input_used:
         debug_info["backend_context_commit_scope"] = "same_root_accepted_mask_union"
     else:
@@ -2972,6 +2970,18 @@ def execute_cleanup_runtime_plan(
     raw_cleaned_image = None
     cleaned_image = None
     if result_space == "crop":
+        if model_required:
+            safe_commit_mask, safe_commit_metrics = _safe_model_inpaint_commit_mask(
+                before=image,
+                candidate=raw_cleaned_crop,
+                crop_bbox=operation_bbox,
+                core_mask=commit_mask_source,
+                support_mask=backend_erase_mask,
+                cleanup_class=cleanup_plan.cleanup_class,
+            )
+            if safe_commit_mask is not None:
+                commit_mask = safe_commit_mask
+                debug_info.update(safe_commit_metrics)
         cleaned_crop = _clip_cleaned_crop_to_authorized_mask(
             before=image,
             candidate_crop=raw_cleaned_crop,
@@ -2983,6 +2993,18 @@ def execute_cleanup_runtime_plan(
     else:
         raw_cleaned_image = execution.cleaned_image or image
         raw_backend_output_hash = _hash_image(raw_cleaned_image)
+        if model_required:
+            safe_commit_mask, safe_commit_metrics = _safe_model_inpaint_commit_mask(
+                before=image,
+                candidate=raw_cleaned_image,
+                crop_bbox=None,
+                core_mask=commit_mask_source,
+                support_mask=backend_erase_mask,
+                cleanup_class=cleanup_plan.cleanup_class,
+            )
+            if safe_commit_mask is not None:
+                commit_mask = safe_commit_mask
+                debug_info.update(safe_commit_metrics)
         cleaned_image = _clip_cleaned_candidate_to_authorized_mask(
             before=image,
             candidate=raw_cleaned_image,
@@ -3183,6 +3205,23 @@ def execute_cleanup_runtime_plan(
             "model_inpaint_mask_standardization": str(
                 debug_info.get("model_inpaint_mask_standardization") or ""
             ),
+            "model_inpaint_commit_surface": str(
+                debug_info.get("model_inpaint_commit_surface") or ""
+            ),
+            "model_inpaint_commit_guard": str(
+                debug_info.get("model_inpaint_commit_guard") or ""
+            ),
+            "model_inpaint_core_commit_pixels": debug_info.get("model_inpaint_core_commit_pixels"),
+            "model_inpaint_support_pixels": debug_info.get("model_inpaint_support_pixels"),
+            "model_inpaint_support_ring_pixels": debug_info.get("model_inpaint_support_ring_pixels"),
+            "model_inpaint_safe_support_ring_pixels": debug_info.get("model_inpaint_safe_support_ring_pixels"),
+            "model_inpaint_suppressed_support_ring_pixels": debug_info.get(
+                "model_inpaint_suppressed_support_ring_pixels"
+            ),
+            "model_inpaint_suppressed_core_pixels": debug_info.get(
+                "model_inpaint_suppressed_core_pixels"
+            ),
+            "model_inpaint_commit_pixels": debug_info.get("model_inpaint_commit_pixels"),
             "backend_elapsed_ms": debug_info.get("backend_elapsed_ms"),
             "model_call_elapsed_ms": debug_info.get("model_call_elapsed_ms"),
             "model_load_elapsed_ms": debug_info.get("model_load_elapsed_ms"),
@@ -3868,6 +3907,112 @@ def _standardized_model_inpaint_support_mask(mask: Any) -> Any | None:
         return output
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
     return cv2.dilate(binary, kernel, iterations=2)
+
+
+def _safe_model_inpaint_commit_mask(
+    *,
+    before: Any,
+    candidate: Any,
+    crop_bbox: Sequence[int] | None,
+    core_mask: Any,
+    support_mask: Any,
+    cleanup_class: CleanupClass | str | None = None,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Build the page-space model commit surface from candidate pixels.
+
+    The model may receive a wider support mask for context, but runtime commit
+    must not blindly write that whole support region back. Core accepted erase
+    pixels normally commit. For speech-bubble cleanup, bright core padding and
+    support-ring pixels are withheld when the model output visibly darkens them.
+    For non-speech cleanup, support-ring pixels are still committed on textured
+    caption/background surfaces so bright text outlines can be erased; the guard
+    only applies when the source support area is itself a flat bright surface.
+    """
+
+    metrics: dict[str, Any] = {
+        "model_inpaint_commit_surface": "candidate_safe_core_plus_support",
+        "model_inpaint_commit_guard": "suppress_darkened_bright_support_ring",
+    }
+    if np is None:
+        return None, metrics
+    before_np = _image_to_rgb_array(before)
+    candidate_np = _image_to_rgb_array(candidate)
+    if before_np is None or candidate_np is None:
+        return None, metrics
+    page_shape = tuple(int(v) for v in before_np.shape[:2])
+    core = _binary_mask(core_mask, page_shape)
+    support = _binary_mask(support_mask, page_shape)
+    if core is None or not np.any(core > 0):
+        return None, metrics
+    if support is None or not np.any(support > 0):
+        support = core.copy()
+
+    candidate_page = candidate_np
+    box = _valid_bbox(crop_bbox)
+    if candidate_np.shape[:2] != before_np.shape[:2]:
+        if box is None:
+            return None, metrics
+        x0, y0, x1, y1 = box
+        if tuple(candidate_np.shape[:2]) != (y1 - y0, x1 - x0):
+            return None, metrics
+        candidate_page = before_np.copy()
+        candidate_page[y0:y1, x0:x1] = candidate_np
+    elif candidate_np.shape != before_np.shape:
+        return None, metrics
+
+    core_bool = core > 0
+    support_bool = support > 0
+    support_ring = support_bool & ~core_bool
+    before_gray = _gray(before_np)
+    candidate_gray = _gray(candidate_page)
+    cleanup_class_value = _enum_value(cleanup_class)
+    speech_bubble_core_guard = cleanup_class_value in {
+        CleanupClass.SPEECH_FLAT_BUBBLE.value,
+        CleanupClass.SPEECH_COMPLEX_BUBBLE.value,
+    }
+    bright_source = before_gray >= 220
+    darkened_candidate = (candidate_gray + 8 < before_gray) & (candidate_gray < 230)
+    support_values = before_gray[support_bool]
+    if support_values.size:
+        support_bright_ratio = float(np.count_nonzero(support_values >= 220)) / float(support_values.size)
+        support_dark_ratio = float(np.count_nonzero(support_values <= 96)) / float(support_values.size)
+    else:
+        support_bright_ratio = 0.0
+        support_dark_ratio = 0.0
+    flat_bright_support_context = bool(
+        support_bright_ratio >= 0.82 and support_dark_ratio <= 0.04
+    )
+    support_ring_guard = bool(speech_bubble_core_guard or flat_bright_support_context)
+    unsafe_ring = (
+        support_ring & bright_source & darkened_candidate
+        if support_ring_guard
+        else np.zeros(page_shape, dtype=bool)
+    )
+    safe_ring = support_ring & ~unsafe_ring
+    unsafe_core = (
+        core_bool & bright_source & darkened_candidate
+        if speech_bubble_core_guard
+        else np.zeros(page_shape, dtype=bool)
+    )
+
+    commit = np.zeros(page_shape, dtype=np.uint8)
+    commit[core_bool & ~unsafe_core] = 255
+    commit[safe_ring] = 255
+    metrics.update(
+        {
+            "model_inpaint_core_commit_pixels": int(np.count_nonzero(core_bool)),
+            "model_inpaint_support_pixels": int(np.count_nonzero(support_bool)),
+            "model_inpaint_support_ring_pixels": int(np.count_nonzero(support_ring)),
+            "model_inpaint_safe_support_ring_pixels": int(np.count_nonzero(safe_ring)),
+            "model_inpaint_suppressed_support_ring_pixels": int(np.count_nonzero(unsafe_ring)),
+            "model_inpaint_suppressed_core_pixels": int(np.count_nonzero(unsafe_core)),
+            "model_inpaint_commit_pixels": int(np.count_nonzero(commit)),
+            "model_inpaint_support_bright_ratio": round(support_bright_ratio, 6),
+            "model_inpaint_support_dark_ratio": round(support_dark_ratio, 6),
+            "model_inpaint_support_ring_guard": bool(support_ring_guard),
+        }
+    )
+    return commit, metrics
 
 
 def _model_required_for_plan(cleanup_plan: CleanupPlan, cleanup_mask: CleanupMask) -> bool:
