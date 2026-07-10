@@ -616,6 +616,7 @@ class PipelineWorker(QtCore.QThread):
         from app.pipeline.source_glyph_masks import generate_source_glyph_masks_for_parent_bundles
         from app.pipeline.text_area_plan import build_text_area_component_authorization_map
         from app.pipeline.debug_artifacts import (
+            append_perf_timing_overhead_artifact,
             debug_enabled,
             debug_pages,
             debug_root,
@@ -642,14 +643,20 @@ class PipelineWorker(QtCore.QThread):
         debug_page_filter = debug_pages(self._settings) if debug_artifacts_enabled else set()
         debug_artifacts_root = debug_root(self._settings) if debug_artifacts_enabled else ""
         perf_telemetry_output_root = perf_telemetry_root(self._settings) if perf_telemetry_is_enabled else ""
+        worker_initialization: dict[str, Any] = {}
         if debug_artifacts_enabled:
             self.message.emit(f"Debug artifacts enabled: {debug_artifacts_root}")
         if perf_telemetry_is_enabled:
             self.message.emit(f"Performance telemetry enabled: {perf_telemetry_output_root}")
         try:
             try:
+                ocr_initialization_start = time.perf_counter()
                 ocr_engine = _create_selected_ocr_engine(self._settings, self.message.emit)
                 self._settings.ocr_engine = _normalize_ocr_engine_name(self._settings.ocr_engine)
+                if perf_telemetry_is_enabled:
+                    worker_initialization["ocr_engine_initialization_time"] = (
+                        time.perf_counter() - ocr_initialization_start
+                    )
             except Exception as inner_exc:
                 self.message.emit(_friendly_model_error(inner_exc))
                 return
@@ -663,6 +670,7 @@ class PipelineWorker(QtCore.QThread):
                     font_detector = None
 
             try:
+                detector_initialization_start = time.perf_counter()
                 if self._settings.detector_engine != "ComicTextDetector":
                     self.message.emit(
                         f"Detector '{self._settings.detector_engine}' is no longer available; using ComicTextDetector."
@@ -670,12 +678,17 @@ class PipelineWorker(QtCore.QThread):
                     self._settings.detector_engine = "ComicTextDetector"
                 from app.detect.comic_text_detector import ComicTextDetector
                 detector = ComicTextDetector(self._settings.use_gpu)
+                if perf_telemetry_is_enabled:
+                    worker_initialization["detector_initialization_time"] = (
+                        time.perf_counter() - detector_initialization_start
+                    )
             except Exception as exc:
                 self.message.emit(_friendly_model_error(exc))
                 return
             background_detector = detector if not self._settings.filter_background else None
 
             try:
+                translator_initialization_start = time.perf_counter()
                 if self._settings.translator_backend == "GGUF":
                     from app.translate.gguf_client import GGUFClient
                     n_gpu_layers = self._settings.gguf_n_gpu_layers
@@ -710,6 +723,10 @@ class PipelineWorker(QtCore.QThread):
                     if not ollama.is_available():
                         self.message.emit("Ollama server is not running. Start it with: ollama serve")
                         return
+                if perf_telemetry_is_enabled:
+                    worker_initialization["translator_initialization_time"] = (
+                        time.perf_counter() - translator_initialization_start
+                    )
             except Exception as exc:
                 self.message.emit(_friendly_model_error(exc))
                 return
@@ -847,12 +864,16 @@ class PipelineWorker(QtCore.QThread):
                         "Cleanup model warmup completed before first page "
                         f"({cleanup_model_warmup_record.get('elapsed_ms')} ms)."
                     )
+            if perf_telemetry_is_enabled:
+                worker_initialization["pre_page_setup_time"] = time.time() - start_time
+                worker_initialization["cleanup_model_warmup_time"] = cleanup_model_warmup_elapsed
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
                     self.message.emit("Stopped")
                     return
 
                 page_start = time.time()
+                page_process_cpu_start = time.process_time() if perf_telemetry_is_enabled else 0.0
                 self.queue_item.emit(index - 1, "processing")
                 self.page_changed.emit(index, total)
 
@@ -869,6 +890,8 @@ class PipelineWorker(QtCore.QThread):
                     )
                 elif perf_telemetry_is_enabled:
                     debug_context = new_perf_page_context(name, source_path, output_path, perf_telemetry_output_root)
+                if debug_context is not None and perf_telemetry_is_enabled and index == 1:
+                    debug_context["worker_initialization"] = dict(worker_initialization)
                 if debug_context is not None and cleanup_model_warmup_record:
                     debug_context["cleanup_model_warmup"] = cleanup_model_warmup_record
                     set_timing(
@@ -1701,14 +1724,7 @@ class PipelineWorker(QtCore.QThread):
                 page_elapsed = time.time() - page_start
                 if debug_context is not None:
                     set_timing(debug_context, "total_page_time", page_elapsed)
-                if perf_telemetry_is_enabled and debug_context is not None:
-                    try:
-                        write_perf_timing_artifact(
-                            debug_context,
-                            execution_regions if parent_execution_bundles else regions,
-                        )
-                    except Exception as exc:
-                        self.message.emit(f"Failed to write performance telemetry for {name}: {exc}")
+                    set_timing(debug_context, "page_functional_time", page_elapsed)
                 if debug_artifacts_enabled and debug_context is not None:
                     try:
                         artifact_start = time.time()
@@ -1745,21 +1761,64 @@ class PipelineWorker(QtCore.QThread):
 
                 # --- PER-PAGE MEMORY CLEANUP ---
                 # Prevent memory accumulation over long chapters (fixes 2GB+ leak)
+                memory_maintenance_start = time.perf_counter() if perf_telemetry_is_enabled else 0.0
                 try:
                     del regions
                 except NameError:
                     pass
                 import gc
+                python_gc_start = time.perf_counter() if perf_telemetry_is_enabled else 0.0
                 gc.collect()
+                python_gc_time = (
+                    time.perf_counter() - python_gc_start
+                    if perf_telemetry_is_enabled
+                    else 0.0
+                )
 
                 # Clear CUDA cache every 5 pages to balance speed vs memory
+                cuda_cache_clear_time = 0.0
                 if self._settings.use_gpu and index % 5 == 0:
                     try:
                         import torch
                         if torch.cuda.is_available():
+                            cuda_cache_start = time.perf_counter() if perf_telemetry_is_enabled else 0.0
                             torch.cuda.empty_cache()
+                            if perf_telemetry_is_enabled:
+                                cuda_cache_clear_time = time.perf_counter() - cuda_cache_start
                     except Exception:
                         pass
+
+                if perf_telemetry_is_enabled and debug_context is not None:
+                    memory_maintenance_time = time.perf_counter() - memory_maintenance_start
+                    page_cycle_time = time.time() - page_start
+                    set_timing(debug_context, "python_gc_time", python_gc_time)
+                    set_timing(debug_context, "cuda_cache_clear_time", cuda_cache_clear_time)
+                    set_timing(debug_context, "memory_maintenance_time", memory_maintenance_time)
+                    set_timing(debug_context, "page_cycle_time", page_cycle_time)
+                    set_timing(
+                        debug_context,
+                        "page_postprocess_time",
+                        max(0.0, page_cycle_time - page_elapsed),
+                    )
+                    set_timing(
+                        debug_context,
+                        "page_process_cpu_time",
+                        max(0.0, time.process_time() - page_process_cpu_start),
+                    )
+                    try:
+                        telemetry_write_start = time.perf_counter()
+                        write_perf_timing_artifact(
+                            debug_context,
+                            execution_regions if parent_execution_bundles else page_record.get("regions", []),
+                        )
+                        telemetry_write_time = time.perf_counter() - telemetry_write_start
+                        append_perf_timing_overhead_artifact(
+                            debug_context,
+                            telemetry_artifact_write_time=telemetry_write_time,
+                            observed_page_cycle_with_telemetry=time.time() - page_start,
+                        )
+                    except Exception as exc:
+                        self.message.emit(f"Failed to write performance telemetry for {name}: {exc}")
 
             project["pages"] = pages
             json_path = self._settings.json_path or os.path.join(self._settings.export_dir, "project.json")
@@ -2774,6 +2833,62 @@ def _is_valid_japanese(text: str) -> float:
             valid += 1
     return valid / len(text) if text else 0.0
 
+
+def _record_perf_ocr_request(
+    debug_context: dict | None,
+    *,
+    trace_context: dict | None,
+    crop,
+    elapsed_seconds: float,
+    failed: bool,
+) -> None:
+    if not debug_context or not debug_context.get("perf_telemetry_only"):
+        return
+    trace = trace_context or {}
+    attempt_kind = str(trace.get("attempt_kind") or "unclassified_ocr")
+    width = 0
+    height = 0
+    try:
+        width, height = [int(value) for value in crop.size]
+    except Exception:
+        pass
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    summary = debug_context.setdefault(
+        "ocr_request_summary",
+        {
+            "request_count": 0,
+            "failed_count": 0,
+            "total_latency_sec": 0.0,
+            "max_latency_sec": 0.0,
+            "attempt_kinds": {},
+        },
+    )
+    summary["request_count"] = int(summary.get("request_count") or 0) + 1
+    summary["failed_count"] = int(summary.get("failed_count") or 0) + (1 if failed else 0)
+    summary["total_latency_sec"] = float(summary.get("total_latency_sec") or 0.0) + elapsed
+    summary["max_latency_sec"] = max(float(summary.get("max_latency_sec") or 0.0), elapsed)
+    kinds = summary.setdefault("attempt_kinds", {})
+    entry = kinds.setdefault(
+        attempt_kind,
+        {
+            "request_count": 0,
+            "failed_count": 0,
+            "total_latency_sec": 0.0,
+            "max_latency_sec": 0.0,
+            "total_crop_area": 0,
+            "max_crop_area": 0,
+        },
+    )
+    area = max(0, width * height)
+    entry["request_count"] = int(entry.get("request_count") or 0) + 1
+    entry["failed_count"] = int(entry.get("failed_count") or 0) + (1 if failed else 0)
+    entry["total_latency_sec"] = float(entry.get("total_latency_sec") or 0.0) + elapsed
+    entry["max_latency_sec"] = max(float(entry.get("max_latency_sec") or 0.0), elapsed)
+    entry["total_crop_area"] = int(entry.get("total_crop_area") or 0) + area
+    entry["max_crop_area"] = max(int(entry.get("max_crop_area") or 0), area)
+    debug_context.setdefault("counts", {})["ocr_request_count"] = int(summary["request_count"])
+
+
 def _recognize_with_fallback(
     ocr_engine,
     crop,
@@ -2815,11 +2930,30 @@ def _recognize_with_fallback(
             print(f"[OCR DEBUG] Failed to save crop: {crop_error}")
         _ocr_debug_counter += 1
 
-    if hasattr(ocr_engine, "recognize_with_confidence"):
-        text, conf = ocr_engine.recognize_with_confidence(crop)
-    else:
-        text = ocr_engine.recognize(crop)
-        conf = 1.0
+    perf_ocr_start = (
+        time.perf_counter()
+        if debug_context and debug_context.get("perf_telemetry_only")
+        else None
+    )
+    ocr_failed = False
+    try:
+        if hasattr(ocr_engine, "recognize_with_confidence"):
+            text, conf = ocr_engine.recognize_with_confidence(crop)
+        else:
+            text = ocr_engine.recognize(crop)
+            conf = 1.0
+    except Exception:
+        ocr_failed = True
+        raise
+    finally:
+        if perf_ocr_start is not None:
+            _record_perf_ocr_request(
+                debug_context,
+                trace_context=trace_context,
+                crop=crop,
+                elapsed_seconds=time.perf_counter() - perf_ocr_start,
+                failed=ocr_failed,
+            )
 
     if settings and getattr(settings, 'debug_ocr', False):
          backend = getattr(ocr_engine, "backend_name", ocr_engine.__class__.__name__)
@@ -8562,6 +8696,7 @@ def _process_page(
     text_area_plan = None
     text_area_plan_start = time.time()
     try:
+        bubble_detection_start = time.perf_counter()
         bubble_detection_result = run_bubble_detection(
             BubbleDetectionInput(
                 page_id=page_id,
@@ -8571,12 +8706,19 @@ def _process_page(
                 mode="default_text_area_plan",
             )
         )
+        add_timing(debug_context, "bubble_detection_time", time.perf_counter() - bubble_detection_start)
+        text_area_plan_build_start = time.perf_counter()
         text_area_plan = build_text_area_plan(
             page_id,
             image_path,
             image_size,
             bubble_detection_result,
             current_region_records=None,
+        )
+        add_timing(
+            debug_context,
+            "text_area_plan_build_time",
+            time.perf_counter() - text_area_plan_build_start,
         )
         if debug_context is not None:
             debug_context["bubble_detection_pre_ocr"] = bubble_detection_result.to_dict()
@@ -8600,7 +8742,9 @@ def _process_page(
         use_gpu=bool(settings and settings.use_gpu),
         debug_context=debug_context,
     )
-    add_timing(debug_context, "detection_time", time.time() - detect_start)
+    primary_detection_elapsed = time.time() - detect_start
+    add_timing(debug_context, "detection_time", primary_detection_elapsed)
+    add_timing(debug_context, "detection_primary_time", primary_detection_elapsed)
     if text_area_plan is not None and hasattr(text_area_plan, "runtime"):
         try:
             text_area_plan.runtime.true_scoped_detector_available = text_area_detection_source == DETECTION_SCOPED
@@ -8638,7 +8782,9 @@ def _process_page(
             use_gpu=bool(settings and settings.use_gpu),
             debug_context=debug_context,
         )
-        add_timing(debug_context, "detection_time", time.time() - bg_detect_start)
+        background_detection_elapsed = time.time() - bg_detect_start
+        add_timing(debug_context, "detection_time", background_detection_elapsed)
+        add_timing(debug_context, "detection_background_time", background_detection_elapsed)
         if debug_context is not None and bg_scoped_candidates:
             debug_context.setdefault("scoped_detection_candidates", []).extend(bg_scoped_candidates)
         grouping_start = time.time()
@@ -9449,6 +9595,7 @@ def _process_page(
         set_count(debug_context, "logical_text_block_applied", logical_block_result.applied_count)
         set_count(debug_context, "logical_text_block_skipped_containers", logical_block_result.skipped_container_count)
     hierarchy_start = time.time()
+    initial_hierarchy_start = time.perf_counter()
     initial_text_block_hierarchy = build_text_block_hierarchy(
         page_id=page_id,
         regions=regions,
@@ -9456,6 +9603,12 @@ def _process_page(
         logical_block_result=logical_block_result,
         mutate_regions=False,
     )
+    add_timing(
+        debug_context,
+        "hierarchy_initial_build_time",
+        time.perf_counter() - initial_hierarchy_start,
+    )
+    root_reconstruction_start = time.perf_counter()
     root_reconstruction_status = _reconstruct_text_block_roots(
         regions,
         logical_block_result,
@@ -9472,11 +9625,17 @@ def _process_page(
         quality_func=assess_logical_text_source_quality,
         debug_context=debug_context,
     )
+    add_timing(
+        debug_context,
+        "root_reconstruction_time",
+        time.perf_counter() - root_reconstruction_start,
+    )
     if debug_context is not None and root_reconstruction_status.get("applied_count"):
         debug_context["pipeline_logical_text_block_result"] = logical_block_result.to_dict()
         debug_context["pipeline_logical_text_blocks"] = [
             block.to_dict() for block in logical_block_result.blocks
         ]
+    parent_ocr_start = time.perf_counter()
     parent_ocr_source_status = _append_parent_boundary_ocr_source_regions(
         regions=regions,
         text_area_plan=logical_text_area_plan,
@@ -9492,6 +9651,8 @@ def _process_page(
         build_scoped_ocr_candidate=build_scoped_ocr_candidate,
         existing_parent_units=initial_text_block_hierarchy.parent_units,
     )
+    add_timing(debug_context, "parent_ocr_time", time.perf_counter() - parent_ocr_start)
+    final_hierarchy_start = time.perf_counter()
     text_block_hierarchy = build_text_block_hierarchy(
         page_id=page_id,
         regions=regions,
@@ -9499,6 +9660,11 @@ def _process_page(
         logical_block_result=logical_block_result,
         mutate_regions=True,
         root_reconstruction_status=root_reconstruction_status,
+    )
+    add_timing(
+        debug_context,
+        "hierarchy_final_build_time",
+        time.perf_counter() - final_hierarchy_start,
     )
     add_timing(debug_context, "text_block_hierarchy_time", time.time() - hierarchy_start)
     if debug_context is not None:
@@ -10087,6 +10253,7 @@ def _process_page(
             )
     if translation_touched:
         add_timing(debug_context, "translation_time", time.time() - translation_start)
+    _summarize_translation_requests(debug_context)
 
     sync_bundles_from_region_records(parent_execution_bundles, execution_regions)
     if debug_context is not None and parent_execution_bundles:
@@ -16098,12 +16265,14 @@ def _translation_perf_record_llm_call(
     status: str = "ok",
     shared_batch_size: int | None = None,
     error: str | None = None,
+    request_id: str | None = None,
 ) -> None:
     if not record:
         return
     prompt_len = len(str(prompt or ""))
     output_len = len(str(output or ""))
     call = {
+        "request_id": str(request_id or _translation_perf_request_id(phase)),
         "phase": phase,
         "latency_sec": round(max(0.0, float(latency_sec or 0.0)), 4),
         "prompt_char_count": prompt_len,
@@ -16125,6 +16294,73 @@ def _translation_perf_record_llm_call(
         float(record.get("total_unit_latency_sec") or 0.0) + call["latency_sec"],
         4,
     )
+
+
+def _translation_perf_request_id(phase: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(phase or "request")).strip("_") or "request"
+    return f"{token}_{time.time_ns()}"
+
+
+def _summarize_translation_requests(debug_context: dict[str, Any] | None) -> None:
+    if not isinstance(debug_context, dict):
+        return
+    requests_by_id: dict[str, dict[str, Any]] = {}
+    for unit in debug_context.get("translation_unit_timings") or []:
+        if not isinstance(unit, dict):
+            continue
+        unit_id = str(unit.get("translation_unit_id") or "")
+        backend = str(unit.get("model_backend") or unit.get("translation_result_model_backend") or "unknown")
+        for index, call in enumerate(unit.get("llm_calls") or []):
+            if not isinstance(call, dict):
+                continue
+            request_id = str(call.get("request_id") or f"{unit_id or 'unit'}:{index}")
+            record = requests_by_id.setdefault(
+                request_id,
+                {
+                    "request_id": request_id,
+                    "phase": str(call.get("phase") or "unknown"),
+                    "backend": backend,
+                    "status": str(call.get("status") or "unknown"),
+                    "latency_sec": round(_numeric_or_zero(call.get("latency_sec")), 4),
+                    "prompt_char_count": int(call.get("prompt_char_count") or 0),
+                    "output_length": int(call.get("output_length") or 0),
+                    "token_limit": call.get("token_limit"),
+                    "payload_items": int(call.get("shared_batch_size") or 1),
+                    "translation_unit_ids": [],
+                },
+            )
+            if unit_id and unit_id not in record["translation_unit_ids"]:
+                record["translation_unit_ids"].append(unit_id)
+
+    request_records = list(requests_by_id.values())
+    phase_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    backend_counts: dict[str, int] = {}
+    for record in request_records:
+        phase = str(record.get("phase") or "unknown")
+        status = str(record.get("status") or "unknown")
+        backend = str(record.get("backend") or "unknown")
+        phase_counts[phase] = phase_counts.get(phase, 0) + 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+        backend_counts[backend] = backend_counts.get(backend, 0) + 1
+    total_latency = sum(_numeric_or_zero(record.get("latency_sec")) for record in request_records)
+    payload_items = sum(int(record.get("payload_items") or 0) for record in request_records)
+    summary = {
+        "request_count": len(request_records),
+        "payload_item_count": payload_items,
+        "total_request_latency_sec": round(total_latency, 4),
+        "max_request_latency_sec": round(
+            max([_numeric_or_zero(record.get("latency_sec")) for record in request_records] or [0.0]),
+            4,
+        ),
+        "phase_counts": phase_counts,
+        "status_counts": status_counts,
+        "backend_counts": backend_counts,
+        "requests": request_records,
+    }
+    debug_context["translation_request_summary"] = summary
+    debug_context.setdefault("counts", {})["translation_request_count"] = len(request_records)
+    debug_context.setdefault("counts", {})["translation_request_payload_items"] = payload_items
 
 
 def _translation_perf_set_final(
@@ -16471,8 +16707,9 @@ def _batch_translate(
                 record["batch_initial_size"] = initial_batch_size
                 record["batch_effective_size"] = len(chunk)
                 record["batch_chunk_index"] = chunk_index
+        batch_request_id = _translation_perf_request_id("batch_chunk")
+        call_start = time.time()
         try:
-            call_start = time.time()
             raw = ollama.generate(
                 resolved,
                 prompt,
@@ -16491,19 +16728,22 @@ def _batch_translate(
                     output=raw,
                     token_limit=token_limit,
                     shared_batch_size=len(chunk),
-            )
+                    request_id=batch_request_id,
+                )
         except Exception as exc:
+            call_latency = time.time() - call_start
             for record in chunk_records:
                 _translation_perf_record_llm_call(
                     record,
                     phase="batch_chunk",
                     prompt=prompt,
-                    latency_sec=0.0,
+                    latency_sec=call_latency,
                     output="",
                     token_limit=token_limit,
                     status="exception",
                     shared_batch_size=len(chunk),
                     error=f"{type(exc).__name__}: {exc}",
+                    request_id=batch_request_id,
                 )
                 record.setdefault("failure_retry_reason", []).append("batch_chunk_exception")
                 if record:
@@ -16611,8 +16851,11 @@ def _batch_translate(
                         repair_items,
                         json_object_wrapper=True,
                     )
+                compact_request_id = _translation_perf_request_id(
+                    "batch_empty_translation_compact_repair"
+                )
+                repair_start = time.time()
                 try:
-                    repair_start = time.time()
                     repair_options = {"num_predict": repair_token_limit, "temperature": temp, "top_p": top_p}
                     repair_timeout = 600
                     if deepseek_backend:
@@ -16635,6 +16878,7 @@ def _batch_translate(
                             output=repair_raw,
                             token_limit=repair_token_limit,
                             shared_batch_size=len(repair_items),
+                            request_id=compact_request_id,
                         )
                     repair_translations = _parse_compact_batch_retry_output(repair_raw, repair_items, target_lang)
                     translations.update(repair_translations)
@@ -16664,18 +16908,20 @@ def _batch_translate(
                             record["compact_repair_single_fallback_count"] = len(failed_ids)
                             record.setdefault("failure_retry_reason", []).append("batch_empty_translation")
                 except Exception as exc:
+                    repair_latency = time.time() - repair_start
                     failed_ids = [str(item.get("id") or "") for item in repair_items if isinstance(item, dict)]
                     for record in empty_records:
                         _translation_perf_record_llm_call(
                             record,
                             phase="batch_empty_translation_compact_repair",
                             prompt=repair_prompt,
-                            latency_sec=0.0,
+                            latency_sec=repair_latency,
                             output="",
                             token_limit=repair_token_limit,
                             status="exception",
                             shared_batch_size=len(repair_items),
                             error=f"{type(exc).__name__}: {exc}",
+                            request_id=compact_request_id,
                         )
                         if record:
                             record.setdefault("json_repair_fallback_status", []).append(

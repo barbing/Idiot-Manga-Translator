@@ -107,14 +107,29 @@ def new_page_context(
         "regions": {},
         "timing": {
             "total_page_time": None,
+            "page_functional_time": 0.0,
+            "page_postprocess_time": 0.0,
+            "page_cycle_time": 0.0,
+            "page_process_cpu_time": 0.0,
+            "python_gc_time": 0.0,
+            "cuda_cache_clear_time": 0.0,
+            "memory_maintenance_time": 0.0,
             "image_loading_time": 0.0,
+            "bubble_detection_time": 0.0,
+            "text_area_plan_build_time": 0.0,
             "detection_time": 0.0,
+            "detection_primary_time": 0.0,
+            "detection_background_time": 0.0,
             "ocr_time": 0.0,
             "grouping_time": 0.0,
             "glossary_time": 0.0,
             "translation_time": 0.0,
             "logical_text_block_time": 0.0,
             "text_block_hierarchy_time": 0.0,
+            "hierarchy_initial_build_time": 0.0,
+            "root_reconstruction_time": 0.0,
+            "parent_ocr_time": 0.0,
+            "hierarchy_final_build_time": 0.0,
             "source_glyph_mask_time": 0.0,
             "mask_generation_time": 0.0,
             "inpainting_time": 0.0,
@@ -127,7 +142,13 @@ def new_page_context(
             "translated_regions": 0,
             "skipped_regions": 0,
             "inpaint_calls": 0,
+            "ocr_request_count": 0,
+            "translation_request_count": 0,
+            "translation_request_payload_items": 0,
         },
+        "worker_initialization": {},
+        "ocr_request_summary": {},
+        "translation_request_summary": {},
     }
 
 
@@ -482,14 +503,29 @@ def new_perf_page_context(page_name: str, source_path: str, output_path: str, ro
         "regions": {},
         "timing": {
             "total_page_time": None,
+            "page_functional_time": 0.0,
+            "page_postprocess_time": 0.0,
+            "page_cycle_time": 0.0,
+            "page_process_cpu_time": 0.0,
+            "python_gc_time": 0.0,
+            "cuda_cache_clear_time": 0.0,
+            "memory_maintenance_time": 0.0,
             "image_loading_time": 0.0,
+            "bubble_detection_time": 0.0,
+            "text_area_plan_build_time": 0.0,
             "detection_time": 0.0,
+            "detection_primary_time": 0.0,
+            "detection_background_time": 0.0,
             "ocr_time": 0.0,
             "grouping_time": 0.0,
             "glossary_time": 0.0,
             "translation_time": 0.0,
             "logical_text_block_time": 0.0,
             "text_block_hierarchy_time": 0.0,
+            "hierarchy_initial_build_time": 0.0,
+            "root_reconstruction_time": 0.0,
+            "parent_ocr_time": 0.0,
+            "hierarchy_final_build_time": 0.0,
             "source_glyph_mask_time": 0.0,
             "cleanup_mask_contract_time": 0.0,
             "text_area_component_authorization_time": 0.0,
@@ -523,7 +559,13 @@ def new_perf_page_context(page_name: str, source_path: str, output_path: str, ro
             "cleanup_ai_backend_calls": 0,
             "cleanup_result_records": 0,
             "cleanup_proof_records": 0,
+            "ocr_request_count": 0,
+            "translation_request_count": 0,
+            "translation_request_payload_items": 0,
         },
+        "worker_initialization": {},
+        "ocr_request_summary": {},
+        "translation_request_summary": {},
     }
 
 
@@ -740,12 +782,45 @@ def write_perf_timing_artifact(context: dict[str, Any] | None, regions: list[dic
         "cleanup_runtime_summary": _json_safe(context.get("cleanup_runtime_summary") or {}),
         "cleanup_job_timings": _json_safe(context.get("cleanup_job_timings") or []),
         "cleanup_model_warmup": _json_safe(context.get("cleanup_model_warmup") or {}),
+        "worker_initialization": _json_safe(context.get("worker_initialization") or {}),
+        "ocr_request_summary": _json_safe(context.get("ocr_request_summary") or {}),
+        "translation_request_summary": _json_safe(context.get("translation_request_summary") or {}),
         "watch_regions": _perf_watch_regions(context, regions),
     }
     timing_path = os.path.join(root_dir, f"{page_id}_timing.json")
     with open(timing_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
     return timing_path
+
+
+def append_perf_timing_overhead_artifact(
+    context: dict[str, Any] | None,
+    *,
+    telemetry_artifact_write_time: float,
+    observed_page_cycle_with_telemetry: float,
+) -> str:
+    """Record telemetry's own write cost outside the page timing payload."""
+
+    if not context:
+        return ""
+    root_dir = str(context.get("perf_telemetry_dir") or "").strip()
+    if not root_dir:
+        output_path = str(context.get("output_path") or "")
+        export_dir = os.path.dirname(output_path) if output_path else ""
+        root_dir = os.path.join(export_dir, "performance_timing") if export_dir else "performance_timing"
+    os.makedirs(root_dir, exist_ok=True)
+    path = os.path.join(root_dir, "_telemetry_overhead.jsonl")
+    record = {
+        "page_id": str(context.get("page_id") or "page"),
+        "telemetry_artifact_write_time": round(max(0.0, float(telemetry_artifact_write_time or 0.0)), 6),
+        "observed_page_cycle_with_telemetry": round(
+            max(0.0, float(observed_page_cycle_with_telemetry or 0.0)),
+            6,
+        ),
+    }
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return path
 
 
 def _sha256_file(path: str) -> str:
