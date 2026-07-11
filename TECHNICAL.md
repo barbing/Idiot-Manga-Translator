@@ -269,7 +269,7 @@ Glossary enforcement must not mask upstream OCR or detection failures. If a name
 
 ## Models and Environment
 
-The project is Windows-first. For public setup, use Python 3.10 and install `requirements.txt` in an isolated virtual environment. Conda is also acceptable when users need GPU-specific Torch, PaddlePaddle, or llama-cpp-python builds.
+The project is Windows-first. For public setup, use Python 3.10 and install `requirements.txt` in an isolated virtual environment. YuzuMarker font detection uses `onnxruntime-gpu` by default, requests CUDA before CPU, and records the active provider plus any non-blocking CPU fallback reason. Conda is also acceptable when users need GPU-specific Torch, PaddlePaddle, or llama-cpp-python builds.
 
 Local assets and caches are preferred over environment changes. Heavy new dependencies or mandatory extra models should not be added unless the roadmap or user explicitly authorizes them.
 

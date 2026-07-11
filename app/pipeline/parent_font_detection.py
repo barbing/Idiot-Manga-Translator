@@ -41,6 +41,13 @@ class ParentFontDetectionRunResult:
     skipped_count: int = 0
     model_path: str = ""
     labels_path: str = ""
+    gpu_requested: bool = False
+    requested_execution_provider: str = ""
+    available_execution_providers: list[str] = field(default_factory=list)
+    active_execution_providers: list[str] = field(default_factory=list)
+    primary_execution_provider: str = ""
+    provider_fallback_reason: str = ""
+    provider_preload_error: str = ""
     errors: list[str] = field(default_factory=list)
     records: list[dict[str, Any]] = field(default_factory=list)
 
@@ -55,6 +62,13 @@ class ParentFontDetectionRunResult:
             "skipped_count": self.skipped_count,
             "model_path": self.model_path,
             "labels_path": self.labels_path,
+            "gpu_requested": self.gpu_requested,
+            "requested_execution_provider": self.requested_execution_provider,
+            "available_execution_providers": list(self.available_execution_providers),
+            "active_execution_providers": list(self.active_execution_providers),
+            "primary_execution_provider": self.primary_execution_provider,
+            "provider_fallback_reason": self.provider_fallback_reason,
+            "provider_preload_error": self.provider_preload_error,
             "errors": list(self.errors),
             "records": [dict(record) for record in self.records],
         }
@@ -78,6 +92,30 @@ class YuzuMarkerOnnxFontDetector:
             raise FileNotFoundError("YuzuMarker font labels are missing")
         self._labels = _load_font_labels(self.labels_path)
         self._session = _load_onnx_session(self.model_path, use_gpu=use_gpu)
+        provider_metadata = _onnx_session_provider_metadata(
+            self.model_path,
+            use_gpu=use_gpu,
+            session=self._session,
+        )
+        self.gpu_requested = bool(provider_metadata.get("gpu_requested"))
+        self.requested_execution_provider = str(
+            provider_metadata.get("requested_execution_provider") or ""
+        )
+        self.available_execution_providers = list(
+            provider_metadata.get("available_execution_providers") or []
+        )
+        self.active_execution_providers = list(
+            provider_metadata.get("active_execution_providers") or []
+        )
+        self.primary_execution_provider = str(
+            provider_metadata.get("primary_execution_provider") or ""
+        )
+        self.provider_fallback_reason = str(
+            provider_metadata.get("provider_fallback_reason") or ""
+        )
+        self.provider_preload_error = str(
+            provider_metadata.get("provider_preload_error") or ""
+        )
         inputs = self._session.get_inputs()
         if not inputs:
             raise RuntimeError("YuzuMarker ONNX model has no inputs")
@@ -135,6 +173,7 @@ class YuzuMarkerOnnxFontDetector:
 
 
 _SESSION_CACHE: dict[tuple[str, bool], Any] = {}
+_SESSION_PROVIDER_METADATA: dict[tuple[str, bool], dict[str, Any]] = {}
 
 
 def apply_parent_font_detection(
@@ -186,6 +225,8 @@ def apply_parent_font_detection(
         except Exception as exc:
             result.errors.append(f"yuzumarker_unavailable:{type(exc).__name__}:{exc}")
             active_detector = None
+    if normalized_mode == "yuzumarker" and active_detector is not None:
+        _copy_provider_metadata_to_result(result, active_detector)
 
     evidence_records: list[dict[str, Any]] = []
     for bundle in bundles:
@@ -1534,14 +1575,101 @@ def _load_onnx_session(model_path: str, *, use_gpu: bool) -> Any:
         return _SESSION_CACHE[key]
     import onnxruntime as ort
 
-    providers = ["CPUExecutionProvider"]
+    preload_error = ""
     if use_gpu:
-        available = set(ort.get_available_providers())
-        if "CUDAExecutionProvider" in available:
-            providers.insert(0, "CUDAExecutionProvider")
-    session = ort.InferenceSession(model_path, providers=providers)
+        preload_dlls = getattr(ort, "preload_dlls", None)
+        if callable(preload_dlls):
+            try:
+                preload_dlls()
+            except Exception as exc:
+                preload_error = f"{type(exc).__name__}:{exc}"
+
+    available = [str(provider) for provider in ort.get_available_providers()]
+    providers = ["CPUExecutionProvider"]
+    if use_gpu and "CUDAExecutionProvider" in available:
+        providers.insert(0, "CUDAExecutionProvider")
+
+    initialization_error = ""
+    try:
+        session = ort.InferenceSession(model_path, providers=providers)
+    except Exception as exc:
+        if not use_gpu or providers == ["CPUExecutionProvider"]:
+            raise
+        initialization_error = f"{type(exc).__name__}:{exc}"
+        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+    active = [str(provider) for provider in session.get_providers()]
+    requested = "CUDAExecutionProvider" if use_gpu else "CPUExecutionProvider"
+    fallback_reason = ""
+    if use_gpu and "CUDAExecutionProvider" not in active:
+        if "CUDAExecutionProvider" not in available:
+            fallback_reason = "cuda_execution_provider_not_available"
+        else:
+            fallback_reason = "cuda_execution_provider_initialization_failed"
+
+    _SESSION_PROVIDER_METADATA[key] = {
+        "gpu_requested": bool(use_gpu),
+        "requested_execution_provider": requested,
+        "available_execution_providers": available,
+        "active_execution_providers": active,
+        "primary_execution_provider": active[0] if active else "",
+        "provider_fallback_reason": fallback_reason,
+        "provider_preload_error": preload_error,
+        "provider_initialization_error": initialization_error,
+    }
     _SESSION_CACHE[key] = session
     return session
+
+
+def _onnx_session_provider_metadata(
+    model_path: str,
+    *,
+    use_gpu: bool,
+    session: Any,
+) -> dict[str, Any]:
+    key = (os.path.abspath(model_path), bool(use_gpu))
+    metadata = dict(_SESSION_PROVIDER_METADATA.get(key) or {})
+    if metadata:
+        return metadata
+    active = [str(provider) for provider in session.get_providers()]
+    requested = "CUDAExecutionProvider" if use_gpu else "CPUExecutionProvider"
+    fallback_reason = ""
+    if use_gpu and "CUDAExecutionProvider" not in active:
+        fallback_reason = "cuda_execution_provider_initialization_failed"
+    return {
+        "gpu_requested": bool(use_gpu),
+        "requested_execution_provider": requested,
+        "available_execution_providers": [],
+        "active_execution_providers": active,
+        "primary_execution_provider": active[0] if active else "",
+        "provider_fallback_reason": fallback_reason,
+        "provider_preload_error": "",
+    }
+
+
+def _copy_provider_metadata_to_result(
+    result: ParentFontDetectionRunResult,
+    detector: Any,
+) -> None:
+    result.gpu_requested = bool(getattr(detector, "gpu_requested", False))
+    result.requested_execution_provider = str(
+        getattr(detector, "requested_execution_provider", "") or ""
+    )
+    result.available_execution_providers = list(
+        getattr(detector, "available_execution_providers", []) or []
+    )
+    result.active_execution_providers = list(
+        getattr(detector, "active_execution_providers", []) or []
+    )
+    result.primary_execution_provider = str(
+        getattr(detector, "primary_execution_provider", "") or ""
+    )
+    result.provider_fallback_reason = str(
+        getattr(detector, "provider_fallback_reason", "") or ""
+    )
+    result.provider_preload_error = str(
+        getattr(detector, "provider_preload_error", "") or ""
+    )
 
 
 def _load_font_labels(path: str) -> list[dict[str, Any]]:

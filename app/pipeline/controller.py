@@ -1125,8 +1125,23 @@ class PipelineWorker(QtCore.QThread):
                             applied_count=parent_font_detection_result.applied_count,
                             fallback_count=parent_font_detection_result.fallback_count,
                             skipped_count=parent_font_detection_result.skipped_count,
+                            requested_execution_provider=(
+                                parent_font_detection_result.requested_execution_provider
+                            ),
+                            primary_execution_provider=(
+                                parent_font_detection_result.primary_execution_provider
+                            ),
+                            provider_fallback_reason=(
+                                parent_font_detection_result.provider_fallback_reason
+                            ),
                             elapsed_ms=round((time.time() - parent_font_start) * 1000.0, 3),
                         )
+                        if parent_font_detection_result.provider_fallback_reason:
+                            self.message.emit(
+                                "Font detection GPU fallback: "
+                                f"{parent_font_detection_result.provider_fallback_reason}; "
+                                "continuing with CPUExecutionProvider."
+                            )
                         if debug_context is not None:
                             if not debug_context.get("perf_telemetry_only"):
                                 debug_context["parent_font_detection"] = parent_font_detection_result.to_audit_dict()
