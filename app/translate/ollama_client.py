@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 import requests
+import threading
 from typing import Optional
 import json
 
@@ -19,6 +20,40 @@ _DEEPSEEK_API_KEY_FIELDS = ("DEEPSEEK_API_KEY", "API_KEY", "api_key", "key")
 _DEEPSEEK_PROVIDER_FIELDS = ("Deepseek", "DeepSeek", "deepseek")
 _DEEPSEEK_JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 _DEEPSEEK_DISABLED_THINKING = {"type": "disabled"}
+
+
+class _ThreadLocalSessionPool:
+    """Own one persistent requests session per caller thread."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+        self._sessions: list[requests.Session] = []
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def get(self) -> requests.Session:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("HTTP client is closed")
+            session = getattr(self._local, "session", None)
+            if session is None:
+                session = requests.Session()
+                self._sessions.append(session)
+                self._local.session = session
+            return session
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            sessions = list(self._sessions)
+            self._sessions.clear()
+            self._closed = True
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def _strip_wrapping_quotes(value: str) -> str:
@@ -165,6 +200,8 @@ def _parse_glossary_response(text: str) -> dict[str, str]:
 
 
 class DeepSeekClient:
+    owns_http_sessions = True
+
     def __init__(
         self,
         base_url: str = "https://api.deepseek.com",
@@ -174,6 +211,7 @@ class DeepSeekClient:
         self._base_url = base_url.rstrip("/")
         self._api_key_path = api_key_path
         self.model_name = model_name
+        self._http_sessions = _ThreadLocalSessionPool()
 
     @staticmethod
     def has_configured_key(api_key_path: str = "api/API_KEY") -> bool:
@@ -200,7 +238,12 @@ class DeepSeekClient:
             "max_tokens": 1,
         }
         try:
-            response = requests.post(url, headers=self._headers(), json=payload, timeout=timeout)
+            response = self._http_sessions.get().post(
+                url,
+                headers=self._headers(),
+                json=payload,
+                timeout=timeout,
+            )
             return response.status_code == 200
         except (DeepSeekApiKeyError, requests.RequestException) as exc:
             logger.debug(f"DeepSeek unavailable: {exc}")
@@ -235,7 +278,12 @@ class DeepSeekClient:
         elif options.get("json_mode"):
             payload["response_format"] = dict(_DEEPSEEK_JSON_OBJECT_RESPONSE_FORMAT)
 
-        response = requests.post(url, headers=self._headers(), json=payload, timeout=timeout)
+        response = self._http_sessions.get().post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=timeout,
+        )
         response.raise_for_status()
         data = response.json()
         choices = data.get("choices") if isinstance(data, dict) else None
@@ -297,10 +345,22 @@ class DeepSeekClient:
 
         return final_map
 
+    def close(self) -> None:
+        self._http_sessions.close()
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 class OllamaClient:
+    owns_http_sessions = True
+
     def __init__(self, base_url: str = "http://localhost:11434") -> None:
         self._base_url = base_url.rstrip("/")
+        self._http_sessions = _ThreadLocalSessionPool()
 
     _availability_cache = {"timestamp": 0.0, "status": False}
 
@@ -315,7 +375,7 @@ class OllamaClient:
         url = f"{self._base_url}/api/tags"
         available = False
         try:
-            response = requests.get(url, timeout=timeout)
+            response = self._http_sessions.get().get(url, timeout=timeout)
             available = response.status_code == 200
             if not available:
                 logger.debug(f"Ollama check failed. Status: {response.status_code}")
@@ -334,7 +394,7 @@ class OllamaClient:
         if options:
             default_options.update(options)
         payload = {"model": model, "prompt": prompt, "stream": False, "options": default_options}
-        response = requests.post(url, json=payload, timeout=timeout)
+        response = self._http_sessions.get().post(url, json=payload, timeout=timeout)
         response.raise_for_status()
         data = response.json()
         logger.debug(f"Ollama generation success for model {model}")
@@ -391,3 +451,12 @@ class OllamaClient:
                 final_map[term] = str(results[term]).strip()
         
         return final_map
+
+    def close(self) -> None:
+        self._http_sessions.close()
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass

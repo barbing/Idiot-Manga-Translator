@@ -46,6 +46,7 @@ class PaddleOcrVlEngine:
             resolve_paddle_ocr_vl_mmproj_file(),
             "PaddleOCR-VL multimodal projector",
         )
+        self._session: requests.Session | None = requests.Session()
         self.endpoint = _normalize_endpoint(os.environ.get("MT_PADDLEOCR_VL_ENDPOINT"))
         self._process: subprocess.Popen | None = None
         self._stdout_handle = None
@@ -89,7 +90,7 @@ class PaddleOcrVlEngine:
             "temperature": 0,
             "max_tokens": int(os.environ.get("MT_PADDLEOCR_VL_MAX_TOKENS", "192") or 192),
         }
-        response = requests.post(
+        response = self._request_session().post(
             f"{self.endpoint}/chat/completions",
             json=payload,
             timeout=self._timeout,
@@ -125,6 +126,10 @@ class PaddleOcrVlEngine:
                 except Exception:
                     pass
                 setattr(self, handle_name, None)
+        session = getattr(self, "_session", None)
+        if session is not None:
+            session.close()
+            self._session = None
 
     def __del__(self) -> None:  # pragma: no cover - best effort cleanup
         try:
@@ -185,7 +190,7 @@ class PaddleOcrVlEngine:
     def _endpoint_ready(self) -> bool:
         try:
             base = self.endpoint.rsplit("/v1", 1)[0]
-            response = requests.get(f"{base}/health", timeout=2)
+            response = self._request_session().get(f"{base}/health", timeout=2)
             return response.status_code == 200
         except Exception:
             return False
@@ -196,7 +201,7 @@ class PaddleOcrVlEngine:
         if trust_custom_endpoint:
             return
         try:
-            response = requests.get(f"{self.endpoint}/models", timeout=5)
+            response = self._request_session().get(f"{self.endpoint}/models", timeout=5)
             response.raise_for_status()
             body = json.dumps(response.json(), ensure_ascii=False).lower()
             if "paddleocr" not in body and "paddleocr-vl" not in body:
@@ -205,6 +210,12 @@ class PaddleOcrVlEngine:
             raise
         except Exception as exc:
             raise RuntimeError(f"failed to verify PaddleOCR-VL endpoint model: {exc}") from exc
+
+    def _request_session(self) -> requests.Session:
+        session = getattr(self, "_session", None)
+        if session is None:
+            raise RuntimeError("PaddleOCR-VL HTTP session is closed")
+        return session
 
 
 def _required_path(path: str | None, label: str) -> str:

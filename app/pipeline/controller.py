@@ -712,6 +712,7 @@ class PipelineWorker(QtCore.QThread):
         )
 
         ocr_engine = None
+        ollama = None
         font_detector = None
         auto_glossary_state = None
         pages = []
@@ -2061,6 +2062,20 @@ class PipelineWorker(QtCore.QThread):
                     ocr_engine.close()
             except Exception:
                 pass
+
+            glossary_client_in_use = False
+            if auto_glossary_state is not None:
+                with _glossary_lock:
+                    glossary_client_in_use = bool(auto_glossary_state.get("is_running", False))
+            if (
+                not glossary_client_in_use
+                and getattr(ollama, "owns_http_sessions", False)
+                and hasattr(ollama, "close")
+            ):
+                try:
+                    ollama.close()
+                except Exception:
+                    pass
 
 
 class PipelineController(QtCore.QObject):
@@ -8720,6 +8735,23 @@ def _detect_regions_scoped_by_text_area_plan(
     return detections, candidates, DETECTION_SCOPED
 
 
+def _reuse_identical_scoped_detection_result(
+    detector,
+    background_detector,
+    detections,
+    scoped_detection_candidates,
+    text_area_detection_source,
+):
+    """Reuse a scoped result only when both roles share one detector instance."""
+    if background_detector is not detector:
+        return None
+    return (
+        list(detections),
+        list(scoped_detection_candidates),
+        text_area_detection_source,
+    )
+
+
 def _process_page(
     image_path: str,
     detector,
@@ -8853,16 +8885,29 @@ def _process_page(
     add_timing(debug_context, "grouping_time", time.time() - grouping_start)
     if background_detector is not None:
         bg_detect_start = time.time()
-        bg_detections, bg_scoped_candidates, bg_detection_source = _detect_regions_scoped_by_text_area_plan(
+        reused_background_result = _reuse_identical_scoped_detection_result(
+            detector,
             background_detector,
-            image_path,
-            image_size,
-            text_area_plan,
-            page_id=page_id,
-            input_size=image_input_size,
-            use_gpu=bool(settings and settings.use_gpu),
-            debug_context=debug_context,
+            detections,
+            scoped_detection_candidates,
+            text_area_detection_source,
         )
+        if reused_background_result is None:
+            bg_detections, bg_scoped_candidates, bg_detection_source = _detect_regions_scoped_by_text_area_plan(
+                background_detector,
+                image_path,
+                image_size,
+                text_area_plan,
+                page_id=page_id,
+                input_size=image_input_size,
+                use_gpu=bool(settings and settings.use_gpu),
+                debug_context=debug_context,
+            )
+        else:
+            bg_detections, bg_scoped_candidates, bg_detection_source = reused_background_result
+            add_count(debug_context, "detection_background_reuse_count", 1)
+            if debug_context is not None:
+                debug_context["background_scoped_detection_reused"] = True
         background_detection_elapsed = time.time() - bg_detect_start
         add_timing(debug_context, "detection_time", background_detection_elapsed)
         add_timing(debug_context, "detection_background_time", background_detection_elapsed)
