@@ -114,6 +114,13 @@ _CLEANUP_RUNTIME_PERF_COLLECTOR: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class _CleanupExecutionPageContext:
+    image_np: Any
+    image_gray: Any
+    image_hash: str
+
+
 @contextmanager
 def collect_cleanup_runtime_perf(enabled: bool):
     """Collect passive cleanup timings without placing them in contract objects."""
@@ -1415,6 +1422,27 @@ def _cleanup_proof_page_context(source_image: Any) -> dict[str, Any]:
     }
 
 
+def _cleanup_execution_page_context(image: Any) -> _CleanupExecutionPageContext | None:
+    """Materialize immutable page data reused by independent parent jobs."""
+
+    if np is None or image is None:
+        return None
+    try:
+        image_np = np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
+        image_np = np.ascontiguousarray(image_np)
+        image_gray = np.ascontiguousarray(_gray(image_np))
+        image_hash = _hash_array(image_np)
+        image_np.flags.writeable = False
+        image_gray.flags.writeable = False
+    except Exception:
+        return None
+    return _CleanupExecutionPageContext(
+        image_np=image_np,
+        image_gray=image_gray,
+        image_hash=image_hash,
+    )
+
+
 def _proof_scope_metadata(cleanup_plan: CleanupPlan, cleanup_mask: CleanupMask) -> dict[str, Any]:
     params = cleanup_plan.backend_parameters or {}
     visual_scope = _normalise_cleanup_visual_scope(getattr(cleanup_mask, "visual_scope", ""))
@@ -1506,6 +1534,7 @@ def run_cleanup_runtime_contract(
         masks_by_job_id.setdefault(str(cleanup_mask.cleanup_job_id), []).append(cleanup_mask)
     render_eligibility_by_region = _render_eligibility_by_region_id(render_eligibility)
     proof_context = _cleanup_proof_page_context(source_image)
+    execution_context = _cleanup_execution_page_context(image)
     _page014_timeout_checkpoint(
         "cleanup_runtime_contract",
         "start",
@@ -1804,6 +1833,7 @@ def run_cleanup_runtime_contract(
                     ) = _run_partitioned_cleanup_attempts(
                         image=image.copy() if hasattr(image, "copy") else image,
                         source_image=source_image,
+                        execution_context=execution_context,
                         formal_plan=formal_plan,
                         job=job,
                         parent_cleanup_mask=runtime_mask,
@@ -1906,6 +1936,7 @@ def run_cleanup_runtime_contract(
             job_results, job_proofs, attempt_records = _run_adaptive_cleanup_attempts(
                 image=before,
                 source_image=source_image,
+                execution_context=execution_context,
                 cleanup_plan=plan,
                 cleanup_mask=runtime_mask,
                 backend_context=backend_contexts_by_mask_id.get(str(runtime_mask.cleanup_mask_id)),
@@ -2917,6 +2948,7 @@ def execute_cleanup_runtime_plan(
     use_gpu: bool,
     model_id: str,
     artifact_dir: str | None = None,
+    execution_context: _CleanupExecutionPageContext | None = None,
 ) -> CleanupResult:
     """Execute a Phase 5 runtime plan on a scratch image copy."""
 
@@ -3013,7 +3045,11 @@ def execute_cleanup_runtime_plan(
     if runtime_perf is not None:
         _perf_add(runtime_perf, "post_mask_setup_ms", _perf_elapsed_ms(perf_post_mask_started))
     perf_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
-    input_image_hash = _hash_image(image)
+    input_image_hash = (
+        execution_context.image_hash
+        if execution_context is not None
+        else _hash_image(image)
+    )
     if runtime_perf is not None:
         _perf_add(runtime_perf, "input_image_hash_ms", _perf_elapsed_ms(perf_hash_started))
     perf_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
@@ -3060,6 +3096,8 @@ def execute_cleanup_runtime_plan(
                 core_mask=commit_mask_source,
                 support_mask=backend_erase_mask,
                 cleanup_class=cleanup_plan.cleanup_class,
+                before_array=(execution_context.image_np if execution_context is not None else None),
+                before_gray=(execution_context.image_gray if execution_context is not None else None),
             )
             if safe_commit_mask is not None:
                 commit_mask = safe_commit_mask
@@ -3072,6 +3110,7 @@ def execute_cleanup_runtime_plan(
             candidate_crop=raw_cleaned_crop,
             crop_bbox=operation_bbox,
             accepted_mask=commit_mask,
+            before_array=(execution_context.image_np if execution_context is not None else None),
         )
         if runtime_perf is not None:
             _perf_add(runtime_perf, "authorized_clip_ms", _perf_elapsed_ms(perf_clip_started))
@@ -3095,6 +3134,8 @@ def execute_cleanup_runtime_plan(
                 core_mask=commit_mask_source,
                 support_mask=backend_erase_mask,
                 cleanup_class=cleanup_plan.cleanup_class,
+                before_array=(execution_context.image_np if execution_context is not None else None),
+                before_gray=(execution_context.image_gray if execution_context is not None else None),
             )
             if safe_commit_mask is not None:
                 commit_mask = safe_commit_mask
@@ -3121,6 +3162,7 @@ def execute_cleanup_runtime_plan(
             cleaned_crop=cleaned_crop,
             crop_bbox=operation_bbox,
             accepted_mask=commit_mask,
+            before_array=(execution_context.image_np if execution_context is not None else None),
         )
     else:
         changed_pixels = _changed_pixel_count(image, cleaned_image)
@@ -4070,6 +4112,8 @@ def _safe_model_inpaint_commit_mask(
     core_mask: Any,
     support_mask: Any,
     cleanup_class: CleanupClass | str | None = None,
+    before_array: Any | None = None,
+    before_gray: Any | None = None,
 ) -> tuple[Any | None, dict[str, Any]]:
     """Build the page-space model commit surface from candidate pixels.
 
@@ -4088,11 +4132,14 @@ def _safe_model_inpaint_commit_mask(
     }
     if np is None:
         return None, metrics
-    before_np = _image_to_rgb_array(before)
+    before_np = np.asarray(before_array) if before_array is not None else _image_to_rgb_array(before)
     candidate_np = _image_to_rgb_array(candidate)
     if before_np is None or candidate_np is None:
         return None, metrics
     page_shape = tuple(int(v) for v in before_np.shape[:2])
+    source_gray = np.asarray(before_gray) if before_gray is not None else _gray(before_np)
+    if tuple(source_gray.shape[:2]) != page_shape:
+        source_gray = _gray(before_np)
     core = _binary_mask(core_mask, page_shape)
     support = _binary_mask(support_mask, page_shape)
     if core is None or not np.any(core > 0):
@@ -4100,32 +4147,26 @@ def _safe_model_inpaint_commit_mask(
     if support is None or not np.any(support > 0):
         support = core.copy()
 
-    candidate_page = candidate_np
     box = _valid_bbox(crop_bbox)
+    candidate_is_crop = candidate_np.shape[:2] != before_np.shape[:2]
     if candidate_np.shape[:2] != before_np.shape[:2]:
         if box is None:
             return None, metrics
         x0, y0, x1, y1 = box
         if tuple(candidate_np.shape[:2]) != (y1 - y0, x1 - x0):
             return None, metrics
-        candidate_page = before_np.copy()
-        candidate_page[y0:y1, x0:x1] = candidate_np
     elif candidate_np.shape != before_np.shape:
         return None, metrics
 
     core_bool = core > 0
     support_bool = support > 0
     support_ring = support_bool & ~core_bool
-    before_gray = _gray(before_np)
-    candidate_gray = _gray(candidate_page)
     cleanup_class_value = _enum_value(cleanup_class)
     speech_bubble_core_guard = cleanup_class_value in {
         CleanupClass.SPEECH_FLAT_BUBBLE.value,
         CleanupClass.SPEECH_COMPLEX_BUBBLE.value,
     }
-    bright_source = before_gray >= 220
-    darkened_candidate = (candidate_gray + 8 < before_gray) & (candidate_gray < 230)
-    support_values = before_gray[support_bool]
+    support_values = source_gray[support_bool]
     if support_values.size:
         support_bright_ratio = float(np.count_nonzero(support_values >= 220)) / float(support_values.size)
         support_dark_ratio = float(np.count_nonzero(support_values <= 96)) / float(support_values.size)
@@ -4136,29 +4177,63 @@ def _safe_model_inpaint_commit_mask(
         support_bright_ratio >= 0.82 and support_dark_ratio <= 0.04
     )
     support_ring_guard = bool(speech_bubble_core_guard or flat_bright_support_context)
-    unsafe_ring = (
-        support_ring & bright_source & darkened_candidate
-        if support_ring_guard
-        else np.zeros(page_shape, dtype=bool)
-    )
-    safe_ring = support_ring & ~unsafe_ring
-    unsafe_core = (
-        core_bool & bright_source & darkened_candidate
-        if speech_bubble_core_guard
-        else np.zeros(page_shape, dtype=bool)
-    )
-
     commit = np.zeros(page_shape, dtype=np.uint8)
-    commit[core_bool & ~unsafe_core] = 255
-    commit[safe_ring] = 255
+    commit[core_bool] = 255
+    commit[support_ring] = 255
+    unsafe_ring_pixels = 0
+    unsafe_core_pixels = 0
+    if candidate_is_crop and box is not None:
+        x0, y0, x1, y1 = box
+        source_gray_crop = source_gray[y0:y1, x0:x1]
+        candidate_gray_crop = _gray(candidate_np)
+        bright_source_crop = source_gray_crop >= 220
+        darkened_candidate_crop = (
+            (candidate_gray_crop + 8 < source_gray_crop)
+            & (candidate_gray_crop < 230)
+        )
+        core_crop = core_bool[y0:y1, x0:x1]
+        support_ring_crop = support_ring[y0:y1, x0:x1]
+        unsafe_ring_crop = (
+            support_ring_crop & bright_source_crop & darkened_candidate_crop
+            if support_ring_guard
+            else np.zeros(candidate_gray_crop.shape[:2], dtype=bool)
+        )
+        unsafe_core_crop = (
+            core_crop & bright_source_crop & darkened_candidate_crop
+            if speech_bubble_core_guard
+            else np.zeros(candidate_gray_crop.shape[:2], dtype=bool)
+        )
+        commit_crop = commit[y0:y1, x0:x1]
+        commit_crop[unsafe_ring_crop | unsafe_core_crop] = 0
+        commit[y0:y1, x0:x1] = commit_crop
+        unsafe_ring_pixels = int(np.count_nonzero(unsafe_ring_crop))
+        unsafe_core_pixels = int(np.count_nonzero(unsafe_core_crop))
+    else:
+        candidate_gray = _gray(candidate_np)
+        bright_source = source_gray >= 220
+        darkened_candidate = (candidate_gray + 8 < source_gray) & (candidate_gray < 230)
+        unsafe_ring = (
+            support_ring & bright_source & darkened_candidate
+            if support_ring_guard
+            else np.zeros(page_shape, dtype=bool)
+        )
+        unsafe_core = (
+            core_bool & bright_source & darkened_candidate
+            if speech_bubble_core_guard
+            else np.zeros(page_shape, dtype=bool)
+        )
+        commit[unsafe_ring | unsafe_core] = 0
+        unsafe_ring_pixels = int(np.count_nonzero(unsafe_ring))
+        unsafe_core_pixels = int(np.count_nonzero(unsafe_core))
     metrics.update(
         {
             "model_inpaint_core_commit_pixels": int(np.count_nonzero(core_bool)),
             "model_inpaint_support_pixels": int(np.count_nonzero(support_bool)),
             "model_inpaint_support_ring_pixels": int(np.count_nonzero(support_ring)),
-            "model_inpaint_safe_support_ring_pixels": int(np.count_nonzero(safe_ring)),
-            "model_inpaint_suppressed_support_ring_pixels": int(np.count_nonzero(unsafe_ring)),
-            "model_inpaint_suppressed_core_pixels": int(np.count_nonzero(unsafe_core)),
+            "model_inpaint_safe_support_ring_pixels": int(np.count_nonzero(support_ring))
+            - unsafe_ring_pixels,
+            "model_inpaint_suppressed_support_ring_pixels": unsafe_ring_pixels,
+            "model_inpaint_suppressed_core_pixels": unsafe_core_pixels,
             "model_inpaint_commit_pixels": int(np.count_nonzero(commit)),
             "model_inpaint_support_bright_ratio": round(support_bright_ratio, 6),
             "model_inpaint_support_dark_ratio": round(support_dark_ratio, 6),
@@ -4315,6 +4390,7 @@ def _clip_cleaned_crop_to_authorized_mask(
     candidate_crop: Any,
     crop_bbox: Sequence[int],
     accepted_mask: Any,
+    before_array: Any | None = None,
 ) -> Any:
     if np is None or Image is None or accepted_mask is None:
         return candidate_crop
@@ -4323,7 +4399,7 @@ def _clip_cleaned_crop_to_authorized_mask(
         return candidate_crop
     try:
         x0, y0, x1, y1 = box
-        before_np = _image_to_rgb_array(before)
+        before_np = np.asarray(before_array) if before_array is not None else _image_to_rgb_array(before)
         candidate_np = _image_to_rgb_array(candidate_crop)
         accepted = np.asarray(accepted_mask) > 0
         if (
@@ -4398,11 +4474,12 @@ def _changed_pixel_count_crop(
     cleaned_crop: Any,
     crop_bbox: Sequence[int] | None,
     accepted_mask: Any | None = None,
+    before_array: Any | None = None,
 ) -> int:
     if np is None:
         return 0
     box = _valid_bbox(crop_bbox)
-    before_np = _image_to_rgb_array(before)
+    before_np = np.asarray(before_array) if before_array is not None else _image_to_rgb_array(before)
     crop_np = _image_to_rgb_array(cleaned_crop)
     if box is None or before_np is None or crop_np is None:
         return 0
@@ -5120,6 +5197,7 @@ def _run_partitioned_cleanup_attempts(
     *,
     image: Any,
     source_image: Any,
+    execution_context: _CleanupExecutionPageContext | None,
     formal_plan: CleanupPlan,
     job: CleanupJob,
     parent_cleanup_mask: CleanupMask,
@@ -5218,6 +5296,7 @@ def _run_partitioned_cleanup_attempts(
     parent_full_results, parent_full_proofs, parent_full_attempts = _run_adaptive_cleanup_attempts(
         image=image,
         source_image=source_image,
+        execution_context=execution_context,
         cleanup_plan=parent_full_plan,
         cleanup_mask=parent_cleanup_mask,
         page_id=page_id,
@@ -5363,6 +5442,7 @@ def _run_partitioned_cleanup_attempts(
         partition_results, partition_proofs, attempt_records = _run_adaptive_cleanup_attempts(
             image=image,
             source_image=source_image,
+            execution_context=execution_context,
             cleanup_plan=plan,
             cleanup_mask=partition_mask,
             page_id=page_id,
@@ -5887,6 +5967,7 @@ def _run_adaptive_cleanup_attempts(
     model_id: str,
     artifact_dir: str | None,
     proof_context: Mapping[str, Any] | None = None,
+    execution_context: _CleanupExecutionPageContext | None = None,
 ) -> tuple[list[CleanupResult], list[CleanupProof], list[dict[str, Any]]]:
     adaptive_started = time.time()
     region_id = _canonical_parent_region_id(cleanup_plan, cleanup_mask, fallback_region_id=region_id) or region_id
@@ -5940,6 +6021,7 @@ def _run_adaptive_cleanup_attempts(
             strategy="model_required_full_mask_inpaint",
             retry_reason="model_required_by_ai_mode",
             proof_context=proof_context,
+            execution_context=execution_context,
         )
         results.append(model_result)
         proofs.append(model_proof)
@@ -6012,6 +6094,7 @@ def _run_adaptive_cleanup_attempts(
             strategy="current_conservative",
             retry_reason="initial_attempt",
             proof_context=proof_context,
+            execution_context=execution_context,
         )
         results.append(first_result)
         proofs.append(first_proof)
@@ -6082,6 +6165,7 @@ def _run_adaptive_cleanup_attempts(
                 strategy=strategy,
                 retry_reason=last_proof.failure_reason or last_result.failure_reason or "backend_noop_or_error",
                 proof_context=proof_context,
+                execution_context=execution_context,
             )
             results.append(noop_result)
             proofs.append(noop_proof)
@@ -6161,6 +6245,7 @@ def _run_adaptive_cleanup_attempts(
             strategy="mask_faithful_root_inpaint_retry",
             retry_reason=last_proof.failure_reason or last_result.failure_reason or "background_cleanup_incomplete",
             proof_context=proof_context,
+            execution_context=execution_context,
         )
         results.append(inpaint_result)
         proofs.append(inpaint_proof)
@@ -6382,6 +6467,7 @@ def _run_adaptive_cleanup_attempts(
             strategy="restoration_scale_back_retry",
             retry_reason=last_proof.failure_reason or "collateral_or_destructive_fill",
             proof_context=proof_context,
+            execution_context=execution_context,
         )
         results.append(restoration_result)
         proofs.append(restoration_proof)
@@ -6449,6 +6535,7 @@ def _run_adaptive_cleanup_attempts(
             strategy="authorized_ai_inpaint_full_mask_retry",
             retry_reason=last_proof.failure_reason or "caption_background_cleanup_incomplete",
             proof_context=proof_context,
+            execution_context=execution_context,
         )
         results.append(ai_result)
         proofs.append(ai_proof)
@@ -6656,6 +6743,7 @@ def _execute_cleanup_attempt(
     strategy: str,
     retry_reason: str,
     proof_context: Mapping[str, Any] | None = None,
+    execution_context: _CleanupExecutionPageContext | None = None,
 ) -> tuple[CleanupResult, CleanupProof]:
     attempt_started = time.time()
     canonical_region_id = _canonical_parent_region_id(cleanup_plan, cleanup_mask, fallback_region_id=region_id)
@@ -6680,6 +6768,7 @@ def _execute_cleanup_attempt(
         use_gpu=use_gpu,
         model_id=model_id,
         artifact_dir=artifact_dir,
+        execution_context=execution_context,
     )
     result.backend_parameters.setdefault("attempt_index", attempt_index)
     result.backend_parameters.setdefault("strategy", strategy)
