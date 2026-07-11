@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,22 +83,73 @@ class TorchScriptLamaRunner:
         self._infer_lock = threading.Lock()
         self.last_tensor_meta: LamaTensorMeta | None = None
 
-    def __call__(self, image: Image.Image | np.ndarray, mask: Image.Image | np.ndarray) -> Image.Image:
-        return self.inpaint(image, mask)
+    def __call__(
+        self,
+        image: Image.Image | np.ndarray,
+        mask: Image.Image | np.ndarray,
+        *,
+        perf_timings: dict[str, Any] | None = None,
+    ) -> Image.Image:
+        return self.inpaint(image, mask, perf_timings=perf_timings)
 
-    def inpaint(self, image: Image.Image | np.ndarray, mask: Image.Image | np.ndarray) -> Image.Image:
+    def inpaint(
+        self,
+        image: Image.Image | np.ndarray,
+        mask: Image.Image | np.ndarray,
+        *,
+        perf_timings: dict[str, Any] | None = None,
+    ) -> Image.Image:
         import torch
 
+        runner_started = time.perf_counter() if perf_timings is not None else 0.0
+        normalize_started = time.perf_counter() if perf_timings is not None else 0.0
         image_pil = _as_rgb_image(image)
         mask_pil = _as_mask_image(mask, image_pil.size)
+        if perf_timings is not None:
+            perf_timings["input_normalization_ms"] = _elapsed_ms(normalize_started)
+
+        tensor_started = time.perf_counter() if perf_timings is not None else 0.0
         image_tensor, mask_tensor, meta = _prepare_tensors(image_pil, mask_pil, self.device_name)
         self.last_tensor_meta = meta
+        if perf_timings is not None:
+            perf_timings["tensor_prepare_transfer_ms"] = _elapsed_ms(tensor_started)
+            perf_timings["device"] = self.device_name
+            perf_timings["tensor_meta"] = meta.to_dict()
 
+        lock_started = time.perf_counter() if perf_timings is not None else 0.0
         with self._infer_lock:
+            if perf_timings is not None:
+                perf_timings["inference_lock_wait_ms"] = _elapsed_ms(lock_started)
+            model_started = time.perf_counter() if perf_timings is not None else 0.0
+            cuda_start = None
+            cuda_end = None
+            if perf_timings is not None and self.device_name.startswith("cuda"):
+                cuda_start = torch.cuda.Event(enable_timing=True)
+                cuda_end = torch.cuda.Event(enable_timing=True)
+                cuda_start.record()
             with torch.inference_mode():
                 output = self.model(image_tensor, mask_tensor)
+            if cuda_end is not None:
+                cuda_end.record()
 
-        return _tensor_to_rgb_image(output, meta)
+        result = _tensor_to_rgb_image(output, meta)
+        if perf_timings is not None:
+            model_and_output_ms = _elapsed_ms(model_started)
+            perf_timings["model_and_output_ms"] = model_and_output_ms
+            if cuda_start is not None and cuda_end is not None:
+                try:
+                    perf_timings["cuda_model_event_ms"] = round(
+                        float(cuda_start.elapsed_time(cuda_end)),
+                        3,
+                    )
+                except Exception:
+                    pass
+            perf_timings["runner_total_ms"] = _elapsed_ms(runner_started)
+        return result
+
+
+def _elapsed_ms(started: float) -> float:
+    return round(max(0.0, (time.perf_counter() - started) * 1000.0), 3)
 
 
 def _as_uint8_array(array: np.ndarray) -> np.ndarray:

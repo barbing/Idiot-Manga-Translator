@@ -88,6 +88,41 @@ def _page014_timeout_checkpoint(stage: str, event: str, **fields: Any) -> None:
         return
 
 
+def _perf_bucket(perf_timings: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
+    if perf_timings is None:
+        return None
+    bucket = perf_timings.get(name)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        perf_timings[name] = bucket
+    return bucket
+
+
+def _perf_elapsed_ms(started: float) -> float:
+    return round(max(0.0, (time.perf_counter() - started) * 1000.0), 3)
+
+
+def _perf_add(bucket: dict[str, Any] | None, key: str, value: float) -> None:
+    if bucket is None:
+        return
+    bucket[key] = round(float(bucket.get(key) or 0.0) + max(0.0, float(value or 0.0)), 3)
+
+
+def _perf_backend_wall_ms(perf_timings: dict[str, Any] | None) -> float:
+    if perf_timings is None:
+        return 0.0
+    total = 0.0
+    backend_wrapper = perf_timings.get("backend_wrapper")
+    if isinstance(backend_wrapper, dict):
+        total += float(backend_wrapper.get("wrapper_total_ms") or 0.0)
+    elif isinstance(perf_timings.get("backend"), dict):
+        total += float(perf_timings["backend"].get("engine_total_ms") or 0.0)
+    crop_local = perf_timings.get("crop_local_backend")
+    if isinstance(crop_local, dict):
+        total += float(crop_local.get("elapsed_ms") or 0.0)
+    return total
+
+
 @dataclass(frozen=True)
 class CleanupExecutionResult:
     cleaned_image: Any
@@ -116,6 +151,7 @@ def apply_text_removal(
     use_gpu: bool,
     model_id: str = FIXED_CLEANUP_INPAINT_MODEL_ID,
     debug_info: dict | None = None,
+    perf_timings: dict[str, Any] | None = None,
 ) -> CleanupExecutionResult:
     started = time.time()
     model_required = bool((debug_info or {}).get("model_required"))
@@ -218,6 +254,7 @@ def apply_text_removal(
     # For remaining complex areas: use AI inpainting if enabled, otherwise CV2
     ai_failed = False
     if mode == "ai" and (use_gpu or force_ai_first or model_required):
+        ai_wrapper_started = time.perf_counter() if perf_timings is not None else 0.0
         try:
             model_info = _cleanup_inpaint_model_info(model_id)
             print(
@@ -238,13 +275,22 @@ def apply_text_removal(
             )
             from app.inpaint.simple_lama_engine import ai_inpaint_cleanup
             ai_mask = (np.asarray(text_mask) > 0).astype(np.uint8) * 255
-            result = ai_inpaint_cleanup(
-                image,
-                ai_mask,
-                use_gpu=use_gpu,
-                model_id=model_id,
-                mask_prepared=bool((debug_info or {}).get("model_inpaint_mask_prepared")),
-            )
+            engine_timings: dict[str, Any] | None = {} if perf_timings is not None else None
+            engine_kwargs = {
+                "use_gpu": use_gpu,
+                "model_id": model_id,
+                "mask_prepared": bool((debug_info or {}).get("model_inpaint_mask_prepared")),
+            }
+            if engine_timings is not None:
+                engine_kwargs["perf_timings"] = engine_timings
+            result = ai_inpaint_cleanup(image, ai_mask, **engine_kwargs)
+            if perf_timings is not None:
+                perf_timings["backend"] = engine_timings or {}
+                wrapper_ms = _perf_elapsed_ms(ai_wrapper_started)
+                engine_ms = float((engine_timings or {}).get("engine_total_ms") or 0.0)
+                wrapper_bucket = _perf_bucket(perf_timings, "backend_wrapper")
+                _perf_add(wrapper_bucket, "wrapper_total_ms", wrapper_ms)
+                _perf_add(wrapper_bucket, "wrapper_exclusive_ms", max(0.0, wrapper_ms - engine_ms))
             print("[TextRemoval] AI INPAINT Success")
             _set_cleanup_backend(
                 debug_info,
@@ -266,6 +312,9 @@ def apply_text_removal(
             )
             return _result(result, debug_info)
         except Exception as e:
+            if perf_timings is not None:
+                wrapper_bucket = _perf_bucket(perf_timings, "backend_wrapper")
+                _perf_add(wrapper_bucket, "wrapper_failed_ms", _perf_elapsed_ms(ai_wrapper_started))
             print(f"[TextRemoval] AI INPAINT failed: {e}, falling back to CV2")
             ai_failed = True
             if force_ai_first or model_required:
@@ -326,6 +375,7 @@ def _apply_crop_local_ai_backend(
     debug_info: dict[str, object] | None,
     model_required: bool,
     cleanup_tag: str | None = None,
+    perf_timings: dict[str, Any] | None = None,
 ) -> Any | None:
     if str(local_mode or "").lower() != "ai" or not (use_gpu or model_required):
         return None
@@ -367,6 +417,8 @@ def _apply_crop_local_ai_backend(
             model_id=model_id,
             mask_prepared=bool((debug_info or {}).get("model_inpaint_mask_prepared")),
         )
+        if perf_timings is not None:
+            perf_timings["crop_local_backend"] = dict(backend_meta or {})
         _set_cleanup_backend(
             debug_info,
             "cleanup_ai_inpaint",
@@ -418,8 +470,12 @@ def apply_local_text_removal(
     foreground_mask: Any | None = None,
     debug_info: dict | None = None,
     return_full_image: bool = True,
+    perf_timings: dict[str, Any] | None = None,
 ) -> CleanupExecutionResult:
     started = time.time()
+    local_perf_started = time.perf_counter() if perf_timings is not None else 0.0
+    local_prepare_started = time.perf_counter() if perf_timings is not None else 0.0
+    local_bucket = _perf_bucket(perf_timings, "local")
     cleanup_tag_normalized = str(cleanup_tag or "").strip().lower()
     model_required = bool((debug_info or {}).get("model_required"))
     _page014_timeout_checkpoint(
@@ -563,6 +619,10 @@ def apply_local_text_removal(
             or crop_h >= crop_w * 1.8
         )
     )
+    if perf_timings is not None:
+        _perf_add(local_bucket, "prepare_ms", _perf_elapsed_ms(local_prepare_started))
+    route_started = time.perf_counter() if perf_timings is not None else 0.0
+    backend_wall_before = _perf_backend_wall_ms(perf_timings)
     if cleanup_tag_normalized == "speech_recovered_anchor_glyph_local":
         cleaned = _apply_speech_strong_local_fill(crop_img, crop_mask, allow_partial=False)
         backend = "speech_strong_local_fill"
@@ -588,6 +648,7 @@ def apply_local_text_removal(
                 debug_info=nested_debug,
                 model_required=model_required,
                 cleanup_tag=cleanup_tag_normalized,
+                perf_timings=perf_timings,
             )
             if cleaned is None:
                 cleaned = apply_text_removal(
@@ -597,6 +658,7 @@ def apply_local_text_removal(
                     use_gpu,
                     model_id=model_id,
                     debug_info=nested_debug,
+                    perf_timings=perf_timings,
                 ).cleaned_image
             backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
             repair_backend = backend
@@ -704,6 +766,7 @@ def apply_local_text_removal(
                 debug_info=nested_debug,
                 model_required=model_required,
                 cleanup_tag=cleanup_tag_normalized,
+                perf_timings=perf_timings,
             )
             if cleaned is None:
                 cleaned = apply_text_removal(
@@ -713,6 +776,7 @@ def apply_local_text_removal(
                     use_gpu,
                     model_id=model_id,
                     debug_info=nested_debug,
+                    perf_timings=perf_timings,
                 ).cleaned_image
             backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
             _merge_nested_backend_debug(debug_info, nested_debug)
@@ -727,6 +791,7 @@ def apply_local_text_removal(
             debug_info=nested_debug,
             model_required=model_required,
             cleanup_tag=cleanup_tag_normalized,
+            perf_timings=perf_timings,
         )
         if cleaned is None:
             cleaned = apply_text_removal(
@@ -736,6 +801,7 @@ def apply_local_text_removal(
                 use_gpu,
                 model_id=model_id,
                 debug_info=nested_debug,
+                perf_timings=perf_timings,
             ).cleaned_image
         backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
         _merge_nested_backend_debug(debug_info, nested_debug)
@@ -769,6 +835,7 @@ def apply_local_text_removal(
                 use_gpu,
                 model_id=model_id,
                 debug_info=nested_debug,
+                perf_timings=perf_timings,
             ).cleaned_image
             backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
             _merge_nested_backend_debug(debug_info, nested_debug)
@@ -810,6 +877,7 @@ def apply_local_text_removal(
                 use_gpu,
                 model_id=model_id,
                 debug_info=nested_debug,
+                perf_timings=perf_timings,
             ).cleaned_image
             backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
             _merge_nested_backend_debug(debug_info, nested_debug)
@@ -856,6 +924,7 @@ def apply_local_text_removal(
             debug_info=nested_debug,
             model_required=model_required,
             cleanup_tag=cleanup_tag_normalized,
+            perf_timings=perf_timings,
         )
         if cleaned is None:
             cleaned = apply_text_removal(
@@ -865,9 +934,16 @@ def apply_local_text_removal(
                 use_gpu,
                 model_id=model_id,
                 debug_info=nested_debug,
+                perf_timings=perf_timings,
             ).cleaned_image
         backend = f"nested:{nested_debug.get('backend') or 'unknown'}"
         _merge_nested_backend_debug(debug_info, nested_debug)
+    if perf_timings is not None:
+        route_ms = _perf_elapsed_ms(route_started)
+        backend_ms = max(0.0, _perf_backend_wall_ms(perf_timings) - backend_wall_before)
+        _perf_add(local_bucket, "backend_wall_ms", backend_ms)
+        _perf_add(local_bucket, "deterministic_route_ms", max(0.0, route_ms - backend_ms))
+    postprocess_started = time.perf_counter() if perf_timings is not None else 0.0
     if debug_info is not None:
         debug_info["backend"] = debug_info.get("backend") or backend
     if cleaned is None:
@@ -895,6 +971,9 @@ def apply_local_text_removal(
             mask_pixels=int(mask_pixels),
             elapsed_ms=round((time.time() - started) * 1000.0, 3),
         )
+        if perf_timings is not None:
+            _perf_add(local_bucket, "postprocess_ms", _perf_elapsed_ms(postprocess_started))
+            local_bucket["total_ms"] = _perf_elapsed_ms(local_perf_started)
         return _result(image, debug_info)
     if not _masked_pixels_changed(crop_img, cleaned, crop_mask) and cleanup_tag_normalized != "authorized_ai_inpaint_full_mask":
         repaired = _apply_authorized_mask_median_fill(crop_img, crop_mask)
@@ -919,6 +998,9 @@ def apply_local_text_removal(
         mask_pixels=int(mask_pixels),
         elapsed_ms=round((time.time() - started) * 1000.0, 3),
     )
+    if perf_timings is not None:
+        _perf_add(local_bucket, "postprocess_ms", _perf_elapsed_ms(postprocess_started))
+        local_bucket["total_ms"] = _perf_elapsed_ms(local_perf_started)
     return _result(patched, debug_info, cleaned_crop=cleaned)
 
 

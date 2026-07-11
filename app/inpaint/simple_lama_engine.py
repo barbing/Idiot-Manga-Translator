@@ -438,10 +438,12 @@ def ai_inpaint_cleanup(
     use_gpu: bool = True,
     model_id: str = FIXED_CLEANUP_INPAINT_MODEL_ID,
     mask_prepared: bool = False,
+    perf_timings: dict | None = None,
 ):
     """Perform cleanup-owned AI inpainting using LaMa."""
 
     started = time.time()
+    perf_started = time.perf_counter() if perf_timings is not None else 0.0
     _page014_timeout_checkpoint(
         "cleanup_ai_inpaint",
         "start",
@@ -463,23 +465,35 @@ def ai_inpaint_cleanup(
     if cv2 is None or np is None:
         raise RuntimeError("cv2 and numpy are required for AI inpainting")
 
+    mask_prepare_started = time.perf_counter() if perf_timings is not None else 0.0
     if mask_prepared:
         dilated_mask = (np.asarray(mask) > 0).astype(np.uint8) * 255
     else:
         kernel_size = max(5, int(max(mask.shape) * 0.005))
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         dilated_mask = cv2.dilate(mask, kernel, iterations=2)
+    if perf_timings is not None:
+        perf_timings["mask_prepare_ms"] = _perf_elapsed_ms(mask_prepare_started)
 
+    resolve_started = time.perf_counter() if perf_timings is not None else 0.0
     device = resolve_lama_device_name(use_gpu=use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = model_info.get("actual_model_path", "")
+    if perf_timings is not None:
+        perf_timings["device_model_resolve_ms"] = _perf_elapsed_ms(resolve_started)
+        perf_timings["device"] = device
+        perf_timings["requested_use_gpu"] = bool(use_gpu)
 
+    model_lookup_started = time.perf_counter() if perf_timings is not None else 0.0
     try:
         lama = _load_lama_model(device, actual_model_path)
     except Exception as exc:
         print(f"[Cleanup Inpaint] Failed to load LaMa model: {exc}")
         raise
+    if perf_timings is not None:
+        perf_timings["model_lookup_ms"] = _perf_elapsed_ms(model_lookup_started)
 
+    crop_prepare_started = time.perf_counter() if perf_timings is not None else 0.0
     mask_image = Image.fromarray(dilated_mask).convert("L")
     bbox = mask_image.getbbox()
     if not bbox:
@@ -490,6 +504,9 @@ def ai_inpaint_cleanup(
             reason="empty_mask_bbox",
             elapsed_ms=round((time.time() - started) * 1000.0, 3),
         )
+        if perf_timings is not None:
+            perf_timings["crop_prepare_ms"] = _perf_elapsed_ms(crop_prepare_started)
+            perf_timings["engine_total_ms"] = _perf_elapsed_ms(perf_started)
         return image
 
     x0, y0, x1, y1 = bbox
@@ -504,6 +521,11 @@ def ai_inpaint_cleanup(
     crop_h = cy1 - cy0
     crop_img = image.crop((cx0, cy0, cx1, cy1))
     crop_mask = mask_image.crop((cx0, cy0, cx1, cy1))
+    if perf_timings is not None:
+        perf_timings["crop_prepare_ms"] = _perf_elapsed_ms(crop_prepare_started)
+        perf_timings["crop_bbox"] = [cx0, cy0, cx1, cy1]
+        perf_timings["crop_width"] = crop_w
+        perf_timings["crop_height"] = crop_h
 
     print(f"[Cleanup Inpaint] Processing region: {crop_w}x{crop_h}")
     _page014_timeout_checkpoint(
@@ -514,8 +536,17 @@ def ai_inpaint_cleanup(
         crop_width=crop_w,
         crop_height=crop_h,
     )
-    result = lama(crop_img, crop_mask)
+    runner_timings: dict | None = {} if perf_timings is not None else None
+    runner_started = time.perf_counter() if perf_timings is not None else 0.0
+    if runner_timings is None:
+        result = lama(crop_img, crop_mask)
+    else:
+        result = lama(crop_img, crop_mask, perf_timings=runner_timings)
+    if perf_timings is not None:
+        perf_timings["runner_wall_ms"] = _perf_elapsed_ms(runner_started)
+        perf_timings["runner"] = runner_timings or {}
 
+    composite_started = time.perf_counter() if perf_timings is not None else 0.0
     if result.size != (crop_w, crop_h):
         print(f"[Cleanup Inpaint] Resizing result from {result.size} to {(crop_w, crop_h)}")
         result = result.resize((crop_w, crop_h), Image.LANCZOS)
@@ -526,6 +557,9 @@ def ai_inpaint_cleanup(
     out_crop = Image.composite(result, crop_img, crop_mask)
     out = image.copy()
     out.paste(out_crop, (cx0, cy0))
+    if perf_timings is not None:
+        perf_timings["result_composite_ms"] = _perf_elapsed_ms(composite_started)
+        perf_timings["engine_total_ms"] = _perf_elapsed_ms(perf_started)
 
     print("[Cleanup Inpaint] Success")
     _page014_timeout_checkpoint(
@@ -539,6 +573,10 @@ def ai_inpaint_cleanup(
         elapsed_ms=round((time.time() - started) * 1000.0, 3),
     )
     return out
+
+
+def _perf_elapsed_ms(started: float) -> float:
+    return round(max(0.0, (time.perf_counter() - started) * 1000.0), 3)
 
 
 def ai_inpaint(

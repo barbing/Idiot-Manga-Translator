@@ -12,6 +12,8 @@ import json
 import os
 import hashlib
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping, Sequence
@@ -105,6 +107,36 @@ COMPONENT_PROJECTION_AUDIT_ONLY_REJECTED_COMPONENT_REASONS = {
     "effective_mask_not_ready",
     "ambiguous_component_owner_components",
 }
+
+_CLEANUP_RUNTIME_PERF_COLLECTOR: ContextVar[dict[str, Any] | None] = ContextVar(
+    "cleanup_runtime_perf_collector",
+    default=None,
+)
+
+
+@contextmanager
+def collect_cleanup_runtime_perf(enabled: bool):
+    """Collect passive cleanup timings without placing them in contract objects."""
+
+    if not enabled:
+        yield None
+        return
+    collector: dict[str, Any] = {"jobs": [], "contract": {}}
+    token = _CLEANUP_RUNTIME_PERF_COLLECTOR.set(collector)
+    try:
+        yield collector
+    finally:
+        _CLEANUP_RUNTIME_PERF_COLLECTOR.reset(token)
+
+
+def _perf_elapsed_ms(started: float) -> float:
+    return round(max(0.0, (time.perf_counter() - started) * 1000.0), 3)
+
+
+def _perf_add(bucket: dict[str, Any] | None, key: str, value: float) -> None:
+    if bucket is None:
+        return
+    bucket[key] = round(float(bucket.get(key) or 0.0) + max(0.0, float(value or 0.0)), 3)
 
 
 def _page014_timeout_diag_enabled() -> bool:
@@ -1455,6 +1487,9 @@ def run_cleanup_runtime_contract(
     """Run Phase 5 cleanup-owned runtime proof without renderer consumption."""
 
     runtime_started = time.time()
+    perf_collector = _CLEANUP_RUNTIME_PERF_COLLECTOR.get()
+    perf_contract = perf_collector.get("contract") if isinstance(perf_collector, dict) else None
+    perf_contract_started = time.perf_counter() if perf_contract is not None else 0.0
     status_records: list[dict[str, Any]] = []
     result_records: list[CleanupResult] = []
     proof_records: list[CleanupProof] = []
@@ -1631,6 +1666,9 @@ def run_cleanup_runtime_contract(
             ),
             elapsed_ms=round((time.time() - warmup_started) * 1000.0, 3),
         )
+    if perf_contract is not None:
+        perf_contract["pre_job_setup_ms"] = _perf_elapsed_ms(perf_contract_started)
+    perf_job_loop_started = time.perf_counter() if perf_contract is not None else 0.0
 
     for job, cleanup_mask, formal_plan in runtime_obligations:
         job_started = time.time()
@@ -2007,6 +2045,12 @@ def run_cleanup_runtime_contract(
                 }
             )
 
+    if perf_contract is not None:
+        perf_contract["job_loop_and_selection_ms"] = _perf_elapsed_ms(perf_job_loop_started)
+        perf_contract["contract_total_ms"] = _perf_elapsed_ms(perf_contract_started)
+        perf_contract["runtime_obligation_count"] = len(runtime_obligations)
+        perf_contract["result_count"] = len(result_records)
+        perf_contract["proof_count"] = len(proof_records)
     _page014_timeout_checkpoint(
         "cleanup_runtime_contract",
         "end",
@@ -2877,6 +2921,18 @@ def execute_cleanup_runtime_plan(
     """Execute a Phase 5 runtime plan on a scratch image copy."""
 
     started = time.time()
+    perf_collector = _CLEANUP_RUNTIME_PERF_COLLECTOR.get()
+    perf_record: dict[str, Any] | None = None
+    perf_stages: dict[str, Any] | None = None
+    runtime_perf: dict[str, Any] | None = None
+    perf_total_started = 0.0
+    perf_setup_started = 0.0
+    if isinstance(perf_collector, dict):
+        perf_stages = {"runtime": {}, "local": {}, "backend": {}, "runner": {}}
+        runtime_perf = perf_stages["runtime"]
+        perf_record = {"stages": perf_stages}
+        perf_total_started = time.perf_counter()
+        perf_setup_started = perf_total_started
     params = cleanup_plan.backend_parameters or {}
     identity = _cleanup_identity_fields(cleanup_plan, cleanup_mask, params, fallback_region_id=region_id)
     canonical_region_id = _canonical_parent_region_id(cleanup_plan, cleanup_mask, params, fallback_region_id=region_id)
@@ -2924,6 +2980,9 @@ def execute_cleanup_runtime_plan(
         backend_foreground_mask if backend_context_executable_input_used else cleanup_mask.foreground_mask
     )
     commit_mask = commit_mask_source
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "pre_mask_setup_ms", _perf_elapsed_ms(perf_setup_started))
+    perf_mask_started = time.perf_counter() if runtime_perf is not None else 0.0
     if model_required:
         model_backend_mask = _standardized_model_inpaint_support_mask(backend_erase_mask)
         if model_backend_mask is not None and np is not None and np.any(model_backend_mask > 0):
@@ -2931,6 +2990,9 @@ def execute_cleanup_runtime_plan(
             debug_info["model_inpaint_mask_prepared"] = True
             debug_info["model_inpaint_mask_standardization"] = "cleanup_runtime_support_mask"
         debug_info["model_inpaint_commit_surface"] = "candidate_safe_core_plus_support"
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "mask_standardization_ms", _perf_elapsed_ms(perf_mask_started))
+    perf_post_mask_started = time.perf_counter() if runtime_perf is not None else 0.0
     if backend_context_executable_input_used:
         debug_info["backend_context_commit_scope"] = "same_root_accepted_mask_union"
     else:
@@ -2948,19 +3010,36 @@ def execute_cleanup_runtime_plan(
         inpaint_mode=mode,
         model_required=bool(model_required),
     )
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "post_mask_setup_ms", _perf_elapsed_ms(perf_post_mask_started))
+    perf_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
     input_image_hash = _hash_image(image)
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "input_image_hash_ms", _perf_elapsed_ms(perf_hash_started))
+    perf_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
     input_mask_hash = _hash_mask(backend_erase_mask)
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "input_mask_hash_ms", _perf_elapsed_ms(perf_hash_started))
+    perf_execution_started = time.perf_counter() if runtime_perf is not None else 0.0
+    execution_kwargs = {
+        "model_id": model_id,
+        "cleanup_tag": cleanup_tag,
+        "foreground_mask": backend_foreground_mask,
+        "debug_info": debug_info,
+        "return_full_image": False,
+    }
+    if perf_stages is not None:
+        execution_kwargs["perf_timings"] = perf_stages
     execution = cleanup_execution.apply_local_text_removal(
         image,
         backend_erase_mask,
         mode,
         use_gpu,
-        model_id=model_id,
-        cleanup_tag=cleanup_tag,
-        foreground_mask=backend_foreground_mask,
-        debug_info=debug_info,
-        return_full_image=False,
+        **execution_kwargs,
     )
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "local_execution_ms", _perf_elapsed_ms(perf_execution_started))
+    perf_result_prepare_started = time.perf_counter() if runtime_perf is not None else 0.0
     operation_bbox = _valid_bbox(execution.crop_bbox) or _valid_bbox(cleanup_mask.erase_mask_bbox)
     raw_cleaned_crop = execution.cleaned_crop
     if raw_cleaned_crop is None and execution.cleaned_image is not None and operation_bbox is not None:
@@ -2969,8 +3048,11 @@ def execute_cleanup_runtime_plan(
     cleaned_crop = None
     raw_cleaned_image = None
     cleaned_image = None
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "result_prepare_ms", _perf_elapsed_ms(perf_result_prepare_started))
     if result_space == "crop":
         if model_required:
+            perf_safe_commit_started = time.perf_counter() if runtime_perf is not None else 0.0
             safe_commit_mask, safe_commit_metrics = _safe_model_inpaint_commit_mask(
                 before=image,
                 candidate=raw_cleaned_crop,
@@ -2982,18 +3064,30 @@ def execute_cleanup_runtime_plan(
             if safe_commit_mask is not None:
                 commit_mask = safe_commit_mask
                 debug_info.update(safe_commit_metrics)
+            if runtime_perf is not None:
+                _perf_add(runtime_perf, "safe_commit_ms", _perf_elapsed_ms(perf_safe_commit_started))
+        perf_clip_started = time.perf_counter() if runtime_perf is not None else 0.0
         cleaned_crop = _clip_cleaned_crop_to_authorized_mask(
             before=image,
             candidate_crop=raw_cleaned_crop,
             crop_bbox=operation_bbox,
             accepted_mask=commit_mask,
         )
+        if runtime_perf is not None:
+            _perf_add(runtime_perf, "authorized_clip_ms", _perf_elapsed_ms(perf_clip_started))
+        perf_output_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
         raw_backend_output_hash = _hash_image(raw_cleaned_crop)
         final_clipped_output_hash = _hash_image(cleaned_crop)
+        if runtime_perf is not None:
+            _perf_add(runtime_perf, "output_hash_ms", _perf_elapsed_ms(perf_output_hash_started))
     else:
         raw_cleaned_image = execution.cleaned_image or image
+        perf_output_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
         raw_backend_output_hash = _hash_image(raw_cleaned_image)
+        if runtime_perf is not None:
+            _perf_add(runtime_perf, "output_hash_ms", _perf_elapsed_ms(perf_output_hash_started))
         if model_required:
+            perf_safe_commit_started = time.perf_counter() if runtime_perf is not None else 0.0
             safe_commit_mask, safe_commit_metrics = _safe_model_inpaint_commit_mask(
                 before=image,
                 candidate=raw_cleaned_image,
@@ -3005,13 +3099,22 @@ def execute_cleanup_runtime_plan(
             if safe_commit_mask is not None:
                 commit_mask = safe_commit_mask
                 debug_info.update(safe_commit_metrics)
+            if runtime_perf is not None:
+                _perf_add(runtime_perf, "safe_commit_ms", _perf_elapsed_ms(perf_safe_commit_started))
+        perf_clip_started = time.perf_counter() if runtime_perf is not None else 0.0
         cleaned_image = _clip_cleaned_candidate_to_authorized_mask(
             before=image,
             candidate=raw_cleaned_image,
             accepted_mask=commit_mask,
         )
+        if runtime_perf is not None:
+            _perf_add(runtime_perf, "authorized_clip_ms", _perf_elapsed_ms(perf_clip_started))
+        perf_output_hash_started = time.perf_counter() if runtime_perf is not None else 0.0
         final_clipped_output_hash = _hash_image(cleaned_image)
+        if runtime_perf is not None:
+            _perf_add(runtime_perf, "output_hash_ms", _perf_elapsed_ms(perf_output_hash_started))
     runtime_ms = (time.time() - started) * 1000.0
+    perf_changed_started = time.perf_counter() if runtime_perf is not None else 0.0
     if result_space == "crop":
         changed_pixels = _changed_pixel_count_crop(
             before=image,
@@ -3021,6 +3124,9 @@ def execute_cleanup_runtime_plan(
         )
     else:
         changed_pixels = _changed_pixel_count(image, cleaned_image)
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "changed_pixel_count_ms", _perf_elapsed_ms(perf_changed_started))
+    perf_metadata_started = time.perf_counter() if runtime_perf is not None else 0.0
     pixel_changed = changed_pixels > 0
     backend = str(execution.backend or debug_info.get("backend") or "unknown")
     backend_kind = str(execution.backend_kind or debug_info.get("backend_kind") or _backend_kind_for_name(backend))
@@ -3050,6 +3156,9 @@ def execute_cleanup_runtime_plan(
         failure_reason = "" if pixel_changed else "no_pixels_changed"
     raw_artifact_image = raw_cleaned_image
     cleaned_artifact_image = cleaned_image
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "metadata_finalize_ms", _perf_elapsed_ms(perf_metadata_started))
+    perf_artifact_started = time.perf_counter() if runtime_perf is not None else 0.0
     if artifact_dir and result_space == "crop":
         raw_artifact_image = _materialize_cleaned_crop_on_page(
             before=image,
@@ -3074,6 +3183,8 @@ def execute_cleanup_runtime_plan(
         cleaned=cleaned_artifact_image if cleaned_artifact_image is not None else image,
         commit_mask=commit_mask,
     )
+    if runtime_perf is not None:
+        _perf_add(runtime_perf, "artifact_write_ms", _perf_elapsed_ms(perf_artifact_started))
     _page014_timeout_checkpoint(
         "cleanup_execute_runtime_plan",
         "end",
@@ -3091,7 +3202,8 @@ def execute_cleanup_runtime_plan(
         artifact_ref_count=len([value for value in refs.values() if value]),
         elapsed_ms=round(runtime_ms, 3),
     )
-    return CleanupResult(
+    perf_result_build_started = time.perf_counter() if runtime_perf is not None else 0.0
+    result = CleanupResult(
         cleanup_result_id=f"cres_{_safe_id(cleanup_plan.cleanup_plan_id)}",
         cleanup_plan_id=str(cleanup_plan.cleanup_plan_id),
         cleanup_job_id=str(cleanup_plan.cleanup_job_id),
@@ -3238,6 +3350,47 @@ def execute_cleanup_runtime_plan(
         cleaned_image=cleaned_image,
         cleaned_crop=cleaned_crop,
     )
+    if runtime_perf is not None and perf_record is not None and isinstance(perf_collector, dict):
+        _perf_add(runtime_perf, "result_build_ms", _perf_elapsed_ms(perf_result_build_started))
+        runtime_perf["total_observed_ms"] = _perf_elapsed_ms(perf_total_started)
+        runtime_leaf_keys = (
+            "pre_mask_setup_ms",
+            "mask_standardization_ms",
+            "post_mask_setup_ms",
+            "input_image_hash_ms",
+            "input_mask_hash_ms",
+            "local_execution_ms",
+            "result_prepare_ms",
+            "safe_commit_ms",
+            "authorized_clip_ms",
+            "output_hash_ms",
+            "changed_pixel_count_ms",
+            "metadata_finalize_ms",
+            "artifact_write_ms",
+            "result_build_ms",
+        )
+        leaf_sum_ms = sum(float(runtime_perf.get(key) or 0.0) for key in runtime_leaf_keys)
+        runtime_perf["leaf_sum_ms"] = round(leaf_sum_ms, 3)
+        runtime_perf["unattributed_ms"] = round(
+            max(0.0, float(runtime_perf["total_observed_ms"]) - leaf_sum_ms),
+            3,
+        )
+        perf_record.update(
+            {
+                "cleanup_result_id": str(result.cleanup_result_id),
+                "cleanup_plan_id": str(result.cleanup_plan_id),
+                "cleanup_job_id": str(result.cleanup_job_id),
+                "cleanup_mask_id": str(result.cleanup_mask_id),
+                "region_id": str(result.region_id or ""),
+                "parent_execution_bundle_id": str(result.parent_execution_bundle_id or ""),
+                "backend_name": str(result.backend_name or ""),
+                "backend_kind": str(result.backend_kind or ""),
+                "backend_method": str(result.backend_method or ""),
+                "runtime_ms": round(float(result.runtime_ms or 0.0), 3),
+            }
+        )
+        perf_collector.setdefault("jobs", []).append(perf_record)
+    return result
 
 
 def _proof(

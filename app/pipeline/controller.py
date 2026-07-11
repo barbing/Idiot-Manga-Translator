@@ -136,11 +136,28 @@ def _compact_enum_value(value: Any) -> str:
     return str(value or "")
 
 
+def _merge_numeric_perf_tree(target: dict[str, Any], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    for key, value in source.items():
+        if isinstance(value, dict):
+            child = target.setdefault(str(key), {})
+            if isinstance(child, dict):
+                _merge_numeric_perf_tree(child, value)
+        elif (
+            str(key).endswith("_ms")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            target[str(key)] = round(float(target.get(str(key)) or 0.0) + float(value), 3)
+
+
 def _attach_cleanup_runtime_perf_summary(
     debug_context: dict[str, Any] | None,
     cleanup_runtime_contract_result: Any,
     *,
     runtime_elapsed_seconds: float,
+    cleanup_runtime_perf: dict[str, Any] | None = None,
 ) -> None:
     if not isinstance(debug_context, dict) or cleanup_runtime_contract_result is None:
         return
@@ -150,10 +167,19 @@ def _attach_cleanup_runtime_perf_summary(
         for proof in getattr(cleanup_runtime_contract_result, "proof_records", []) or []
         if str(getattr(proof, "cleanup_result_id", "") or "")
     }
+    perf_jobs = list((cleanup_runtime_perf or {}).get("jobs") or [])
+    perf_by_result_id = {
+        str(record.get("cleanup_result_id") or ""): record
+        for record in perf_jobs
+        if isinstance(record, dict) and str(record.get("cleanup_result_id") or "")
+    }
     job_records: list[dict[str, Any]] = []
     backend_elapsed_ms = 0.0
     model_call_elapsed_ms = 0.0
     proof_elapsed_ms = 0.0
+    result_runtime_observed_ms = 0.0
+    substage_totals: dict[str, Any] = {}
+    cleanup_devices: set[str] = set()
     crop_area_pixels = 0
     ai_backend_calls = 0
 
@@ -161,8 +187,27 @@ def _attach_cleanup_runtime_perf_summary(
         params = getattr(result, "backend_parameters", {}) or {}
         proof = proof_by_result_id.get(str(getattr(result, "cleanup_result_id", "") or ""))
         proof_metrics = getattr(proof, "metrics", {}) or {}
-        backend_ms = _numeric_or_zero(params.get("backend_elapsed_ms"))
-        model_ms = _numeric_or_zero(params.get("model_call_elapsed_ms"))
+        result_id = str(getattr(result, "cleanup_result_id", "") or "")
+        perf_record = perf_by_result_id.get(result_id, {})
+        perf_stages = perf_record.get("stages") if isinstance(perf_record, dict) else {}
+        if not isinstance(perf_stages, dict):
+            perf_stages = {}
+        backend_perf = perf_stages.get("backend") if isinstance(perf_stages.get("backend"), dict) else {}
+        crop_local_perf = (
+            perf_stages.get("crop_local_backend")
+            if isinstance(perf_stages.get("crop_local_backend"), dict)
+            else {}
+        )
+        runner_perf = backend_perf.get("runner") if isinstance(backend_perf.get("runner"), dict) else {}
+        backend_ms = _numeric_or_zero(backend_perf.get("engine_total_ms"))
+        backend_ms += _numeric_or_zero(crop_local_perf.get("elapsed_ms"))
+        if backend_ms <= 0:
+            backend_ms = _numeric_or_zero(params.get("backend_elapsed_ms"))
+        model_ms = _numeric_or_zero(runner_perf.get("cuda_model_event_ms"))
+        if model_ms <= 0:
+            model_ms = _numeric_or_zero(runner_perf.get("model_and_output_ms"))
+        if model_ms <= 0:
+            model_ms = _numeric_or_zero(params.get("model_call_elapsed_ms"))
         proof_ms = _numeric_or_zero(params.get("proof_elapsed_ms") or proof_metrics.get("proof_elapsed_ms"))
         runtime_ms = _numeric_or_zero(getattr(result, "runtime_ms", 0.0))
         backend_kind = str(getattr(result, "backend_kind", "") or params.get("backend_kind") or "")
@@ -173,12 +218,22 @@ def _attach_cleanup_runtime_perf_summary(
         if backend_kind == "model_inpaint" or model_attempted:
             ai_backend_calls += 1
             crop_area_pixels += max(0, crop_area)
-            backend_elapsed_ms += backend_ms if backend_ms > 0 else runtime_ms
+            backend_elapsed_ms += backend_ms
             model_call_elapsed_ms += model_ms
         proof_elapsed_ms += proof_ms
+        runtime_observed_ms = _numeric_or_zero(
+            ((perf_stages.get("runtime") or {}).get("total_observed_ms"))
+            if isinstance(perf_stages.get("runtime"), dict)
+            else 0.0
+        )
+        result_runtime_observed_ms += runtime_observed_ms
+        _merge_numeric_perf_tree(substage_totals, perf_stages)
+        cleanup_device = str(backend_perf.get("device") or runner_perf.get("device") or "")
+        if cleanup_device:
+            cleanup_devices.add(cleanup_device)
         job_records.append(
             {
-                "cleanup_result_id": str(getattr(result, "cleanup_result_id", "") or ""),
+                "cleanup_result_id": result_id,
                 "cleanup_plan_id": str(getattr(result, "cleanup_plan_id", "") or ""),
                 "cleanup_job_id": str(getattr(result, "cleanup_job_id", "") or ""),
                 "cleanup_mask_id": str(getattr(result, "cleanup_mask_id", "") or ""),
@@ -201,11 +256,14 @@ def _attach_cleanup_runtime_perf_summary(
                 "proof_status": _compact_enum_value(getattr(proof, "proof_status", "")) if proof else "",
                 "execution_status": str(getattr(result, "execution_status", "") or ""),
                 "failure_reason": str(getattr(result, "failure_reason", "") or ""),
+                "cleanup_substage_ms": perf_stages,
             }
         )
 
     runtime_elapsed_ms = max(0.0, float(runtime_elapsed_seconds or 0.0) * 1000.0)
     debug_context["cleanup_job_timings"] = job_records
+    contract_perf = dict((cleanup_runtime_perf or {}).get("contract") or {})
+    contract_total_ms = _numeric_or_zero(contract_perf.get("contract_total_ms"))
     debug_context["cleanup_runtime_summary"] = {
         "result_count": len(getattr(cleanup_runtime_contract_result, "result_records", []) or []),
         "proof_count": len(getattr(cleanup_runtime_contract_result, "proof_records", []) or []),
@@ -216,6 +274,15 @@ def _attach_cleanup_runtime_perf_summary(
         "proof_elapsed_ms": round(proof_elapsed_ms, 3),
         "runtime_elapsed_ms": round(runtime_elapsed_ms, 3),
         "runtime_overhead_ms": round(max(0.0, runtime_elapsed_ms - backend_elapsed_ms - proof_elapsed_ms), 3),
+        "result_runtime_observed_ms": round(result_runtime_observed_ms, 3),
+        "contract_perf": contract_perf,
+        "contract_wrapper_unattributed_ms": round(max(0.0, runtime_elapsed_ms - contract_total_ms), 3),
+        "contract_non_result_proof_ms": round(
+            max(0.0, contract_total_ms - result_runtime_observed_ms - proof_elapsed_ms),
+            3,
+        ),
+        "cleanup_devices": sorted(cleanup_devices),
+        "substage_totals_ms": substage_totals,
     }
     debug_context.setdefault("counts", {})["cleanup_result_records"] = len(job_records)
     debug_context.setdefault("counts", {})["cleanup_proof_records"] = len(getattr(cleanup_runtime_contract_result, "proof_records", []) or [])
@@ -227,6 +294,15 @@ def _attach_cleanup_runtime_perf_summary(
     timing["cleanup_proof_time"] = round(proof_elapsed_ms / 1000.0, 6)
     timing["cleanup_runtime_overhead_time"] = round(
         max(0.0, runtime_elapsed_ms - backend_elapsed_ms - proof_elapsed_ms) / 1000.0,
+        6,
+    )
+    timing["cleanup_runtime_result_observed_time"] = round(result_runtime_observed_ms / 1000.0, 6)
+    timing["cleanup_contract_wrapper_unattributed_time"] = round(
+        max(0.0, runtime_elapsed_ms - contract_total_ms) / 1000.0,
+        6,
+    )
+    timing["cleanup_contract_non_result_proof_time"] = round(
+        max(0.0, contract_total_ms - result_runtime_observed_ms - proof_elapsed_ms) / 1000.0,
         6,
     )
 
@@ -609,6 +685,7 @@ class PipelineWorker(QtCore.QThread):
         from app.pipeline.parent_font_detection import apply_parent_font_detection
         from app.pipeline.cleanup_planning import (
             build_cleanup_plans,
+            collect_cleanup_runtime_perf,
             commit_cleanup_runtime_results_to_working_image,
             run_cleanup_runtime_contract,
         )
@@ -1277,20 +1354,23 @@ class PipelineWorker(QtCore.QThread):
                         with Image.open(source_path) as runtime_source:
                             runtime_source_image = runtime_source.convert("RGB")
                         _page014_timeout_checkpoint("cleanup_runtime_contract", "start", page_id=page_id)
-                        cleanup_runtime_contract_result = run_cleanup_runtime_contract(
-                            page_id=page_id,
-                            image=runtime_source_image.copy(),
-                            source_image=runtime_source_image.copy(),
-                            job_candidates=cleanup_job_contract_result.jobs,
-                            mask_contracts=cleanup_mask_contract_result,
-                            plan_contracts=cleanup_plan_contract_result,
-                            render_eligibility=render_eligibility_contract_result,
-                            use_gpu=self._settings.use_gpu,
-                            model_id=self._settings.inpaint_model_id,
-                            artifact_dir=runtime_artifact_dir,
-                            inpaint_mode=self._settings.inpaint_mode,
-                            prewarmed_cleanup_model=cleanup_model_prewarmed,
-                        )
+                        with collect_cleanup_runtime_perf(
+                            bool(debug_context and debug_context.get("perf_telemetry_only"))
+                        ) as cleanup_runtime_perf:
+                            cleanup_runtime_contract_result = run_cleanup_runtime_contract(
+                                page_id=page_id,
+                                image=runtime_source_image.copy(),
+                                source_image=runtime_source_image.copy(),
+                                job_candidates=cleanup_job_contract_result.jobs,
+                                mask_contracts=cleanup_mask_contract_result,
+                                plan_contracts=cleanup_plan_contract_result,
+                                render_eligibility=render_eligibility_contract_result,
+                                use_gpu=self._settings.use_gpu,
+                                model_id=self._settings.inpaint_model_id,
+                                artifact_dir=runtime_artifact_dir,
+                                inpaint_mode=self._settings.inpaint_mode,
+                                prewarmed_cleanup_model=cleanup_model_prewarmed,
+                            )
                         cleanup_runtime_elapsed = time.time() - cleanup_runtime_start
                         _page014_timeout_checkpoint(
                             "cleanup_runtime_contract",
@@ -1307,6 +1387,7 @@ class PipelineWorker(QtCore.QThread):
                                 debug_context,
                                 cleanup_runtime_contract_result,
                                 runtime_elapsed_seconds=cleanup_runtime_elapsed,
+                                cleanup_runtime_perf=cleanup_runtime_perf,
                             )
                         render_eligibility_contract_result = _apply_cleanup_runtime_render_blocks(
                             render_eligibility_contract_result,
