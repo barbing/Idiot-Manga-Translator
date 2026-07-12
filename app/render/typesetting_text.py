@@ -25,7 +25,8 @@ except Exception:  # pragma: no cover - optional until dependency install
 SYMBOL_CHARS = {"☆", "★", "♡", "❤", "♪"}
 LTR_COMPLEX_SCRIPTS = {"Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh", "Thai"}
 ELLIPSIS_CHARS = {"…", "︙"}
-DASH_CHARS = {"-", "ー", "―", "—", "─", "︱"}
+DASH_CHARS = {"-", "―", "—", "─", "︱", "ー"}
+_TYPESETTING_DASH_CHARS = DASH_CHARS.difference({"ー"})
 WAVE_DASH_CHARS = {"~", "～", "〜", "〰", "︴"}
 COMPACT_VERTICAL_PUNCTUATION_CHARS = {"!", "?", "！", "？", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
 VERTICAL_CENTERED_PUNCTUATION_CHARS = {
@@ -165,14 +166,63 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
     symbols: list[dict[str, Any]] = []
     notes: list[dict[str, Any]] = []
     if not mode.startswith("vert"):
-        for cluster in grapheme_clusters(value):
+        out: list[str] = []
+        source_index = 0
+        normalized_grapheme_index = 0
+        while source_index < len(value):
+            ellipsis_source = _match_ellipsis_source_run(value, source_index)
+            if ellipsis_source:
+                normalized = _canonical_ellipsis_text(ellipsis_source)
+                punctuation.append(
+                    _punctuation_occurrence(
+                        ellipsis_source,
+                        normalized,
+                        source_index=source_index,
+                        normalized_grapheme_start=normalized_grapheme_index,
+                        occurrence_index=len(punctuation),
+                        supported=_symbol_supported(font_manager, face, normalized),
+                        candidate_forms=[normalized],
+                        supported_forms=[normalized] if _symbol_supported(font_manager, face, normalized) else [],
+                        writing_mode="horizontal",
+                    )
+                )
+                out.append(normalized)
+                normalized_grapheme_index += len(grapheme_clusters(normalized))
+                source_index += len(ellipsis_source)
+                continue
+            cluster = grapheme_clusters(value[source_index:])[0]
             if cluster in SYMBOL_CHARS:
-                symbols.append({"symbol": cluster, "normalized": cluster, "supported": _symbol_supported(font_manager, face, cluster)})
-        return value, punctuation, symbols, notes
+                symbols.append(
+                    _symbol_occurrence(
+                        cluster,
+                        source_index=source_index,
+                        normalized_grapheme_start=normalized_grapheme_index,
+                        occurrence_index=len(symbols),
+                        font_manager=font_manager,
+                        face=face,
+                        writing_mode="horizontal",
+                    )
+                )
+            elif _is_punctuation_cluster(cluster):
+                punctuation.append(
+                    _punctuation_occurrence(
+                        cluster,
+                        cluster,
+                        source_index=source_index,
+                        normalized_grapheme_start=normalized_grapheme_index,
+                        occurrence_index=len(punctuation),
+                        supported=True,
+                        candidate_forms=[cluster],
+                        supported_forms=[cluster],
+                        writing_mode="horizontal",
+                    )
+                )
+            out.append(cluster)
+            source_index += len(cluster)
+            normalized_grapheme_index += 1
+        return "".join(out), punctuation, symbols, notes
 
     replacements = (
-        "……",
-        "...",
         "！！",
         "!!",
         "？？",
@@ -204,9 +254,12 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
         ":",
         "；",
         ";",
+        "．",
+        ".",
     )
     out: list[str] = []
     index = 0
+    normalized_grapheme_index = 0
     while index < len(value):
         cluster = grapheme_clusters(value[index:])[0]
         if cluster.isspace():
@@ -220,6 +273,28 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
             )
             index += len(cluster)
             continue
+        ellipsis_source = _match_ellipsis_source_run(value, index)
+        if ellipsis_source:
+            canonical = _canonical_ellipsis_text(ellipsis_source)
+            support = font_manager.vertical_punctuation_support(face, canonical)
+            normalized = support.selected_form or canonical
+            punctuation.append(
+                _punctuation_occurrence(
+                    ellipsis_source,
+                    normalized,
+                    source_index=index,
+                    normalized_grapheme_start=normalized_grapheme_index,
+                    occurrence_index=len(punctuation),
+                    supported=bool(support.supported),
+                    candidate_forms=list(support.candidate_forms),
+                    supported_forms=list(support.supported_forms),
+                    writing_mode="vertical",
+                )
+            )
+            out.append(normalized)
+            normalized_grapheme_index += len(grapheme_clusters(normalized))
+            index += len(ellipsis_source)
+            continue
         matched = ""
         for source in replacements:
             if value.startswith(source, index):
@@ -229,20 +304,50 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
             support = font_manager.vertical_punctuation_support(face, matched)
             normalized = support.selected_form or matched
             punctuation.append(
-                {
-                    "source": matched,
-                    "normalized": normalized,
-                    "supported": bool(support.supported),
-                    "candidate_forms": list(support.candidate_forms),
-                    "supported_forms": list(support.supported_forms),
-                }
+                _punctuation_occurrence(
+                    matched,
+                    normalized,
+                    source_index=index,
+                    normalized_grapheme_start=normalized_grapheme_index,
+                    occurrence_index=len(punctuation),
+                    supported=bool(support.supported),
+                    candidate_forms=list(support.candidate_forms),
+                    supported_forms=list(support.supported_forms),
+                    writing_mode="vertical",
+                )
             )
             out.append(normalized)
+            normalized_grapheme_index += len(grapheme_clusters(normalized))
             index += len(matched)
             continue
         if cluster in SYMBOL_CHARS:
-            symbols.append({"symbol": cluster, "normalized": cluster, "supported": _symbol_supported(font_manager, face, cluster)})
+            symbols.append(
+                _symbol_occurrence(
+                    cluster,
+                    source_index=index,
+                    normalized_grapheme_start=normalized_grapheme_index,
+                    occurrence_index=len(symbols),
+                    font_manager=font_manager,
+                    face=face,
+                    writing_mode="vertical",
+                )
+            )
+        elif _is_punctuation_cluster(cluster):
+            punctuation.append(
+                _punctuation_occurrence(
+                    cluster,
+                    cluster,
+                    source_index=index,
+                    normalized_grapheme_start=normalized_grapheme_index,
+                    occurrence_index=len(punctuation),
+                    supported=_symbol_supported(font_manager, face, cluster),
+                    candidate_forms=[cluster],
+                    supported_forms=[cluster] if _symbol_supported(font_manager, face, cluster) else [],
+                    writing_mode="vertical",
+                )
+            )
         out.append(cluster)
+        normalized_grapheme_index += 1
         index += len(cluster)
     return "".join(out), punctuation, symbols, notes
 
@@ -284,7 +389,14 @@ def classify_grapheme(text: str) -> str:
     return "other"
 
 
-def segment_inline_runs(text: str, *, writing_mode: str, language_hint: str = "") -> list[InlineTextRun]:
+def segment_inline_runs(
+    text: str,
+    *,
+    writing_mode: str,
+    language_hint: str = "",
+    punctuation_occurrences: Sequence[dict[str, Any]] | None = None,
+    symbol_occurrences: Sequence[dict[str, Any]] | None = None,
+) -> list[InlineTextRun]:
     clusters = grapheme_clusters(text)
     runs: list[InlineTextRun] = []
     index = 0
@@ -328,6 +440,20 @@ def segment_inline_runs(text: str, *, writing_mode: str, language_hint: str = ""
             metadata["letter_stacking_allowed"] = False
         if direction == "rtl" and _bidi_get_display is not None:
             metadata["bidi_visual_text"] = _bidi_get_display(text_value)
+        punctuation_evidence = _occurrences_for_span(
+            punctuation_occurrences,
+            start,
+            index + 1,
+        )
+        symbol_evidence = _occurrences_for_span(
+            symbol_occurrences,
+            start,
+            index + 1,
+        )
+        if punctuation_evidence:
+            metadata["punctuation_occurrences"] = punctuation_evidence
+        if symbol_evidence:
+            metadata["symbol_occurrences"] = symbol_evidence
         runs.append(
             InlineTextRun(
                 run_id=f"run_{len(runs):04d}",
@@ -398,6 +524,200 @@ def _symbol_supported(font_manager, face, symbol: str) -> bool:
         return False
 
 
+def _symbol_occurrence(
+    symbol: str,
+    *,
+    source_index: int,
+    normalized_grapheme_start: int,
+    occurrence_index: int,
+    font_manager,
+    face,
+    writing_mode: str,
+) -> dict[str, Any]:
+    supported = _symbol_supported(font_manager, face, symbol)
+    return {
+        "occurrence_id": f"symbol_{occurrence_index:04d}",
+        "symbol": symbol,
+        "source": symbol,
+        "normalized": symbol,
+        "source_codepoints": _codepoints(symbol),
+        "normalized_codepoints": _codepoints(symbol),
+        "source_start": int(source_index),
+        "source_end": int(source_index + len(symbol)),
+        "normalized_grapheme_start": int(normalized_grapheme_start),
+        "normalized_grapheme_end": int(normalized_grapheme_start + 1),
+        "writing_mode": writing_mode,
+        "kind": "symbol",
+        "source_class": _symbol_class(symbol),
+        "orientation_policy": "upright_resolved_face" if writing_mode == "vertical" else "horizontal",
+        "render_policy": "resolved_font_glyph",
+        "supported": bool(supported),
+    }
+
+
+def _punctuation_occurrence(
+    source: str,
+    normalized: str,
+    *,
+    source_index: int,
+    normalized_grapheme_start: int,
+    occurrence_index: int,
+    supported: bool,
+    candidate_forms: Sequence[str],
+    supported_forms: Sequence[str],
+    writing_mode: str,
+) -> dict[str, Any]:
+    kind = _punctuation_kind(source)
+    normalized_count = len(grapheme_clusters(normalized))
+    unit_count = _punctuation_unit_count(source, normalized, kind)
+    record = {
+        "occurrence_id": f"punctuation_{occurrence_index:04d}",
+        "source": source,
+        "normalized": normalized,
+        "source_codepoints": _codepoints(source),
+        "normalized_codepoints": _codepoints(normalized),
+        "source_start": int(source_index),
+        "source_end": int(source_index + len(source)),
+        "normalized_grapheme_start": int(normalized_grapheme_start),
+        "normalized_grapheme_end": int(normalized_grapheme_start + normalized_count),
+        "writing_mode": writing_mode,
+        "kind": kind,
+        "source_class": _punctuation_source_class(source, kind),
+        "orientation_policy": _punctuation_orientation_policy(kind, writing_mode),
+        "render_policy": _punctuation_render_policy(kind, writing_mode),
+        "unit_count": unit_count,
+        "supported": bool(supported),
+        "candidate_forms": list(candidate_forms),
+        "supported_forms": list(supported_forms),
+    }
+    if kind == "ellipsis":
+        record["dot_count"] = int(unit_count * 3)
+        record["sequence_group_count"] = 1
+    return record
+
+
+def _occurrences_for_span(
+    occurrences: Sequence[dict[str, Any]] | None,
+    start: int,
+    end: int,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in list(occurrences or []):
+        if not isinstance(item, dict):
+            continue
+        item_start = int(item.get("normalized_grapheme_start") or 0)
+        item_end = int(item.get("normalized_grapheme_end") or item_start)
+        if item_start < end and item_end > start:
+            result.append(dict(item))
+    return result
+
+
+def _is_punctuation_cluster(cluster: str) -> bool:
+    return bool(cluster) and (
+        classify_grapheme(cluster) in {
+            "ellipsis",
+            "dash",
+            "wave",
+            "punctuation",
+            "open_punctuation",
+            "close_punctuation",
+        }
+        or unicodedata.category(cluster[0]).startswith("P")
+    )
+
+
+def _punctuation_kind(source: str) -> str:
+    if _ellipsis_source_unit_count(source) > 0:
+        return "ellipsis"
+    if _is_dash_sequence(source):
+        return "dash"
+    if _is_wave_sequence(source):
+        return "wave"
+    if source and all(char in COMPACT_VERTICAL_PUNCTUATION_CHARS for char in source):
+        return "emphasis_punctuation"
+    if source in OPEN_PUNCTUATION:
+        return "open_punctuation"
+    if source in CLOSE_PUNCTUATION:
+        return "close_punctuation"
+    return "punctuation"
+
+
+def _punctuation_source_class(source: str, kind: str) -> str:
+    if kind == "wave":
+        return {
+            "~": "ascii_tilde",
+            "～": "fullwidth_tilde",
+            "〜": "wave_dash",
+            "〰": "wavy_dash",
+            "︴": "vertical_wavy_line",
+        }.get(source[:1], "mixed_wave_sequence")
+    if kind == "ellipsis":
+        if source and all(char == "." for char in source):
+            units = _ellipsis_source_unit_count(source)
+            if units == 1:
+                return "ascii_three_dot_ellipsis"
+            if units == 2:
+                return "ascii_six_dot_ellipsis"
+            return "ascii_multi_unit_ellipsis"
+        if _is_ellipsis_sequence(source):
+            return "unicode_ellipsis"
+        return "mixed_ellipsis_sequence"
+    if kind == "dash":
+        return "dash_sequence"
+    if kind in {"open_punctuation", "close_punctuation"}:
+        return kind
+    return "punctuation"
+
+
+def _punctuation_orientation_policy(kind: str, writing_mode: str) -> str:
+    if writing_mode != "vertical":
+        return "horizontal"
+    if kind in {"ellipsis", "wave", "dash"}:
+        return "vertical_inline_axis"
+    if kind in {"open_punctuation", "close_punctuation"}:
+        return "font_vertical_alternate"
+    return "upright_vertical_form"
+
+
+def _punctuation_render_policy(kind: str, writing_mode: str) -> str:
+    if writing_mode != "vertical":
+        return "resolved_font_glyph"
+    if kind == "ellipsis":
+        return "vertical_ellipsis_primitive"
+    if kind == "wave":
+        return "vertical_wave_primitive"
+    if kind == "dash":
+        return "vertical_dash_primitive"
+    if kind in {"open_punctuation", "close_punctuation"}:
+        return "font_vertical_alternate"
+    return "resolved_vertical_form_glyph"
+
+
+def _punctuation_unit_count(source: str, normalized: str, kind: str) -> int:
+    if kind == "ellipsis":
+        source_units = _ellipsis_source_unit_count(source)
+        if source_units > 0:
+            return source_units
+        return max(1, len([char for char in normalized if char in ELLIPSIS_CHARS]))
+    if kind in {"wave", "dash"}:
+        return max(1, len(grapheme_clusters(normalized)))
+    return 1
+
+
+def _codepoints(text: str) -> list[str]:
+    return [f"U+{ord(char):04X}" for char in str(text or "")]
+
+
+def _symbol_class(symbol: str) -> str:
+    return {
+        "☆": "white_star",
+        "★": "black_star",
+        "♡": "white_heart",
+        "❤": "heart",
+        "♪": "music_note",
+    }.get(symbol, "symbol")
+
+
 def _is_latin_char(char: str) -> bool:
     if not char:
         return False
@@ -413,8 +733,60 @@ def _is_ellipsis_sequence(text: str) -> bool:
     return bool(text) and all(char in ELLIPSIS_CHARS for char in text)
 
 
+def _ellipsis_source_unit_count(text: str) -> int:
+    value = str(text or "")
+    if not value:
+        return 0
+    units = 0
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char in ELLIPSIS_CHARS:
+            units += 1
+            index += 1
+            continue
+        if value.startswith("...", index):
+            units += 1
+            index += 3
+            continue
+        return 0
+    return units
+
+
+def _canonical_ellipsis_text(source: str) -> str:
+    return "…" * max(1, _ellipsis_source_unit_count(source))
+
+
+def _match_ellipsis_source_run(text: str, start: int) -> str:
+    value = str(text or "")
+    index = max(0, int(start))
+    end = index
+    units = 0
+    while end < len(value):
+        if value[end] in ELLIPSIS_CHARS:
+            units += 1
+            end += 1
+            continue
+        if value[end] == ".":
+            dot_end = end
+            while dot_end < len(value) and value[dot_end] == ".":
+                dot_end += 1
+            complete_length = ((dot_end - end) // 3) * 3
+            if complete_length <= 0:
+                break
+            units += complete_length // 3
+            end += complete_length
+            if end < dot_end:
+                break
+            continue
+        break
+    if units <= 0:
+        return ""
+    return value[index:end]
+
+
 def _is_dash_sequence(text: str) -> bool:
-    return bool(text) and all(char in DASH_CHARS for char in text)
+    return bool(text) and all(char in _TYPESETTING_DASH_CHARS for char in text)
 
 
 def _is_wave_sequence(text: str) -> bool:

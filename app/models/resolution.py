@@ -256,15 +256,27 @@ def resolve_noto_cjk_sc_font_file(
     base_dir: Optional[str] = None,
     serif: bool = False,
     weight: str = "regular",
+    monospace: bool = False,
 ) -> Optional[str]:
     directory = _noto_cjk_sc_font_dir(base_dir)
     normalized_weight = str(weight or "regular").strip().lower()
-    if serif:
+    if monospace:
+        candidates = (
+            "NotoSansMonoCJKsc-Regular.otf",
+            "NotoSansCJKsc-Regular.otf",
+        )
+    elif serif:
         candidates = (
             "NotoSerifCJKsc-Bold.otf",
+            "NotoSerifCJKsc-SemiBold.otf",
             "NotoSerifCJKsc-Regular.otf",
         ) if normalized_weight in {"bold", "black", "heavy"} else (
+            "NotoSerifCJKsc-SemiBold.otf",
             "NotoSerifCJKsc-Regular.otf",
+            "NotoSerifCJKsc-Bold.otf",
+        ) if normalized_weight in {"semibold", "semi-bold", "600"} else (
+            "NotoSerifCJKsc-Regular.otf",
+            "NotoSerifCJKsc-SemiBold.otf",
             "NotoSerifCJKsc-Bold.otf",
         )
     elif normalized_weight in {"black", "heavy"}:
@@ -279,9 +291,16 @@ def resolve_noto_cjk_sc_font_file(
             "NotoSansCJKsc-Black.otf",
             "NotoSansCJKsc-Regular.otf",
         )
+    elif normalized_weight in {"medium", "500"}:
+        candidates = (
+            "NotoSansCJKsc-Medium.otf",
+            "NotoSansCJKsc-Regular.otf",
+            "NotoSansCJKsc-Bold.otf",
+        )
     else:
         candidates = (
             "NotoSansCJKsc-Regular.otf",
+            "NotoSansCJKsc-Medium.otf",
             "NotoSansCJKsc-Bold.otf",
             "NotoSansCJKsc-Black.otf",
         )

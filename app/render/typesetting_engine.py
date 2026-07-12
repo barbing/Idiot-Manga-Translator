@@ -11,14 +11,14 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
-from app.render.font_manager import FontManager
+from app.render.font_manager import FontManager, FontResolution, RunFontResolution
+from app.render.line_break_planner import LineBreakPlanner
 from app.render.text_shaper import HarfBuzzShaper, ShapedRun
 from app.render.typesetting_contracts import FitReport, GlyphPlacement, RenderLayerPlan, TypesetLayout, bbox_from_value
 from app.render.typesetting_text import (
     BreakOpportunity,
     VERTICAL_CENTERED_PUNCTUATION_CHARS,
     InlineTextRun,
-    classify_grapheme,
     compute_break_opportunities,
     grapheme_clusters,
     normalize_for_writing_mode,
@@ -90,10 +90,12 @@ class TypesettingEngine:
         font_manager: FontManager | None = None,
         shaper: HarfBuzzShaper | None = None,
         policy: TypesettingPolicy | None = None,
+        break_planner: LineBreakPlanner | None = None,
     ) -> None:
         self.font_manager = font_manager or FontManager()
         self.shaper = shaper or HarfBuzzShaper(self.font_manager)
         self.policy = policy or TypesettingPolicy()
+        self.break_planner = break_planner or LineBreakPlanner()
 
     def typeset_layer(self, plan: RenderLayerPlan) -> tuple[TypesetLayout, FitReport]:
         missing = _missing_identity(plan)
@@ -122,7 +124,13 @@ class TypesettingEngine:
             self.font_manager,
             face,
         )
-        runs = segment_inline_runs(normalized, writing_mode=writing_mode, language_hint=_language_hint(plan))
+        runs = segment_inline_runs(
+            normalized,
+            writing_mode=writing_mode,
+            language_hint=_language_hint(plan),
+            punctuation_occurrences=punctuation,
+            symbol_occurrences=symbols,
+        )
         breaks = compute_break_opportunities(runs, writing_mode=writing_mode)
         style_issues = _style_issues(runs, writing_mode, self.policy)
         script_policy = _script_policy(runs, writing_mode, self.policy)
@@ -135,7 +143,26 @@ class TypesettingEngine:
             target_box,
             plan.metadata,
         ):
-            shaped_runs = self._shape_runs(runs, face, font_size, writing_mode)
+            shaped_runs, run_font_resolutions = self._shape_runs(
+                runs,
+                resolved,
+                font_size,
+                writing_mode,
+            )
+            metrics_by_face: dict[str, dict[str, Any]] = {}
+            metric_faces = [face]
+            metric_faces.extend(
+                item.selected_face
+                for item in run_font_resolutions
+                if item.selected_face is not None and item.selected_face.face_id != face.face_id
+            )
+            for metric_face in metric_faces:
+                if metric_face.face_id in metrics_by_face:
+                    continue
+                metrics_by_face[metric_face.face_id] = self.font_manager.open_type_metrics(
+                    metric_face,
+                    size=font_size,
+                ).to_audit_dict()
             layout_intent_box, box_model, reason_codes = self._layout_intent_box(
                 plan=plan,
                 hard_bounds=hard_bounds,
@@ -147,24 +174,52 @@ class TypesettingEngine:
                 shaped_runs=shaped_runs,
             )
             if writing_mode == "horizontal":
-                placements, lines, columns, measured_bounds, fit_status, fit_issues = self._layout_horizontal(
+                placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_horizontal(
                     normalized,
                     runs,
                     shaped_runs,
+                    breaks,
                     layout_intent_box,
                     font_size,
                     plan.resolved_render_style,
                 )
             else:
-                placements, lines, columns, measured_bounds, fit_status, fit_issues = self._layout_vertical(
+                placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_vertical(
                     normalized,
                     runs,
                     shaped_runs,
+                    breaks,
                     layout_intent_box,
                     font_size,
                     plan.resolved_render_style,
                     plan,
                 )
+                retry = None
+                if fit_status != "fits" and _font_size_is_locked(plan.resolved_render_style):
+                    retry = self._retry_locked_vertical_fit(
+                        normalized=normalized,
+                        runs=runs,
+                        shaped_runs=shaped_runs,
+                        breaks=breaks,
+                        plan=plan,
+                        style=plan.resolved_render_style,
+                        font_size=font_size,
+                        hard_bounds=hard_bounds,
+                        layout_intent_box=layout_intent_box,
+                        box_model=box_model,
+                        break_plan=break_plan,
+                    )
+                if retry is not None:
+                    placements = retry["placements"]
+                    lines = retry["lines"]
+                    columns = retry["columns"]
+                    measured_bounds = retry["measured_bounds"]
+                    fit_status = retry["fit_status"]
+                    fit_issues = retry["fit_issues"]
+                    break_plan = retry["break_plan"]
+                    layout_intent_box = retry["layout_intent_box"]
+                    box_model = retry["box_model"]
+                    reason_codes.extend(retry["reason_codes"])
             attempt = {
                 "font_size": int(font_size),
                 "fit_status": fit_status,
@@ -177,6 +232,14 @@ class TypesettingEngine:
                 "shaped_runs": shaped_runs,
                 "box_model": box_model,
                 "reason_codes": reason_codes,
+                "break_plan": break_plan,
+                "run_font_resolutions": run_font_resolutions,
+                "open_type_metrics_by_face": metrics_by_face,
+                "effective_line_height": (
+                    float(box_model.get("effective_line_height"))
+                    if box_model.get("effective_line_height") is not None
+                    else _line_height(plan.resolved_render_style)
+                ),
             }
             attempts.append(attempt)
             selected_attempt = attempt
@@ -194,6 +257,10 @@ class TypesettingEngine:
         fit_issues = list(selected_attempt["issues"])
         box_model = dict(selected_attempt["box_model"])
         reason_codes = list(selected_attempt["reason_codes"])
+        break_plan = dict(selected_attempt["break_plan"])
+        run_font_resolutions = list(selected_attempt["run_font_resolutions"])
+        open_type_metrics_by_face = dict(selected_attempt["open_type_metrics_by_face"])
+        effective_line_height = float(selected_attempt.get("effective_line_height") or _line_height(plan.resolved_render_style))
         if font_size < preferred_font_size:
             reason_codes.append("font_size_reduced_to_fit_translated_text")
             if bool(plan.resolved_render_style.get("font_size_locked")):
@@ -204,7 +271,12 @@ class TypesettingEngine:
         if fit_status != "fits" and writing_mode == "vertical":
             fit_issues.append("writing_mode_fit_failure")
 
-        all_issues = _unique([*resolved.issues, *style_issues, *fit_issues])
+        run_font_issues = [
+            issue
+            for item in run_font_resolutions
+            for issue in item.issues
+        ]
+        all_issues = _unique([*resolved.issues, *run_font_issues, *style_issues, *fit_issues])
         full_text_placed = fit_status == "fits"
         metadata = {
             "typesetting_engine_version": "typesetting_engine_stage4_v1",
@@ -212,12 +284,15 @@ class TypesettingEngine:
             "writing_mode_policy": writing_policy,
             "inline_runs": [_run_audit(run, writing_mode, self.policy) for run in runs],
             "break_opportunities": [item.to_audit_dict() for item in breaks],
-            "chosen_breaks": _chosen_breaks(lines, columns, writing_mode),
+            "chosen_breaks": list(break_plan.get("selected_breaks") or []),
+            "break_plan": break_plan,
             "kinsoku_adjustments": kinsoku_adjustments,
             "line_break_policy": {
-                "policy_version": "line_break_policy_stage4_v1",
+                "policy_version": "line_break_policy_stage4_v2",
                 "locale_hint": _language_hint(plan),
                 "writing_mode": writing_mode,
+                "selection_authority": "explicit_break_opportunities",
+                "planner_version": self.break_planner.version,
                 "accepted_tailoring_rules": ["space_word_boundary", "cjk_grapheme_boundary"],
                 "rejected_fallback_rules": ["raw_character_count_splitting"],
             },
@@ -230,6 +305,8 @@ class TypesettingEngine:
             "script_policy": script_policy,
             "shaped_runs": [run.to_audit_dict() for run in shaped_runs],
             "font_resolution": resolved.to_audit_dict(),
+            "run_font_resolutions": [item.to_audit_dict() for item in run_font_resolutions],
+            "open_type_metrics_by_face": open_type_metrics_by_face,
             "font_size_selection": {
                 "preferred_font_size": int(preferred_font_size),
                 "selected_font_size": int(font_size),
@@ -249,6 +326,7 @@ class TypesettingEngine:
             },
             "render_style": {
                 "line_height": plan.resolved_render_style.get("line_height"),
+                "effective_line_height": round(effective_line_height, 4),
                 "align": plan.resolved_render_style.get("align"),
                 "fill_color": plan.resolved_render_style.get("fill_color"),
                 "stroke_color": plan.resolved_render_style.get("stroke_color"),
@@ -305,10 +383,13 @@ class TypesettingEngine:
                 "line_break_policy": metadata["line_break_policy"],
                 "break_opportunities": metadata["break_opportunities"],
                 "chosen_breaks": metadata["chosen_breaks"],
+                "break_plan": break_plan,
                 "kinsoku_adjustments": kinsoku_adjustments,
                 "normalization_notes": normalization_notes,
                 "inline_runs": metadata["inline_runs"],
                 "shaped_runs": metadata["shaped_runs"],
+                "run_font_resolutions": metadata["run_font_resolutions"],
+                "open_type_metrics_by_face": open_type_metrics_by_face,
                 "box_model": box_model,
             },
         )
@@ -343,10 +424,26 @@ class TypesettingEngine:
             "allow_block_writing_mode_auto_flip": self.policy.allow_block_writing_mode_auto_flip,
         }
 
-    def _shape_runs(self, runs: Sequence[InlineTextRun], face, font_size: int, writing_mode: str) -> list[ShapedRun]:
+    def _shape_runs(
+        self,
+        runs: Sequence[InlineTextRun],
+        resolution: FontResolution,
+        font_size: int,
+        writing_mode: str,
+    ) -> tuple[list[ShapedRun], list[RunFontResolution]]:
         shaped: list[ShapedRun] = []
+        run_resolutions: list[RunFontResolution] = []
         for run in runs:
             if not run.normalized_text or run.role == "space":
+                continue
+            run_resolution = self.font_manager.resolve_run_font(
+                resolution,
+                run.normalized_text,
+                run_id=run.run_id,
+            )
+            run_resolutions.append(run_resolution)
+            face = run_resolution.selected_face or resolution.primary_face
+            if face is None:
                 continue
             placement_mode = _run_audit(run, writing_mode, self.policy)["placement_mode"]
             shape_writing_mode = _shape_writing_mode_for_run(run, writing_mode, self.policy)
@@ -371,10 +468,14 @@ class TypesettingEngine:
                         "block_writing_mode": writing_mode,
                         "shape_writing_mode": shape_writing_mode,
                         "inline_placement_mode": placement_mode,
+                        "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
+                        "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
+                        "run_font_resolution": run_resolution.to_audit_dict(),
+                        "font_fallback_used": bool(run_resolution.fallback_used),
                     },
                 )
             )
-        return shaped
+        return shaped, run_resolutions
 
     def _layout_intent_box(
         self,
@@ -425,8 +526,15 @@ class TypesettingEngine:
                 reason_codes.append("source_visual_punctuation_reserved_vertical_capacity")
             if vertical_profile.get("source_columns"):
                 reason_codes.append("source_column_structure_used_for_vertical_layout")
+            if int(vertical_profile.get("source_visual_columns") or 0) > 1:
+                reason_codes.append("source_visual_column_structure_used_for_vertical_layout")
         else:
             natural_w, natural_h = _natural_box_size(text, writing_mode, font_size, plan.resolved_render_style, shaped_runs)
+            if natural_w > max(1, w):
+                estimated_lines = max(1, int(math.ceil(float(natural_w) / float(max(1, w)))))
+                natural_w = max(1, w)
+                natural_h = max(natural_h, int(math.ceil(float(font_size) * _line_height(plan.resolved_render_style) * estimated_lines)))
+                reason_codes.append("horizontal_wrap_capacity_reserved_from_measured_runs")
         if writing_mode == "vertical" and vertical_profile.get("source_columns"):
             column_w = float(vertical_profile.get("column_width") or _vertical_column_pitch(font_size, font_size))
             source_columns = int(vertical_profile.get("source_columns") or 0)
@@ -438,17 +546,34 @@ class TypesettingEngine:
                 reason_codes.append("source_column_capacity_reserved_for_vertical_layout_quality")
         if w > max(natural_w * 2, natural_w + font_size) or h > max(natural_h * 2, natural_h + font_size):
             reason_codes.append("oversized_parent_bbox_not_used_as_fill_box")
+        visual_alignment_center: list[float] = []
+        metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+        visual_center_candidate = _point_from_value(metadata.get("visual_alignment_center"))
+        if visual_center_candidate and _point_inside_box(visual_center_candidate, hard_bounds):
+            visual_alignment_center = visual_center_candidate
+            reason_codes.append("visual_alignment_center_used_as_layout_intent")
+        elif visual_center_candidate:
+            reason_codes.append("visual_alignment_center_outside_hard_bounds_ignored")
+
         source_center: list[float] = []
         source_center_candidate = _center_of(source_box)
         if source_box and source_center_candidate and _point_inside_box(source_center_candidate, hard_bounds):
             source_center = source_center_candidate
-            if source_box != target_box:
+            if source_box != target_box and not visual_alignment_center:
                 reason_codes.append("source_contract_bbox_used_as_layout_alignment_prior")
-            else:
+            elif source_box == target_box:
                 reason_codes.append("source_contract_bbox_equals_target_box")
         natural_w = min(max(1, natural_w), max(1, w))
         natural_h = min(max(1, natural_h), max(1, h))
-        if source_center:
+        if visual_alignment_center:
+            intent = [
+                int(round(float(visual_alignment_center[0]) - float(natural_w) / 2.0)),
+                int(round(float(visual_alignment_center[1]) - float(natural_h) / 2.0)),
+                int(natural_w),
+                int(natural_h),
+            ]
+            reason_codes.append("layout_intent_centered_on_visual_alignment_center")
+        elif source_center:
             intent = [
                 int(round(float(source_center[0]) - float(natural_w) / 2.0)),
                 int(round(float(source_center[1]) - float(natural_h) / 2.0)),
@@ -471,7 +596,9 @@ class TypesettingEngine:
             "layout_intent_evidence": evidence,
             "source_contract_bbox": list(source_box),
             "source_contract_bbox_is_layout_box": False,
-            "source_contract_bbox_is_alignment_prior": bool(source_center),
+            "source_contract_bbox_is_alignment_prior": bool(source_center and not visual_alignment_center),
+            "visual_alignment_center": list(visual_alignment_center),
+            "visual_alignment_center_is_layout_prior": bool(visual_alignment_center),
             "vertical_layout_profile": vertical_profile,
             "rejected_box_candidates": [],
         }, reason_codes
@@ -481,11 +608,20 @@ class TypesettingEngine:
         normalized: str,
         runs: Sequence[InlineTextRun],
         shaped_runs: Sequence[ShapedRun],
+        breaks: Sequence[BreakOpportunity],
         box: list[int],
         font_size: int,
         style: dict[str, Any],
         plan: RenderLayerPlan,
-    ) -> tuple[list[GlyphPlacement], list[dict[str, Any]], list[dict[str, Any]], list[int], str, list[str]]:
+    ) -> tuple[
+        list[GlyphPlacement],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[int],
+        str,
+        list[str],
+        dict[str, Any],
+    ]:
         x, y, w, h = box
         line_height = _line_height(style)
         items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size, plan)
@@ -513,19 +649,22 @@ class TypesettingEngine:
         while rows > max_rows and columns_needed < min(max_columns, max(1, len(items))):
             columns_needed += 1
             rows = max(1, int(math.ceil(total_row_units / columns_needed)))
-        column_groups, grouping_meta = _choose_vertical_column_groups(
+        break_result = self.break_planner.plan_vertical(
             items,
+            breaks,
             desired_columns=columns_needed,
             max_columns=min(max_columns, max(1, len(items))),
             max_rows=max_rows,
             profile=profile,
         )
+        column_groups = break_result.groups
+        grouping_meta = break_result.to_audit_dict()
         rows = max((int(math.ceil(_vertical_items_row_units(group))) for group in column_groups), default=rows)
         columns_needed = max(1, len(column_groups))
         required_w = int(math.ceil(columns_needed * column_w))
         required_h = int(math.ceil(rows * cell_h))
-        fit_status = "fits" if required_w <= w and required_h <= h and items else "overflow"
-        issues: list[str] = []
+        fit_status = "fits" if required_w <= w and required_h <= h and items and not break_result.issues else "overflow"
+        issues: list[str] = list(break_result.issues)
         if fit_status != "fits":
             issues.append("layout_overflow")
             issues.append("line_break_fit_failure")
@@ -558,7 +697,7 @@ class TypesettingEngine:
                         text=str(item["text"]),
                         bbox=[px, py, item_w, item_h],
                         position=[float(px), float(py)],
-                        font_family=shaped_runs[0].font_face_id if shaped_runs else "",
+                        font_family=str(item.get("font_face_id") or ""),
                         font_size=float(font_size),
                         advance=slot_h,
                         writing_mode="vertical",
@@ -578,6 +717,16 @@ class TypesettingEngine:
                             "shaped_y_advance": float(shaped_glyph.y_advance) if shaped_glyph else 0.0,
                             "shaped_position_authority": bool(shaped_glyph),
                             "source_visual_hint": dict(item.get("source_visual_hint") or {}),
+                            "punctuation_occurrences": list(item.get("punctuation_occurrences") or []),
+                            "symbol_occurrences": list(item.get("symbol_occurrences") or []),
+                            "ellipsis_unit_count": int(item.get("ellipsis_unit_count") or 0),
+                            "ellipsis_dot_count": int(item.get("ellipsis_dot_count") or 0),
+                            "ellipsis_sequence_group_count": int(item.get("ellipsis_sequence_group_count") or 0),
+                            "wave_unit_count": int(item.get("wave_unit_count") or 0),
+                            "dash_unit_count": int(item.get("dash_unit_count") or 0),
+                            "font_face_id": str(item.get("font_face_id") or ""),
+                            "font_path": str(item.get("font_path") or ""),
+                            "font_fallback_used": bool(item.get("font_fallback_used")),
                         },
                     )
                 )
@@ -623,74 +772,228 @@ class TypesettingEngine:
                         "measured_bounds": list(measured),
                     }
         lines: list[dict[str, Any]] = []
-        return placements, lines, columns, measured, fit_status, _unique(issues)
+        return placements, lines, columns, measured, fit_status, _unique(issues), grouping_meta
+
+    def _retry_locked_vertical_fit(
+        self,
+        *,
+        normalized: str,
+        runs: Sequence[InlineTextRun],
+        shaped_runs: Sequence[ShapedRun],
+        breaks: Sequence[BreakOpportunity],
+        plan: RenderLayerPlan,
+        style: Mapping[str, Any],
+        font_size: int,
+        hard_bounds: Sequence[int],
+        layout_intent_box: Sequence[int],
+        box_model: Mapping[str, Any],
+        break_plan: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        hard = bbox_from_value(hard_bounds)
+        current = bbox_from_value(layout_intent_box)
+        if not hard or not current:
+            return None
+
+        row_units = [float(value) for value in (break_plan.get("column_row_units") or [])]
+        selected_columns = int(break_plan.get("selected_columns") or len(row_units) or 1)
+        if not row_units or selected_columns <= 0:
+            return None
+
+        items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size, plan)
+        if not items:
+            return None
+        shaped_advance = max(1.0, _dominant_vertical_advance(shaped_runs))
+        item_cell_height = max((_vertical_item_cell_height(item) for item in items), default=0.0)
+        original_line_height = _line_height(dict(style or {}))
+        effective_line_height = original_line_height
+        max_row_units = max(row_units)
+        hard_w = int(hard[2])
+        hard_h = int(hard[3])
+
+        cell_height = max(shaped_advance * effective_line_height, item_cell_height)
+        needed_height = int(math.ceil(max_row_units * cell_height))
+        reason_codes = ["layout_intent_expanded_for_legal_vertical_partition"]
+        if needed_height > hard_h and original_line_height > 1.0:
+            compacted = min(
+                original_line_height,
+                float(hard_h) / max(1.0, max_row_units * shaped_advance),
+            )
+            if compacted >= 1.0:
+                effective_line_height = max(1.0, compacted - 1e-6)
+                cell_height = max(shaped_advance * effective_line_height, item_cell_height)
+                needed_height = int(math.ceil(max_row_units * cell_height))
+                reason_codes.append("line_height_compacted_for_locked_size_fit")
+
+        content_width = max((float(item.get("width", 0.0)) for item in items), default=0.0)
+        column_width = _vertical_column_pitch(font_size, content_width)
+        needed_width = int(math.ceil(float(selected_columns) * column_width))
+        if needed_width > hard_w or needed_height > hard_h:
+            return None
+
+        retry_box = _expanded_box_within_hard_bounds(
+            current,
+            required_width=max(int(current[2]), needed_width),
+            required_height=max(int(current[3]), needed_height),
+            hard_bounds=hard,
+        )
+        retry_style = dict(style or {})
+        retry_style["line_height"] = effective_line_height
+        (
+            placements,
+            lines,
+            columns,
+            measured_bounds,
+            fit_status,
+            fit_issues,
+            retry_break_plan,
+        ) = self._layout_vertical(
+            normalized,
+            runs,
+            shaped_runs,
+            breaks,
+            retry_box,
+            font_size,
+            retry_style,
+            plan,
+        )
+        if fit_status != "fits":
+            return None
+
+        updated_box_model = dict(box_model or {})
+        updated_box_model["layout_intent_box"] = list(retry_box)
+        updated_box_model["layout_intent_evidence"] = (
+            "translated_text_natural_box_expanded_for_legal_vertical_partition"
+        )
+        updated_box_model["effective_line_height"] = round(effective_line_height, 6)
+        if columns and isinstance(columns[0].get("layout_profile"), Mapping):
+            updated_box_model["vertical_layout_profile"] = dict(columns[0]["layout_profile"])
+        return {
+            "placements": placements,
+            "lines": lines,
+            "columns": columns,
+            "measured_bounds": measured_bounds,
+            "fit_status": fit_status,
+            "fit_issues": fit_issues,
+            "break_plan": retry_break_plan,
+            "layout_intent_box": list(retry_box),
+            "box_model": updated_box_model,
+            "reason_codes": reason_codes,
+        }
 
     def _layout_horizontal(
         self,
         normalized: str,
         runs: Sequence[InlineTextRun],
         shaped_runs: Sequence[ShapedRun],
+        breaks: Sequence[BreakOpportunity],
         box: list[int],
         font_size: int,
         style: dict[str, Any],
-    ) -> tuple[list[GlyphPlacement], list[dict[str, Any]], list[dict[str, Any]], list[int], str, list[str]]:
+    ) -> tuple[
+        list[GlyphPlacement],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[int],
+        str,
+        list[str],
+        dict[str, Any],
+    ]:
         x, y, w, h = box
         line_height = max(1.0, font_size * _line_height(style))
-        placements: list[GlyphPlacement] = []
-        cursor_x = float(x)
-        cursor_y = float(y)
-        line_index = 0
-        issues: list[str] = []
+        max_lines = max(1, int(math.floor(float(h) / line_height)))
+        shaped_by_run = {
+            str(item.metadata.get("run_id") or ""): item
+            for item in shaped_runs
+            if str(item.metadata.get("run_id") or "")
+        }
+        layout_items: list[dict[str, Any]] = []
         for run in runs:
-            text = run.normalized_text
+            shaped = shaped_by_run.get(run.run_id)
             if run.role == "space":
                 advance = font_size * 0.35
-                if cursor_x > x and cursor_x + advance > x + w:
-                    cursor_x = float(x)
-                    cursor_y += line_height
-                    line_index += 1
+            else:
+                advance = sum(max(0.0, glyph.x_advance) for glyph in shaped.glyphs) if shaped else font_size * len(run.text)
+            layout_items.append(
+                {
+                    "text": run.normalized_text,
+                    "run_id": run.run_id,
+                    "advance": max(0.0, float(advance)),
+                    "role": run.role,
+                    "script": run.script,
+                    "run": run,
+                    "shaped_run": shaped,
+                }
+            )
+        break_result = self.break_planner.plan_horizontal(
+            layout_items,
+            breaks,
+            max_width=float(w),
+            max_lines=max_lines,
+        )
+        line_groups = break_result.groups
+        placements: list[GlyphPlacement] = []
+        issues: list[str] = list(break_result.issues)
+        lines: list[dict[str, Any]] = []
+        selected_breaks = list(break_result.selected_breaks)
+        for line_index, group in enumerate(line_groups):
+            cursor_x = float(x)
+            raw_y = float(y) + float(line_index) * line_height
+            placement_height = int(max(1, min(float(h), line_height)))
+            py = min(max(y, int(round(raw_y))), y + h - placement_height)
+            for item in group:
+                run = item.get("run")
+                shaped = item.get("shaped_run")
+                text = str(item.get("text") or "")
+                advance = max(0.0, float(item.get("advance") or 0.0))
+                if isinstance(run, InlineTextRun) and run.script == "Latn" and advance > w:
+                    issues.append("word_overflow_break_applied")
+                px = min(max(x, int(round(cursor_x))), x + w - 1)
+                remaining_width = max(1.0, float(x + w - px))
+                visible_width = int(max(1, min(max(1.0, advance), remaining_width)))
                 placements.append(
                     GlyphPlacement(
                         text=text,
-                        bbox=[int(cursor_x), int(cursor_y), int(max(1, advance)), int(max(1, line_height))],
-                        position=[cursor_x, cursor_y],
-                        font_family=shaped_runs[0].font_face_id if shaped_runs else "",
+                        bbox=[px, py, visible_width, placement_height],
+                        position=[float(px), float(py)],
+                        font_family=shaped.font_face_id if isinstance(shaped, ShapedRun) else "",
                         font_size=float(font_size),
                         advance=advance,
                         writing_mode="horizontal",
-                        metadata={"run_id": run.run_id, "line_index": line_index, "space_run": True},
+                        metadata={
+                            "run_id": str(item.get("run_id") or ""),
+                            "line_index": line_index,
+                            "space_run": bool(isinstance(run, InlineTextRun) and run.role == "space"),
+                            "placement_source": "authoritative_break_opportunity_partition",
+                            "font_face_id": shaped.font_face_id if isinstance(shaped, ShapedRun) else "",
+                            "font_path": shaped.font_path if isinstance(shaped, ShapedRun) else "",
+                            "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if isinstance(shaped, ShapedRun) else False,
+                            "punctuation_occurrences": list((run.metadata or {}).get("punctuation_occurrences") or []) if isinstance(run, InlineTextRun) else [],
+                            "symbol_occurrences": list((run.metadata or {}).get("symbol_occurrences") or []) if isinstance(run, InlineTextRun) else [],
+                        },
                     )
                 )
                 cursor_x += advance
-                continue
-            shaped = next((item for item in shaped_runs if item.text == text), None)
-            advance = sum(max(0.0, glyph.x_advance) for glyph in shaped.glyphs) if shaped else font_size * len(text)
-            if cursor_x > x and cursor_x + advance > x + w:
-                cursor_x = float(x)
-                cursor_y += line_height
-                line_index += 1
-            if run.script == "Latn" and advance > w:
-                issues.append("word_overflow_break_applied")
-            visible_width = min(max(1.0, advance), max(1.0, float(w)))
-            placements.append(
-                GlyphPlacement(
-                    text=text,
-                    bbox=[int(cursor_x), int(cursor_y), int(visible_width), int(max(1, line_height))],
-                    position=[cursor_x, cursor_y],
-                    font_family=shaped.font_face_id if shaped else "",
-                    font_size=float(font_size),
-                    advance=advance,
-                    writing_mode="horizontal",
-                    metadata={"run_id": run.run_id, "line_index": line_index},
-                )
-            )
-            cursor_x += advance
+            line_width = sum(max(0.0, float(item.get("advance") or 0.0)) for item in group)
+            line_record: dict[str, Any] = {
+                "line_index": line_index,
+                "writing_mode": "horizontal",
+                "run_ids": [str(item.get("run_id") or "") for item in group],
+                "measured_advance": round(line_width, 3),
+            }
+            if line_index < len(selected_breaks):
+                line_record["selected_break"] = dict(selected_breaks[line_index])
+            lines.append(line_record)
         measured = _union_bounds([item.bbox for item in placements]) or [x, y, 1, 1]
-        overflow = measured[1] + measured[3] > y + h or measured[0] + measured[2] > x + w
+        required_width = max(
+            (sum(max(0.0, float(item.get("advance") or 0.0)) for item in group) for group in line_groups),
+            default=0.0,
+        )
+        required_height = float(len(line_groups)) * line_height
+        overflow = required_width > float(w) or required_height > float(h) or bool(break_result.issues)
         if overflow:
             issues.append("layout_overflow")
-        lines = [{"line_index": idx, "writing_mode": "horizontal"} for idx in range(line_index + 1)]
-        return placements, lines, [], measured, "overflow" if overflow else "fits", _unique(issues)
+        break_plan = break_result.to_audit_dict()
+        return placements, lines, [], measured, "overflow" if overflow else "fits", _unique(issues), break_plan
 
     def _failed(
         self,
@@ -756,6 +1059,8 @@ def _font_size_candidates(
     metadata: dict[str, Any] | None = None,
 ) -> list[int]:
     preferred = max(1, int(preferred))
+    if _font_size_is_locked(style):
+        return [preferred]
     minimum = _minimum_fit_font_size(preferred, style, policy)
     if minimum >= preferred:
         return [preferred]
@@ -765,6 +1070,13 @@ def _font_size_candidates(
     if values[-1] != minimum:
         values.append(minimum)
     return sorted(_unique_ints(values), reverse=True)
+
+
+def _font_size_is_locked(style: Mapping[str, Any] | None) -> bool:
+    values = dict(style or {})
+    return bool(values.get("font_size_locked")) or str(
+        values.get("font_size_fallback_policy") or ""
+    ) == "layout_failure_audit_only"
 
 
 def _minimum_fit_font_size(preferred: int, style: dict[str, Any], policy: TypesettingPolicy) -> int:
@@ -939,9 +1251,20 @@ def _vertical_layout_profile(
     max_columns = max(1, min(count, int(math.floor(max(1, w) / max(1.0, column_w)))))
     max_rows = max(1, int(math.floor(max(1, h) / max(1.0, cell_h))))
     source_box = bbox_from_value(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, dict) else [])
-    source_columns = _source_vertical_column_count(source_box, font_size)
-    source_rows = _source_vertical_row_capacity(source_box, font_size, _line_height(plan.resolved_render_style))
+    geometry_source_columns = _source_vertical_column_count(source_box, font_size)
     style = dict(plan.resolved_render_style or {})
+    source_visual_columns = 0
+    source_visual_column_source = ""
+    if bool(style.get("source_visual_column_reliable")):
+        source_visual_columns = max(
+            0,
+            int(style.get("source_visual_column_count") or 0),
+        )
+        source_visual_column_source = str(
+            style.get("source_visual_column_source") or ""
+        )
+    source_columns = source_visual_columns or geometry_source_columns
+    source_rows = _source_vertical_row_capacity(source_box, font_size, _line_height(plan.resolved_render_style))
     semantic_class = str(style.get("semantic_class") or style.get("source_role") or plan.role or "")
     source_role = str(style.get("source_role") or plan.role or "")
     if count <= 3:
@@ -958,6 +1281,9 @@ def _vertical_layout_profile(
     else:
         desired = max(1, int(round(math.sqrt(count * max(1.0, float(w)) / max(1.0, float(h))))))
         reason = "target_aspect_column_estimate"
+    if source_visual_columns > 1:
+        desired = max(desired, min(source_visual_columns, max_columns))
+        reason = f"{reason}_source_visual_structure"
     desired = min(max(1, desired), max_columns)
     while desired < max_columns and math.ceil(count / desired) > max_rows:
         desired += 1
@@ -965,6 +1291,9 @@ def _vertical_layout_profile(
     return {
         "desired_columns": int(max(1, desired)),
         "source_columns": int(source_columns),
+        "geometry_source_columns": int(geometry_source_columns),
+        "source_visual_columns": int(source_visual_columns),
+        "source_visual_column_source": source_visual_column_source,
         "source_rows": int(source_rows),
         "max_columns": int(max_columns),
         "max_rows": int(max_rows),
@@ -991,6 +1320,29 @@ def _source_vertical_column_count(source_box: Sequence[int], font_size: int) -> 
     return max(1, min(8, int(round(float(w) / pitch))))
 
 
+def _expanded_box_within_hard_bounds(
+    box: Sequence[int],
+    *,
+    required_width: int,
+    required_height: int,
+    hard_bounds: Sequence[int],
+) -> list[int]:
+    current = bbox_from_value(box)
+    hard = bbox_from_value(hard_bounds)
+    if not current or not hard:
+        return list(current or hard or [])
+    hx, hy, hw, hh = hard
+    width = min(hw, max(int(current[2]), int(required_width)))
+    height = min(hh, max(int(current[3]), int(required_height)))
+    center_x = float(current[0]) + float(current[2]) / 2.0
+    center_y = float(current[1]) + float(current[3]) / 2.0
+    x = int(round(center_x - float(width) / 2.0))
+    y = int(round(center_y - float(height) / 2.0))
+    x = min(max(hx, x), hx + hw - width)
+    y = min(max(hy, y), hy + hh - height)
+    return [x, y, width, height]
+
+
 def _source_vertical_row_capacity(source_box: Sequence[int], font_size: int, line_height: float) -> int:
     source = bbox_from_value(source_box)
     if not source:
@@ -1006,206 +1358,6 @@ def _vertical_column_pitch(font_size: int, content_width: float) -> float:
     base = max(1.0, float(font_size))
     width = max(1.0, float(content_width or 0.0))
     return max(base * 1.24, width + base * 0.2)
-
-
-def _choose_vertical_column_groups(
-    items: Sequence[dict[str, Any]],
-    *,
-    desired_columns: int,
-    max_columns: int,
-    max_rows: int,
-    profile: dict[str, Any],
-) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
-    values = list(items or [])
-    if not values:
-        return [[]], {"strategy": "empty"}
-    desired = max(1, min(int(desired_columns or 1), len(values)))
-    limit = max(1, min(int(max_columns or desired), len(values)))
-    row_limit = max(1, int(max_rows or len(values)))
-    total_row_units = _vertical_items_row_units(values)
-    source_columns = max(0, int(profile.get("source_columns") or 0)) if isinstance(profile, dict) else 0
-    candidates = set(range(1, limit + 1))
-    candidates.add(desired)
-    if source_columns:
-        candidates.add(min(limit, source_columns))
-    min_fit_columns = int(math.ceil(float(total_row_units) / float(row_limit)))
-    candidates.add(max(1, min(limit, min_fit_columns)))
-    best: tuple[float, list[list[dict[str, Any]]], dict[str, Any]] | None = None
-    for columns in sorted(value for value in candidates if 1 <= value <= limit):
-        if math.ceil(total_row_units / columns) > row_limit:
-            continue
-        result = _best_vertical_partition(
-            values,
-            columns,
-            row_limit,
-            desired,
-            source_columns,
-            penalize_non_phrase_extra_columns=_vertical_profile_needs_speech_column_conservation(profile),
-        )
-        if result is None:
-            continue
-        score, groups, meta = result
-        if best is None or score < best[0]:
-            best = (score, groups, meta)
-    if best is None:
-        groups = _balanced_vertical_column_groups(values, min(limit, max(1, min_fit_columns)), row_limit)
-        return groups, {
-            "strategy": "balanced_fallback",
-            "desired_columns": desired,
-            "selected_columns": len(groups),
-            "max_rows": row_limit,
-        }
-    score, groups, meta = best
-    meta.update(
-        {
-            "strategy": "quality_scored_vertical_columns",
-            "desired_columns": desired,
-            "selected_columns": len(groups),
-            "max_columns": limit,
-            "max_rows": row_limit,
-            "source_columns": source_columns,
-            "score": round(float(score), 3),
-        }
-    )
-    return groups, meta
-
-
-def _best_vertical_partition(
-    items: Sequence[dict[str, Any]],
-    columns: int,
-    max_rows: int,
-    desired_columns: int,
-    source_columns: int,
-    *,
-    penalize_non_phrase_extra_columns: bool,
-) -> tuple[float, list[list[dict[str, Any]]], dict[str, Any]] | None:
-    values = list(items or [])
-    count = len(values)
-    if columns <= 0 or count <= 0 or columns > count:
-        return None
-    total_row_units = _vertical_items_row_units(values)
-    if math.ceil(total_row_units / columns) > max_rows:
-        return None
-    ideal = float(total_row_units) / float(columns)
-    prefix_units = [0.0]
-    for item in values:
-        prefix_units.append(prefix_units[-1] + _vertical_item_row_units(item))
-
-    def units_between(start: int, end: int) -> float:
-        return max(0.0, prefix_units[end] - prefix_units[start])
-
-    def front_loaded_column_penalty(breaks: Sequence[int]) -> float:
-        cursor = 0
-        row_units: list[float] = []
-        for end in breaks:
-            row_units.append(units_between(cursor, end))
-            cursor = end
-        penalty = 0.0
-        for previous, current in zip(row_units, row_units[1:]):
-            penalty += max(0.0, float(current) - float(previous))
-        return penalty
-
-    dp: dict[tuple[int, int], tuple[float, list[int]]] = {(0, 0): (0.0, [])}
-    for col in range(columns):
-        next_dp: dict[tuple[int, int], tuple[float, list[int]]] = {}
-        for (used_cols, start), (score, breaks) in dp.items():
-            if used_cols != col:
-                continue
-            remaining_cols = columns - col - 1
-            min_end = start + 1
-            max_end = min(count - remaining_cols, count)
-            for end in range(min_end, max_end + 1):
-                segment_units = units_between(start, end)
-                if segment_units > float(max_rows):
-                    break
-                remaining = count - end
-                remaining_units = units_between(end, count)
-                if remaining_cols and math.ceil(remaining_units / remaining_cols) > max_rows:
-                    continue
-                if remaining < remaining_cols:
-                    continue
-                segment = values[start:end]
-                segment_score = _vertical_segment_score(values, start, end, ideal)
-                total = score + segment_score
-                key = (col + 1, end)
-                prior = next_dp.get(key)
-                new_breaks = breaks + [end]
-                if (
-                    prior is None
-                    or total < prior[0]
-                    or (
-                        abs(float(total) - float(prior[0])) <= 1e-9
-                        and front_loaded_column_penalty(new_breaks) < front_loaded_column_penalty(prior[1])
-                    )
-                ):
-                    next_dp[key] = (total, new_breaks)
-        dp = next_dp
-        if not dp:
-            return None
-    final = dp.get((columns, count))
-    if final is None:
-        return None
-    score, breaks = final
-    score += abs(columns - max(1, desired_columns)) * 2.25
-    if source_columns:
-        score += max(0, columns - source_columns) * 4.0
-        if columns < min(source_columns, count) and _has_strong_vertical_phrase_break(values):
-            score += max(0, min(source_columns, count) - columns) * 0.75
-    cursor = 0
-    groups: list[list[dict[str, Any]]] = []
-    split_points: list[int] = []
-    for end in breaks:
-        groups.append(values[cursor:end])
-        if end < count:
-            split_points.append(end)
-        cursor = end
-    extra_columns = max(0, columns - max(1, desired_columns, int(math.ceil(float(total_row_units) / float(max(1, max_rows))))))
-    non_phrase_extra_break_penalty = 0.0
-    if penalize_non_phrase_extra_columns and extra_columns:
-        non_phrase_extra_break_penalty = sum(
-            max(0.0, float(_vertical_break_penalty(values, split)))
-            for split in split_points
-        )
-        score += non_phrase_extra_break_penalty * 2.0
-    rtl_frontload_penalty = front_loaded_column_penalty(breaks)
-    if rtl_frontload_penalty:
-        score += float(rtl_frontload_penalty) * 0.35
-    meta = {
-        "split_points": split_points,
-        "column_lengths": [len(group) for group in groups],
-        "column_row_units": [round(float(_vertical_items_row_units(group)), 3) for group in groups],
-        "right_to_left_frontload_penalty": round(float(rtl_frontload_penalty), 3),
-        "vertical_break_quality_rules": [
-            "terminal_cjk_widow_before_punctuation_tail",
-        ],
-        "segment_quality_adjustments": _vertical_partition_quality_adjustments(groups),
-        "break_penalties": [
-            {
-                "split_after": split,
-                "previous": str(values[split - 1].get("text") or "") if split > 0 else "",
-                "next": str(values[split].get("text") or "") if split < count else "",
-                "penalty": round(float(_vertical_break_penalty(values, split)), 3),
-            }
-            for split in split_points
-        ],
-    }
-    if extra_columns:
-        meta["extra_columns_beyond_desired"] = extra_columns
-        meta["non_phrase_extra_break_penalty"] = round(float(non_phrase_extra_break_penalty), 3)
-        meta["non_phrase_extra_break_penalty_applied"] = bool(penalize_non_phrase_extra_columns)
-    return score, groups, meta
-
-
-def _vertical_profile_needs_speech_column_conservation(profile: dict[str, Any]) -> bool:
-    if not isinstance(profile, dict):
-        return False
-    semantic = str(profile.get("semantic_class") or "").lower()
-    role = str(profile.get("source_role") or "").lower()
-    return (
-        "speech" in semantic
-        or "bubble" in semantic
-        or role in {"speech", "speech_bubble", "dialogue"}
-    )
 
 
 def _vertical_item_row_units(item: Mapping[str, Any]) -> float:
@@ -1231,222 +1383,13 @@ def _vertical_item_cell_height(item: Mapping[str, Any]) -> float:
     return height / row_units
 
 
-def _balanced_vertical_column_groups(items: Sequence[dict[str, Any]], columns_needed: int, max_rows: int) -> list[list[dict[str, Any]]]:
-    values = list(items or [])
-    if not values:
-        return [[]]
-    columns = max(1, min(int(columns_needed), len(values)))
-    groups: list[list[dict[str, Any]]] = []
-    cursor = 0
-    for col in range(columns):
-        remaining_items = len(values) - cursor
-        remaining_columns = max(1, columns - col)
-        if col == columns - 1:
-            take = remaining_items
-        else:
-            remaining_units = _vertical_items_row_units(values[cursor:])
-            target_units = min(float(max_rows), max(1.0, remaining_units / float(remaining_columns)))
-            take = 0
-            taken_units = 0.0
-            while cursor + take < len(values):
-                items_left_after = len(values) - (cursor + take + 1)
-                if items_left_after < remaining_columns - 1:
-                    break
-                next_units = _vertical_item_row_units(values[cursor + take])
-                if take > 0 and taken_units + next_units > target_units and taken_units >= 1.0:
-                    break
-                take += 1
-                taken_units += next_units
-                if taken_units >= target_units:
-                    break
-            if take <= 0 and remaining_items > 0:
-                take = 1
-        groups.append(values[cursor: cursor + take])
-        cursor += take
-    if cursor < len(values) and groups:
-        groups[-1].extend(values[cursor:])
-    return [group for group in groups if group]
-
-
-def _vertical_segment_score(items: Sequence[dict[str, Any]], start: int, end: int, ideal: float) -> float:
-    segment = list(items[start:end])
-    if not segment:
-        return 1000.0
-    segment_units = _vertical_items_row_units(segment)
-    score = abs(float(segment_units) - ideal) * 1.1
-    score += sum(float(item["penalty"]) for item in _vertical_segment_quality_adjustments(segment))
-    if start > 0:
-        first = str(segment[0].get("text") or "")
-        if _item_must_not_start_vertical_column(segment[0]):
-            score += 80.0
-        elif _vertical_item_is_weak_column_start(first):
-            score += 10.0
-    last = str(segment[-1].get("text") or "")
-    if _vertical_item_is_open_punctuation(last):
-        score += 30.0
-    if len(segment) == 1 and len(items) > 3:
-        score += 9.0
-    if _vertical_segment_is_punctuation_only(segment) and not _vertical_segment_is_punctuation_only(items):
-        score += 45.0
-    if end < len(items):
-        score += _vertical_break_penalty(items, end)
-    return score
-
-
-def _vertical_break_penalty(items: Sequence[dict[str, Any]], split: int) -> float:
-    if split <= 0 or split >= len(items):
-        return 0.0
-    prev_text = str(items[split - 1].get("text") or "")
-    next_text = str(items[split].get("text") or "")
-    if _vertical_item_is_continuation_punctuation(next_text):
-        return 90.0
-    if _vertical_item_is_open_punctuation(prev_text):
-        return 40.0
-    if _vertical_item_is_sequence_punctuation(prev_text) and _vertical_item_is_sequence_punctuation(next_text):
-        return 85.0
-    if _vertical_item_is_strong_phrase_end(prev_text) and not _vertical_item_is_continuation_punctuation(next_text):
-        return -8.0
-    if _vertical_item_is_cjk(prev_text) and _vertical_item_is_cjk(next_text):
-        return 4.5
-    return 0.0
-
-
-def _vertical_partition_quality_adjustments(groups: Sequence[Sequence[dict[str, Any]]]) -> list[dict[str, Any]]:
-    adjustments: list[dict[str, Any]] = []
-    start = 0
-    for column_index, group in enumerate(groups or []):
-        group_adjustments = _vertical_segment_quality_adjustments(group)
-        for item in group_adjustments:
-            record = dict(item)
-            record["column_index"] = int(column_index)
-            record["start"] = int(start)
-            record["end"] = int(start + len(group))
-            record["text"] = "".join(str(value.get("text") or "") for value in group)
-            adjustments.append(record)
-        start += len(group)
-    return adjustments
-
-
-def _vertical_segment_quality_adjustments(segment: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    values = list(segment or [])
-    if _vertical_segment_has_terminal_cjk_widow_before_punctuation_tail(values):
-        return [
-            {
-                "reason": "terminal_cjk_widow_before_punctuation_tail",
-                "penalty": 12.0,
-            }
-        ]
-    return []
-
-
-def _vertical_segment_has_terminal_cjk_widow_before_punctuation_tail(segment: Sequence[dict[str, Any]]) -> bool:
-    values = [item for item in (segment or []) if str(item.get("text") or "")]
-    if len(values) < 2:
-        return False
-    content: list[dict[str, Any]] = []
-    trailing_punctuation = 0
-    seen_tail = False
-    for item in reversed(values):
-        text = str(item.get("text") or "")
-        if _vertical_item_is_sequence_punctuation(text) or _vertical_item_is_continuation_punctuation(text):
-            trailing_punctuation += 1
-            seen_tail = True
-            continue
-        content = list(values[: len(values) - trailing_punctuation])
-        break
-    if not seen_tail or not content:
-        return False
-    lexical = [
-        item for item in content
-        if not _vertical_item_is_sequence_punctuation(str(item.get("text") or ""))
-        and not _vertical_item_is_continuation_punctuation(str(item.get("text") or ""))
-        and not _vertical_item_is_open_punctuation(str(item.get("text") or ""))
-    ]
-    if len(lexical) != 1:
-        return False
-    return _vertical_item_is_cjk(str(lexical[0].get("text") or ""))
-
-
-def _item_must_not_start_vertical_column(item: dict[str, Any]) -> bool:
-    text = str(item.get("text") or "")
-    return bool(text) and text[:1] in _VERTICAL_NO_COLUMN_START
-
-
 def _text_has_no_column_start_punctuation(text: str) -> bool:
     return any(cluster[:1] in _VERTICAL_NO_COLUMN_START for cluster in grapheme_clusters(str(text or "")))
-
-
-def _vertical_item_is_open_punctuation(text: str) -> bool:
-    return str(text or "")[:1] in {"(", "（", "[", "［", "{", "｛", "「", "『", "【", "〈", "《", "“", "‘"}
-
-
-def _vertical_item_is_continuation_punctuation(text: str) -> bool:
-    return str(text or "")[:1] in _VERTICAL_NO_COLUMN_START
-
-
-def _vertical_item_is_sequence_punctuation(text: str) -> bool:
-    return str(text or "")[:1] in {"︙", "︱", "︴", "…", "-", "—", "―", "─", "～", "〜", "~", "〰", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
-
-
-def _vertical_item_is_strong_phrase_end(text: str) -> bool:
-    return str(text or "")[:1] in {
-        "︙",
-        "︱",
-        "︴",
-        "。",
-        "，",
-        "、",
-        "︐",
-        "︑",
-        "︒",
-        "！",
-        "？",
-        "︕",
-        "︖",
-        "‼",
-        "⁇",
-        "⁉",
-        "⁈",
-        "!",
-        "?",
-        "～",
-        "〜",
-        "~",
-        "〰",
-    }
-
-
-def _vertical_item_is_weak_column_start(text: str) -> bool:
-    return str(text or "")[:1] in {"个", "的", "了", "吗", "呢", "吧", "啊", "呀", "嘛", "啦", "，", "、"}
-
-
-def _vertical_item_is_cjk(text: str) -> bool:
-    if not text:
-        return False
-    kind = classify_grapheme(str(text)[0])
-    return kind == "cjk"
 
 
 def _vertical_item_is_centered_punctuation(text: str) -> bool:
     value = str(text or "")
     return value in VERTICAL_CENTERED_PUNCTUATION_CHARS
-
-
-def _vertical_segment_is_punctuation_only(items: Sequence[dict[str, Any]]) -> bool:
-    values = [str(item.get("text") or "") for item in items or [] if str(item.get("text") or "")]
-    if not values:
-        return False
-    return all(
-        _vertical_item_is_continuation_punctuation(text)
-        or _vertical_item_is_open_punctuation(text)
-        or _vertical_item_is_sequence_punctuation(text)
-        or _vertical_item_is_strong_phrase_end(text)
-        for text in values
-    )
-
-
-def _has_strong_vertical_phrase_break(items: Sequence[dict[str, Any]]) -> bool:
-    return any(_vertical_break_penalty(items, index) < 0 for index in range(1, len(items)))
 
 
 def _box_inside(box: Sequence[int], container: Sequence[int]) -> bool:
@@ -1587,18 +1530,6 @@ def _shift_column_records(
     return shifted
 
 
-def _chosen_breaks(lines: Sequence[dict[str, Any]], columns: Sequence[dict[str, Any]], writing_mode: str) -> list[dict[str, Any]]:
-    items = columns if writing_mode == "vertical" else lines
-    return [
-        {
-            "index": int(item.get("column_index", item.get("line_index", idx))),
-            "writing_mode": writing_mode,
-            "reason": "measured_fit",
-        }
-        for idx, item in enumerate(items)
-    ]
-
-
 def _vertical_layout_items(
     runs: Sequence[InlineTextRun],
     shaped_runs: Sequence[ShapedRun],
@@ -1642,6 +1573,16 @@ def _vertical_layout_items(
                     "row_units": row_units,
                     "x_advance": x_advance,
                     "source_visual_hint": visual_hint,
+                    "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
+                    "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
+                    "ellipsis_unit_count": _occurrence_unit_count(run, "ellipsis"),
+                    "ellipsis_dot_count": _occurrence_dot_count(run, "ellipsis"),
+                    "ellipsis_sequence_group_count": _occurrence_sequence_group_count(run, "ellipsis"),
+                    "wave_unit_count": _occurrence_unit_count(run, "wave"),
+                    "dash_unit_count": _occurrence_unit_count(run, "dash"),
+                    "font_face_id": shaped.font_face_id if shaped else "",
+                    "font_path": shaped.font_path if shaped else "",
+                    "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if shaped else False,
                 }
             )
             continue
@@ -1658,6 +1599,11 @@ def _vertical_layout_items(
                     "height": item_height,
                     "row_units": 1.0,
                     "x_advance": x_advance,
+                    "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
+                    "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
+                    "font_face_id": shaped.font_face_id if shaped else "",
+                    "font_path": shaped.font_path if shaped else "",
+                    "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if shaped else False,
                 }
             )
             continue
@@ -1686,13 +1632,18 @@ def _vertical_layout_items(
                     "height": max(1.0, glyph_h),
                     "row_units": 1.0,
                     "x_advance": abs(float(glyph.x_advance)) if glyph else 0.0,
+                    "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
+                    "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
+                    "font_face_id": shaped.font_face_id if shaped else "",
+                    "font_path": shaped.font_path if shaped else "",
+                    "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if shaped else False,
                 }
             )
     return items
 
 
 def _vertical_sequence_row_units(run: InlineTextRun) -> float:
-    if run.role in {"dash_sequence", "wave_sequence"}:
+    if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence"}:
         return float(max(1, len(grapheme_clusters(run.text))))
     return 1.0
 
@@ -1727,7 +1678,7 @@ def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: Typ
         count = max(1, len(grapheme_clusters(run.text)))
         width = float(font_size)
         height = float(font_size)
-        if run.role in {"dash_sequence", "wave_sequence"} and count > 1:
+        if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence"} and count > 1:
             height = float(font_size) * float(count)
         elif count > 1:
             height = max(height, min(float(font_size) * 1.15, float(font_size) * (0.58 * count)))
@@ -1756,6 +1707,48 @@ def _vertical_run_is_atomic(run: InlineTextRun, policy: TypesettingPolicy) -> bo
     if run.role in {"numeric_token", "complex_script", "symbol", "ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
         return True
     return False
+
+
+def _occurrence_unit_count(run: InlineTextRun, kind: str) -> int:
+    occurrences = list(run.metadata.get("punctuation_occurrences") or [])
+    count = sum(
+        int(item.get("unit_count") or 0)
+        for item in occurrences
+        if isinstance(item, Mapping) and str(item.get("kind") or "") == kind
+    )
+    if count > 0:
+        return count
+    if (
+        (kind == "ellipsis" and run.role == "ellipsis_sequence")
+        or (kind == "wave" and run.role == "wave_sequence")
+        or (kind == "dash" and run.role == "dash_sequence")
+    ):
+        return max(1, len(grapheme_clusters(run.text)))
+    return 0
+
+
+def _occurrence_dot_count(run: InlineTextRun, kind: str) -> int:
+    occurrences = [
+        item
+        for item in list(run.metadata.get("punctuation_occurrences") or [])
+        if isinstance(item, Mapping) and str(item.get("kind") or "") == kind
+    ]
+    count = sum(int(item.get("dot_count") or 0) for item in occurrences)
+    if count > 0:
+        return count
+    units = _occurrence_unit_count(run, kind)
+    return units * 3 if kind == "ellipsis" and units > 0 else 0
+
+
+def _occurrence_sequence_group_count(run: InlineTextRun, kind: str) -> int:
+    occurrences = [
+        item
+        for item in list(run.metadata.get("punctuation_occurrences") or [])
+        if isinstance(item, Mapping) and str(item.get("kind") or "") == kind
+    ]
+    if not occurrences:
+        return 0
+    return sum(max(1, int(item.get("sequence_group_count") or 1)) for item in occurrences)
 
 
 def _dominant_vertical_advance(shaped_runs: Sequence[ShapedRun]) -> float:

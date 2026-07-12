@@ -1116,6 +1116,7 @@ class PipelineWorker(QtCore.QThread):
                             default_font_name=self._settings.font_name,
                             use_gpu=self._settings.use_gpu,
                             models_dir=os.path.join(os.getcwd(), "models"),
+                            source_glyph_mask_result=source_glyph_mask_result,
                         )
                         execution_regions = parent_execution_region_records(parent_execution_bundles)
                         _page014_timeout_checkpoint(
@@ -1750,6 +1751,7 @@ class PipelineWorker(QtCore.QThread):
                                 source_glyph_masks=source_glyph_mask_result,
                                 render_eligibility=render_eligibility_contract_result,
                                 perf_telemetry_context=debug_context if perf_telemetry_is_enabled else None,
+                                cleaned_page_base=cleaned_page_base_record,
                             )
                         else:
                             render_translations(

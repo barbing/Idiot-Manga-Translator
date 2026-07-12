@@ -44,20 +44,33 @@ VERTICAL_PUNCTUATION_FORMS = {
     "：": ("︓", "："),
     ";": ("︔", "；"),
     "；": ("︔", "；"),
-    "...": ("︙",),
-    "…": ("︙",),
-    "……": ("︙︙",),
+    ".": ("︒", "．", "."),
+    "...": ("…", "︙"),
+    "…": ("…", "︙"),
+    "……": ("……", "︙︙"),
     "-": ("︱",),
     "—": ("︱",),
     "―": ("︱",),
     "－": ("︱",),
     "--": ("︱︱",),
     "——": ("︱︱",),
-    "~": ("︴", "～", "~"),
-    "～": ("︴", "～"),
-    "〜": ("︴", "〜"),
-    "〰": ("︴", "〰"),
+    "~": ("~", "︴"),
+    "～": ("～", "︴"),
+    "〜": ("〜", "︴"),
+    "〰": ("〰", "︴"),
+    "︴": ("︴",),
 }
+
+REQUIRED_FONT_ROLES = (
+    ("sans_regular", "NotoSansCJKsc-Regular.otf", "noto_sans_cjk_sc_regular", ""),
+    ("sans_medium", "NotoSansCJKsc-Medium.otf", "noto_sans_cjk_sc_medium", "noto_sans_cjk_sc_regular"),
+    ("sans_bold", "NotoSansCJKsc-Bold.otf", "noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_medium"),
+    ("sans_black", "NotoSansCJKsc-Black.otf", "noto_sans_cjk_sc_black", "noto_sans_cjk_sc_bold"),
+    ("serif_regular", "NotoSerifCJKsc-Regular.otf", "noto_serif_cjk_sc_regular", ""),
+    ("serif_semibold", "NotoSerifCJKsc-SemiBold.otf", "noto_serif_cjk_sc_semibold", "noto_serif_cjk_sc_bold"),
+    ("serif_bold", "NotoSerifCJKsc-Bold.otf", "noto_serif_cjk_sc_bold", "noto_serif_cjk_sc_semibold"),
+    ("mono_regular", "NotoSansMonoCJKsc-Regular.otf", "noto_sans_mono_cjk_sc_regular", "noto_sans_cjk_sc_regular"),
+)
 
 
 class FontManagerError(RuntimeError):
@@ -146,6 +159,107 @@ class FontResolution:
             "fallback_faces": [face.to_audit_dict() for face in self.fallback_faces],
             "missing_glyphs": list(self.missing_glyphs),
             "issues": list(self.issues),
+        }
+
+
+@dataclass
+class RunFontResolution:
+    run_id: str
+    text: str
+    selected_face: FontFace | None
+    coverage: GlyphCoverage
+    fallback_used: bool = False
+    fallback_index: int = 0
+    selection_reason: str = ""
+    missing_glyphs: list[str] = field(default_factory=list)
+    issues: list[str] = field(default_factory=list)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "font_manager_version": FONT_MANAGER_VERSION,
+            "run_id": self.run_id,
+            "text": self.text,
+            "selected_face": self.selected_face.to_audit_dict() if self.selected_face else None,
+            "coverage": self.coverage.to_audit_dict(),
+            "fallback_used": bool(self.fallback_used),
+            "fallback_index": int(self.fallback_index),
+            "selection_reason": self.selection_reason,
+            "missing_glyphs": list(self.missing_glyphs),
+            "issues": list(self.issues),
+        }
+
+
+@dataclass(frozen=True)
+class OpenTypeMetrics:
+    face_id: str
+    font_path: str
+    font_size: int
+    units_per_em: int
+    ascender: int
+    descender: int
+    line_gap: int
+    typo_ascender: int
+    typo_descender: int
+    typo_line_gap: int
+    cap_height: int
+    x_height: int
+    has_vertical_metrics: bool
+    vertical_ascender: int
+    vertical_descender: int
+    vertical_line_gap: int
+    scaled_ascender: float
+    scaled_descender: float
+    scaled_line_gap: float
+    scaled_line_height: float
+    source: str = "opentype_tables"
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "font_manager_version": FONT_MANAGER_VERSION,
+            "face_id": self.face_id,
+            "font_path": self.font_path,
+            "font_size": int(self.font_size),
+            "units_per_em": int(self.units_per_em),
+            "ascender": int(self.ascender),
+            "descender": int(self.descender),
+            "line_gap": int(self.line_gap),
+            "typo_ascender": int(self.typo_ascender),
+            "typo_descender": int(self.typo_descender),
+            "typo_line_gap": int(self.typo_line_gap),
+            "cap_height": int(self.cap_height),
+            "x_height": int(self.x_height),
+            "has_vertical_metrics": bool(self.has_vertical_metrics),
+            "vertical_ascender": int(self.vertical_ascender),
+            "vertical_descender": int(self.vertical_descender),
+            "vertical_line_gap": int(self.vertical_line_gap),
+            "scaled_ascender": float(self.scaled_ascender),
+            "scaled_descender": float(self.scaled_descender),
+            "scaled_line_gap": float(self.scaled_line_gap),
+            "scaled_line_height": float(self.scaled_line_height),
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
+class FontRoleStatus:
+    role_id: str
+    preferred_filename: str
+    native_face_id: str
+    selected_face_id: str
+    native_asset_available: bool
+    substitute_face_id: str = ""
+    substitution_reason: str = ""
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "font_manager_version": FONT_MANAGER_VERSION,
+            "role_id": self.role_id,
+            "preferred_filename": self.preferred_filename,
+            "native_face_id": self.native_face_id,
+            "selected_face_id": self.selected_face_id,
+            "native_asset_available": bool(self.native_asset_available),
+            "substitute_face_id": self.substitute_face_id,
+            "substitution_reason": self.substitution_reason,
         }
 
 
@@ -239,9 +353,23 @@ class FontManager:
         self._font_cache: dict[tuple[str, int], Any] = {}
         self._glyph_metrics_cache: dict[tuple[str, int, str], GlyphMetrics] = {}
         self._text_metrics_cache: dict[tuple[str, int, str, str], TextMetrics] = {}
-        self._cache_hits = {"font": 0, "glyph_metrics": 0, "text_metrics": 0, "cmap": 0}
-        self._cache_misses = {"font": 0, "glyph_metrics": 0, "text_metrics": 0, "cmap": 0}
+        self._open_type_metrics_cache: dict[tuple[str, int], OpenTypeMetrics] = {}
+        self._cache_hits = {
+            "font": 0,
+            "glyph_metrics": 0,
+            "text_metrics": 0,
+            "open_type_metrics": 0,
+            "cmap": 0,
+        }
+        self._cache_misses = {
+            "font": 0,
+            "glyph_metrics": 0,
+            "text_metrics": 0,
+            "open_type_metrics": 0,
+            "cmap": 0,
+        }
         self._register_noto_cjk_sc_core()
+        self._register_windows_fallbacks()
 
     @property
     def has_font_pack(self) -> bool:
@@ -277,7 +405,8 @@ class FontManager:
             fallback_chain_key=fallback_chain_key,
         )
         issues: list[str] = []
-        if not chain:
+        style_faces = [face for face in chain if face.source != "windows_system_font"]
+        if not style_faces:
             return FontResolution(
                 requested_family=requested_family,
                 requested_weight=requested_weight,
@@ -289,18 +418,15 @@ class FontManager:
                 missing_glyphs=list(_unique_chars(text)),
                 issues=["missing_font_pack"],
             )
-        selected = chain[0]
+        selected = style_faces[0]
         missing_glyphs: list[str] = []
         if text:
-            for face in chain:
-                coverage = self.coverage_for_text(face, text)
-                if coverage.supports_text:
-                    selected = face
-                    missing_glyphs = []
-                    break
-                if face is chain[0]:
-                    missing_glyphs = list(coverage.missing_chars)
-            else:
+            for char in _unique_chars(text):
+                if _ignore_coverage_char(char):
+                    continue
+                if not any(self.coverage_for_text(face, char).supports_text for face in chain):
+                    missing_glyphs.append(char)
+            if missing_glyphs:
                 issues.append("missing_glyphs")
         return FontResolution(
             requested_family=requested_family,
@@ -311,6 +437,75 @@ class FontManager:
             primary_face=selected,
             fallback_faces=[face for face in chain if face.face_id != selected.face_id],
             missing_glyphs=missing_glyphs,
+            issues=issues,
+        )
+
+    def resolve_run_font(
+        self,
+        resolution: FontResolution,
+        text: str,
+        *,
+        run_id: str = "",
+    ) -> RunFontResolution:
+        value = str(text or "")
+        chain: list[FontFace] = []
+        if resolution.primary_face is not None:
+            chain.append(resolution.primary_face)
+        chain.extend(
+            face
+            for face in resolution.fallback_faces
+            if face is not None and all(face.face_id != item.face_id for item in chain)
+        )
+        if not chain:
+            coverage = GlyphCoverage(
+                face_id="",
+                font_path="",
+                text=value,
+                missing_chars=[char for char in _unique_chars(value) if not _ignore_coverage_char(char)],
+            )
+            return RunFontResolution(
+                run_id=str(run_id or ""),
+                text=value,
+                selected_face=None,
+                coverage=coverage,
+                fallback_used=False,
+                fallback_index=-1,
+                selection_reason="missing_font_pack",
+                missing_glyphs=list(coverage.missing_chars),
+                issues=["missing_font_pack"],
+            )
+
+        for index, face in enumerate(chain):
+            coverage = self.coverage_for_text(face, value)
+            if coverage.supports_text:
+                return RunFontResolution(
+                    run_id=str(run_id or ""),
+                    text=value,
+                    selected_face=face,
+                    coverage=coverage,
+                    fallback_used=index > 0,
+                    fallback_index=index,
+                    selection_reason="primary_face_full_run_coverage" if index == 0 else "fallback_face_full_run_coverage",
+                )
+
+        primary = chain[0]
+        coverage = self.coverage_for_text(primary, value)
+        unresolved = [
+            char
+            for char in _unique_chars(value)
+            if not _ignore_coverage_char(char)
+            and not any(self.coverage_for_text(face, char).supports_text for face in chain)
+        ]
+        issues = ["missing_glyphs"] if unresolved else ["run_requires_face_segmentation"]
+        return RunFontResolution(
+            run_id=str(run_id or ""),
+            text=value,
+            selected_face=primary,
+            coverage=coverage,
+            fallback_used=False,
+            fallback_index=0,
+            selection_reason="no_single_face_covers_complete_run",
+            missing_glyphs=unresolved or list(coverage.missing_chars),
             issues=issues,
         )
 
@@ -466,6 +661,92 @@ class FontManager:
         self._text_metrics_cache[key] = metrics
         return metrics
 
+    def open_type_metrics(self, face: FontFace, *, size: int) -> OpenTypeMetrics:
+        if face is None:
+            raise FontManagerError("font face is unavailable")
+        if TTFont is None:
+            raise FontManagerError("fontTools TTFont is unavailable")
+        font_size = max(1, int(size))
+        key = (face.path, font_size)
+        if key in self._open_type_metrics_cache:
+            self._cache_hits["open_type_metrics"] += 1
+            return self._open_type_metrics_cache[key]
+        self._cache_misses["open_type_metrics"] += 1
+        font = None
+        try:
+            font = TTFont(face.path, fontNumber=0, lazy=True)
+            head = font.get("head")
+            hhea = font.get("hhea")
+            os2 = font.get("OS/2")
+            vhea = font.get("vhea")
+            units_per_em = max(1, int(getattr(head, "unitsPerEm", 1000) or 1000))
+            ascender = int(getattr(hhea, "ascent", 0) or 0)
+            descender = int(getattr(hhea, "descent", 0) or 0)
+            line_gap = int(getattr(hhea, "lineGap", 0) or 0)
+            typo_ascender = int(getattr(os2, "sTypoAscender", ascender) or ascender)
+            typo_descender = int(getattr(os2, "sTypoDescender", descender) or descender)
+            typo_line_gap = int(getattr(os2, "sTypoLineGap", line_gap) or line_gap)
+            cap_height = int(getattr(os2, "sCapHeight", 0) or 0)
+            x_height = int(getattr(os2, "sxHeight", 0) or 0)
+            vertical_ascender = int(getattr(vhea, "ascent", 0) or 0)
+            vertical_descender = int(getattr(vhea, "descent", 0) or 0)
+            vertical_line_gap = int(getattr(vhea, "lineGap", 0) or 0)
+            scale = float(font_size) / float(units_per_em)
+            scaled_ascender = float(ascender) * scale
+            scaled_descender = float(descender) * scale
+            scaled_line_gap = float(line_gap) * scale
+            scaled_line_height = float(ascender - descender + line_gap) * scale
+            metrics = OpenTypeMetrics(
+                face_id=face.face_id,
+                font_path=face.path,
+                font_size=font_size,
+                units_per_em=units_per_em,
+                ascender=ascender,
+                descender=descender,
+                line_gap=line_gap,
+                typo_ascender=typo_ascender,
+                typo_descender=typo_descender,
+                typo_line_gap=typo_line_gap,
+                cap_height=cap_height,
+                x_height=x_height,
+                has_vertical_metrics=vhea is not None,
+                vertical_ascender=vertical_ascender,
+                vertical_descender=vertical_descender,
+                vertical_line_gap=vertical_line_gap,
+                scaled_ascender=round(scaled_ascender, 6),
+                scaled_descender=round(scaled_descender, 6),
+                scaled_line_gap=round(scaled_line_gap, 6),
+                scaled_line_height=round(scaled_line_height, 6),
+            )
+        finally:
+            if font is not None:
+                font.close()
+        self._open_type_metrics_cache[key] = metrics
+        return metrics
+
+    def required_role_inventory(self) -> list[FontRoleStatus]:
+        statuses: list[FontRoleStatus] = []
+        for role_id, filename, native_face_id, substitute_face_id in REQUIRED_FONT_ROLES:
+            native = self._faces.get(native_face_id)
+            substitute = self._faces.get(substitute_face_id) if substitute_face_id else None
+            selected = native or substitute
+            statuses.append(
+                FontRoleStatus(
+                    role_id=role_id,
+                    preferred_filename=filename,
+                    native_face_id=native_face_id,
+                    selected_face_id=selected.face_id if selected else "",
+                    native_asset_available=native is not None,
+                    substitute_face_id=substitute.face_id if native is None and substitute is not None else "",
+                    substitution_reason=(
+                        "native_role_asset_missing_explicit_substitute"
+                        if native is None and substitute is not None
+                        else ""
+                    ),
+                )
+            )
+        return statuses
+
     def cache_stats(self) -> dict[str, dict[str, int]]:
         return {
             "hits": dict(self._cache_hits),
@@ -479,6 +760,7 @@ class FontManager:
             "font_pack_dir": model_resolution.noto_cjk_sc_font_dir(self.base_dir),
             "has_font_pack": self.has_font_pack,
             "faces": [face.to_audit_dict() for face in self.available_faces()],
+            "required_role_inventory": [item.to_audit_dict() for item in self.required_role_inventory()],
             "cache_stats": self.cache_stats(),
         }
 
@@ -494,6 +776,16 @@ class FontManager:
                 False,
                 False,
                 10,
+            ),
+            (
+                "noto_sans_cjk_sc_medium",
+                "Noto Sans CJK SC",
+                "medium",
+                "medium",
+                "NotoSansCJKsc-Medium.otf",
+                False,
+                False,
+                15,
             ),
             (
                 "noto_sans_cjk_sc_bold",
@@ -526,6 +818,16 @@ class FontManager:
                 40,
             ),
             (
+                "noto_serif_cjk_sc_semibold",
+                "Noto Serif CJK SC",
+                "serif_semibold",
+                "semibold",
+                "NotoSerifCJKsc-SemiBold.otf",
+                True,
+                False,
+                45,
+            ),
+            (
                 "noto_serif_cjk_sc_bold",
                 "Noto Serif CJK SC",
                 "serif_bold",
@@ -534,6 +836,16 @@ class FontManager:
                 True,
                 False,
                 50,
+            ),
+            (
+                "noto_sans_mono_cjk_sc_regular",
+                "Noto Sans Mono CJK SC",
+                "monospace",
+                "regular",
+                "NotoSansMonoCJKsc-Regular.otf",
+                False,
+                True,
+                60,
             ),
         ]
         for face_id, family, style_class, weight, filename, serif, monospace, priority in candidates:
@@ -551,6 +863,33 @@ class FontManager:
                 priority=priority,
             )
 
+    def _register_windows_fallbacks(self) -> None:
+        if os.name != "nt":
+            return
+        windows_dir = os.environ.get("WINDIR") or r"C:\Windows"
+        font_dir = os.path.join(windows_dir, "Fonts")
+        candidates = [
+            ("windows_arial_regular", "Arial", "script_fallback", "regular", "arial.ttf", False, False, 200),
+            ("windows_nirmala_ui_regular", "Nirmala UI", "script_fallback", "regular", "Nirmala.ttc", False, False, 210),
+            ("windows_segoe_ui_symbol", "Segoe UI Symbol", "symbol_fallback", "regular", "seguisym.ttf", False, False, 220),
+            ("windows_segoe_ui_emoji", "Segoe UI Emoji", "emoji_fallback", "regular", "seguiemj.ttf", False, False, 230),
+        ]
+        for face_id, family, style_class, weight, filename, serif, monospace, priority in candidates:
+            path = os.path.join(font_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            self._faces[face_id] = FontFace(
+                face_id=face_id,
+                family=family,
+                style_class=style_class,
+                weight=weight,
+                path=path,
+                source="windows_system_font",
+                serif=serif,
+                monospace=monospace,
+                priority=priority,
+            )
+
     def _fallback_chain(
         self,
         *,
@@ -561,26 +900,49 @@ class FontManager:
     ) -> list[FontFace]:
         ids: list[str] = []
         family_key = requested_family.strip().lower()
+        requested_basename = os.path.basename(requested_family.strip()).lower()
         style_key = style_class.strip().lower()
         weight_key = requested_weight.strip().lower()
-        if "serif" in family_key or style_key in {"serif", "narration", "caption_serif"}:
-            ids.extend(["noto_serif_cjk_sc_regular", "noto_serif_cjk_sc_bold"])
-        elif "mono" in family_key or style_key in {"mono", "monospace"}:
-            ids.extend(["noto_sans_cjk_sc_regular"])
+        if requested_basename:
+            ids.extend(
+                face.face_id
+                for face in self.available_faces()
+                if os.path.basename(face.path).lower() == requested_basename
+            )
+        if "mono" in family_key or "mono" in style_key:
+            ids.extend(["noto_sans_mono_cjk_sc_regular", "noto_sans_cjk_sc_regular"])
+        elif "serif" in family_key or "serif" in style_key or style_key == "narration":
+            if weight_key in {"bold", "black", "heavy"}:
+                ids.extend(["noto_serif_cjk_sc_bold", "noto_serif_cjk_sc_semibold", "noto_serif_cjk_sc_regular"])
+            elif weight_key == "semibold":
+                ids.extend(["noto_serif_cjk_sc_semibold", "noto_serif_cjk_sc_bold", "noto_serif_cjk_sc_regular"])
+            else:
+                ids.extend(["noto_serif_cjk_sc_regular", "noto_serif_cjk_sc_semibold", "noto_serif_cjk_sc_bold"])
         elif weight_key in {"black", "heavy"} or style_key in {"heavy", "impact"}:
-            ids.extend(["noto_sans_cjk_sc_black", "noto_sans_cjk_sc_bold"])
+            ids.extend(["noto_sans_cjk_sc_black", "noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_medium"])
         elif weight_key == "bold" or style_key in {"bold", "emphasis"}:
-            ids.extend(["noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_black"])
+            ids.extend(["noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_black", "noto_sans_cjk_sc_medium"])
+        elif weight_key == "semibold":
+            ids.extend(["noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_medium", "noto_sans_cjk_sc_regular"])
+        elif weight_key == "medium":
+            ids.extend(["noto_sans_cjk_sc_medium", "noto_sans_cjk_sc_regular", "noto_sans_cjk_sc_bold"])
         else:
-            ids.extend(["noto_sans_cjk_sc_regular", "noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_black"])
+            ids.extend(["noto_sans_cjk_sc_regular", "noto_sans_cjk_sc_medium", "noto_sans_cjk_sc_bold", "noto_sans_cjk_sc_black"])
         if fallback_chain_key == "serif-first":
-            ids = ["noto_serif_cjk_sc_regular", "noto_serif_cjk_sc_bold", *ids]
+            ids = ["noto_serif_cjk_sc_regular", "noto_serif_cjk_sc_semibold", "noto_serif_cjk_sc_bold", *ids]
         ids.extend([
             "noto_sans_cjk_sc_regular",
+            "noto_sans_cjk_sc_medium",
             "noto_sans_cjk_sc_bold",
             "noto_sans_cjk_sc_black",
             "noto_serif_cjk_sc_regular",
+            "noto_serif_cjk_sc_semibold",
             "noto_serif_cjk_sc_bold",
+            "noto_sans_mono_cjk_sc_regular",
+            "windows_arial_regular",
+            "windows_nirmala_ui_regular",
+            "windows_segoe_ui_symbol",
+            "windows_segoe_ui_emoji",
         ])
         chain: list[FontFace] = []
         seen: set[str] = set()
@@ -620,9 +982,13 @@ def _normalize_weight(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"700", "800", "900"}:
         return "bold" if text == "700" else "black"
+    if text in {"600", "semibold", "semi-bold"}:
+        return "semibold"
+    if text in {"500", "medium"}:
+        return "medium"
     if text in {"black", "heavy"}:
         return "black"
-    if text in {"bold", "semibold", "semi-bold", "medium"}:
+    if text == "bold":
         return "bold"
     return text or "regular"
 

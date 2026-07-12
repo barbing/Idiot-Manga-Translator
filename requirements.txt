@@ -9,6 +9,7 @@ numpy==1.26.4
 regex
 uharfbuzz
 python-bidi
+freetype-py
 
 # OCR / detection
 manga-ocr

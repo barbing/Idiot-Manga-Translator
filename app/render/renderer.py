@@ -7,7 +7,7 @@ import math
 import os
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 from app.pipeline.debug_artifacts import (
     add_count,
@@ -1077,6 +1077,7 @@ def render_parent_execution_bundles(
     source_glyph_masks: object | None = None,
     render_eligibility: object | None = None,
     perf_telemetry_context: dict | None = None,
+    cleaned_page_base: Mapping[str, Any] | None = None,
 ) -> None:
     """Render translated text from finalized parent execution bundles."""
 
@@ -1093,11 +1094,15 @@ def render_parent_execution_bundles(
         perf_telemetry_context=perf_telemetry_context,
     )
     page_id = _renderer_stage5_page_id(compositor_bundles, parent_execution_bundles, debug_context, image_path)
-    cleaned_page_base = _renderer_stage5_cleaned_page_base_ref(image_path, debug_context)
+    cleaned_page_base_ref = _renderer_stage5_cleaned_page_base_ref(
+        image_path,
+        debug_context,
+        cleaned_page_base=cleaned_page_base,
+    )
     plans = build_render_layer_plans_from_parent_bundles(
         page_id=page_id,
         parent_execution_bundles=compositor_bundles,
-        cleaned_page_base=cleaned_page_base,
+        cleaned_page_base=cleaned_page_base_ref,
     )
     compositor_result = RendererCompositor().compose(image_path, output_path, plans)
     audit = compositor_result.to_audit_dict()
@@ -1185,18 +1190,29 @@ def _renderer_stage5_page_id(
     return stem or "unknown_page"
 
 
-def _renderer_stage5_cleaned_page_base_ref(image_path: str, debug_context: dict | None) -> dict[str, object]:
-    existing = None
-    source_image_path = ""
+def _renderer_stage5_cleaned_page_base_ref(
+    image_path: str,
+    debug_context: dict | None,
+    *,
+    cleaned_page_base: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    existing: Mapping[str, Any] | None = None
+    if isinstance(cleaned_page_base, Mapping) and cleaned_page_base:
+        existing = cleaned_page_base
+    source_image_path = str(existing.get("source_image_path") or "") if existing is not None else ""
     if isinstance(debug_context, dict):
-        existing = debug_context.get("cleaned_page_base") or debug_context.get("cleaned_page_base_ref")
-        source_image_path = str(
-            debug_context.get("source_image_path")
-            or debug_context.get("source_path")
-            or debug_context.get("original_image_path")
-            or ""
-        )
-    if isinstance(existing, dict):
+        if existing is None:
+            debug_existing = debug_context.get("cleaned_page_base") or debug_context.get("cleaned_page_base_ref")
+            if isinstance(debug_existing, Mapping):
+                existing = debug_existing
+        if not source_image_path:
+            source_image_path = str(
+                debug_context.get("source_image_path")
+                or debug_context.get("source_path")
+                or debug_context.get("original_image_path")
+                or ""
+            )
+    if isinstance(existing, Mapping):
         ref = dict(existing)
         ref.setdefault("image_path", image_path)
         ref.setdefault("valid", os.path.isfile(str(ref.get("image_path") or "")))

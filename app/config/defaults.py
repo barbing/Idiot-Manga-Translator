@@ -27,10 +27,13 @@ YUZUMARKER_FONT_LABELS_FALLBACK_FILE = "font-labels.json"
 NOTO_CJK_SC_FONT_BASE_URL = "https://raw.githubusercontent.com/notofonts/noto-cjk/main"
 NOTO_CJK_SC_FONT_FILES = [
     "Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Medium.otf",
     "Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Bold.otf",
     "Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Black.otf",
     "Serif/OTF/SimplifiedChinese/NotoSerifCJKsc-Regular.otf",
+    "Serif/OTF/SimplifiedChinese/NotoSerifCJKsc-SemiBold.otf",
     "Serif/OTF/SimplifiedChinese/NotoSerifCJKsc-Bold.otf",
+    "Sans/Mono/NotoSansMonoCJKsc-Regular.otf",
 ]
 SIL_OFL_TEXT_URL = "https://openfontlicense.org/documents/OFL.txt"
 MANGA_OCR_BASE_URL = "https://huggingface.co/kha-white/manga-ocr-base/resolve/main/"
