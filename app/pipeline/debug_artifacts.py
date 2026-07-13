@@ -3110,6 +3110,11 @@ def _build_audit(context: dict[str, Any], regions: list[dict]) -> dict[str, Any]
         "cleanup_runtime_status": context.get("cleanup_runtime_status") or {},
         "cleanup_upstream_commit_contracts": context.get("cleanup_upstream_commit_contracts") or {},
         "cleanup_upstream_renderer_input_path": context.get("cleanup_upstream_renderer_input_path") or "",
+        "authorized_source_style_views": context.get("authorized_source_style_views") or {},
+        "authorized_source_style_view_artifacts": context.get(
+            "authorized_source_style_view_artifacts"
+        ) or {},
+        "parent_font_detection": context.get("parent_font_detection") or {},
         "logical_text_source_reconstruction": context.get("logical_text_source_reconstruction") or {},
         "logical_text_punctuation_only_speech_recovery": context.get("logical_text_punctuation_only_speech_recovery") or {},
         "root_reconstruction_executor": context.get("root_reconstruction_executor") or {},

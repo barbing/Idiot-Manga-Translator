@@ -195,8 +195,8 @@ class TypesettingEngine:
                     plan,
                 )
                 retry = None
-                if fit_status != "fits" and _font_size_is_locked(plan.resolved_render_style):
-                    retry = self._retry_locked_vertical_fit(
+                if fit_status != "fits":
+                    retry = self._retry_vertical_fit_within_hard_bounds(
                         normalized=normalized,
                         runs=runs,
                         shaped_runs=shaped_runs,
@@ -734,6 +734,7 @@ class TypesettingEngine:
             cursor += len(group)
         columns: list[dict[str, Any]] = []
         for idx in range(columns_needed):
+            column_group = column_groups[idx] if idx < len(column_groups) else []
             raw_x = int(round(base_x + block_w - float((idx + 1) * column_w)))
             raw_y = int(round(base_y))
             raw_box = [raw_x, raw_y, int(max(1, math.ceil(column_w))), int(max(1, math.ceil(rows * cell_h)))]
@@ -741,6 +742,10 @@ class TypesettingEngine:
             columns.append(
                 {
                     "column_index": idx,
+                    "text": "".join(str(item.get("text") or "") for item in column_group),
+                    "run_ids": [str(item.get("run_id") or "") for item in column_group],
+                    "item_count": len(column_group),
+                    "row_units": round(_vertical_items_row_units(column_group), 3),
                     "x": clipped[0],
                     "y": clipped[1],
                     "width": clipped[2],
@@ -774,7 +779,7 @@ class TypesettingEngine:
         lines: list[dict[str, Any]] = []
         return placements, lines, columns, measured, fit_status, _unique(issues), grouping_meta
 
-    def _retry_locked_vertical_fit(
+    def _retry_vertical_fit_within_hard_bounds(
         self,
         *,
         normalized: str,
@@ -813,7 +818,11 @@ class TypesettingEngine:
         cell_height = max(shaped_advance * effective_line_height, item_cell_height)
         needed_height = int(math.ceil(max_row_units * cell_height))
         reason_codes = ["layout_intent_expanded_for_legal_vertical_partition"]
-        if needed_height > hard_h and original_line_height > 1.0:
+        if (
+            needed_height > hard_h
+            and original_line_height > 1.0
+            and _font_size_is_locked(style)
+        ):
             compacted = min(
                 original_line_height,
                 float(hard_h) / max(1.0, max_row_units * shaped_advance),
@@ -822,7 +831,9 @@ class TypesettingEngine:
                 effective_line_height = max(1.0, compacted - 1e-6)
                 cell_height = max(shaped_advance * effective_line_height, item_cell_height)
                 needed_height = int(math.ceil(max_row_units * cell_height))
-                reason_codes.append("line_height_compacted_for_locked_size_fit")
+                reason_codes.append("line_height_compacted_for_hard_bound_fit")
+                if _font_size_is_locked(style):
+                    reason_codes.append("line_height_compacted_for_locked_size_fit")
 
         content_width = max((float(item.get("width", 0.0)) for item in items), default=0.0)
         column_width = _vertical_column_pitch(font_size, content_width)
@@ -976,6 +987,7 @@ class TypesettingEngine:
             line_width = sum(max(0.0, float(item.get("advance") or 0.0)) for item in group)
             line_record: dict[str, Any] = {
                 "line_index": line_index,
+                "text": "".join(str(item.get("text") or "") for item in group),
                 "writing_mode": "horizontal",
                 "run_ids": [str(item.get("run_id") or "") for item in group],
                 "measured_advance": round(line_width, 3),
@@ -1074,9 +1086,16 @@ def _font_size_candidates(
 
 def _font_size_is_locked(style: Mapping[str, Any] | None) -> bool:
     values = dict(style or {})
-    return bool(values.get("font_size_locked")) or str(
-        values.get("font_size_fallback_policy") or ""
-    ) == "layout_failure_audit_only"
+    authority = str(values.get("font_size_authority") or "")
+    if authority == "automated_style_arbitrator" or str(
+        values.get("font_size_policy") or ""
+    ) == "source_ink_preferred":
+        return False
+    return authority == "user_override" and (
+        bool(values.get("font_size_locked"))
+        or str(values.get("font_size_fallback_policy") or "")
+        == "layout_failure_audit_only"
+    )
 
 
 def _minimum_fit_font_size(preferred: int, style: dict[str, Any], policy: TypesettingPolicy) -> int:
@@ -1255,7 +1274,11 @@ def _vertical_layout_profile(
     style = dict(plan.resolved_render_style or {})
     source_visual_columns = 0
     source_visual_column_source = ""
-    if bool(style.get("source_visual_column_reliable")):
+    if (
+        bool(style.get("source_visual_column_reliable"))
+        and str(style.get("source_visual_column_authority") or "")
+        == "authorized_source_style_view"
+    ):
         source_visual_columns = max(
             0,
             int(style.get("source_visual_column_count") or 0),

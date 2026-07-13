@@ -1106,6 +1106,7 @@ def render_parent_execution_bundles(
     )
     compositor_result = RendererCompositor().compose(image_path, output_path, plans)
     audit = compositor_result.to_audit_dict()
+    _stamp_parent_bundle_render_layout_summaries(compositor_bundles, audit)
     if debug_context is not None:
         debug_context["render_layer_audit"] = render_layer_plan_audit(plans)
         debug_context["renderer_compositor"] = audit
@@ -1267,6 +1268,113 @@ def _stamp_parent_bundle_renderer_audit_ids(
             if isinstance(render, dict):
                 render.update(fields)
         _renderer_perf_mark_region(debug_context, perf_telemetry_context, bundle_id, **fields)
+
+
+def _stamp_parent_bundle_render_layout_summaries(
+    parent_execution_bundles: list[Any],
+    compositor_audit: Mapping[str, Any],
+) -> None:
+    """Persist compact layout and text-conservation evidence on rendered parents."""
+
+    def by_bundle(key: str) -> dict[str, Mapping[str, Any]]:
+        records = compositor_audit.get(key) or []
+        return {
+            str(item.get("bundle_id") or item.get("parent_id") or ""): item
+            for item in records
+            if isinstance(item, Mapping)
+            and str(item.get("bundle_id") or item.get("parent_id") or "")
+        }
+
+    plans = by_bundle("render_layer_plans")
+    layouts = by_bundle("typeset_layouts")
+    layers = by_bundle("layers")
+    reports = by_bundle("fit_reports")
+    for bundle in parent_execution_bundles or []:
+        bundle_id = str(getattr(bundle, "bundle_id", "") or getattr(bundle, "parent_id", "") or "")
+        layout = layouts.get(bundle_id)
+        if not bundle_id or layout is None:
+            continue
+        plan = plans.get(bundle_id) or {}
+        layer = layers.get(bundle_id) or {}
+        report = reports.get(bundle_id) or {}
+        translated_text = str(plan.get("translated_text") or getattr(bundle, "translated_text", "") or "")
+        original_text = str(layout.get("original_text") or "")
+        normalized_text = str(layout.get("normalized_text") or "")
+        glyph_text = "".join(
+            str(item.get("text") or "")
+            for item in layout.get("glyphs") or []
+            if isinstance(item, Mapping)
+        )
+        line_records = [_compact_layout_record(item, "line_index") for item in layout.get("lines") or []]
+        column_records = [
+            _compact_layout_record(item, "column_index") for item in layout.get("columns") or []
+        ]
+        translated_matches_original = translated_text == original_text
+        normalized_matches_glyphs = normalized_text == glyph_text
+        full_text_placed = bool(layer.get("full_text_placed")) and bool(report.get("full_text_placed"))
+        glyph_text_matches_layout = bool(layer.get("glyph_text_matches_layout"))
+        conservation_complete = (
+            translated_matches_original
+            and normalized_matches_glyphs
+            and full_text_placed
+            and glyph_text_matches_layout
+        )
+        summary = {
+            "parent_render_layout_summary_version": "parent_render_layout_summary_v1",
+            "renderer_audit_id": str(getattr(bundle, "renderer_audit_id", "") or ""),
+            "page_id": str(layout.get("page_id") or getattr(bundle, "page_id", "") or ""),
+            "layer_id": str(layout.get("layer_id") or ""),
+            "bundle_id": bundle_id,
+            "parent_id": str(layout.get("parent_id") or getattr(bundle, "parent_id", "") or ""),
+            "root_id": str(layout.get("root_id") or getattr(bundle, "root_id", "") or ""),
+            "translated_text": translated_text,
+            "layout_original_text": original_text,
+            "layout_normalized_text": normalized_text,
+            "layout_glyph_text": glyph_text,
+            "wrapped_lines": [str(item.get("text") or "") for item in line_records],
+            "wrapped_columns": [str(item.get("text") or "") for item in column_records],
+            "line_records": line_records,
+            "column_records": column_records,
+            "translated_text_matches_layout_original": translated_matches_original,
+            "normalized_text_matches_layout_glyphs": normalized_matches_glyphs,
+            "full_text_placed": full_text_placed,
+            "glyph_text_matches_layout": glyph_text_matches_layout,
+            "conservation_status": "complete" if conservation_complete else "failed",
+            "selected_font_face": str(layout.get("selected_font_face") or ""),
+            "selected_font_size": float(layout.get("selected_font_size") or 0.0),
+            "writing_mode": str(layout.get("writing_mode") or ""),
+            "fit_status": str(layout.get("fit_status") or report.get("fit_status") or ""),
+            "fallback_used": bool(report.get("fallback_used")),
+            "fallback_reason": str(report.get("fallback_reason") or ""),
+            "overflow_risk": bool(report.get("overflow_risk")),
+            "clipping_risk": bool(report.get("clipping_risk")),
+            "punctuation_normalization_applied": list(
+                report.get("punctuation_normalization_applied") or []
+            ),
+        }
+        try:
+            setattr(bundle, "render_layout_summary", summary)
+            sync = getattr(bundle, "to_region_record", None)
+            if callable(sync):
+                sync()
+        except Exception:
+            continue
+
+
+def _compact_layout_record(item: Any, index_key: str) -> dict[str, Any]:
+    if not isinstance(item, Mapping):
+        return {}
+    record = {
+        index_key: int(item.get(index_key) or 0),
+        "text": str(item.get("text") or ""),
+        "writing_mode": str(item.get("writing_mode") or ""),
+    }
+    for key in ("x", "y", "width", "height", "measured_advance", "row_units", "item_count"):
+        if item.get(key) is not None:
+            record[key] = item.get(key)
+    if item.get("run_ids") is not None:
+        record["run_ids"] = list(item.get("run_ids") or [])
+    return record
 
 
 def _renderer_safe_id(value: str) -> str:

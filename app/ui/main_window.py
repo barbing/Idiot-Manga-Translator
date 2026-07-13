@@ -14,7 +14,7 @@ from app.models.ollama import list_models
 from app.ui.theme import apply_dark_palette, apply_light_palette
 from app.io.project import load_project
 from app.pipeline.parent_execution_bundle import parent_execution_bundles_from_audit_records
-from app.render.renderer import render_parent_execution_bundles, render_translations
+from app.render.renderer import render_parent_execution_bundles
 from app.ui.style_guide_editor import StyleGuideEditor
 from app.ui.region_review import RegionReviewDialog
 from app.models.downloader import ModelDownloader
@@ -2768,7 +2768,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             filename = os.path.basename(image_path)
             output_path = os.path.join(export_dir, f"{os.path.splitext(filename)[0]}{suffix}{os.path.splitext(filename)[1]}")
-            regions = page.get("regions", [])
             parent_execution_bundles = parent_execution_bundles_from_audit_records(
                 page.get("parent_execution_bundles") or []
             )
@@ -2784,14 +2783,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         model_id=self.inpaint_model_id.text().strip(),
                     )
                 else:
-                    render_translations(
-                        image_path,
-                        output_path,
-                        regions,
-                        self.font_name.currentText().strip(),
-                        inpaint_mode=self.inpaint_mode.currentText(),
-                        use_gpu=self.use_gpu.isChecked(),
-                        model_id=self.inpaint_model_id.text().strip(),
+                    raise RuntimeError(
+                        "reapply_parent_execution_bundle_contract_error:"
+                        "missing_current_parent_execution_bundles"
                     )
                 self._update_queue_item(idx - 1, "done")
             except Exception as exc:

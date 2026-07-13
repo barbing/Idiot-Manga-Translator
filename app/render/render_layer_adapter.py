@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Sequence
 
-from app.pipeline.parent_execution_bundle import PARENT_EXECUTION_BUNDLE_VERSION
+from app.pipeline.parent_execution_bundle import (
+    PARENT_EXECUTION_BUNDLE_VERSION,
+    PARENT_RENDER_STYLE_VERSION,
+    PARENT_STYLE_ARBITRATOR_PROVIDER,
+    PARENT_STYLE_ARBITRATOR_SOURCE,
+    PARENT_STYLE_RESOLUTION_STATUSES,
+)
 from app.render.source_punctuation_hints import source_visual_punctuation_hints
 from app.render.typesetting_contracts import (
     RENDER_LAYER_PLAN_VERSION,
@@ -87,7 +93,11 @@ def render_layer_plan_from_parent_bundle(
 
     execution_region = _mapping_field(bundle, "execution_region")
     render_record = _nested_mapping(execution_region, "render")
-    render_style = _style_from_bundle(bundle, execution_region, render_record)
+    render_style = _style_from_bundle(bundle)
+    if not render_style:
+        raise RenderLayerContractError(
+            f"render_required_parent_missing_arbitrator_resolved_style:{bundle_id}"
+        )
     slot = dict(render_layout_slot or _render_layout_slot_for_bundle(bundle))
     target_box = bbox_from_value(slot.get("box")) or _target_box_from_bundle(bundle, execution_region, render_record)
     hard_bounds = bbox_from_value(slot.get("hard_bounds")) or _hard_bounds_from_bundle(bundle, execution_region, render_record, target_box)
@@ -115,7 +125,7 @@ def render_layer_plan_from_parent_bundle(
         hard_bounds=hard_bounds,
         clipping_region_ref=_clipping_region_ref(bundle, execution_region, render_record),
         resolved_render_style=render_style,
-        writing_mode=_writing_mode(render_style, execution_region, render_record),
+        writing_mode=_writing_mode(render_style),
         draw_order=plan_draw_order,
         editable=True,
         editability_flags=["text", "resolved_render_style"],
@@ -197,19 +207,24 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", text).strip("_") or "unknown"
 
 
-def _style_from_bundle(
-    bundle: Any,
-    execution_region: Mapping[str, Any],
-    render_record: Mapping[str, Any],
-) -> dict[str, Any]:
-    for value in (
-        _field(bundle, "render_style", {}),
-        execution_region.get("render_style"),
-        render_record.get("render_style"),
-    ):
-        if isinstance(value, Mapping) and value:
-            return copy_jsonish(value)
-    return {}
+def _style_from_bundle(bundle: Any) -> dict[str, Any]:
+    value = _field(bundle, "render_style", {})
+    if not isinstance(value, Mapping) or not value:
+        return {}
+    style = copy_jsonish(value)
+    if str(style.get("render_style_version") or "") != PARENT_RENDER_STYLE_VERSION:
+        return {}
+    if str(style.get("render_style_owner") or "") != "parent_execution_bundle":
+        return {}
+    if str(style.get("render_style_source") or "") != PARENT_STYLE_ARBITRATOR_SOURCE:
+        return {}
+    if str(style.get("render_style_provider") or "") != PARENT_STYLE_ARBITRATOR_PROVIDER:
+        return {}
+    if str(style.get("style_resolution_status") or "") not in PARENT_STYLE_RESOLUTION_STATUSES:
+        return {}
+    if str(style.get("style_evidence_status") or "") not in {"observed", "unavailable"}:
+        return {}
+    return style
 
 
 def _target_box_from_bundle(
@@ -592,21 +607,11 @@ def _translated_text_from_bundle(
     return ""
 
 
-def _writing_mode(
-    render_style: Mapping[str, Any],
-    execution_region: Mapping[str, Any],
-    render_record: Mapping[str, Any],
-) -> str:
+def _writing_mode(render_style: Mapping[str, Any]) -> str:
     for value in (
         render_style.get("writing_mode"),
         render_style.get("source_orientation"),
         render_style.get("wrap_mode"),
-        render_record.get("writing_mode"),
-        render_record.get("source_orientation"),
-        render_record.get("wrap_mode"),
-        execution_region.get("writing_mode"),
-        execution_region.get("source_orientation"),
-        execution_region.get("wrap_mode"),
     ):
         text = str(value or "").strip()
         if text:

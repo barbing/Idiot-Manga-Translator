@@ -7,7 +7,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from app.io.project import default_project_dict, load_project, save_project
 from app.pipeline.cleaned_page_base import resolve_cleaned_page_base_for_rerender
 from app.pipeline.parent_execution_bundle import parent_execution_bundles_from_audit_records
-from app.render.renderer import render_parent_execution_bundles, render_translations
+from app.render.renderer import render_parent_execution_bundles
+from app.render.render_layer_adapter import RenderLayerContractError
 
 
 class ResizableLabel(QtWidgets.QLabel):
@@ -186,23 +187,32 @@ class PageReviewDialog(QtWidgets.QDialog):
             self._page.get("parent_execution_bundles") or []
         )
         if parent_execution_bundles:
-            render_parent_execution_bundles(
-                render_image_path,
-                output_path,
-                parent_execution_bundles,
-                self._font_name,
-                inpaint_mode=self._inpaint_mode,
-                use_gpu=self._use_gpu,
-            )
+            try:
+                render_parent_execution_bundles(
+                    render_image_path,
+                    output_path,
+                    parent_execution_bundles,
+                    self._font_name,
+                    inpaint_mode=self._inpaint_mode,
+                    use_gpu=self._use_gpu,
+                )
+            except RenderLayerContractError as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Re-render unavailable",
+                    "This saved page does not contain a current arbitrator-owned "
+                    f"render style ({exc}). Run translation again before re-rendering.",
+                )
+                return
         else:
-            render_translations(
-                render_image_path,
-                output_path,
-                self._page.get("regions", []),
-                self._font_name,
-                inpaint_mode=self._inpaint_mode,
-                use_gpu=self._use_gpu,
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Re-render unavailable",
+                "This saved page has no current ParentExecutionBundle records. "
+                "Run translation again before re-rendering; legacy region styles "
+                "cannot be used as source evidence.",
             )
+            return
         if os.path.isfile(output_path):
             pixmap = QtGui.QPixmap(output_path)
             self.translated_view.setPixmap(pixmap)

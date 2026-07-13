@@ -678,11 +678,10 @@ class PipelineWorker(QtCore.QThread):
 
         start_time = time.time()
         from app.translate.ollama_client import DeepSeekClient, OllamaClient
-        from app.render.renderer import render_parent_execution_bundles, render_translations
+        from app.render.renderer import render_parent_execution_bundles
         from app.pipeline.cleaned_page_base import persist_cleaned_page_base
         from app.pipeline.cleanup_contracts import build_cleanup_job_candidates_for_parent_bundles
         from app.pipeline.cleanup_masks import build_cleanup_masks
-        from app.pipeline.parent_font_detection import apply_parent_font_detection
         from app.pipeline.cleanup_planning import (
             build_cleanup_plans,
             collect_cleanup_runtime_perf,
@@ -713,7 +712,6 @@ class PipelineWorker(QtCore.QThread):
 
         ocr_engine = None
         ollama = None
-        font_detector = None
         auto_glossary_state = None
         pages = []
         debug_artifacts_enabled = debug_enabled(self._settings)
@@ -738,14 +736,6 @@ class PipelineWorker(QtCore.QThread):
             except Exception as inner_exc:
                 self.message.emit(_friendly_model_error(inner_exc))
                 return
-
-            if str(self._settings.font_detection or "").strip().lower() == "heuristic":
-                try:
-                    from app.render.font_detection import FontDetection
-                    font_detector = FontDetection(mode=self._settings.font_detection)
-                except Exception as exc:
-                    self.message.emit(_friendly_model_error(exc))
-                    font_detector = None
 
             try:
                 detector_initialization_start = time.perf_counter()
@@ -1000,7 +990,6 @@ class PipelineWorker(QtCore.QThread):
                         self._settings.font_name,
                         self._settings.filter_background,
                         self._settings.filter_strength,
-                        font_detector,
                         translation_cache,
                         background_detector,
 
@@ -1097,85 +1086,6 @@ class PipelineWorker(QtCore.QThread):
                             "source_glyph_masks": [],
                         }
 
-                try:
-                    parent_font_mode = str(self._settings.font_detection or "off").strip()
-                    if parent_execution_bundles and parent_font_mode.lower() != "off":
-                        parent_font_start = time.time()
-                        _page014_timeout_checkpoint(
-                            "parent_font_detection",
-                            "start",
-                            page_id=page_id,
-                            mode=parent_font_mode,
-                            parent_execution_bundle_count=len(parent_execution_bundles),
-                        )
-                        parent_font_detection_result = apply_parent_font_detection(
-                            page_id=page_id,
-                            image_path=source_path,
-                            parent_execution_bundles=parent_execution_bundles,
-                            mode=parent_font_mode,
-                            default_font_name=self._settings.font_name,
-                            use_gpu=self._settings.use_gpu,
-                            models_dir=os.path.join(os.getcwd(), "models"),
-                            source_glyph_mask_result=source_glyph_mask_result,
-                        )
-                        execution_regions = parent_execution_region_records(parent_execution_bundles)
-                        _page014_timeout_checkpoint(
-                            "parent_font_detection",
-                            "end",
-                            page_id=page_id,
-                            applied_count=parent_font_detection_result.applied_count,
-                            fallback_count=parent_font_detection_result.fallback_count,
-                            skipped_count=parent_font_detection_result.skipped_count,
-                            requested_execution_provider=(
-                                parent_font_detection_result.requested_execution_provider
-                            ),
-                            primary_execution_provider=(
-                                parent_font_detection_result.primary_execution_provider
-                            ),
-                            provider_fallback_reason=(
-                                parent_font_detection_result.provider_fallback_reason
-                            ),
-                            elapsed_ms=round((time.time() - parent_font_start) * 1000.0, 3),
-                        )
-                        if parent_font_detection_result.provider_fallback_reason:
-                            self.message.emit(
-                                "Font detection GPU fallback: "
-                                f"{parent_font_detection_result.provider_fallback_reason}; "
-                                "continuing with CPUExecutionProvider."
-                            )
-                        if debug_context is not None:
-                            if not debug_context.get("perf_telemetry_only"):
-                                debug_context["parent_font_detection"] = parent_font_detection_result.to_audit_dict()
-                            set_timing(debug_context, "parent_font_detection_time", time.time() - parent_font_start)
-                            set_count(debug_context, "parent_font_detection_applied", parent_font_detection_result.applied_count)
-                            set_count(debug_context, "parent_font_detection_fallback", parent_font_detection_result.fallback_count)
-                            for record in parent_font_detection_result.records:
-                                rid = str(record.get("bundle_id") or "")
-                                if rid:
-                                    mark_render_region(debug_context, rid, parent_font_detection=record)
-                    elif debug_context is not None and not debug_context.get("perf_telemetry_only"):
-                        debug_context["parent_font_detection"] = {
-                            "parent_font_detection_version": "parent_font_detection_v1",
-                            "page_id": page_id,
-                            "mode": parent_font_mode,
-                            "enabled": False,
-                        }
-                except Exception as exc:
-                    _page014_timeout_checkpoint(
-                        "parent_font_detection",
-                        "error",
-                        page_id=page_id,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                    if debug_context is not None and not debug_context.get("perf_telemetry_only"):
-                        debug_context["parent_font_detection"] = {
-                            "parent_font_detection_version": "parent_font_detection_v1",
-                            "page_id": page_id,
-                            "mode": str(self._settings.font_detection or "off"),
-                            "enabled": False,
-                            "errors": [f"{type(exc).__name__}: {exc}"],
-                        }
-
                 cleanup_job_contract_result = None
                 cleanup_mask_contract_result = None
                 cleanup_plan_contract_result = None
@@ -1185,6 +1095,7 @@ class PipelineWorker(QtCore.QThread):
                 render_input_path = source_path
                 cleaned_page_base_record = {}
                 cleanup_upstream_temp_path = ""
+                source_image_size = None
                 try:
                     cleanup_contract_start = time.time()
                     _page014_timeout_checkpoint("cleanup_contract_chain", "start", page_id=page_id)
@@ -1735,6 +1646,167 @@ class PipelineWorker(QtCore.QThread):
                         self.message.emit(f"Failed to write cleanup validation output for {name}: {exc}")
                         continue
                 else:
+                    parent_font_mode = str(self._settings.font_detection or "off").strip()
+                    if parent_execution_bundles:
+                        parent_font_start = time.time()
+                        try:
+                            _page014_timeout_checkpoint(
+                                "parent_style_after_cleanup",
+                                "start",
+                                page_id=page_id,
+                                mode=parent_font_mode,
+                                parent_execution_bundle_count=len(parent_execution_bundles),
+                            )
+                            style_view_result, parent_font_detection_result = (
+                                _apply_parent_style_after_cleanup(
+                                    page_id=page_id,
+                                    image_path=source_path,
+                                    parent_execution_bundles=parent_execution_bundles,
+                                    cleanup_masks=cleanup_mask_contract_result,
+                                    image_size=source_image_size,
+                                    mode=parent_font_mode,
+                                    default_font_name=self._settings.font_name,
+                                    use_gpu=self._settings.use_gpu,
+                                    models_dir=os.path.join(os.getcwd(), "models"),
+                                )
+                            )
+                            execution_regions = parent_execution_region_records(parent_execution_bundles)
+                            _page014_timeout_checkpoint(
+                                "parent_style_after_cleanup",
+                                "end",
+                                page_id=page_id,
+                                applied_count=parent_font_detection_result.applied_count,
+                                fallback_count=parent_font_detection_result.fallback_count,
+                                skipped_count=parent_font_detection_result.skipped_count,
+                                requested_execution_provider=(
+                                    parent_font_detection_result.requested_execution_provider
+                                ),
+                                primary_execution_provider=(
+                                    parent_font_detection_result.primary_execution_provider
+                                ),
+                                provider_fallback_reason=(
+                                    parent_font_detection_result.provider_fallback_reason
+                                ),
+                                elapsed_ms=round((time.time() - parent_font_start) * 1000.0, 3),
+                            )
+                            if parent_font_detection_result.provider_fallback_reason:
+                                self.message.emit(
+                                    "Font detection GPU fallback: "
+                                    f"{parent_font_detection_result.provider_fallback_reason}; "
+                                    "continuing with CPUExecutionProvider."
+                                )
+                            if debug_context is not None:
+                                if not debug_context.get("perf_telemetry_only"):
+                                    from app.pipeline.parent_style_evidence import (
+                                        write_authorized_source_style_view_debug_artifacts,
+                                    )
+
+                                    debug_context["authorized_source_style_views"] = (
+                                        style_view_result.to_audit_dict()
+                                    )
+                                    debug_context["authorized_source_style_view_artifacts"] = (
+                                        write_authorized_source_style_view_debug_artifacts(
+                                            debug_context,
+                                            image_path=source_path,
+                                            result=style_view_result,
+                                        )
+                                    )
+                                    debug_context["parent_font_detection"] = (
+                                        parent_font_detection_result.to_audit_dict()
+                                    )
+                                set_timing(
+                                    debug_context,
+                                    "parent_font_detection_time",
+                                    time.time() - parent_font_start,
+                                )
+                                set_count(
+                                    debug_context,
+                                    "authorized_source_style_views_ready",
+                                    sum(1 for view in style_view_result.views if view.available),
+                                )
+                                set_count(
+                                    debug_context,
+                                    "parent_font_detection_applied",
+                                    parent_font_detection_result.applied_count,
+                                )
+                                set_count(
+                                    debug_context,
+                                    "parent_font_detection_fallback",
+                                    parent_font_detection_result.fallback_count,
+                                )
+                                for record in parent_font_detection_result.records:
+                                    rid = str(record.get("bundle_id") or "")
+                                    if rid:
+                                        mark_render_region(
+                                            debug_context,
+                                            rid,
+                                            parent_font_detection=record,
+                                        )
+                        except Exception as exc:
+                            _page014_timeout_checkpoint(
+                                "parent_style_after_cleanup",
+                                "error",
+                                page_id=page_id,
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                            try:
+                                from app.pipeline.parent_font_detection import (
+                                    resolve_unavailable_parent_styles,
+                                )
+
+                                parent_font_detection_result = resolve_unavailable_parent_styles(
+                                    page_id=page_id,
+                                    parent_execution_bundles=parent_execution_bundles,
+                                    reason_codes=(
+                                        "authorized_style_stage_failed",
+                                        f"authorized_style_stage_failed_{type(exc).__name__}",
+                                    ),
+                                    mode=parent_font_mode,
+                                    default_font_name=self._settings.font_name,
+                                    models_dir=os.path.join(os.getcwd(), "models"),
+                                    errors=(
+                                        f"authorized_style_stage_failed:{type(exc).__name__}:{exc}",
+                                    ),
+                                )
+                                self.message.emit(
+                                    f"Parent style evidence failed for {name}; "
+                                    "rendering with an explicit unresolved default."
+                                )
+                                execution_regions = parent_execution_region_records(
+                                    parent_execution_bundles
+                                )
+                            except Exception as fallback_exc:
+                                page_elapsed = time.time() - page_start
+                                self.queue_item.emit(
+                                    index - 1,
+                                    f"error ({_format_seconds(page_elapsed)}): {fallback_exc}",
+                                )
+                                self.message.emit(
+                                    f"Failed to resolve parent styles for {name}: {fallback_exc}"
+                                )
+                                continue
+                            if debug_context is not None and not debug_context.get(
+                                "perf_telemetry_only"
+                            ):
+                                debug_context["authorized_source_style_views"] = {
+                                    "authorized_source_style_view_version": (
+                                        "authorized_source_style_view_v1"
+                                    ),
+                                    "page_id": page_id,
+                                    "views": [],
+                                    "errors": [f"{type(exc).__name__}: {exc}"],
+                                }
+                                debug_context["parent_font_detection"] = (
+                                    parent_font_detection_result.to_audit_dict()
+                                )
+                    elif debug_context is not None and not debug_context.get("perf_telemetry_only"):
+                        debug_context["parent_font_detection"] = {
+                            "parent_font_detection_version": "parent_font_detection_v2",
+                            "page_id": page_id,
+                            "mode": parent_font_mode,
+                            "enabled": False,
+                            "reason": "no_parent_execution_bundles",
+                        }
                     try:
                         render_start = time.time()
                         _page014_timeout_checkpoint("renderer_entry", "start", page_id=page_id, render_input_path=render_input_path)
@@ -1754,18 +1826,10 @@ class PipelineWorker(QtCore.QThread):
                                 cleaned_page_base=cleaned_page_base_record,
                             )
                         else:
-                            render_translations(
+                            _write_no_layer_render_output(
                                 render_input_path,
                                 output_path,
-                                execution_regions,
-                                self._settings.font_name,
-                                inpaint_mode=self._settings.inpaint_mode,
-                                use_gpu=self._settings.use_gpu,
-                                model_id=self._settings.inpaint_model_id,
-                                debug_context=debug_context if debug_artifacts_enabled else None,
-                                source_glyph_masks=source_glyph_mask_result,
-                                render_eligibility=render_eligibility_contract_result,
-                                perf_telemetry_context=debug_context if perf_telemetry_is_enabled else None,
+                                debug_context=debug_context,
                             )
                         if parent_execution_bundles:
                             execution_regions = parent_execution_region_records(parent_execution_bundles)
@@ -3734,8 +3798,6 @@ def _append_parent_boundary_ocr_source_regions(
             bg_text=route == "translate_caption_background",
             needs_review=quality_action != "translate",
             ignore=False,
-            font_name=getattr(settings, "font_family", "") or "",
-            detected_font=None,
             region_type=region_type,
             ocr_conf=ocr_conf,
             render_updates={
@@ -4360,7 +4422,6 @@ def _recover_punctuation_only_speech_containers(
     image_size: tuple[int, int] | None,
     ocr_engine,
     settings,
-    font_name: str,
     quality_func,
     debug_context: dict | None = None,
 ) -> dict[str, Any]:
@@ -4487,7 +4548,6 @@ def _recover_punctuation_only_speech_containers(
             False,
             False,
             False,
-            font_name,
             region_type="speech_bubble",
             ocr_conf=float(recovered_conf or 0.0),
             render_updates={"classification_reason": "punctuation_only_speech_container_recovered", "cleanup_mode": "bubble"},
@@ -6682,8 +6742,6 @@ def _apply_root_reconstruction_candidate(
         bg_text=is_caption,
         needs_review=False,
         ignore=False,
-        font_name=font_name,
-        detected_font=None,
         region_type=region_type,
         ocr_conf=float(candidate.get("ocr_confidence") or 0.0),
         render_updates=render_updates,
@@ -8782,7 +8840,6 @@ def _process_page(
     font_name: str,
     filter_background: bool,
     filter_strength: str,
-    font_detector,
     translation_cache: dict[str, str],
     background_detector,
     auto_glossary_state,
@@ -9217,8 +9274,6 @@ def _process_page(
                 bg_text=semantic_bg,
                 needs_review=semantic_review or skip_text,
                 ignore=semantic_ignore or skip_text,
-                font_name=font_name,
-                detected_font=None,
                 region_type=region_type,
                 ocr_conf=ocr_conf,
                 render_updates=render_updates,
@@ -9339,8 +9394,6 @@ def _process_page(
                 bg_text=semantic_bg,
                 needs_review=needs_review or semantic_review or skip_text,
                 ignore=ignore,
-                font_name=font_name,
-                detected_font=None,
                 region_type=region_type,
                 ocr_conf=ocr_conf,
                 render_updates=render_updates,
@@ -9443,8 +9496,6 @@ def _process_page(
                 bg_text=semantic_bg,
                 needs_review=True,
                 ignore=True,
-                font_name=font_name,
-                detected_font=None,
                 region_type=region_type,
                 ocr_conf=ocr_conf,
                 render_updates=render_updates,
@@ -9467,15 +9518,6 @@ def _process_page(
         # REMOVED: _should_skip_text filter for speech bubbles
         # Speech bubbles detected by the detector should NEVER be filtered
         # They are legitimate dialogue that must always be translated
-        detected_font = None
-        if font_detector is not None:
-            try:
-                detected_font = font_detector.detect(crop)
-            except Exception:
-                detected_font = None
-
-
-
         # REMOVED: TextFilter check for speech bubbles
         # Speech bubbles detected by the detector should NEVER be filtered
         # They are legitimate dialogue - always translate them
@@ -9490,8 +9532,6 @@ def _process_page(
             bg_text=semantic_bg,
             needs_review=needs_review or semantic_review,
             ignore=False,
-            font_name=font_name,
-            detected_font=detected_font if (target_lang != "Simplified Chinese" or _is_font_allowed_for_cn(detected_font or "")) else None,
             region_type=region_type,
             ocr_conf=ocr_conf,
             render_updates=render_updates,
@@ -9567,7 +9607,6 @@ def _process_page(
         ocr_engine,
         settings,
         text_filter,
-        font_name,
         pending_texts,
         glossary_texts,
         page_class=page_class,
@@ -9718,7 +9757,6 @@ def _process_page(
         image_size=image_size,
         ocr_engine=ocr_engine,
         settings=settings,
-        font_name=font_name,
         quality_func=assess_logical_text_source_quality,
         debug_context=debug_context,
     )
@@ -9828,16 +9866,20 @@ def _process_page(
         regions=regions,
     )
     parent_execution_bundles = parent_execution_bundle_result.executable_bundles()
-    execution_regions = (
-        parent_execution_region_records(parent_execution_bundles)
-        if parent_execution_bundles
-        else regions
-    )
     if debug_context is not None:
         debug_context["parent_execution_bundles"] = parent_execution_bundle_result.to_audit_dict()
         set_count(debug_context, "parent_execution_bundle_count", len(parent_execution_bundles))
         set_count(debug_context, "parent_execution_blocked_bundle_count", len(parent_execution_bundle_result.blocked_bundles))
         set_count(debug_context, "parent_execution_bundle_error_count", len(parent_execution_bundle_result.errors))
+    if not parent_execution_bundles:
+        _enforce_no_bundle_parent_contract(
+            page_id=page_id,
+            regions=regions,
+            debug_context=debug_context,
+        )
+        pending_texts = {}
+        glossary_texts = []
+    execution_regions = parent_execution_region_records(parent_execution_bundles)
     if (
         parent_execution_bundles
         or logical_block_result.applied_count
@@ -9849,8 +9891,6 @@ def _process_page(
     ):
         if parent_execution_bundles:
             pending_texts, glossary_texts = _rebuild_translation_inputs_from_parent_execution_bundles(parent_execution_bundles)
-        else:
-            pending_texts, glossary_texts = _rebuild_translation_inputs_from_regions(execution_regions)
 
     active_style_guide = style_guide
     use_context_lines = bool(
@@ -10216,8 +10256,6 @@ def _process_page(
                         region["flags"].pop("hard_fail", None)
                         render = region.setdefault("render", {})
                         render["cleanup_mode"] = "bubble"
-                        if str(render.get("source_orientation", "") or "").strip().lower() == "vertical":
-                            render["wrap_mode"] = "vertical"
                     final_translation = translation
                     region["translation"] = final_translation
                     _translation_perf_mark_region_consumed(
@@ -10247,132 +10285,8 @@ def _process_page(
             and _is_short_reaction_source(region.get("ocr_text", ""))
         ):
             region["translation"] = _translate_short_reaction_fallback(region.get("ocr_text", ""), target_lang)
-        trans = str(region.get("translation", "") or "").strip()
-        if trans:
-            _apply_default_render_tuning(region, trans)
 
-    for region in execution_regions:
-        if parent_execution_bundles:
-            continue
-        region_type = str(region.get("type", "") or "").strip().lower()
-        recover_candidate = _looks_like_recoverable_speech_region(region, page_class)
-        recover_as_speech = region_type == "speech_bubble" or recover_candidate
-        if not recover_as_speech:
-            continue
-        if _logical_text_region_blocks_independent_render(region):
-            region["translation"] = ""
-            region["translated_text"] = ""
-            continue
-        flags = region.get("flags", {}) or {}
-        if flags.get("ignore") and not recover_candidate:
-            continue
-        ocr_text = str(region.get("ocr_text", "") or "").strip()
-        if not _is_meaningful_speech_source(ocr_text):
-            continue
-        if str(region.get("translation", "") or "").strip():
-            continue
-        translation_touched = True
-        retry_perf_record = None
-        if debug_context is not None:
-            retry_perf_record = _translation_perf_records_for_page(
-                debug_context,
-                {ocr_text: [str(region.get("region_id") or "")]},
-                execution_regions,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                settings=settings,
-            ).get(ocr_text)
-            _translation_perf_add_path(retry_perf_record, "speech_recovery_retry")
-            _translation_perf_set_glossary_context(
-                retry_perf_record,
-                _matched_glossary_terms(ocr_text, active_style_guide),
-            )
-        retry_prompt_style_guide = _build_page_style_guide(active_style_guide, [ocr_text])
-        retry_context_lines = (
-            context_lines
-            if use_context_lines and _should_use_context_for_text(ocr_text, [region.get("region_id")], execution_regions)
-            else []
-        )
-        retry_translation = _translate_single(
-            ollama,
-            model,
-            source_lang,
-            target_lang,
-            retry_prompt_style_guide,
-            ocr_text,
-            context_lines=retry_context_lines,
-            settings=settings,
-            debug_record=retry_perf_record,
-        )
-        if retry_context_lines and _translation_reuses_recent_context(retry_translation, ocr_text, retry_context_lines):
-            _translation_perf_add_path(retry_perf_record, "context_reuse_retry_no_context")
-            if retry_perf_record:
-                retry_perf_record.setdefault("failure_retry_reason", []).append("translation_reused_recent_context")
-            retry_translation = _translate_single(
-                ollama,
-                model,
-                source_lang,
-                target_lang,
-                retry_prompt_style_guide,
-                ocr_text,
-                context_lines=[],
-                settings=settings,
-                debug_record=retry_perf_record,
-            )
-        retry_translation, retry_lang_ok = _ensure_target_language(
-            ollama,
-            _resolve_model(model),
-            source_lang,
-            target_lang,
-            ocr_text,
-            retry_translation,
-            is_bubble=True,
-            debug_record=retry_perf_record,
-        )
-        if retry_translation and not _translation_is_unsafe_for_output(retry_translation, ocr_text):
-            retry_translation = _apply_source_level_semantic_corrections(ocr_text, retry_translation)
-            if _should_preserve_decorative_fragment_translation(ocr_text, region, active_style_guide) and not recover_candidate:
-                region["translation"] = ""
-                region["flags"]["ignore"] = True
-                region["flags"]["bg_text"] = True
-                region["flags"]["needs_review"] = False
-                region.setdefault("render", {})["cleanup_mode"] = "preserve"
-                continue
-            if region_type != "speech_bubble" or flags.get("ignore"):
-                region["type"] = "speech_bubble"
-                flags["bg_text"] = False
-                flags["ignore"] = False
-                flags.pop("hard_fail", None)
-                render = region.setdefault("render", {})
-                render["cleanup_mode"] = "bubble"
-                if str(render.get("source_orientation", "") or "").strip().lower() == "vertical":
-                    render["wrap_mode"] = "vertical"
-            retry_translation = _enforce_glossary(retry_translation, ocr_text, active_style_guide)
-            region["translation"] = retry_translation
-            _translation_perf_set_final(retry_perf_record, translation=retry_translation, status="speech_recovery_final")
-            _translation_perf_set_glossary_status(
-                retry_perf_record,
-                applied_terms=_matched_glossary_terms(ocr_text, active_style_guide),
-                ignored_terms=[],
-                warnings=[],
-            )
-            _translation_perf_mark_region_consumed(
-                retry_perf_record,
-                region,
-                retry_translation,
-                consumed_path="region.translation.speech_recovery",
-            )
-            region["flags"]["needs_review"] = not retry_lang_ok
-            _apply_default_render_tuning(region, retry_translation)
-        else:
-            region["flags"]["needs_review"] = True
-            region["flags"]["hard_fail"] = True
     final_logical_repairs = {}
-    if not parent_execution_bundles:
-        final_logical_repairs = enforce_logical_text_render_eligibility(execution_regions)
-        duplicate_caption_repairs = _suppress_duplicate_caption_background_regions(execution_regions, debug_context)
-        if duplicate_caption_repairs.get("duplicate_caption_background_suppressed_count"):
-            pending_texts, glossary_texts = _rebuild_translation_inputs_from_regions(execution_regions)
     if debug_context is not None:
         result_payload = debug_context.get("pipeline_logical_text_block_result")
         if isinstance(result_payload, dict):
@@ -10417,6 +10331,70 @@ def _process_page(
             context_window.pop(0)
 
     return PageProcessingResult(regions, execution_regions, parent_execution_bundles, page_class, text_area_plan)
+
+
+def _enforce_no_bundle_parent_contract(
+    *,
+    page_id: str,
+    regions: list[dict],
+    debug_context: dict | None = None,
+) -> None:
+    """Reject authorized workflow regions that lost their canonical parent unit."""
+
+    authorized_region_ids: list[str] = []
+    for index, region in enumerate(regions or []):
+        if not isinstance(region, dict):
+            continue
+        if not _region_has_translatable_text_area_route(region):
+            continue
+        region_id = str(region.get("region_id") or f"region_{index}")
+        if region_id not in authorized_region_ids:
+            authorized_region_ids.append(region_id)
+    if debug_context is not None:
+        debug_context["parent_execution_no_bundle_contract"] = {
+            "page_id": str(page_id or ""),
+            "authorized_region_ids": list(authorized_region_ids),
+            "status": (
+                "contract_error_authorized_regions_without_parent_bundle"
+                if authorized_region_ids
+                else "no_render_layers"
+            ),
+            "legacy_region_fallback_used": False,
+        }
+    if authorized_region_ids:
+        joined = ",".join(authorized_region_ids)
+        raise RuntimeError(
+            "parent_execution_bundle_contract_error:"
+            f"no_executable_bundle_for_authorized_regions:{page_id}:{joined}"
+        )
+
+
+def _write_no_layer_render_output(
+    render_input_path: str,
+    output_path: str,
+    *,
+    debug_context: dict | None = None,
+) -> None:
+    """Preserve CleanedPageBase when the canonical graph has no render layers."""
+
+    source = os.path.abspath(str(render_input_path or ""))
+    target = os.path.abspath(str(output_path or ""))
+    if not source or not os.path.isfile(source):
+        raise FileNotFoundError(
+            f"no_layer_render_input_missing:{render_input_path}"
+        )
+    if source != target:
+        shutil.copyfile(source, target)
+    if debug_context is not None:
+        debug_context["stage5_renderer_compositor_active"] = False
+        debug_context["render_translations_called"] = False
+        debug_context["final_translated_text_drawn"] = False
+        debug_context["legacy_region_rendering_used"] = False
+        debug_context["renderer_no_layer_result"] = {
+            "status": "cleaned_page_base_copied_without_render_layers",
+            "render_input_path": source,
+            "output_path": target,
+        }
 
 
 def _logical_text_region_blocks_independent_render(region: dict) -> bool:
@@ -10539,6 +10517,44 @@ def _sync_parent_execution_downstream_contracts(
             record["render_decision_id"] = parent_id
 
     sync_bundles_from_region_records(bundles, execution_regions)
+
+
+def _apply_parent_style_after_cleanup(
+    *,
+    page_id: str,
+    image_path: str,
+    parent_execution_bundles: list[ParentExecutionBundle],
+    cleanup_masks: Any,
+    image_size: tuple[int, int] | None,
+    mode: str,
+    default_font_name: str,
+    use_gpu: bool,
+    models_dir: str,
+    detector: Any = None,
+) -> tuple[Any, Any]:
+    """Observe and resolve style only after parent cleanup authority exists."""
+
+    from app.pipeline.parent_font_detection import apply_parent_font_detection
+    from app.pipeline.parent_style_evidence import build_authorized_source_style_views
+
+    style_views = build_authorized_source_style_views(
+        page_id=page_id,
+        parent_execution_bundles=parent_execution_bundles,
+        cleanup_masks=cleanup_masks,
+        image_size=image_size,
+    )
+    font_result = apply_parent_font_detection(
+        page_id=page_id,
+        image_path=image_path,
+        parent_execution_bundles=parent_execution_bundles,
+        authorized_style_views=style_views.views_by_bundle_id,
+        mode=mode,
+        default_font_name=default_font_name,
+        use_gpu=use_gpu,
+        models_dir=models_dir,
+        detector=detector,
+    )
+    return style_views, font_result
 
 
 def _safe_region_audit_fields(source_glyph_masks: Any) -> dict[str, dict[str, Any]]:
@@ -11706,7 +11722,6 @@ def _replace_region_with_rescued_ocr(
     image_obj,
     image_size: tuple[int, int],
     text_filter: TextFilter,
-    font_name: str,
     rescue_reason: str,
     rescue_variant: str,
     rescue_bbox: list[int],
@@ -11740,8 +11755,6 @@ def _replace_region_with_rescued_ocr(
         bg_text=semantic_bg,
         needs_review=semantic_review,
         ignore=semantic_ignore,
-        font_name=font_name,
-        detected_font=None,
         region_type=region_type,
         ocr_conf=rescued_conf,
         render_updates=render_updates,
@@ -11763,7 +11776,6 @@ def _rescue_top_row_caption_ocr_regions(
     ocr_engine,
     settings,
     text_filter: TextFilter,
-    font_name: str,
     pending_texts: dict[str, list[str]],
     glossary_texts: list[str],
     page_class: str = "normal",
@@ -11821,7 +11833,6 @@ def _rescue_top_row_caption_ocr_regions(
             image_obj,
             image_size,
             text_filter,
-            font_name,
             "top_row_caption_expanded_crop",
             variant,
             rescue_box,
@@ -12057,8 +12068,6 @@ def _recover_missed_speech_text_area_regions(
             bg_text=False,
             needs_review=False,
             ignore=False,
-            font_name=font_name,
-            detected_font=None,
             region_type="speech_bubble",
             ocr_conf=rescued_conf,
             render_updates={
@@ -12325,8 +12334,6 @@ def _recover_adjacent_vertical_speech_text_conservation_regions(
                 bg_text=False,
                 needs_review=False,
                 ignore=False,
-                font_name=font_name,
-                detected_font=None,
                 region_type="speech_bubble",
                 ocr_conf=rescued_conf,
                 render_updates={
@@ -12676,8 +12683,6 @@ def _apply_bubble_local_nested_speech_ownership(
             bg_text=False,
             needs_review=False,
             ignore=False,
-            font_name=font_name,
-            detected_font=None,
             region_type="speech_bubble",
             ocr_conf=combined_ocr_conf,
             render_updates={
@@ -14259,59 +14264,6 @@ def _should_preserve_decorative_fragment_translation(
     if body == "むきむき" or re.fullmatch(r"(?:むき){2,}", body):
         return True
     return False
-
-
-def _repair_region_render_metadata(
-    region_type: str,
-    ocr_text: str,
-    bbox: list,
-    render: dict,
-) -> dict:
-    if not isinstance(render, dict):
-        return render
-    font_style = str(render.get("font_style", "") or "dialogue")
-    try:
-        source_hint = int(render.get("source_size_hint", 0) or 0)
-    except Exception:
-        source_hint = 0
-    try:
-        source_min = int(render.get("source_size_min", 0) or 0)
-    except Exception:
-        source_min = 0
-    try:
-        source_max = int(render.get("source_size_max", 0) or 0)
-    except Exception:
-        source_max = 0
-    if source_hint <= 0 or source_min <= 0 or source_max < max(source_hint, source_min):
-        band_hint, band_min, band_max = _estimate_region_font_size_band(
-            region_type,
-            ocr_text,
-            bbox,
-            font_style,
-        )
-        if band_hint > 0:
-            if source_hint <= 0:
-                source_hint = band_hint
-            if source_min <= 0:
-                source_min = band_min
-            source_max = max(source_max, band_max, source_min, source_hint)
-            render["source_size_hint"] = source_hint
-            render["source_size_min"] = source_min
-            render["source_size_max"] = source_max
-    if region_type == "speech_bubble":
-        if _is_ellipsis_like(ocr_text) or _is_short_reaction_source(ocr_text):
-            if str(render.get("source_orientation", "") or "").strip().lower() == "vertical":
-                render["wrap_mode"] = "vertical"
-            render["cleanup_mode"] = "bubble"
-    else:
-        if source_min > 0:
-            try:
-                render_font_size = int(render.get("font_size", 0) or 0)
-            except Exception:
-                render_font_size = 0
-            if render_font_size < source_min:
-                render["font_size"] = source_min
-    return render
 
 
 def _strip_name_suffixes(text: str) -> str:
@@ -17504,356 +17456,6 @@ def _looks_like_merged_batch_output(translation: str, ocr_text: str) -> bool:
     return False
 
 
-def _translate_brief(
-    ollama,
-    model: str,
-    source_lang: str,
-    target_lang: str,
-    text: str,
-) -> str:
-    if target_lang == "Simplified Chinese":
-        prompt = f"将以下{source_lang}翻译成简体中文，保持简短，不要把同一个字重复很多次：{text}"
-    elif target_lang == "English":
-        prompt = f"Translate the following {source_lang} into English. Keep it short: {text}"
-    else:
-        prompt = f"Translate the following {source_lang} into {target_lang}. Keep it short: {text}"
-    result = ollama.generate(
-        _resolve_model(model),
-        prompt,
-        timeout=30,
-        options={"num_predict": _estimate_single_num_predict(text, target_lang), "temperature": 0.1, "top_p": 0.9},
-    )
-    return _clean_translation(result)
-
-
-def _crowding_reason_for_region(region: dict, translation: str) -> str | None:
-    text = str(translation or "").strip()
-    if not text or not isinstance(region, dict):
-        return None
-    if str(region.get("type", "") or "") != "speech_bubble":
-        return None
-    bbox = region.get("bbox") or [0, 0, 0, 0]
-    if len(bbox) < 4:
-        return None
-    w = max(1, int(bbox[2]))
-    h = max(1, int(bbox[3]))
-    render = region.get("render") or {}
-    wrap_mode = str(render.get("wrap_mode", "auto") or "auto").strip().lower()
-    vertical = wrap_mode == "vertical" or (
-        wrap_mode == "auto" and any(_is_cjk_char(ch) for ch in str(text or "")) and " " not in text and h > w * 1.12
-    )
-    body = re.sub(r"\s+", "", text)
-    length = len(body)
-    area = w * h
-    if vertical and w < 70 and length >= 10:
-        return "narrow-vertical"
-    if min(w, h) < 48 and length >= 7:
-        return "small-box"
-    if length >= 12 and area < length * 260:
-        return "dense-text"
-    return None
-
-
-def _default_speech_line_height_for_translation(region: dict, translation: str) -> float | None:
-    if not isinstance(region, dict):
-        return None
-    if str(region.get("type", "") or "") != "speech_bubble":
-        return None
-    # Keep the default path conservative. Earlier aggressive tightening caused
-    # abrupt unreadable shrink on narrow vertical bubbles in real chapter tests.
-    return 1.0
-
-
-def _apply_default_render_tuning(region: dict, translation: str) -> None:
-    if not isinstance(region, dict):
-        return
-    render = region.get("render") or {}
-    if not isinstance(render, dict):
-        return
-    line_height = _default_speech_line_height_for_translation(region, translation)
-    if line_height is not None:
-        render["line_height"] = line_height
-        region["render"] = render
-
-
-def _crowding_rank(reason: str | None) -> int:
-    order = {
-        None: 0,
-        "dense-text": 1,
-        "small-box": 2,
-        "narrow-vertical": 3,
-    }
-    return order.get(reason, 4)
-
-
-def _brevity_normalize_cn(text: str, aggressive: bool = False) -> str:
-    cleaned = str(text or "").strip()
-    if not cleaned:
-        return ""
-    replacements = [
-        ("现在是", "现在"),
-        ("已经", "已"),
-        ("能够", "能"),
-        ("为了此", "为此"),
-        ("……", "…"),
-        ("・・", "…"),
-        ("・", "·"),
-        ("。。", "。"),
-    ]
-    for old, new in replacements:
-        cleaned = cleaned.replace(old, new)
-    cleaned = re.sub(r"^现在是(.+?)时间([哦啊呀呢啦嘛]?[。！？…]?)$", r"现在\1\2", cleaned)
-    cleaned = re.sub(r"^根据(.+?)的调查，", r"据\1调查，", cleaned)
-    cleaned = re.sub(r"^根据(.+?)所说，", r"据\1说，", cleaned)
-    cleaned = re.sub(r"^从(.+?)来看", r"看\1", cleaned)
-    cleaned = re.sub(r"^如果(.+?)，那也可以", r"\1也能", cleaned)
-    cleaned = cleaned.replace("在组织和思想上都受到控制", "在组织和思想上都受控")
-    cleaned = cleaned.replace("以魔力为引子的", "以魔力为引的")
-    cleaned = cleaned.replace("用来避人耳目的设施", "掩人耳目的设施")
-    cleaned = cleaned.replace("越来越可疑了", "越来越可疑")
-    cleaned = cleaned.replace("需要时间的", "需时的")
-    cleaned = cleaned.replace("和母猫比起来", "和母猫比")
-    cleaned = cleaned.replace("相当辽阔", "很辽阔")
-    cleaned = cleaned.replace("已经抓住了", "已抓住")
-    cleaned = cleaned.replace("都杀光", "全杀光")
-    cleaned = cleaned.replace("已查明了", "已查明")
-    cleaned = cleaned.replace("展开调查和歼灭吧", "调查并歼灭吧")
-    cleaned = cleaned.replace("必须将", "得把")
-    cleaned = cleaned.replace("而且她毫不犹豫地用在自己身上", "而且她还直接用在自己身上")
-    cleaned = cleaned.replace("而且她还直接用在自己身上", "而且她还直接给自己用了")
-    cleaned = cleaned.replace("据伊塔说，那是以魔力为引的剧毒", "据伊塔说，那是魔力引发的剧毒")
-    cleaned = cleaned.replace("圣殿骑士们在组织和思想上都受控", "圣殿骑士在组织与思想上都受控")
-    cleaned = cleaned.replace("圣殿骑士在组织与思想上都受控", "圣殿骑士在组织与思想上受控")
-    cleaned = cleaned.replace("我可受不了狗和野猪混在一起的臭味", "我受不了狗和野猪混在一起的臭味")
-    cleaned = cleaned.replace("光是山岳地带就已很辽阔了", "光山岳地带就很辽阔")
-    cleaned = cleaned.replace("或许这里藏着掩人耳目的设施", "这里或许藏着障眼设施")
-    cleaned = cleaned.replace("这里藏着掩人耳目的设施", "这里藏着障眼设施")
-    cleaned = cleaned.replace("既然已抓住了他们的尾巴", "既已抓住他们的尾巴")
-    cleaned = cleaned.replace("得把他逼到绝境", "得把他逼入绝境")
-    cleaned = cleaned.replace("和母猫比谁更臭呢～", "和母猫谁更臭呢～")
-    cleaned = cleaned.replace("米德加王国北部山岳地带", "米德加王国北部山地")
-    cleaned = re.sub(r"^是啊，", "", cleaned)
-    cleaned = re.sub(r"[—―－-]{2,}$", "", cleaned)
-    cleaned = re.sub(r"([哦啊呀呢啦嘛])([。！？…])$", r"\2", cleaned)
-    if aggressive:
-        cleaned = re.sub(r"([。！？…])$", "", cleaned)
-        cleaned = re.sub(r"[哦啊呀呢啦嘛]$", "", cleaned)
-        cleaned = cleaned.replace("的话", "")
-        cleaned = cleaned.replace("一下", "")
-        cleaned = cleaned.replace("说不定", "或许")
-    return cleaned.strip()
-
-
-def _rewrite_bubble_brief_cn(
-    ollama,
-    model: str,
-    source_text: str,
-    translation: str,
-    style_guide: dict,
-) -> str:
-    current = str(translation or "").strip()
-    if not current:
-        return ""
-    matched_terms = _matched_glossary_terms(source_text, style_guide)
-    masked = current
-    placeholders: list[tuple[str, str]] = []
-    for idx, item in enumerate(matched_terms):
-        target = str(item.get("target", "")).strip()
-        if not target or target not in masked:
-            continue
-        token = f"@@N{idx}@@"
-        masked = masked.replace(target, token)
-        placeholders.append((token, target))
-    token_hint = ""
-    if placeholders:
-        token_hint = " 保留这些标记不变：" + " ".join(token for token, _ in placeholders) + "。"
-    prompt = (
-        "把下面简体中文改写得更短，适合漫画气泡。要求：保留原意，口语自然，不要解释。"
-        f"{token_hint}\n{masked}"
-    )
-    try:
-        raw = ollama.generate(
-            _resolve_model(model),
-            prompt,
-            timeout=20,
-            options={"num_predict": min(80, max(40, len(current) * 2)), "temperature": 0.05, "top_p": 0.9},
-        )
-    except Exception:
-        return ""
-    rewritten = _clean_translation(raw)
-    if _translation_is_unsafe_for_output(rewritten, source_text):
-        return ""
-    for token, target in placeholders:
-        if token not in rewritten:
-            return ""
-        rewritten = rewritten.replace(token, target)
-    if _translation_is_unsafe_for_output(rewritten, source_text):
-        return ""
-    return rewritten
-
-
-def _translate_bubble_brief(
-    ollama,
-    model: str,
-    source_lang: str,
-    target_lang: str,
-    source_text: str,
-    style_guide: dict,
-) -> str:
-    if target_lang != "Simplified Chinese" or not source_text:
-        return ""
-    matched_terms = _matched_glossary_terms(source_text, style_guide)
-    masked_source = source_text
-    placeholders: list[tuple[str, str]] = []
-    for idx, item in enumerate(matched_terms):
-        source = str(item.get("source", "")).strip()
-        target = str(item.get("target", "")).strip()
-        if not source or not target or source not in masked_source:
-            continue
-        token = f"@@N{idx}@@"
-        masked_source = masked_source.replace(source, token)
-        placeholders.append((token, target))
-    token_hint = ""
-    if placeholders:
-        token_hint = " 保留这些标记不变：" + " ".join(token for token, _ in placeholders) + "。"
-    prompt = (
-        "把下面日语译成适合漫画气泡的简体中文。要求：简短、自然、像漫画对白，不要解释。"
-        f"{token_hint}\n{masked_source}"
-    )
-    try:
-        raw = ollama.generate(
-            _resolve_model(model),
-            prompt,
-            timeout=30,
-            options={
-                "num_predict": min(96, _estimate_single_num_predict(source_text, target_lang)),
-                "temperature": 0.05,
-                "top_p": 0.9,
-            },
-        )
-    except Exception:
-        return ""
-    translated = _clean_translation(raw)
-    if _translation_is_unsafe_for_output(translated, source_text):
-        return ""
-    for token, target in placeholders:
-        if token not in translated:
-            return ""
-        translated = translated.replace(token, target)
-    if _translation_is_unsafe_for_output(translated, source_text):
-        return ""
-    return translated
-
-
-def _shorten_translation_for_region(
-    ollama,
-    model: str,
-    source_lang: str,
-    target_lang: str,
-    source_text: str,
-    translation: str,
-    style_guide: dict,
-    region: dict,
-) -> str:
-    current = str(translation or "").strip()
-    if target_lang != "Simplified Chinese" or not current:
-        return current
-    initial_reason = _crowding_reason_for_region(region, current)
-    if not initial_reason:
-        return current
-
-    candidates: list[str] = [current]
-    normalized = _brevity_normalize_cn(current, aggressive=initial_reason in {"small-box", "narrow-vertical"})
-    if normalized and normalized != current and not _translation_is_unsafe_for_output(normalized, source_text):
-        candidates.append(normalized)
-
-    rewritten = _rewrite_bubble_brief_cn(
-        ollama,
-        model,
-        source_text,
-        normalized or current,
-        style_guide,
-    )
-    if rewritten:
-        rewritten = _brevity_normalize_cn(
-            _enforce_glossary(rewritten, source_text, style_guide),
-            aggressive=initial_reason in {"small-box", "narrow-vertical"},
-        )
-        if (
-            rewritten
-            and _language_ok(target_lang, rewritten)
-            and not _translation_is_unsafe_for_output(rewritten, source_text)
-        ):
-            candidates.append(rewritten)
-
-    brief = _translate_bubble_brief(
-        ollama,
-        model,
-        source_lang,
-        target_lang,
-        source_text,
-        style_guide,
-    )
-    if brief:
-        brief = _brevity_normalize_cn(
-            _enforce_glossary(brief, source_text, style_guide),
-            aggressive=initial_reason in {"small-box", "narrow-vertical"},
-        )
-        if (
-            brief
-            and _language_ok(target_lang, brief)
-            and not _translation_is_unsafe_for_output(brief, source_text)
-        ):
-            candidates.append(brief)
-
-    def _candidate_key(text: str) -> tuple[int, int]:
-        compact = re.sub(r"\s+", "", text or "")
-        return (_crowding_rank(_crowding_reason_for_region(region, text)), len(compact))
-
-    best = current
-    best_key = _candidate_key(best)
-    for candidate in candidates[1:]:
-        if not candidate:
-            continue
-        cand_key = _candidate_key(candidate)
-        if cand_key < best_key:
-            best = candidate
-            best_key = cand_key
-        elif cand_key == best_key and len(candidate) + 1 < len(best):
-            best = candidate
-            best_key = cand_key
-
-    render = region.get("render") or {}
-    remaining_reason = _crowding_reason_for_region(region, best)
-    if remaining_reason and str(render.get("wrap_mode", "auto") or "auto").strip().lower() == "vertical":
-        try:
-            line_height = float(render.get("line_height", 1.0) or 1.0)
-        except Exception:
-            line_height = 1.0
-        try:
-            font_size = int(render.get("font_size", 0) or 0)
-        except Exception:
-            font_size = 0
-        try:
-            source_min = int(render.get("source_size_min", 0) or 0)
-        except Exception:
-            source_min = 0
-        if remaining_reason == "small-box":
-            render["line_height"] = min(line_height, 0.93)
-            if font_size > 0:
-                render["font_size"] = max(source_min or 10, int(font_size * 0.92))
-        elif remaining_reason == "narrow-vertical":
-            render["line_height"] = min(line_height, 0.91)
-            if font_size > 0:
-                render["font_size"] = max(source_min or 10, int(font_size * 0.90))
-        else:
-            render["line_height"] = min(line_height, 0.94)
-            if font_size > 0:
-                render["font_size"] = max(source_min or 10, int(font_size * 0.95))
-        region["render"] = render
-    return best
-
-
 def _language_ok(target_lang: str, text: str) -> bool:
     if not text:
         return False
@@ -18279,10 +17881,6 @@ def _classify_semantic_region(
         region_type = "narration_box"
         bg_text = True
         render_updates = {
-            "color": "#FFFFFF",
-            "stroke": "#000000",
-            "stroke_width": 1,
-            "line_height": 1.0,
             "cleanup_mode": "caption_box",
         }
 
@@ -18928,72 +18526,6 @@ def _is_kana(ch: str) -> bool:
     return 0x3040 <= code <= 0x30FF
 
 
-def _is_font_allowed_for_cn(font_name: str) -> bool:
-    if not font_name:
-        return False
-    allowed = {
-        "Noto Sans CJK",
-        "Noto Sans SC",
-        "Noto Serif SC",
-        "Microsoft YaHei",
-        "SimSun",
-        "SimHei",
-        "KaiTi",
-        "STKaiti",
-        "FangSong",
-        "Deng",
-    }
-    name = font_name.strip().lower()
-    for item in allowed:
-        if item.lower() in name:
-            return True
-    return False
-
-
-def _font_style_from_detected_font(detected_font: str) -> str | None:
-    name = str(detected_font or "").strip().lower()
-    if not name:
-        return None
-    if "kaiti" in name:
-        return "soft"
-    if "simhei" in name:
-        return "emphasis"
-    if any(token in name for token in ("yahei", "noto", "simsun", "fangsong", "deng")):
-        return "dialogue"
-    return None
-
-
-def _font_family_profile_from_detected_font(detected_font: str) -> str:
-    name = str(detected_font or "").strip().lower()
-    if not name:
-        return ""
-    if any(token in name for token in ("kaiti", "kai")):
-        return "handwritten"
-    if any(token in name for token in ("simhei", "bold", "black")):
-        return "bold"
-    if any(token in name for token in ("simsun", "fangsong", "serif", "mincho")):
-        return "serif"
-    if any(token in name for token in ("yahei", "noto", "deng", "gothic", "sans")):
-        return "sans"
-    return ""
-
-
-def _select_region_font_style(
-    region_type: str,
-    text: str,
-    bbox: list,
-    detected_font: str | None = None,
-) -> str:
-    region_type = str(region_type or "").strip()
-    if region_type == "narration_box":
-        return "narration"
-    if region_type in {"background_text", "decorative_text"}:
-        return "caption"
-    if region_type == "sfx":
-        return "emphasis"
-    return "dialogue"
-
-
 def _source_script_mix(text: str) -> tuple[int, float, float]:
     body = _non_punct_chars(text)
     if not body:
@@ -19002,195 +18534,6 @@ def _source_script_mix(text: str) -> tuple[int, float, float]:
     kana = sum(1 for ch in body if (0x3040 <= ord(ch) <= 0x30FF))
     kanji = sum(1 for ch in body if 0x4E00 <= ord(ch) <= 0x9FFF)
     return total, kana / max(1, total), kanji / max(1, total)
-
-
-def _estimate_region_font_size_hint(
-    region_type: str,
-    ocr_text: str,
-    bbox: list,
-    font_style: str,
-) -> int:
-    if region_type not in {"speech_bubble", "background_text", "narration_box"} or not bbox:
-        return 0
-    box_w = max(1, int(bbox[2]))
-    box_h = max(1, int(bbox[3]))
-    if _is_ellipsis_like(ocr_text):
-        verticalish = box_h > box_w * 1.12
-        if verticalish:
-            preferred = max(
-                int(round(min(box_h * 0.20, max(box_w * 0.78, 18)))),
-                int(round(box_w * 0.72)),
-            )
-            return max(20, min(34, preferred))
-        else:
-            preferred = max(
-                int(round(min(box_w * 0.24, max(box_h * 0.52, 16)))),
-                int(round(box_h * 0.58)),
-            )
-            return max(18, min(30, preferred))
-    total, kana_ratio, kanji_ratio = _source_script_mix(ocr_text)
-    if total <= 0:
-        return 0
-    verticalish = box_h > box_w * 1.12
-    speech_body = _non_punct_chars(ocr_text)
-    speech_cjk = any(_is_cjk_char(ch) for ch in str(ocr_text or "")) and " " not in str(ocr_text or "")
-    ellipsis_source = _is_ellipsis_like(ocr_text)
-    speech_verticalish = (
-        region_type == "speech_bubble"
-        and (speech_cjk or ellipsis_source)
-        and (
-            verticalish
-            or (ellipsis_source and box_h > box_w * 0.9)
-            or box_h > box_w * 0.92
-            or (box_h > box_w * 0.78 and len(speech_body) >= 4)
-        )
-    )
-    background_verticalish = (
-        region_type in {"background_text", "narration_box"}
-        and speech_cjk
-        and (
-            verticalish
-            or box_h > box_w * 0.9
-            or (box_h > box_w * 0.72 and len(speech_body) >= 4)
-        )
-    )
-    factor = 1.05 if kana_ratio > kanji_ratio else 0.98
-    if speech_verticalish:
-        semantic_total = max(1, total)
-        min_dim = min(box_w, box_h)
-        area_hint = math.sqrt((box_w * box_h) / semantic_total)
-        area_factor = 0.42 if kana_ratio > kanji_ratio else 0.39
-        preferred = int(round(area_hint * area_factor))
-        if semantic_total <= 3:
-            preferred = max(preferred, int(round(min_dim * 0.34)))
-        elif semantic_total <= 6:
-            preferred = max(preferred, int(round(min_dim * 0.28)))
-        elif semantic_total <= 12:
-            preferred = max(preferred, int(round(min_dim * 0.20)))
-        else:
-            preferred = max(preferred, int(round(min_dim * 0.11)))
-        if semantic_total <= 2:
-            preferred = max(preferred, int(round(box_w * 0.78)))
-        elif semantic_total <= 4:
-            preferred = max(preferred, int(round(box_w * 0.70)))
-        elif semantic_total <= 8:
-            preferred = max(preferred, int(round(box_w * 0.60)))
-        else:
-            preferred = max(preferred, int(round(box_w * 0.50)))
-        if font_style == "caption":
-            preferred = int(round(preferred * 0.95))
-        return max(16, min(38, preferred))
-    if verticalish or background_verticalish:
-        if region_type == "speech_bubble":
-            effective_total = max(total, 5 if total <= 3 else 4)
-        elif region_type == "background_text":
-            meaningful_short_caption = (
-                verticalish
-                and _is_meaningful_background_caption_source(ocr_text)
-                and len(speech_body) <= 4
-            )
-            effective_total = max(total, 3 if meaningful_short_caption else 4)
-        else:
-            effective_total = max(total, 3)
-        base = box_h / effective_total
-    else:
-        effective_total = max(total, 3 if region_type == "speech_bubble" else 2)
-        base = box_w / effective_total
-    preferred = int(round(base * factor))
-    if font_style == "caption" and not (
-        region_type == "background_text"
-        and verticalish
-        and _is_meaningful_background_caption_source(ocr_text)
-        and len(speech_body) <= 4
-    ):
-        preferred = int(round(preferred * 0.95))
-    return max(12, min(42, preferred))
-
-
-def _estimate_region_font_size_band(
-    region_type: str,
-    ocr_text: str,
-    bbox: list,
-    font_style: str,
-) -> tuple[int, int, int]:
-    preferred = _estimate_region_font_size_hint(region_type, ocr_text, bbox, font_style)
-    if preferred <= 0:
-        return 0, 0, 0
-    if region_type == "speech_bubble":
-        size_min = max(14, int(round(preferred * 0.92)))
-        size_max = max(size_min, min(40, int(round(preferred * 1.18))))
-        box_w = max(1, int((bbox or [0, 0, 0, 0])[2] or 1))
-        box_h = max(1, int((bbox or [0, 0, 0, 0])[3] or 1))
-        speech_body = _non_punct_chars(ocr_text)
-        speech_cjk = any(_is_cjk_char(ch) for ch in str(ocr_text or "")) and " " not in str(ocr_text or "")
-        ellipsis_source = _is_ellipsis_like(ocr_text)
-        long_vertical_speech = (
-            (speech_cjk or ellipsis_source)
-            and (
-                box_h > box_w * 1.12
-                or (ellipsis_source and box_h > box_w * 0.9)
-                or box_h > box_w * 0.92
-                or (box_h > box_w * 0.78 and len(speech_body) >= 4)
-            )
-        )
-        semantic_total = max(_source_script_mix(ocr_text)[0], len(speech_body))
-        min_dim = min(box_w, box_h)
-        if long_vertical_speech:
-            if semantic_total <= 2:
-                width_floor = int(round(box_w * 0.68))
-            elif semantic_total <= 4:
-                width_floor = int(round(box_w * 0.60))
-            elif semantic_total <= 6:
-                width_floor = int(round(box_w * 0.54))
-            elif semantic_total <= 10:
-                width_floor = int(round(box_w * 0.46))
-            else:
-                width_floor = int(round(box_w * 0.40))
-            width_floor = max(14, min(28, width_floor))
-            size_min = max(size_min, width_floor)
-            size_max = max(size_max, min(44, int(round(size_min * 1.22))))
-        if long_vertical_speech and semantic_total >= 8 and min_dim >= 96:
-            area_cap = int(round(min_dim * (0.18 if semantic_total >= 14 else 0.16)))
-            ratio_cap = int(round(preferred * (1.48 if semantic_total >= 14 else 1.38)))
-            size_max = max(size_max, min(42, max(area_cap, ratio_cap)))
-    else:
-        size_min = max(12, int(round(preferred * 0.82)))
-        size_max = max(size_min, int(round(preferred * 1.12)))
-        box_w = max(1, int((bbox or [0, 0, 0, 0])[2] or 1))
-        box_h = max(1, int((bbox or [0, 0, 0, 0])[3] or 1))
-        if box_h > box_w * 1.12:
-            semantic_total = max(_source_script_mix(ocr_text)[0], len(_non_punct_chars(ocr_text)))
-            meaningful_short_caption = (
-                region_type == "background_text"
-                and _is_meaningful_background_caption_source(ocr_text)
-                and semantic_total <= 4
-            )
-            if semantic_total <= 4:
-                width_floor = int(round(box_w * 0.62))
-            elif semantic_total <= 8:
-                width_floor = int(round(box_w * 0.52))
-            else:
-                width_floor = int(round(box_w * 0.44))
-            width_floor = max(14, min(30, width_floor))
-            size_min = max(size_min, width_floor)
-            if meaningful_short_caption:
-                size_min = max(size_min, max(22, int(round(preferred * 0.95))))
-            size_max = max(size_max, min(48, int(round(size_min * 1.20))))
-    return preferred, size_min, size_max
-
-
-def _select_region_font_name(
-    region_type: str,
-    text: str,
-    bbox: list,
-    font_style: str,
-    detected_font: str | None,
-    default_font: str,
-) -> str:
-    region_type = str(region_type or "").strip()
-    if region_type == "sfx":
-        return "SimHei"
-    return default_font or "Microsoft YaHei"
 
 
 def _region_record(
@@ -19203,91 +18546,11 @@ def _region_record(
     bg_text: bool,
     needs_review: bool,
     ignore: bool,
-    font_name: str,
-    detected_font: str | None = None,
     region_type: str = "speech_bubble",
     ocr_conf: float = 1.0,
     render_updates: dict | None = None,
 ) -> dict:
-    box_w = max(1, int(bbox[2])) if bbox else 1
-    box_h = max(1, int(bbox[3])) if bbox else 1
-    verticalish = box_h > box_w * 1.18
-    small_box = min(box_w, box_h) <= 48
-    speech_body = _non_punct_chars(ocr_text)
-    speech_cjk = any(_is_cjk_char(ch) for ch in str(ocr_text or "")) and " " not in str(ocr_text or "")
-    ellipsis_source = _is_ellipsis_like(ocr_text)
-    prefer_vertical_speech = (
-        region_type == "speech_bubble"
-        and (speech_cjk or ellipsis_source)
-        and (
-            verticalish
-            or (ellipsis_source and box_h > box_w * 0.9)
-            or box_h > box_w * 0.92
-            or (box_h > box_w * 0.78 and len(speech_body) >= 4)
-        )
-    )
-    prefer_vertical_background = (
-        region_type in {"background_text", "narration_box"}
-        and speech_cjk
-        and (
-            verticalish
-            or box_h > box_w * 0.9
-            or (box_h > box_w * 0.72 and len(speech_body) >= 4)
-        )
-    )
-    font_style = _select_region_font_style(region_type, ocr_text, bbox, detected_font)
-    resolved_font_name = _select_region_font_name(region_type, ocr_text, bbox, font_style, detected_font, font_name)
-    font_size_hint, font_size_min, font_size_max = _estimate_region_font_size_band(
-        region_type,
-        ocr_text,
-        bbox,
-        font_style,
-    )
-    source_orientation = (
-        "vertical"
-        if (prefer_vertical_speech or prefer_vertical_background or verticalish)
-        else "horizontal"
-    )
-    speech_line_height = 0.96 if prefer_vertical_speech else 1.0
-    slim_vertical_caption = (
-        region_type in {"background_text", "narration_box"}
-        and prefer_vertical_background
-        and box_w <= 40
-        and box_h >= 80
-    )
     render = {
-        "font": resolved_font_name,
-        "font_size": (
-            0
-            if region_type == "speech_bubble"
-            else max(font_size_hint, font_size_min)
-        ),
-        "source_size_hint": font_size_hint,
-        "source_size_min": font_size_min,
-        "source_size_max": font_size_max,
-        "source_orientation": source_orientation,
-        "font_style": font_style,
-        "line_height": (
-            speech_line_height
-            if region_type == "speech_bubble"
-            else (1.0 if slim_vertical_caption else 1.1)
-        ),
-        "align": "center",
-        "color": "#000000",
-        "stroke": "#FFFFFF",
-        "stroke_width": (
-            1
-            if (
-                (region_type == "speech_bubble" and (prefer_vertical_speech or small_box))
-                or slim_vertical_caption
-            )
-            else 2
-        ),
-        "wrap_mode": (
-            "vertical"
-            if (prefer_vertical_speech or prefer_vertical_background)
-            else ("horizontal" if region_type in {"background_text", "decorative_text"} else "auto")
-        ),
         "cleanup_mode": (
             "bubble"
             if region_type == "speech_bubble"
@@ -19295,7 +18558,40 @@ def _region_record(
         ),
     }
     if isinstance(render_updates, dict):
-        render.update({k: v for k, v in render_updates.items() if v is not None})
+        legacy_style_keys = {
+            "font",
+            "font_size",
+            "source_size_hint",
+            "source_size_min",
+            "source_size_max",
+            "font_size_locked",
+            "font_size_policy",
+            "font_size_fallback_policy",
+            "source_orientation",
+            "wrap_mode",
+            "line_height",
+            "align",
+            "color",
+            "stroke",
+            "stroke_width",
+            "font_style",
+            "font_weight",
+            "spacing_profile",
+            "render_style",
+            "render_style_owner",
+            "render_style_version",
+            "render_style_source",
+            "render_style_provider",
+            "render_style_provider_model",
+            "render_style_confidence",
+        }
+        render.update(
+            {
+                key: value
+                for key, value in render_updates.items()
+                if value is not None and key not in legacy_style_keys
+            }
+        )
     return {
         "region_id": f"r{idx:03d}",
         "bbox": bbox,
