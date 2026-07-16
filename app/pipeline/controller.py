@@ -51,6 +51,18 @@ _PARENT_SOURCE_BLOCKING_ACTIONS = {
     "block_review_only",
     "repair_required",
 }
+_TERMINAL_EMPHASIS_SYMBOL_EXPANSIONS = {
+    "!": "!",
+    "！": "!",
+    "︕": "!",
+    "?": "?",
+    "？": "?",
+    "︖": "?",
+    "‼": "!!",
+    "⁇": "??",
+    "⁉": "!?",
+    "⁈": "?!",
+}
 
 
 @dataclass(frozen=True)
@@ -3774,6 +3786,22 @@ def _append_parent_boundary_ocr_source_regions(
             if not ocr_backend_meta:
                 ocr_backend_meta = {"ocr_backend": ocr_engine.__class__.__name__}
         ocr_text = _clean_ocr_text(str(ocr_text or ""))
+        terminal_symbol_evidence = {
+            "text": ocr_text,
+            "raw_text": ocr_text,
+            "applied": False,
+            "reason": "deterministic_source_preserved" if deterministic_source else "no_qualifying_terminal_symbol_evidence",
+        }
+        if not deterministic_source:
+            terminal_symbol_evidence = _reconcile_parent_terminal_symbol_multiplicity(
+                ocr_text,
+                parent_node=parent_node,
+                parent_bbox=bbox,
+                regions=regions,
+            )
+            ocr_text = str(terminal_symbol_evidence.get("text") or ocr_text)
+            if terminal_symbol_evidence.get("applied"):
+                status = "created_with_terminal_symbol_multiplicity_evidence"
         if not deterministic_source:
             state, reason = _ocr_transaction_state_for_text_area_route(ocr_text, ocr_conf, route)
         assignment = _parent_boundary_ocr_assignment(
@@ -3820,6 +3848,7 @@ def _append_parent_boundary_ocr_source_regions(
             source_contract_scope=source_scope,
             source_contract_stage=source_stage,
         )
+        _stamp_parent_terminal_symbol_evidence(region, terminal_symbol_evidence)
         for meta_key, meta_value in ocr_backend_meta.items():
             region[meta_key] = meta_value
             region.setdefault("render", {})[meta_key] = meta_value
@@ -3847,6 +3876,7 @@ def _append_parent_boundary_ocr_source_regions(
                     "source_contract_scope": source_scope,
                     "source_contract_stage": source_stage,
                     "source_contract_ocr_confidence": float(ocr_conf or 0.0),
+                    **_parent_terminal_symbol_audit_fields(terminal_symbol_evidence),
                     **ocr_backend_meta,
                 }
             )
@@ -3869,6 +3899,7 @@ def _append_parent_boundary_ocr_source_regions(
                 "source_contract_scope": source_scope,
                 "source_contract_stage": source_stage,
                 "source_contract_ocr_confidence": float(ocr_conf or 0.0),
+                **_parent_terminal_symbol_audit_fields(terminal_symbol_evidence),
                 "ocr_backend": ocr_backend_meta.get("ocr_backend", ""),
                 "ocr_model_path": ocr_backend_meta.get("ocr_model_path", ""),
                 "ocr_mmproj_path": ocr_backend_meta.get("ocr_mmproj_path", ""),
@@ -4004,6 +4035,176 @@ def _is_identity_punctuation_source_text(text: str) -> bool:
     if not cleaned:
         return False
     return _is_punct_only(cleaned) or not _non_punct_chars(cleaned)
+
+
+def _terminal_emphasis_symbol_run(text: str) -> str:
+    value = str(text or "")
+    index = len(value)
+    while index > 0 and value[index - 1] in _TERMINAL_EMPHASIS_SYMBOL_EXPANSIONS:
+        index -= 1
+    return value[index:]
+
+
+def _expanded_emphasis_symbols(text: str) -> str:
+    return "".join(
+        _TERMINAL_EMPHASIS_SYMBOL_EXPANSIONS.get(char, "")
+        for char in str(text or "")
+    )
+
+
+def _parent_terminal_symbol_evidence_rank(
+    region: Mapping[str, Any],
+    *,
+    parent_id: str,
+    container_id: str,
+    parent_bbox: list[int],
+) -> int:
+    if bool(region.get("parent_boundary_ocr_source_contract")):
+        return 0
+    render = region.get("render") if isinstance(region.get("render"), Mapping) else {}
+    route = str(
+        region.get("text_area_route_intent")
+        or render.get("text_area_route_intent")
+        or ""
+    ).strip()
+    if route and route not in {"translate_speech", "translate_caption", "translate_caption_background"}:
+        return 0
+    region_parent_id = str(
+        region.get("parent_logical_text_unit_id")
+        or render.get("parent_logical_text_unit_id")
+        or region.get("source_text_represented_by_block_id")
+        or render.get("source_text_represented_by_block_id")
+        or ""
+    ).strip()
+    region_container_id = str(
+        region.get("text_area_container_id")
+        or render.get("text_area_container_id")
+        or ""
+    ).strip()
+    region_bbox = _clip_controller_bbox(list(region.get("bbox") or []), None)
+    covers_parent = bool(
+        region_bbox
+        and _bbox_inside_ratio_controller(parent_bbox, region_bbox) >= 0.80
+        and _bbox_inside_ratio_controller(region_bbox, parent_bbox) >= 0.80
+    )
+    same_parent = bool(region_parent_id and region_parent_id == parent_id)
+    same_container = bool(container_id and region_container_id == container_id)
+    if same_parent and covers_parent:
+        return 3
+    if same_parent or (same_container and covers_parent):
+        return 2
+    return 0
+
+
+def _reconcile_parent_terminal_symbol_multiplicity(
+    parent_text: str,
+    *,
+    parent_node: Mapping[str, Any],
+    parent_bbox: list[int],
+    regions: list[dict],
+) -> dict[str, Any]:
+    raw_text = _clean_ocr_text(parent_text)
+    parent_run = _terminal_emphasis_symbol_run(raw_text)
+    parent_expanded = _expanded_emphasis_symbols(parent_run)
+    result: dict[str, Any] = {
+        "text": raw_text,
+        "raw_text": raw_text,
+        "applied": False,
+        "reason": "parent_terminal_emphasis_run_missing",
+        "parent_run": parent_run,
+        "parent_expanded": parent_expanded,
+    }
+    if not parent_run or not parent_expanded:
+        return result
+
+    parent_id = str(parent_node.get("parent_node_id") or "").strip()
+    container_id = str(parent_node.get("container_id") or "").strip()
+    candidates: list[dict[str, Any]] = []
+    for region in regions:
+        if not isinstance(region, Mapping):
+            continue
+        rank = _parent_terminal_symbol_evidence_rank(
+            region,
+            parent_id=parent_id,
+            container_id=container_id,
+            parent_bbox=parent_bbox,
+        )
+        if rank <= 0:
+            continue
+        evidence_text = _clean_ocr_text(str(region.get("ocr_text") or ""))
+        evidence_run = _terminal_emphasis_symbol_run(evidence_text)
+        evidence_expanded = _expanded_emphasis_symbols(evidence_run)
+        if len(evidence_expanded) <= len(parent_expanded):
+            continue
+        if not evidence_expanded.startswith(parent_expanded):
+            continue
+        candidates.append(
+            {
+                "rank": rank,
+                "region_id": str(region.get("region_id") or ""),
+                "run": evidence_run,
+                "expanded": evidence_expanded,
+            }
+        )
+    if not candidates:
+        result["reason"] = "no_longer_compatible_terminal_symbol_evidence"
+        return result
+
+    best_rank = max(int(item["rank"]) for item in candidates)
+    best = [item for item in candidates if int(item["rank"]) == best_rank]
+    exact_runs = {str(item["run"]) for item in best}
+    expanded_runs = {str(item["expanded"]) for item in best}
+    if len(exact_runs) != 1 or len(expanded_runs) != 1:
+        result["reason"] = "conflicting_terminal_symbol_evidence"
+        result["conflicting_region_ids"] = sorted(
+            str(item["region_id"]) for item in best if str(item["region_id"])
+        )
+        return result
+
+    evidence_run = next(iter(exact_runs))
+    corrected = raw_text[: len(raw_text) - len(parent_run)] + evidence_run
+    result.update(
+        {
+            "text": corrected,
+            "applied": True,
+            "reason": "longer_exact_terminal_symbol_run_from_parent_attached_evidence",
+            "evidence_run": evidence_run,
+            "evidence_expanded": next(iter(expanded_runs)),
+            "evidence_region_ids": sorted(
+                str(item["region_id"]) for item in best if str(item["region_id"])
+            ),
+            "evidence_rank": best_rank,
+        }
+    )
+    return result
+
+
+def _parent_terminal_symbol_audit_fields(evidence: Mapping[str, Any] | None) -> dict[str, Any]:
+    item = dict(evidence or {})
+    if not item.get("applied"):
+        return {}
+    return {
+        "parent_ocr_raw_text": str(item.get("raw_text") or ""),
+        "parent_terminal_symbol_multiplicity_restored": True,
+        "parent_terminal_symbol_before": str(item.get("parent_run") or ""),
+        "parent_terminal_symbol_after": str(item.get("evidence_run") or ""),
+        "parent_terminal_symbol_expanded_before": str(item.get("parent_expanded") or ""),
+        "parent_terminal_symbol_expanded_after": str(item.get("evidence_expanded") or ""),
+        "parent_terminal_symbol_evidence_region_ids": list(item.get("evidence_region_ids") or []),
+        "parent_terminal_symbol_evidence_reason": str(item.get("reason") or ""),
+    }
+
+
+def _stamp_parent_terminal_symbol_evidence(
+    region: dict[str, Any],
+    evidence: Mapping[str, Any] | None,
+) -> None:
+    fields = _parent_terminal_symbol_audit_fields(evidence)
+    if not fields:
+        return
+    region.update(fields)
+    render = region.setdefault("render", {})
+    render.update(fields)
 
 
 def _parent_boundary_ocr_route(parent_node: Mapping[str, Any]) -> str:
@@ -10211,6 +10412,20 @@ def _process_page(
                             translation=translation,
                             status="bubble_local_translation_repair",
                         )
+                translation, terminal_symbol_evidence = _preserve_repeated_terminal_emphasis_symbols(
+                    text,
+                    translation,
+                )
+                if terminal_symbol_evidence.get("changed"):
+                    _translation_perf_record_terminal_symbol_conservation(
+                        unit_record,
+                        terminal_symbol_evidence,
+                    )
+                    _translation_perf_set_final(
+                        unit_record,
+                        translation=translation,
+                        status="terminal_symbol_multiplicity_repaired",
+                    )
                 translation_cache[assignment.cache_key] = translation
             matched_terms = _matched_glossary_terms(text, active_style_guide)
             applied_terms = []
@@ -14071,6 +14286,71 @@ def _normalize_translation_format_for_record(
             stage=stage,
         )
     return normalized
+
+
+def _preserve_repeated_terminal_emphasis_symbols(
+    source_text: str,
+    translation: str,
+) -> tuple[str, dict[str, Any]]:
+    source = str(source_text or "").strip()
+    translated = str(translation or "").strip()
+    source_run = _terminal_emphasis_symbol_run(source)
+    translation_run = _terminal_emphasis_symbol_run(translated)
+    expanded_source = _expanded_emphasis_symbols(source_run)
+    expanded_translation = _expanded_emphasis_symbols(translation_run)
+    evidence: dict[str, Any] = {
+        "changed": False,
+        "source_run": source_run,
+        "translation_run_before": translation_run,
+        "expanded_source_symbols": expanded_source,
+        "expanded_translation_symbols_before": expanded_translation,
+        "reason": "source_has_no_repeated_terminal_emphasis_run",
+    }
+    if not translated or len(expanded_source) < 2:
+        return translated, evidence
+    if expanded_translation == expanded_source:
+        evidence["reason"] = "terminal_symbol_multiplicity_already_equal"
+        return translated, evidence
+
+    if translation_run:
+        body = translated[: len(translated) - len(translation_run)]
+    else:
+        body = translated.rstrip()
+        while body.endswith(("。", "．", ".")):
+            body = body[:-1].rstrip()
+    corrected = body + source_run
+    if not body or corrected == translated:
+        evidence["reason"] = "terminal_symbol_conservation_not_applied"
+        return translated, evidence
+    evidence.update(
+        {
+            "changed": True,
+            "translation_after": corrected,
+            "translation_run_after": source_run,
+            "expanded_translation_symbols_after": expanded_source,
+            "reason": "repeated_terminal_emphasis_count_and_order_conserved",
+        }
+    )
+    return corrected, evidence
+
+
+def _translation_perf_record_terminal_symbol_conservation(
+    record: dict[str, Any] | None,
+    evidence: Mapping[str, Any],
+) -> None:
+    if not record or not evidence.get("changed"):
+        return
+    record["translation_terminal_symbol_multiplicity_repaired"] = True
+    record["translation_terminal_symbol_source_run"] = str(evidence.get("source_run") or "")
+    record["translation_terminal_symbol_before"] = str(evidence.get("translation_run_before") or "")
+    record["translation_terminal_symbol_after"] = str(evidence.get("translation_run_after") or "")
+    record["translation_terminal_symbol_expanded_source"] = str(
+        evidence.get("expanded_source_symbols") or ""
+    )
+    record["translation_terminal_symbol_expanded_before"] = str(
+        evidence.get("expanded_translation_symbols_before") or ""
+    )
+    record["translation_terminal_symbol_reason"] = str(evidence.get("reason") or "")
 
 
 def _looks_like_runtime_failure(text: str) -> bool:

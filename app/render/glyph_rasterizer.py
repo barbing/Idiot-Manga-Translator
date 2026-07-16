@@ -130,7 +130,11 @@ class FreeTypeGlyphRasterizer:
             return _failure(base_audit, "raster_font_path_missing")
         if not shaped_glyphs:
             return _failure(base_audit, "raster_shaped_glyphs_missing")
-        if position_policy not in {"harfbuzz", "compact_vertical_sequence_preserved"}:
+        if position_policy not in {
+            "harfbuzz",
+            "compact_vertical_sequence_preserved",
+            "compact_horizontal_sequence_preserved",
+        }:
             return _failure(base_audit, f"raster_position_policy_unsupported:{position_policy}")
         selected = _select_glyph_sequence(shaped_glyphs, requested)
         if selected is None:
@@ -236,6 +240,29 @@ class FreeTypeGlyphRasterizer:
                     int(bitmap_h),
                 ]
             base_audit["compact_vertical_step"] = round(step, 4)
+        elif position_policy == "compact_horizontal_sequence_preserved":
+            max_bitmap_h = max(int(item["image"].size[1]) for item in bitmaps)
+            total_bitmap_w = sum(int(item["image"].size[0]) for item in bitmaps)
+            if len(bitmaps) > 1:
+                available_gap = max(0.0, float(width - total_bitmap_w)) / float(len(bitmaps) - 1)
+                preferred_gap = max(1.0, round(float(font_size) * 0.06))
+                gap = max(0.0, min(preferred_gap, available_gap))
+            else:
+                gap = 0.0
+            cursor_x = 0.0
+            for item in bitmaps:
+                bitmap_w, bitmap_h = item["image"].size
+                item["left"] = cursor_x
+                item["top"] = (float(max_bitmap_h) - float(bitmap_h)) / 2.0
+                item["record"]["bitmap_box"] = [
+                    round(float(item["left"]), 4),
+                    round(float(item["top"]), 4),
+                    int(bitmap_w),
+                    int(bitmap_h),
+                ]
+                cursor_x += float(bitmap_w) + gap
+            base_audit["compact_horizontal_gap"] = round(gap, 4)
+            base_audit["compact_horizontal_symbol_count"] = len(bitmaps)
 
         min_x = min(float(item["left"]) for item in bitmaps)
         min_y = min(float(item["top"]) for item in bitmaps)

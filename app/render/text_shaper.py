@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.render.typesetting_text import (
+    is_default_ignorable_codepoint,
+    source_text_requires_visible_glyph,
+)
+
 try:
     import uharfbuzz as hb
 except Exception:  # pragma: no cover - tested through runtime behavior
@@ -117,6 +122,13 @@ class HarfBuzzShaper:
         hb_font.scale = (size * 64, size * 64)
         buffer = hb.Buffer()
         buffer.add_str(text_value)
+        remove_default_ignorables = getattr(
+            getattr(hb, "BufferFlags", None),
+            "REMOVE_DEFAULT_IGNORABLES",
+            None,
+        )
+        if remove_default_ignorables is not None:
+            buffer.flags |= remove_default_ignorables
         if resolved_direction:
             buffer.direction = resolved_direction
         if resolved_script:
@@ -135,16 +147,28 @@ class HarfBuzzShaper:
         infos = list(buffer.glyph_infos)
         positions = list(buffer.glyph_positions)
         glyphs: list[ShapedGlyph] = []
+        removed_nonvisual_notdef: list[dict[str, Any]] = []
         cluster_values = [int(info.cluster) for info in infos]
         for index, (info, pos) in enumerate(zip(infos, positions)):
             cluster = int(info.cluster)
             glyph_id = int(info.codepoint)
+            cluster_text = _cluster_text(text_value, cluster, cluster_values)
+            if glyph_id == 0 and not source_text_requires_visible_glyph(cluster_text):
+                removed_nonvisual_notdef.append(
+                    {
+                        "glyph_id": glyph_id,
+                        "cluster": cluster,
+                        "text": cluster_text,
+                        "reason": "unicode_default_ignorable_no_visible_ink",
+                    }
+                )
+                continue
             glyphs.append(
                 ShapedGlyph(
                     glyph_id=glyph_id,
                     glyph_name=self._glyph_name(face.path, glyph_id),
                     cluster=cluster,
-                    text=_cluster_text(text_value, cluster, cluster_values),
+                    text=cluster_text,
                     x_advance=float(pos.x_advance) / 64.0,
                     y_advance=float(pos.y_advance) / 64.0,
                     x_offset=float(pos.x_offset) / 64.0,
@@ -156,6 +180,21 @@ class HarfBuzzShaper:
         final_direction = str(buffer.direction or resolved_direction or "").lower()
         final_script = str(buffer.script or resolved_script or "")
         final_language = str(buffer.language or resolved_language or "")
+        default_ignorable_codepoints = [
+            f"U+{ord(char):04X}"
+            for char in text_value
+            if is_default_ignorable_codepoint(char)
+        ]
+        default_ignorable_metadata = (
+            {
+                "default_ignorable_policy": "unicode_property_no_visible_ink",
+                "default_ignorable_codepoints": default_ignorable_codepoints,
+                "removed_nonvisual_notdef_count": len(removed_nonvisual_notdef),
+                "removed_nonvisual_notdef_glyphs": removed_nonvisual_notdef,
+            }
+            if default_ignorable_codepoints or removed_nonvisual_notdef
+            else {}
+        )
         return ShapedRun(
             text=text_value,
             normalized_text=text_value,
@@ -172,6 +211,7 @@ class HarfBuzzShaper:
                 "position_scale": "26.6_to_px",
                 "complex_script": final_script in COMPLEX_SCRIPTS or final_direction == "rtl",
                 "writing_mode": writing_mode,
+                **default_ignorable_metadata,
             },
         )
 

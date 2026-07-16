@@ -45,6 +45,20 @@ HEURISTIC_STYLE_SOURCE = "authorized_source_style_view_heuristic"
 STYLE_ARBITRATOR_PROVIDER = PARENT_STYLE_ARBITRATOR_PROVIDER
 STYLE_ARBITRATOR_SOURCE = PARENT_STYLE_ARBITRATOR_SOURCE
 MIN_STYLE_EVIDENCE_CONFIDENCE = 0.05
+PERCEPTUAL_STYLE_AXES_VERSION = "authorized_perceptual_style_axes_v2"
+PERCEPTUAL_STYLE_RESOLUTION_VERSION = "parent_style_perceptual_axis_resolution_v2"
+PERCEPTUAL_STYLE_PROVENANCE = "cleanup_mask_authorized_source_style_view_v1"
+PERCEPTUAL_STYLE_FACT_SET_PREFIX = "authorized_perceptual_fact_set_v1:"
+PERCEPTUAL_STYLE_AXES = ("fill", "outline", "shadow", "rotation")
+TARGET_FONT_REQUEST_VERSION = "target_font_request_v1"
+TARGET_FONT_REQUEST_PROVENANCE = "parent_style_arbitrator_source_label_taxonomy_v1"
+OPTIONAL_TARGET_FONT_LABEL_TAXONOMY: dict[str, dict[str, str]] = {
+    "STXINGKA.TTF": {
+        "catalog_face_id": "stxingkai_regular",
+        "style_class": "calligraphic",
+        "weight": "regular",
+    },
+}
 
 @dataclass(frozen=True)
 class StyleEvidence:
@@ -63,6 +77,9 @@ class StyleEvidence:
     content_bbox: tuple[int, int, int, int] = ()
     analysis_bbox: tuple[int, int, int, int] = ()
     detector_input_sha256: str = ""
+    authorized_perceptual_source_identity: Mapping[str, Any] = field(
+        default_factory=dict
+    )
     evidence_provider: str = ""
     evidence_source: str = ""
     evidence_model: str = ""
@@ -78,6 +95,13 @@ class StyleEvidence:
     stroke_color: str = ""
     text_size_ratio: float = 0.0
     source_size_px: float = 0.0
+    source_size_vertical_px: float = 0.0
+    source_size_horizontal_px: float = 0.0
+    source_size_confidence_vertical: float = 0.0
+    source_size_confidence_horizontal: float = 0.0
+    source_size_support_vertical: str = ""
+    source_size_support_horizontal: str = ""
+    source_scale_support_status: str = ""
     source_stroke_width_px: float = 0.0
     source_ink_stroke_width_px: float = 0.0
     stroke_width_ratio: float = 0.0
@@ -91,6 +115,7 @@ class StyleEvidence:
     peer_normalization_applied: bool = False
     peer_normalized_axes: tuple[str, ...] = ()
     peer_support_summary: Mapping[str, Any] = field(default_factory=dict)
+    perceptual_axis_evidence: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def unavailable(
@@ -102,6 +127,9 @@ class StyleEvidence:
         root_id: str,
         reason_codes: Sequence[str],
         view: AuthorizedSourceStyleView | None = None,
+        detector_input_sha256: str = "",
+        authorized_perceptual_source_identity: Mapping[str, Any] | None = None,
+        perceptual_axis_evidence: Mapping[str, Any] | None = None,
     ) -> "StyleEvidence":
         return cls(
             page_id=str(page_id or ""),
@@ -116,6 +144,11 @@ class StyleEvidence:
             owned_component_ids=tuple(getattr(view, "owned_component_ids", ()) or ()),
             content_bbox=tuple(getattr(view, "content_bbox", ()) or ()),
             analysis_bbox=tuple(getattr(view, "analysis_bbox", ()) or ()),
+            detector_input_sha256=str(detector_input_sha256 or ""),
+            authorized_perceptual_source_identity=dict(
+                authorized_perceptual_source_identity or {}
+            ),
+            perceptual_axis_evidence=dict(perceptual_axis_evidence or {}),
         )
 
     @classmethod
@@ -159,6 +192,13 @@ class StyleEvidence:
             stroke_color="#EEEEEE",
             text_size_ratio=float(source_size_px) / 36.0,
             source_size_px=float(source_size_px),
+            source_size_vertical_px=float(source_size_px),
+            source_size_horizontal_px=float(source_size_px),
+            source_size_confidence_vertical=float(confidence),
+            source_size_confidence_horizontal=float(confidence),
+            source_size_support_vertical="supported_test_evidence",
+            source_size_support_horizontal="supported_test_evidence",
+            source_scale_support_status="supported_test_evidence",
             source_stroke_width_px=max(0.0, float(source_size_px) * 0.02),
             source_ink_stroke_width_px=max(0.0, float(source_size_px) * 0.08),
             stroke_width_ratio=0.02,
@@ -193,6 +233,21 @@ class StyleEvidence:
             "stroke_color": self.stroke_color,
             "text_size_ratio": round(float(self.text_size_ratio), 8),
             "source_size_px": round(float(self.source_size_px), 8),
+            "source_size_vertical_px": round(
+                float(self.source_size_vertical_px), 8
+            ),
+            "source_size_horizontal_px": round(
+                float(self.source_size_horizontal_px), 8
+            ),
+            "source_size_confidence_vertical": round(
+                float(self.source_size_confidence_vertical), 8
+            ),
+            "source_size_confidence_horizontal": round(
+                float(self.source_size_confidence_horizontal), 8
+            ),
+            "source_size_support_vertical": self.source_size_support_vertical,
+            "source_size_support_horizontal": self.source_size_support_horizontal,
+            "source_scale_support_status": self.source_scale_support_status,
             "source_stroke_width_px": round(float(self.source_stroke_width_px), 8),
             "source_ink_stroke_width_px": round(
                 float(self.source_ink_stroke_width_px), 8
@@ -207,7 +262,7 @@ class StyleEvidence:
         }
 
     def to_audit_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "style_evidence_version": "parent_style_evidence_v2",
             "page_id": self.page_id,
             "bundle_id": self.bundle_id,
@@ -232,6 +287,16 @@ class StyleEvidence:
             "peer_normalized_axes": list(self.peer_normalized_axes),
             "peer_support_summary": dict(self.peer_support_summary),
         }
+        if self.perceptual_axis_evidence:
+            result["authorized_perceptual_source_identity"] = (
+                _json_safe_audit_mapping(
+                    self.authorized_perceptual_source_identity
+                )
+            )
+            result["perceptual_axis_evidence"] = _json_safe_audit_mapping(
+                self.perceptual_axis_evidence
+            )
+        return result
 
 
 @dataclass
@@ -416,6 +481,10 @@ _SESSION_CACHE: dict[tuple[str, bool], Any] = {}
 _SESSION_PROVIDER_METADATA: dict[tuple[str, bool], dict[str, Any]] = {}
 
 
+def _scale_support_is_supported(value: str) -> bool:
+    return str(value or "").startswith("supported_")
+
+
 def observe_parent_style_evidence(
     *,
     page_id: str,
@@ -520,6 +589,44 @@ def observe_parent_style_evidence(
                 )
             )
             continue
+        actual_detector_input_sha256 = _image_sha256(detector_input)
+        declared_detector_input_sha256 = str(
+            getattr(observation_inputs, "detector_input_sha256", "") or ""
+        )
+        if (
+            not declared_detector_input_sha256
+            or declared_detector_input_sha256 != actual_detector_input_sha256
+        ):
+            result.evidence.append(
+                StyleEvidence.unavailable(
+                    page_id=page_id,
+                    bundle_id=bundle_id,
+                    parent_id=parent_id,
+                    root_id=root_id,
+                    reason_codes=("authorized_detector_input_identity_mismatch",),
+                    view=view,
+                    detector_input_sha256=actual_detector_input_sha256,
+                )
+            )
+            continue
+        raw_perceptual_carrier = getattr(
+            observation_inputs, "perceptual_axis_evidence", {}
+        )
+        perceptual_carrier = (
+            dict(raw_perceptual_carrier)
+            if isinstance(raw_perceptual_carrier, Mapping)
+            and raw_perceptual_carrier
+            else {}
+        )
+        raw_perceptual_identity = getattr(
+            observation_inputs, "authorized_perceptual_source_identity", {}
+        )
+        trusted_perceptual_identity = (
+            dict(raw_perceptual_identity)
+            if perceptual_carrier
+            and isinstance(raw_perceptual_identity, Mapping)
+            else {}
+        )
         if (
             normalized_mode == "yuzumarker"
             and active_detector is None
@@ -547,6 +654,9 @@ def observe_parent_style_evidence(
                     root_id=root_id,
                     reason_codes=("yuzumarker_detector_unavailable",),
                     view=view,
+                    detector_input_sha256=actual_detector_input_sha256,
+                    authorized_perceptual_source_identity=trusted_perceptual_identity,
+                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -578,6 +688,9 @@ def observe_parent_style_evidence(
                     root_id=root_id,
                     reason_codes=(f"style_detector_failed:{type(exc).__name__}",),
                     view=view,
+                    detector_input_sha256=actual_detector_input_sha256,
+                    authorized_perceptual_source_identity=trusted_perceptual_identity,
+                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -590,6 +703,9 @@ def observe_parent_style_evidence(
                     root_id=root_id,
                     reason_codes=("style_detector_output_contract_invalid",),
                     view=view,
+                    detector_input_sha256=actual_detector_input_sha256,
+                    authorized_perceptual_source_identity=trusted_perceptual_identity,
+                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -603,6 +719,9 @@ def observe_parent_style_evidence(
                     root_id=root_id,
                     reason_codes=("font_model_confidence_contract_invalid",),
                     view=view,
+                    detector_input_sha256=actual_detector_input_sha256,
+                    authorized_perceptual_source_identity=trusted_perceptual_identity,
+                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -615,6 +734,9 @@ def observe_parent_style_evidence(
                     root_id=root_id,
                     reason_codes=("font_model_confidence_below_observation_floor",),
                     view=view,
+                    detector_input_sha256=actual_detector_input_sha256,
+                    authorized_perceptual_source_identity=trusted_perceptual_identity,
+                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -627,16 +749,6 @@ def observe_parent_style_evidence(
             detection,
             neutral_detection,
         )
-        direct_weight = str(observation_inputs.ink_weight_class or "").strip().lower()
-        direct_weight_confidence = float(observation_inputs.ink_weight_confidence)
-        if direct_weight in {"regular", "bold"} and direct_weight_confidence > 0.0:
-            parsed_weight = direct_weight
-            weight_confidence = direct_weight_confidence
-            weight_reason = "weight_authorized_ink_geometry_measured"
-        else:
-            parsed_weight = model_weight
-            weight_confidence = model_weight_confidence
-            weight_reason = model_weight_reason
         font_serif, family_confidence, family_reason = _family_axis_from_variants(
             detection,
             neutral_detection,
@@ -645,10 +757,36 @@ def observe_parent_style_evidence(
             detection,
             neutral_detection,
         )
-        source_size_px = observation_inputs.source_cell_size_for_direction(direction)
+        (
+            direct_weight,
+            direct_weight_confidence,
+            direct_weight_support,
+        ) = observation_inputs.ink_weight_measurement_for_direction(direction)
+        direct_weight = str(direct_weight or "").strip().lower()
+        if direct_weight in {"regular", "bold"} and direct_weight_confidence > 0.0:
+            parsed_weight = direct_weight
+            weight_confidence = direct_weight_confidence
+            weight_reason = "weight_authorized_ink_geometry_measured"
+        else:
+            parsed_weight = model_weight
+            weight_confidence = model_weight_confidence
+            weight_reason = model_weight_reason
+        (
+            source_size_px,
+            source_scale_confidence,
+            source_scale_axis,
+        ) = observation_inputs.source_cell_measurement_for_direction(direction)
+        source_scale_support_status = (
+            observation_inputs.source_cell_support_for_direction(direction)
+        )
+        source_scale_supported = bool(
+            source_size_px > 0.0
+            and source_scale_confidence > 0.0
+            and _scale_support_is_supported(source_scale_support_status)
+        )
         text_size_ratio = (
             float(source_size_px) / float(max(1, analysis_width))
-            if source_size_px > 0
+            if source_scale_supported
             else 0.0
         )
         source_stroke_width_px = max(
@@ -671,8 +809,8 @@ def observe_parent_style_evidence(
             "family": family_confidence,
             "weight": weight_confidence,
             "scale": (
-                float(observation_inputs.scale_confidence)
-                if source_size_px > 0
+                float(source_scale_confidence)
+                if source_scale_supported
                 else 0.0
             ),
             "paint": (
@@ -696,8 +834,9 @@ def observe_parent_style_evidence(
                 else "target_fallback:unresolved_source_weight_label"
             ),
             "scale": (
-                "authorized_source_style_view:foreground_geometry_cell_measurement"
-                if source_size_px > 0
+                "authorized_source_style_view:foreground_geometry_"
+                f"qualified_{source_scale_axis}_cell_measurement"
+                if source_scale_supported
                 else "typesetting_default:source_scale_unavailable"
             ),
             "paint": (
@@ -732,8 +871,10 @@ def observe_parent_style_evidence(
             evidence_reasons.append(neutral_error)
         if parsed_weight is None:
             evidence_reasons.append("source_weight_label_unresolved")
-        if source_size_px <= 0:
+        if not source_scale_supported:
             evidence_reasons.append("source_scale_axis_unavailable")
+            if source_scale_support_status:
+                evidence_reasons.append(source_scale_support_status)
         if not paint_valid:
             evidence_reasons.append("source_paint_axis_contract_invalid")
         if direction not in {"ltr", "ttb"}:
@@ -741,7 +882,7 @@ def observe_parent_style_evidence(
         detector_variant_summary = _detector_variant_summary(
             detection,
             neutral_detection,
-            primary_sha256=_image_sha256(detector_input),
+            primary_sha256=actual_detector_input_sha256,
             neutral_sha256=_image_sha256(observation_inputs.neutral_input),
             neutral_error=neutral_error,
         )
@@ -759,7 +900,8 @@ def observe_parent_style_evidence(
                 owned_component_ids=tuple(view.owned_component_ids),
                 content_bbox=tuple(view.content_bbox),
                 analysis_bbox=tuple(view.analysis_bbox),
-                detector_input_sha256=_image_sha256(detector_input),
+                detector_input_sha256=actual_detector_input_sha256,
+                authorized_perceptual_source_identity=trusted_perceptual_identity,
                 evidence_provider=provider,
                 evidence_source=source,
                 evidence_model=model,
@@ -775,6 +917,25 @@ def observe_parent_style_evidence(
                 stroke_color=stroke_color,
                 text_size_ratio=text_size_ratio,
                 source_size_px=source_size_px,
+                source_size_vertical_px=float(
+                    observation_inputs.source_cell_size_vertical_px
+                ),
+                source_size_horizontal_px=float(
+                    observation_inputs.source_cell_size_horizontal_px
+                ),
+                source_size_confidence_vertical=float(
+                    observation_inputs.source_cell_confidence_vertical
+                ),
+                source_size_confidence_horizontal=float(
+                    observation_inputs.source_cell_confidence_horizontal
+                ),
+                source_size_support_vertical=str(
+                    observation_inputs.source_cell_support_vertical or ""
+                ),
+                source_size_support_horizontal=str(
+                    observation_inputs.source_cell_support_horizontal or ""
+                ),
+                source_scale_support_status=source_scale_support_status,
                 source_stroke_width_px=source_stroke_width_px,
                 source_ink_stroke_width_px=source_ink_stroke_width_px,
                 stroke_width_ratio=stroke_width_ratio,
@@ -784,6 +945,7 @@ def observe_parent_style_evidence(
                 axis_provenance=axis_provenance,
                 observation_summary=observation_inputs.to_audit_dict(),
                 detector_variant_summary=detector_variant_summary,
+                perceptual_axis_evidence=perceptual_carrier,
             )
         )
 
@@ -907,10 +1069,17 @@ def arbitrate_parent_styles(
         record.update(
             {
                 "style_evidence_status": item.status,
-                "status": "applied" if item.vote_eligible else "fallback",
+                "status": (
+                    "applied"
+                    if item.vote_eligible or _style_has_resolved_perceptual_axis(style)
+                    else "fallback"
+                ),
                 "render_style_provider": style.get("render_style_provider"),
                 "render_style_source": style.get("render_style_source"),
                 "style_resolution_status": style.get("style_resolution_status"),
+                "style_perceptual_axis_resolution": style.get(
+                    "style_perceptual_axis_resolution"
+                ),
                 "base_style_id": style.get("base_style_id"),
                 "font_family": style.get("font_family"),
                 "font_family_role": style.get("font_family_role"),
@@ -921,6 +1090,7 @@ def arbitrate_parent_styles(
                 "fill_color": style.get("fill_color"),
                 "stroke_color": style.get("stroke_color"),
                 "stroke_width": style.get("stroke_width"),
+                "target_font_request": style.get("target_font_request"),
             }
         )
         records.append({key: value for key, value in record.items() if value not in (None, "", [])})
@@ -961,14 +1131,34 @@ def _reconcile_root_local_peer_evidence(
             axis="orientation",
             value_getter=lambda item: str(item.direction or ""),
         )
+        scale_direction = (
+            str(direction_value) if direction_value in {"ltr", "ttb"} else ""
+        )
         scale_value, scale_confidence = _peer_numeric_consensus(
             members,
             axis="scale",
-            value_getter=lambda item: float(item.source_size_px),
+            value_getter=lambda item: _style_evidence_scale_for_direction(
+                item, scale_direction
+            )[0],
+            confidence_getter=lambda item: _style_evidence_scale_for_direction(
+                item, scale_direction
+            )[1],
             maximum_relative_spread=0.18,
         )
-        paint_member = _peer_representative_member(members, axis="paint")
-        stroke_member = _peer_representative_member(members, axis="stroke")
+        paint_member = (
+            _peer_representative_member(members, axis="paint")
+            if _peer_axis_is_supported_by_all(
+                members,
+                axis="paint",
+                value_validator=lambda item: bool(_hex_color(item.text_color)),
+            )
+            else None
+        )
+        stroke_member = (
+            _peer_representative_member(members, axis="stroke")
+            if _peer_axis_is_supported_by_all(members, axis="stroke")
+            else None
+        )
         summary = {
             "scope": "root_local_compatible",
             "member_bundle_ids": member_ids,
@@ -1019,6 +1209,9 @@ def _reconcile_root_local_peer_evidence(
                         scale_value / float(max(1, analysis_width))
                     )
                     normalized_axes.append("scale")
+                changes["source_scale_support_status"] = (
+                    "supported_root_local_direction_reconciliation"
+                )
                 axis_confidence["scale"] = max(
                     float(axis_confidence.get("scale") or 0.0), scale_confidence
                 )
@@ -1074,11 +1267,20 @@ def _reconcile_root_local_peer_evidence(
 
 
 def _peer_members_are_visually_compatible(members: Sequence[StyleEvidence]) -> bool:
-    sizes = [
-        float(item.source_size_px)
+    strong_directions = {
+        str(item.direction or "")
         for item in members
-        if float(item.axis_confidence.get("scale") or 0.0) > 0.0
-        and float(item.source_size_px) > 0.0
+        if str(item.direction or "") in {"ltr", "ttb"}
+        and float(item.axis_confidence.get("orientation") or 0.0) >= 0.65
+    }
+    if len(strong_directions) > 1:
+        return False
+    comparison_direction = next(iter(strong_directions), "")
+    sizes = [
+        _style_evidence_scale_for_direction(item, comparison_direction)[0]
+        for item in members
+        if _style_evidence_scale_for_direction(item, comparison_direction)[0] > 0.0
+        and _style_evidence_scale_for_direction(item, comparison_direction)[1] > 0.0
     ]
     if len(sizes) >= 2 and max(sizes) / max(1.0, min(sizes)) > 1.25:
         return False
@@ -1089,14 +1291,6 @@ def _peer_members_are_visually_compatible(members: Sequence[StyleEvidence]) -> b
         and float(item.axis_confidence.get("weight") or 0.0) >= 0.65
     }
     if len(strong_weights) > 1:
-        return False
-    strong_directions = {
-        str(item.direction or "")
-        for item in members
-        if str(item.direction or "") in {"ltr", "ttb"}
-        and float(item.axis_confidence.get("orientation") or 0.0) >= 0.65
-    }
-    if len(strong_directions) > 1:
         return False
     colors = [
         item.text_color
@@ -1153,12 +1347,17 @@ def _peer_numeric_consensus(
     *,
     axis: str,
     value_getter: Any,
+    confidence_getter: Any | None = None,
     maximum_relative_spread: float,
 ) -> tuple[float | None, float]:
     values: list[tuple[float, float, float]] = []
     for item in members:
         value = float(value_getter(item) or 0.0)
-        confidence = float(item.axis_confidence.get(axis) or 0.0)
+        confidence = float(
+            confidence_getter(item)
+            if confidence_getter is not None
+            else item.axis_confidence.get(axis) or 0.0
+        )
         if value <= 0.0 or confidence <= 0.0:
             continue
         values.append((value, confidence, _peer_observation_reliability(item)))
@@ -1171,6 +1370,43 @@ def _peer_numeric_consensus(
     consensus = float(np.average(raw, weights=weights))
     confidence = float(np.average([item[1] for item in values], weights=weights))
     return consensus, min(1.0, confidence)
+
+
+def _style_evidence_scale_for_direction(
+    item: StyleEvidence,
+    direction: str,
+) -> tuple[float, float, str]:
+    normalized = str(direction or "").strip().lower()
+    if normalized == "ttb":
+        value = float(item.source_size_vertical_px)
+        confidence = float(item.source_size_confidence_vertical)
+        support = str(item.source_size_support_vertical or "")
+    elif normalized == "ltr":
+        value = float(item.source_size_horizontal_px)
+        confidence = float(item.source_size_confidence_horizontal)
+        support = str(item.source_size_support_horizontal or "")
+    else:
+        value = float(item.source_size_px)
+        confidence = float(item.axis_confidence.get("scale") or 0.0)
+        support = str(item.source_scale_support_status or "")
+    if value <= 0.0 or confidence <= 0.0 or not _scale_support_is_supported(support):
+        return 0.0, 0.0, support
+    return value, confidence, support
+
+
+def _peer_axis_is_supported_by_all(
+    members: Sequence[StyleEvidence],
+    *,
+    axis: str,
+    value_validator: Any | None = None,
+) -> bool:
+    if not members:
+        return False
+    return all(
+        float(item.axis_confidence.get(axis) or 0.0) > 0.0
+        and (value_validator is None or bool(value_validator(item)))
+        for item in members
+    )
 
 
 def _peer_representative_member(
@@ -1332,7 +1568,7 @@ def _resolved_style_for_bundle(
             serif=False,
             weight="regular",
         ) or "Noto Sans CJK SC"
-        return {
+        style = {
             **base,
             "render_style_version": PARENT_RENDER_STYLE_VERSION,
             "render_style_owner": "parent_execution_bundle",
@@ -1365,6 +1601,11 @@ def _resolved_style_for_bundle(
             "source_visual_column_reliable": False,
             "source_visual_column_authority": "none",
         }
+        return _apply_additive_perceptual_style_axes(
+            bundle=bundle,
+            evidence=evidence,
+            task_a_style=style,
+        )
 
     axis_confidence = {
         key: float(value or 0.0) for key, value in dict(evidence.axis_confidence).items()
@@ -1377,6 +1618,7 @@ def _resolved_style_for_bundle(
     scale_supported = (
         float(evidence.source_size_px) > 0.0
         and axis_confidence.get("scale", 0.0) > 0.0
+        and _scale_support_is_supported(evidence.source_scale_support_status)
     )
     paint_supported = bool(
         _hex_color(evidence.text_color)
@@ -1526,6 +1768,7 @@ def _resolved_style_for_bundle(
         "style_axis_provenance": dict(evidence.axis_provenance),
         "detector_input_sha256": evidence.detector_input_sha256,
         "source_scale_px": round(float(evidence.source_size_px), 6),
+        "source_scale_support_status": evidence.source_scale_support_status,
         "source_scale_conversion_count": 1 if preferred_size > 0 else 0,
         "source_scale_source": "authorized_foreground_geometry_cell_measurement",
         "source_ink_stroke_width_px": round(
@@ -1553,7 +1796,565 @@ def _resolved_style_for_bundle(
                 "font_size_policy": "unresolved_scale_default",
             }
         )
+    target_font_request = _optional_target_font_request(evidence)
+    if target_font_request:
+        style["target_font_request"] = target_font_request
+    return _apply_additive_perceptual_style_axes(
+        bundle=bundle,
+        evidence=evidence,
+        task_a_style=style,
+    )
+
+
+def _apply_additive_perceptual_style_axes(
+    *,
+    bundle: Any,
+    evidence: StyleEvidence,
+    task_a_style: dict[str, Any],
+) -> dict[str, Any]:
+    """Overlay independently resolved axes without replacing Task A style."""
+
+    raw_carrier = evidence.perceptual_axis_evidence
+    if not raw_carrier:
+        return task_a_style
+
+    carrier = dict(raw_carrier) if isinstance(raw_carrier, Mapping) else {}
+    global_reasons, carrier_fact_set_id = _perceptual_carrier_validation(
+        bundle=bundle,
+        evidence=evidence,
+        raw_carrier=raw_carrier,
+        carrier=carrier,
+    )
+    resolved_values: dict[str, dict[str, Any]] = {}
+    axis_audits: dict[str, dict[str, Any]] = {}
+    for axis in PERCEPTUAL_STYLE_AXES:
+        value, audit = _resolve_perceptual_axis(
+            axis=axis,
+            record=carrier.get(axis),
+            carrier_fact_set_id=carrier_fact_set_id,
+            global_reasons=global_reasons,
+        )
+        axis_audits[axis] = audit
+        if value is not None:
+            resolved_values[axis] = value
+
+    style = dict(task_a_style)
+    if "fill" in resolved_values:
+        style.update(
+            {
+                "fill_color": resolved_values["fill"]["color"],
+                "fill_color_authority": "authorized_perceptual_style_axis",
+            }
+        )
+    if "outline" in resolved_values:
+        style.update(
+            {
+                "stroke_color": resolved_values["outline"]["color"],
+                "stroke_width": resolved_values["outline"]["width_px"],
+                "stroke_authority": "authorized_perceptual_style_axis",
+            }
+        )
+    if "rotation" in resolved_values or "shadow" in resolved_values:
+        style["parent_layer_effects"] = {
+            "contract_version": "parent_layer_effects_v1",
+            "rotation": (
+                {
+                    "availability": "resolved",
+                    **resolved_values["rotation"],
+                }
+                if "rotation" in resolved_values
+                else {"availability": "unavailable"}
+            ),
+            "shadow": (
+                {
+                    "availability": "resolved",
+                    **resolved_values["shadow"],
+                }
+                if "shadow" in resolved_values
+                else {"availability": "unavailable"}
+            ),
+        }
+
+    resolved_axes = [
+        axis for axis in PERCEPTUAL_STYLE_AXES if axis in resolved_values
+    ]
+    unavailable_axes = [
+        axis for axis in PERCEPTUAL_STYLE_AXES if axis not in resolved_values
+    ]
+    style["style_perceptual_axis_resolution"] = {
+        "contract_version": PERCEPTUAL_STYLE_RESOLUTION_VERSION,
+        "source_contract_version": _plain_string(carrier.get("contract_version")),
+        "carrier_status": "valid" if not global_reasons else "rejected",
+        "resolved_axes": resolved_axes,
+        "unavailable_axes": unavailable_axes,
+        **axis_audits,
+    }
+    if resolved_axes:
+        style["style_resolution_coverage"] = (
+            "partial_authorized_perceptual_resolution"
+            if str(style.get("style_resolution_status") or "") == "unresolved"
+            else "authorized_core_plus_perceptual_resolution"
+        )
     return style
+
+
+def _perceptual_carrier_validation(
+    *,
+    bundle: Any,
+    evidence: StyleEvidence,
+    raw_carrier: Any,
+    carrier: Mapping[str, Any],
+) -> tuple[list[str], str]:
+    reasons: list[str] = []
+    if not isinstance(raw_carrier, Mapping):
+        return ["perceptual_carrier_not_mapping"], ""
+    if not _is_json_safe(raw_carrier):
+        # Axis-local payloads are checked separately so one malformed axis does
+        # not suppress a valid sibling. Only a malformed header is global.
+        header = {
+            key: carrier.get(key)
+            for key in ("contract_version", "source_identity", "fact_set_id")
+        }
+        if not _is_json_safe(header):
+            reasons.append("perceptual_carrier_header_not_json_safe")
+    allowed_fields = {
+        "contract_version",
+        "source_identity",
+        "fact_set_id",
+        *PERCEPTUAL_STYLE_AXES,
+    }
+    reasons.extend(
+        _mapping_key_reasons(
+            carrier,
+            allowed_fields=allowed_fields,
+            reason_prefix="perceptual_carrier",
+        )
+    )
+    if carrier.get("contract_version") != PERCEPTUAL_STYLE_AXES_VERSION:
+        reasons.append("perceptual_carrier_contract_version_invalid")
+
+    source_identity = carrier.get("source_identity")
+    expected_identity = {
+        "authorized_source_style_view_version": "authorized_source_style_view_v1",
+        "page_id": str(getattr(bundle, "page_id", "") or ""),
+        "view_id": evidence.view_id,
+        "bundle_id": str(getattr(bundle, "bundle_id", "") or ""),
+        "parent_id": str(getattr(bundle, "parent_id", "") or ""),
+        "root_id": str(getattr(bundle, "root_id", "") or ""),
+        "content_bbox": list(evidence.content_bbox),
+        "analysis_bbox": list(evidence.analysis_bbox),
+        "cleanup_mask_ids": list(evidence.cleanup_mask_ids),
+        "owned_component_ids": list(evidence.owned_component_ids),
+        "detector_input_sha256": evidence.detector_input_sha256,
+    }
+    required_identity_fields = {
+        *expected_identity,
+        "crop_shape",
+        "authorized_mask_sha256",
+        "authorized_pixel_sha256",
+    }
+    trusted_source_identity = evidence.authorized_perceptual_source_identity
+    trusted_identity: dict[str, Any] = {}
+    if not isinstance(trusted_source_identity, Mapping):
+        reasons.append("perceptual_trusted_source_identity_not_mapping")
+    elif not _is_json_safe(trusted_source_identity):
+        reasons.append("perceptual_trusted_source_identity_not_json_safe")
+    else:
+        trusted_identity = dict(trusted_source_identity)
+        trusted_string_keys = {
+            key for key in trusted_identity if isinstance(key, str)
+        }
+        for key in sorted(required_identity_fields - trusted_string_keys):
+            reasons.append(f"perceptual_trusted_source_identity_missing_field:{key}")
+        reasons.extend(
+            _mapping_key_reasons(
+                trusted_identity,
+                allowed_fields=required_identity_fields,
+                reason_prefix="perceptual_trusted_source_identity",
+            )
+        )
+        for key, expected in expected_identity.items():
+            if trusted_identity.get(key) != expected:
+                reasons.append(
+                    f"perceptual_trusted_source_identity_{key}_mismatch"
+                )
+        trusted_crop_shape = trusted_identity.get("crop_shape")
+        if (
+            not _is_plain_sequence(trusted_crop_shape)
+            or len(list(trusted_crop_shape)) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in list(trusted_crop_shape)
+            )
+        ):
+            reasons.append("perceptual_trusted_source_identity_crop_shape_invalid")
+        for key in (
+            "authorized_mask_sha256",
+            "authorized_pixel_sha256",
+            "detector_input_sha256",
+        ):
+            if not _is_sha256(trusted_identity.get(key)):
+                reasons.append(
+                    f"perceptual_trusted_source_identity_{key}_invalid"
+                )
+    computed_fact_set_id = ""
+    if not isinstance(source_identity, Mapping):
+        reasons.append("perceptual_source_identity_not_mapping")
+    elif not _is_json_safe(source_identity):
+        reasons.append("perceptual_source_identity_not_json_safe")
+    else:
+        identity = dict(source_identity)
+        identity_string_keys = {
+            key for key in identity if isinstance(key, str)
+        }
+        for key in sorted(required_identity_fields - identity_string_keys):
+            reasons.append(f"perceptual_source_identity_missing_field:{key}")
+        reasons.extend(
+            _mapping_key_reasons(
+                identity,
+                allowed_fields=required_identity_fields,
+                reason_prefix="perceptual_source_identity",
+            )
+        )
+        for key, expected in expected_identity.items():
+            if identity.get(key) != expected:
+                reasons.append(f"perceptual_source_identity_{key}_mismatch")
+        for key in sorted(required_identity_fields):
+            if identity.get(key) != trusted_identity.get(key):
+                reasons.append(
+                    f"perceptual_source_identity_trusted_{key}_mismatch"
+                )
+        crop_shape = identity.get("crop_shape")
+        if (
+            not _is_plain_sequence(crop_shape)
+            or len(list(crop_shape)) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in list(crop_shape)
+            )
+        ):
+            reasons.append("perceptual_source_identity_crop_shape_invalid")
+        for key in (
+            "authorized_mask_sha256",
+            "authorized_pixel_sha256",
+            "detector_input_sha256",
+        ):
+            if not _is_sha256(identity.get(key)):
+                reasons.append(f"perceptual_source_identity_{key}_invalid")
+        computed_fact_set_id = _perceptual_fact_set_id(identity)
+
+    carrier_fact_set_id = _plain_string(carrier.get("fact_set_id"))
+    if not computed_fact_set_id or carrier_fact_set_id != computed_fact_set_id:
+        reasons.append("perceptual_carrier_fact_set_identity_mismatch")
+    return _unique_strings(reasons), carrier_fact_set_id
+
+
+def _resolve_perceptual_axis(
+    *,
+    axis: str,
+    record: Any,
+    carrier_fact_set_id: str,
+    global_reasons: Sequence[str],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    validation_reasons = list(global_reasons)
+    payload = dict(record) if isinstance(record, Mapping) else {}
+    support_status = _plain_string(payload.get("support_status")) or "invalid"
+    provenance = _plain_string(payload.get("provenance"))
+    fact_set_id = _plain_string(payload.get("fact_set_id"))
+    confidence = _strict_perceptual_number(payload.get("confidence"))
+    audit_confidence = (
+        round(float(confidence), 8)
+        if confidence is not None and 0.0 <= confidence <= 1.0
+        else 0.0
+    )
+
+    if not isinstance(record, Mapping):
+        validation_reasons.append(f"perceptual_{axis}_record_not_mapping")
+    elif not _is_json_safe(record):
+        validation_reasons.append(f"perceptual_{axis}_record_not_json_safe")
+    allowed_fields = {
+        "support_status",
+        "value",
+        "confidence",
+        "provenance",
+        "fact_set_id",
+        "reason_codes",
+        "support",
+        "conflict",
+        "uncertainty",
+    }
+    validation_reasons.extend(
+        _mapping_key_reasons(
+            payload,
+            allowed_fields=allowed_fields,
+            reason_prefix=f"perceptual_{axis}",
+        )
+    )
+    if provenance != PERCEPTUAL_STYLE_PROVENANCE:
+        validation_reasons.append(f"perceptual_{axis}_provenance_invalid")
+    if not carrier_fact_set_id or fact_set_id != carrier_fact_set_id:
+        validation_reasons.append(f"perceptual_{axis}_fact_set_identity_mismatch")
+    if confidence is None or not 0.0 <= confidence <= 1.0:
+        validation_reasons.append(f"perceptual_{axis}_confidence_invalid")
+    reason_codes = payload.get("reason_codes")
+    if not isinstance(reason_codes, list) or any(
+        not isinstance(value, str) for value in reason_codes
+    ):
+        validation_reasons.append(f"perceptual_{axis}_reason_codes_invalid")
+        input_reasons: list[str] = []
+    else:
+        input_reasons = [value for value in reason_codes if value]
+    for key in ("support", "conflict", "uncertainty"):
+        if not isinstance(payload.get(key), Mapping):
+            validation_reasons.append(f"perceptual_{axis}_{key}_invalid")
+    conflict = payload.get("conflict")
+    conflict_status = (
+        _plain_string(conflict.get("status"))
+        if isinstance(conflict, Mapping)
+        else ""
+    )
+
+    resolved_value: dict[str, Any] | None = None
+    if support_status == "supported":
+        if confidence is None or confidence <= 0.0:
+            validation_reasons.append(f"perceptual_{axis}_supported_confidence_invalid")
+        if conflict_status != "clear":
+            validation_reasons.append(f"perceptual_{axis}_supported_conflict_invalid")
+        value, value_reasons = _validated_perceptual_axis_value(
+            axis,
+            payload.get("value"),
+        )
+        validation_reasons.extend(value_reasons)
+        if not validation_reasons:
+            resolved_value = value
+    else:
+        if support_status not in {"unavailable", "ambiguous"}:
+            validation_reasons.append(f"perceptual_{axis}_support_status_rejected")
+        expected_conflict = (
+            "ambiguous" if support_status == "ambiguous" else "unavailable"
+        )
+        if conflict_status != expected_conflict:
+            validation_reasons.append(f"perceptual_{axis}_conflict_status_invalid")
+        if "value" in payload:
+            validation_reasons.append(f"perceptual_{axis}_non_supported_value_rejected")
+        validation_reasons.append(f"perceptual_{axis}_not_independently_supported")
+
+    availability = "resolved" if resolved_value is not None else "unavailable"
+    audit = {
+        "availability": availability,
+        "decision": (
+            "apply_independently_supported_axis"
+            if resolved_value is not None
+            else "preserve_task_a_axis"
+        ),
+        "support_status": support_status,
+        "confidence": audit_confidence,
+        "provenance": provenance,
+        "fact_set_id": fact_set_id,
+        "reason_codes": _unique_strings([*input_reasons, *validation_reasons]),
+    }
+    return resolved_value, audit
+
+
+def _validated_perceptual_axis_value(
+    axis: str,
+    raw_value: Any,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not isinstance(raw_value, Mapping):
+        return None, [f"perceptual_{axis}_value_not_mapping"]
+    if not _is_json_safe(raw_value):
+        return None, [f"perceptual_{axis}_value_not_json_safe"]
+    value = dict(raw_value)
+    required: dict[str, set[str]] = {
+        "fill": {"color"},
+        "outline": {"color", "width_px"},
+        "rotation": {"degrees_clockwise", "pivot"},
+        "shadow": {"color", "offset_px", "blur_radius_px"},
+    }
+    expected = required[axis]
+    if set(value) != expected:
+        return None, [f"perceptual_{axis}_value_fields_invalid"]
+
+    if axis == "fill":
+        color = _perceptual_color(value.get("color"), allow_alpha=False)
+        return (
+            ({"color": color}, [])
+            if color
+            else (None, ["perceptual_fill_value_color_invalid"])
+        )
+    if axis == "outline":
+        color = _perceptual_color(value.get("color"), allow_alpha=False)
+        width = _strict_perceptual_number(value.get("width_px"))
+        reasons: list[str] = []
+        if not color:
+            reasons.append("perceptual_outline_value_color_invalid")
+        if width is None or not 0.0 < width <= 256.0:
+            reasons.append("perceptual_outline_value_width_px_invalid")
+        return (
+            ({"color": color, "width_px": float(width)}, [])
+            if not reasons and width is not None
+            else (None, reasons)
+        )
+    if axis == "rotation":
+        degrees = _strict_perceptual_number(value.get("degrees_clockwise"))
+        pivot = value.get("pivot")
+        reasons = []
+        if degrees is None or not -45.0 <= degrees <= 45.0:
+            reasons.append("perceptual_rotation_value_degrees_invalid")
+        if pivot != "visual_center":
+            reasons.append("perceptual_rotation_value_pivot_invalid")
+        return (
+            (
+                {
+                    "degrees_clockwise": float(degrees),
+                    "pivot": "visual_center",
+                },
+                [],
+            )
+            if not reasons and degrees is not None
+            else (None, reasons)
+        )
+
+    color = _perceptual_color(value.get("color"), allow_alpha=True)
+    offset = value.get("offset_px")
+    offsets = list(offset) if _is_plain_sequence(offset) else []
+    parsed_offsets = [_strict_perceptual_number(item) for item in offsets]
+    blur = _strict_perceptual_number(value.get("blur_radius_px"))
+    reasons = []
+    if not color:
+        reasons.append("perceptual_shadow_value_color_invalid")
+    if (
+        len(parsed_offsets) != 2
+        or any(item is None or abs(item) > 256.0 for item in parsed_offsets)
+    ):
+        reasons.append("perceptual_shadow_value_offset_px_invalid")
+    if blur is None or not 0.0 <= blur <= 64.0:
+        reasons.append("perceptual_shadow_value_blur_radius_px_invalid")
+    return (
+        (
+            {
+                "color": color,
+                "offset_px": [float(parsed_offsets[0]), float(parsed_offsets[1])],
+                "blur_radius_px": float(blur),
+            },
+            [],
+        )
+        if not reasons and blur is not None
+        else (None, reasons)
+    )
+
+
+def _style_has_resolved_perceptual_axis(style: Mapping[str, Any]) -> bool:
+    resolution = style.get("style_perceptual_axis_resolution")
+    if not isinstance(resolution, Mapping):
+        return False
+    axes = resolution.get("resolved_axes")
+    return bool(_is_plain_sequence(axes) and list(axes))
+
+
+def _perceptual_fact_set_id(source_identity: Mapping[str, Any]) -> str:
+    try:
+        encoded = json.dumps(
+            dict(source_identity),
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ):
+        return ""
+    return f"{PERCEPTUAL_STYLE_FACT_SET_PREFIX}{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _json_safe_audit_mapping(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"audit_status": "rejected_non_mapping_payload"}
+    try:
+        encoded = json.dumps(
+            dict(value),
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return {"audit_status": "rejected_non_json_payload"}
+    return decoded if isinstance(decoded, dict) else {"audit_status": "rejected_payload"}
+
+
+def _is_json_safe(value: Any) -> bool:
+    try:
+        json.dumps(value, ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return False
+    return True
+
+
+def _strict_perceptual_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _perceptual_color(value: Any, *, allow_alpha: bool) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().upper()
+    lengths = {7, 9} if allow_alpha else {7}
+    if len(text) not in lengths or not text.startswith("#"):
+        return ""
+    try:
+        int(text[1:], 16)
+    except ValueError:
+        return ""
+    return text
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9A-Fa-f]{64}", value))
+
+
+def _is_plain_sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _plain_string(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _mapping_key_reasons(
+    value: Mapping[Any, Any],
+    *,
+    allowed_fields: set[str],
+    reason_prefix: str,
+) -> list[str]:
+    reasons: list[str] = []
+    unknown_strings: list[str] = []
+    for key in value:
+        if not isinstance(key, str):
+            reasons.append(f"{reason_prefix}_key_not_string")
+        elif key not in allowed_fields:
+            unknown_strings.append(key)
+    reasons.extend(
+        f"{reason_prefix}_unknown_field:{key}"
+        for key in sorted(unknown_strings)
+    )
+    return _unique_strings(reasons)
 
 
 def _style_contract_base(bundle: Any) -> dict[str, Any]:
@@ -1785,6 +2586,57 @@ def _detector_variant_summary(
         "neutral_input_sha256": neutral_sha256,
         "neutral_error": neutral_error,
         "model_scale_and_paint_regressions_diagnostic_only": True,
+    }
+
+
+def _optional_target_font_request(evidence: StyleEvidence) -> dict[str, str]:
+    """Return one exact, independently agreed optional target-face request."""
+
+    summary = evidence.detector_variant_summary
+    if not isinstance(summary, Mapping):
+        return {}
+    if (
+        str(summary.get("variant_contract") or "")
+        != "fill_contrast_primary_plus_neutral_disagreement_probe"
+    ):
+        return {}
+    primary = summary.get("primary")
+    neutral = summary.get("neutral")
+    if not isinstance(primary, Mapping) or not isinstance(neutral, Mapping):
+        return {}
+    source_label = str(evidence.font_label or "")
+    primary_label = str(primary.get("font_path") or "")
+    neutral_label = str(neutral.get("font_path") or "")
+    if not source_label or not (
+        source_label == primary_label == neutral_label
+    ):
+        return {}
+    taxonomy = OPTIONAL_TARGET_FONT_LABEL_TAXONOMY.get(source_label)
+    if not isinstance(taxonomy, Mapping):
+        return {}
+    weight = str(evidence.font_weight or "").strip().lower()
+    primary_weight = str(primary.get("font_weight") or "").strip().lower()
+    neutral_weight = str(neutral.get("font_weight") or "").strip().lower()
+    if not weight or not (weight == primary_weight == neutral_weight):
+        return {}
+    if weight != str(taxonomy.get("weight") or ""):
+        return {}
+    axis_confidence = dict(evidence.axis_confidence or {})
+    if float(axis_confidence.get("family") or 0.0) < 0.8:
+        return {}
+    if float(axis_confidence.get("weight") or 0.0) < 0.8:
+        return {}
+    if float(primary.get("confidence") or 0.0) < 0.8:
+        return {}
+    if float(neutral.get("confidence") or 0.0) < 0.8:
+        return {}
+    return {
+        "contract_version": TARGET_FONT_REQUEST_VERSION,
+        "catalog_face_id": str(taxonomy.get("catalog_face_id") or ""),
+        "style_class": str(taxonomy.get("style_class") or ""),
+        "weight": weight,
+        "source_label": source_label,
+        "provenance": TARGET_FONT_REQUEST_PROVENANCE,
     }
 
 

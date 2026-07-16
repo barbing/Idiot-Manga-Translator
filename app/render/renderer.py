@@ -1313,14 +1313,90 @@ def _stamp_parent_bundle_render_layout_summaries(
         normalized_matches_glyphs = normalized_text == glyph_text
         full_text_placed = bool(layer.get("full_text_placed")) and bool(report.get("full_text_placed"))
         glyph_text_matches_layout = bool(layer.get("glyph_text_matches_layout"))
+        layer_drawn = bool(layer.get("drawn"))
+        failed_raster_placement_count = int(layer.get("failed_raster_placement_count") or 0)
+        hard_bound_containment_failure_count = int(
+            layer.get("hard_bound_containment_failure_count") or 0
+        )
+        parent_layer_composition = (
+            layer.get("parent_layer_composition")
+            if isinstance(layer.get("parent_layer_composition"), Mapping)
+            else {}
+        )
+        parent_layer_composition_status = str(
+            parent_layer_composition.get("status") or "missing"
+        )
+        parent_layer_page_composite_count = int(
+            parent_layer_composition.get("page_composite_count") or 0
+        )
+        parent_layer_effect_requested = bool(
+            parent_layer_composition.get("effect_requested")
+        )
+        parent_layer_effects_status = str(
+            parent_layer_composition.get("effects_status") or "unavailable"
+        )
+        parent_layer_effect_contract = (
+            parent_layer_composition.get("parent_layer_effects")
+            if isinstance(parent_layer_composition.get("parent_layer_effects"), Mapping)
+            else {}
+        )
+        parent_layer_effect_active = bool(
+            parent_layer_effect_contract.get("active")
+        )
+        parent_layer_effect_contract_status = str(
+            parent_layer_effect_contract.get("status") or "unavailable"
+        )
+        parent_layer_final_alpha_containment = (
+            parent_layer_composition.get("final_alpha_containment")
+            if isinstance(parent_layer_composition.get("final_alpha_containment"), Mapping)
+            else {}
+        )
+        parent_layer_final_alpha_contained = bool(
+            parent_layer_final_alpha_containment.get("accepted")
+        )
+        parent_layer_untransformed_fallback_used = bool(
+            parent_layer_composition.get("untransformed_fallback_used")
+        )
+        if parent_layer_effect_requested:
+            parent_layer_effect_commit_complete = bool(
+                parent_layer_effect_contract_status == "resolved"
+                and not parent_layer_untransformed_fallback_used
+                and (
+                    (
+                        parent_layer_effect_active
+                        and parent_layer_effects_status == "applied"
+                        and parent_layer_final_alpha_contained
+                    )
+                    or (
+                        not parent_layer_effect_active
+                        and parent_layer_effects_status == "no_visible_effect"
+                    )
+                )
+            )
+        else:
+            parent_layer_effect_commit_complete = bool(
+                parent_layer_effect_contract_status == "unavailable"
+                and parent_layer_effects_status == "unavailable"
+                and not parent_layer_effect_active
+                and not parent_layer_untransformed_fallback_used
+            )
+        render_commit_complete = (
+            layer_drawn
+            and failed_raster_placement_count == 0
+            and hard_bound_containment_failure_count == 0
+            and parent_layer_composition_status == "committed"
+            and parent_layer_page_composite_count == 1
+            and parent_layer_effect_commit_complete
+        )
         conservation_complete = (
             translated_matches_original
             and normalized_matches_glyphs
             and full_text_placed
             and glyph_text_matches_layout
+            and render_commit_complete
         )
         summary = {
-            "parent_render_layout_summary_version": "parent_render_layout_summary_v1",
+            "parent_render_layout_summary_version": "parent_render_layout_summary_v3",
             "renderer_audit_id": str(getattr(bundle, "renderer_audit_id", "") or ""),
             "page_id": str(layout.get("page_id") or getattr(bundle, "page_id", "") or ""),
             "layer_id": str(layout.get("layer_id") or ""),
@@ -1339,6 +1415,18 @@ def _stamp_parent_bundle_render_layout_summaries(
             "normalized_text_matches_layout_glyphs": normalized_matches_glyphs,
             "full_text_placed": full_text_placed,
             "glyph_text_matches_layout": glyph_text_matches_layout,
+            "layer_drawn": layer_drawn,
+            "failed_raster_placement_count": failed_raster_placement_count,
+            "hard_bound_containment_failure_count": hard_bound_containment_failure_count,
+            "parent_layer_composition_status": parent_layer_composition_status,
+            "parent_layer_page_composite_count": parent_layer_page_composite_count,
+            "parent_layer_effect_requested": parent_layer_effect_requested,
+            "parent_layer_effect_active": parent_layer_effect_active,
+            "parent_layer_effects_status": parent_layer_effects_status,
+            "parent_layer_final_alpha_contained": parent_layer_final_alpha_contained,
+            "parent_layer_untransformed_fallback_used": parent_layer_untransformed_fallback_used,
+            "parent_layer_effect_commit_complete": parent_layer_effect_commit_complete,
+            "render_commit_complete": render_commit_complete,
             "conservation_status": "complete" if conservation_complete else "failed",
             "selected_font_face": str(layout.get("selected_font_face") or ""),
             "selected_font_size": float(layout.get("selected_font_size") or 0.0),

@@ -2,11 +2,16 @@
 """OpenType font registry, coverage, fallback, and metrics services."""
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from app.models import resolution as model_resolution
+from app.render.typesetting_text import (
+    is_emoji_grapheme_cluster,
+    strict_grapheme_clusters,
+)
 
 try:
     from PIL import ImageFont
@@ -21,6 +26,14 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 FONT_MANAGER_VERSION = "font_manager_v1"
 DEFAULT_FALLBACK_CHAIN = "cjk-sc"
+TARGET_FONT_REQUEST_VERSION = "target_font_request_v1"
+TARGET_FONT_REQUEST_PROVENANCE = "parent_style_arbitrator_source_label_taxonomy_v1"
+OPTIONAL_TARGET_FONT_STYLE_CLASSES = {
+    "calligraphic",
+    "handwritten",
+    "display",
+    "rounded",
+}
 
 SYMBOL_FALLBACK_CHARS = ("☆", "★", "♡", "❤", "♪")
 VERTICAL_PUNCTUATION_FORMS = {
@@ -141,13 +154,14 @@ class FontResolution:
     fallback_faces: list[FontFace] = field(default_factory=list)
     missing_glyphs: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    optional_target_face_resolution: dict[str, Any] = field(default_factory=dict)
 
     @property
     def usable(self) -> bool:
         return self.primary_face is not None
 
     def to_audit_dict(self) -> dict[str, Any]:
-        return {
+        audit = {
             "font_manager_version": FONT_MANAGER_VERSION,
             "requested_family": self.requested_family,
             "requested_weight": self.requested_weight,
@@ -160,6 +174,11 @@ class FontResolution:
             "missing_glyphs": list(self.missing_glyphs),
             "issues": list(self.issues),
         }
+        if self.optional_target_face_resolution:
+            audit["optional_target_face_resolution"] = dict(
+                self.optional_target_face_resolution
+            )
+        return audit
 
 
 @dataclass
@@ -186,6 +205,50 @@ class RunFontResolution:
             "selection_reason": self.selection_reason,
             "missing_glyphs": list(self.missing_glyphs),
             "issues": list(self.issues),
+        }
+
+
+@dataclass
+class FontSpanResolution:
+    """One face-owned, extended-grapheme-aligned span of a logical run."""
+
+    logical_run_id: str
+    span_id: str
+    text: str
+    source_grapheme_start: int
+    source_grapheme_end: int
+    source_codepoint_start: int
+    source_codepoint_end: int
+    selected_face: FontFace | None
+    coverage: GlyphCoverage
+    fallback_used: bool = False
+    fallback_index: int = 0
+    selection_reason: str = ""
+    missing_clusters: list[str] = field(default_factory=list)
+    issues: list[str] = field(default_factory=list)
+
+    @property
+    def usable(self) -> bool:
+        return self.selected_face is not None and self.coverage.supports_text and not self.issues
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "font_manager_version": FONT_MANAGER_VERSION,
+            "logical_run_id": self.logical_run_id,
+            "span_id": self.span_id,
+            "text": self.text,
+            "source_grapheme_start": int(self.source_grapheme_start),
+            "source_grapheme_end": int(self.source_grapheme_end),
+            "source_codepoint_start": int(self.source_codepoint_start),
+            "source_codepoint_end": int(self.source_codepoint_end),
+            "selected_face": self.selected_face.to_audit_dict() if self.selected_face else None,
+            "coverage": self.coverage.to_audit_dict(),
+            "fallback_used": bool(self.fallback_used),
+            "fallback_index": int(self.fallback_index),
+            "selection_reason": self.selection_reason,
+            "missing_clusters": list(self.missing_clusters),
+            "issues": list(self.issues),
+            "usable": self.usable,
         }
 
 
@@ -346,7 +409,12 @@ class VerticalPunctuationSupport:
 class FontManager:
     """Registry and metrics owner for the new typesetting path."""
 
-    def __init__(self, *, base_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        base_dir: str | None = None,
+        optional_font_catalog: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
         self.base_dir = base_dir
         self._faces: dict[str, FontFace] = {}
         self._cmap_cache: dict[str, set[int]] = {}
@@ -354,6 +422,24 @@ class FontManager:
         self._glyph_metrics_cache: dict[tuple[str, int, str], GlyphMetrics] = {}
         self._text_metrics_cache: dict[tuple[str, int, str, str], TextMetrics] = {}
         self._open_type_metrics_cache: dict[tuple[str, int], OpenTypeMetrics] = {}
+        catalog = (
+            list(optional_font_catalog)
+            if optional_font_catalog is not None
+            else _default_optional_target_font_catalog()
+        )
+        self._optional_font_catalog: dict[str, dict[str, Any]] = {}
+        self._duplicate_optional_font_face_ids: set[str] = set()
+        for raw_record in catalog:
+            if not isinstance(raw_record, Mapping):
+                continue
+            record = dict(raw_record)
+            face_id = str(record.get("catalog_face_id") or "").strip()
+            if not face_id:
+                continue
+            if face_id in self._optional_font_catalog:
+                self._duplicate_optional_font_face_ids.add(face_id)
+                continue
+            self._optional_font_catalog[face_id] = record
         self._cache_hits = {
             "font": 0,
             "glyph_metrics": 0,
@@ -428,7 +514,7 @@ class FontManager:
                     missing_glyphs.append(char)
             if missing_glyphs:
                 issues.append("missing_glyphs")
-        return FontResolution(
+        core_resolution = FontResolution(
             requested_family=requested_family,
             requested_weight=requested_weight,
             style_class=style_class,
@@ -439,6 +525,195 @@ class FontManager:
             missing_glyphs=missing_glyphs,
             issues=issues,
         )
+        optional_face, optional_audit = self._resolve_optional_target_face(
+            style=style,
+            text=str(text or ""),
+            requested_weight=requested_weight,
+        )
+        if optional_face is None:
+            core_resolution.optional_target_face_resolution = optional_audit
+            return core_resolution
+        return FontResolution(
+            requested_family=requested_family,
+            requested_weight=requested_weight,
+            style_class=style_class,
+            fallback_chain_key=fallback_chain_key,
+            writing_mode=writing_mode,
+            primary_face=optional_face,
+            fallback_faces=[
+                face for face in chain if face.face_id != optional_face.face_id
+            ],
+            missing_glyphs=[],
+            issues=[],
+            optional_target_face_resolution=optional_audit,
+        )
+
+    def _resolve_optional_target_face(
+        self,
+        *,
+        style: Mapping[str, Any],
+        text: str,
+        requested_weight: str,
+    ) -> tuple[FontFace | None, dict[str, Any]]:
+        raw_request = style.get("target_font_request")
+        if raw_request in (None, "", {}):
+            return None, {}
+        audit: dict[str, Any] = {
+            "contract_version": TARGET_FONT_REQUEST_VERSION,
+            "status": "fallback_core",
+            "reason_codes": [],
+            "coverage_complete": False,
+        }
+
+        def reject(*reasons: str) -> tuple[None, dict[str, Any]]:
+            current = list(audit.get("reason_codes") or [])
+            for reason in reasons:
+                value = str(reason or "").strip()
+                if value and value not in current:
+                    current.append(value)
+            audit["reason_codes"] = current
+            return None, audit
+
+        if not isinstance(raw_request, Mapping):
+            return reject("optional_font_request_malformed")
+        request = dict(raw_request)
+        audit["request"] = dict(request)
+        required_request_keys = {
+            "contract_version",
+            "catalog_face_id",
+            "style_class",
+            "weight",
+            "source_label",
+            "provenance",
+        }
+        if set(request) != required_request_keys:
+            return reject("optional_font_request_malformed")
+        if request.get("contract_version") != TARGET_FONT_REQUEST_VERSION:
+            return reject("optional_font_request_contract_invalid")
+        if request.get("provenance") != TARGET_FONT_REQUEST_PROVENANCE:
+            return reject("optional_font_request_provenance_invalid")
+
+        face_id = str(request.get("catalog_face_id") or "").strip()
+        style_class = str(request.get("style_class") or "").strip().lower()
+        request_weight = _normalize_weight(request.get("weight"))
+        audit.update(
+            {
+                "catalog_face_id": face_id,
+                "requested_style_class": style_class,
+                "requested_weight": request_weight,
+                "source_label": str(request.get("source_label") or ""),
+            }
+        )
+        if style_class not in OPTIONAL_TARGET_FONT_STYLE_CLASSES:
+            return reject("optional_font_style_class_unsupported")
+        if face_id in self._duplicate_optional_font_face_ids:
+            return reject("optional_font_catalog_face_duplicate")
+        raw_catalog = self._optional_font_catalog.get(face_id)
+        if not isinstance(raw_catalog, Mapping):
+            return reject("optional_font_catalog_face_missing")
+        catalog = dict(raw_catalog)
+        audit["catalog"] = dict(catalog)
+        required_catalog_keys = {
+            "catalog_face_id",
+            "path",
+            "sha256",
+            "face_index",
+            "family",
+            "subfamily",
+            "weight",
+            "weight_class",
+            "style_class",
+            "style_class_provenance",
+            "source",
+        }
+        if not required_catalog_keys.issubset(catalog):
+            return reject("optional_font_catalog_record_malformed")
+        catalog_style = str(catalog.get("style_class") or "").strip().lower()
+        catalog_weight = _normalize_weight(catalog.get("weight"))
+        if catalog_style != style_class:
+            return reject("optional_font_style_class_mismatch")
+        if request_weight != catalog_weight or request_weight != requested_weight:
+            return reject("optional_font_weight_mismatch")
+
+        path = os.path.abspath(str(catalog.get("path") or ""))
+        audit["verified_path"] = path
+        if not path or not os.path.isabs(path) or not os.path.isfile(path):
+            return reject("optional_font_file_missing")
+        try:
+            expected_hash = str(catalog.get("sha256") or "").strip().lower()
+            with open(path, "rb") as handle:
+                verified_hash = hashlib.sha256(handle.read()).hexdigest()
+            audit["verified_sha256"] = verified_hash
+        except Exception:
+            return reject("optional_font_sha256_unreadable")
+        if len(expected_hash) != 64 or verified_hash != expected_hash:
+            return reject("optional_font_sha256_mismatch")
+        if TTFont is None:
+            return reject("optional_font_opentype_audit_unavailable")
+
+        font = None
+        try:
+            face_index = int(catalog.get("face_index") or 0)
+            font = TTFont(path, fontNumber=face_index, lazy=True)
+            family_names = _font_name_values(font, 1)
+            subfamily_names = _font_name_values(font, 2)
+            expected_family = str(catalog.get("family") or "").strip()
+            expected_subfamily = str(catalog.get("subfamily") or "").strip()
+            verified_family = _matching_font_name(expected_family, family_names)
+            verified_subfamily = _matching_font_name(
+                expected_subfamily, subfamily_names
+            )
+            os2 = font.get("OS/2")
+            verified_weight_class = int(getattr(os2, "usWeightClass", 0) or 0)
+            expected_weight_class = int(catalog.get("weight_class") or 0)
+            audit.update(
+                {
+                    "verified_face_index": face_index,
+                    "verified_family": verified_family,
+                    "verified_subfamily": verified_subfamily,
+                    "verified_weight_class": verified_weight_class,
+                }
+            )
+        except Exception:
+            return reject("optional_font_opentype_metadata_unreadable")
+        finally:
+            if font is not None:
+                font.close()
+        if not verified_family:
+            return reject("optional_font_family_mismatch")
+        if not verified_subfamily:
+            return reject("optional_font_subfamily_mismatch")
+        if verified_weight_class != expected_weight_class:
+            return reject("optional_font_weight_class_mismatch")
+        if not _weight_class_is_exact(catalog_weight, verified_weight_class):
+            return reject("optional_font_weight_class_mismatch")
+
+        face = FontFace(
+            face_id=face_id,
+            family=verified_family,
+            style_class=catalog_style,
+            weight=catalog_weight,
+            path=path,
+            source="optional_target_font",
+            serif=False,
+            monospace=False,
+            priority=5,
+        )
+        coverage = self.coverage_for_text(face, text)
+        coverage_complete = bool(coverage.supports_text)
+        audit["coverage_complete"] = coverage_complete
+        audit["coverage"] = coverage.to_audit_dict()
+        rejection_reasons: list[str] = []
+        if not coverage_complete:
+            rejection_reasons.append("optional_font_incomplete_text_coverage")
+        if _contains_complex_script(text):
+            rejection_reasons.append("optional_font_complex_script_conflict")
+        if rejection_reasons:
+            return reject(*rejection_reasons)
+
+        audit["status"] = "resolved"
+        audit["reason_codes"] = ["optional_font_exact_audit_resolved"]
+        return face, audit
 
     def resolve_run_font(
         self,
@@ -508,6 +783,185 @@ class FontManager:
             missing_glyphs=unresolved or list(coverage.missing_chars),
             issues=issues,
         )
+
+    def resolve_run_font_spans(
+        self,
+        resolution: FontResolution,
+        text: str,
+        *,
+        run_id: str = "",
+        script: str = "",
+        direction: str = "",
+        role: str = "",
+        writing_mode: str = "horizontal",
+    ) -> list[FontSpanResolution]:
+        """Resolve a logical run without splitting an extended grapheme.
+
+        The exact existing whole-run resolution is the fast path. Only a run
+        that genuinely needs more than one face receives synthetic span IDs.
+        Contextual shaping domains and semantic atomic runs fail closed when no
+        single face covers them.
+        """
+
+        value = str(text or "")
+        logical_run_id = str(run_id or "")
+        clusters = strict_grapheme_clusters(value)
+        codepoint_offsets = _cluster_codepoint_offsets(clusters)
+        chain = _font_resolution_chain(resolution)
+
+        whole = self.resolve_run_font(resolution, value, run_id=logical_run_id)
+        preferred_chain = _preferred_sequence_chain(chain, value)
+        if preferred_chain != chain:
+            preferred_whole = _first_covering_face(self, preferred_chain, value)
+            if preferred_whole is not None:
+                preferred_index, preferred_face, preferred_coverage = preferred_whole
+                original_index = next(
+                    index for index, face in enumerate(chain) if face.face_id == preferred_face.face_id
+                )
+                whole = RunFontResolution(
+                    run_id=logical_run_id,
+                    text=value,
+                    selected_face=preferred_face,
+                    coverage=preferred_coverage,
+                    fallback_used=original_index > 0,
+                    fallback_index=original_index,
+                    selection_reason=(
+                        "emoji_sequence_face_full_run_coverage"
+                        if preferred_face.style_class == "emoji_fallback"
+                        else "sequence_face_full_run_coverage"
+                    ),
+                )
+        if whole.selected_face is not None and whole.coverage.supports_text:
+            return [
+                FontSpanResolution(
+                    logical_run_id=logical_run_id,
+                    span_id=logical_run_id,
+                    text=value,
+                    source_grapheme_start=0,
+                    source_grapheme_end=len(clusters),
+                    source_codepoint_start=0,
+                    source_codepoint_end=len(value),
+                    selected_face=whole.selected_face,
+                    coverage=whole.coverage,
+                    fallback_used=whole.fallback_used,
+                    fallback_index=whole.fallback_index,
+                    selection_reason=whole.selection_reason,
+                    missing_clusters=[],
+                    issues=list(whole.issues),
+                )
+            ]
+
+        if not chain:
+            return [
+                _unresolved_font_span(
+                    logical_run_id=logical_run_id,
+                    span_id=logical_run_id,
+                    text=value,
+                    grapheme_start=0,
+                    grapheme_end=len(clusters),
+                    codepoint_start=0,
+                    codepoint_end=len(value),
+                    missing_clusters=list(clusters),
+                    issue="missing_font_pack",
+                )
+            ]
+
+        assignments: list[tuple[str, FontFace | None, int]] = []
+        for cluster in clusters:
+            cluster_chain = _preferred_sequence_chain(chain, cluster)
+            selected = _first_covering_face(self, cluster_chain, cluster)
+            if selected is None:
+                assignments.append((cluster, None, -1))
+                continue
+            _, face, _ = selected
+            original_index = next(
+                index for index, item in enumerate(chain) if item.face_id == face.face_id
+            )
+            assignments.append((cluster, face, original_index))
+
+        must_remain_atomic = _font_run_must_remain_atomic(
+            script=script,
+            direction=direction,
+            role=role,
+            writing_mode=writing_mode,
+        )
+        if must_remain_atomic or len(clusters) <= 1:
+            return [
+                _unresolved_font_span(
+                    logical_run_id=logical_run_id,
+                    span_id=logical_run_id,
+                    text=value,
+                    grapheme_start=0,
+                    grapheme_end=len(clusters),
+                    codepoint_start=0,
+                    codepoint_end=len(value),
+                    missing_clusters=list(clusters),
+                    issue=(
+                        "atomic_run_requires_single_covering_face"
+                        if must_remain_atomic
+                        else "missing_glyphs"
+                    ),
+                )
+            ]
+
+        groups: list[tuple[int, int, FontFace | None, int]] = []
+        group_start = 0
+        group_face = assignments[0][1] if assignments else None
+        group_index = assignments[0][2] if assignments else -1
+        for index, (_, face, fallback_index) in enumerate(assignments[1:], start=1):
+            face_id = face.face_id if face is not None else ""
+            group_face_id = group_face.face_id if group_face is not None else ""
+            if face_id != group_face_id or fallback_index != group_index:
+                groups.append((group_start, index, group_face, group_index))
+                group_start = index
+                group_face = face
+                group_index = fallback_index
+        if assignments:
+            groups.append((group_start, len(assignments), group_face, group_index))
+
+        spans: list[FontSpanResolution] = []
+        for span_index, (start, end, face, fallback_index) in enumerate(groups):
+            span_text = "".join(clusters[start:end])
+            codepoint_start = codepoint_offsets[start]
+            codepoint_end = codepoint_offsets[end]
+            span_id = f"{logical_run_id}:fs{span_index:03d}"
+            if face is None:
+                spans.append(
+                    _unresolved_font_span(
+                        logical_run_id=logical_run_id,
+                        span_id=span_id,
+                        text=span_text,
+                        grapheme_start=start,
+                        grapheme_end=end,
+                        codepoint_start=codepoint_start,
+                        codepoint_end=codepoint_end,
+                        missing_clusters=list(clusters[start:end]),
+                        issue="missing_glyphs",
+                    )
+                )
+                continue
+            coverage = self.coverage_for_text(face, span_text)
+            spans.append(
+                FontSpanResolution(
+                    logical_run_id=logical_run_id,
+                    span_id=span_id,
+                    text=span_text,
+                    source_grapheme_start=start,
+                    source_grapheme_end=end,
+                    source_codepoint_start=codepoint_start,
+                    source_codepoint_end=codepoint_end,
+                    selected_face=face,
+                    coverage=coverage,
+                    fallback_used=fallback_index > 0,
+                    fallback_index=fallback_index,
+                    selection_reason=(
+                        "cluster_safe_fallback_span"
+                        if fallback_index > 0
+                        else "cluster_safe_primary_span"
+                    ),
+                )
+            )
+        return spans
 
     def coverage_for_text(self, face: FontFace | None, text: str) -> GlyphCoverage:
         if face is None:
@@ -978,6 +1432,81 @@ class FontManager:
         return cmap
 
 
+def _default_optional_target_font_catalog() -> list[dict[str, Any]]:
+    windows_dir = os.environ.get("WINDIR") or r"C:\Windows"
+    return [
+        {
+            "catalog_face_id": "stxingkai_regular",
+            "path": os.path.abspath(
+                os.path.join(windows_dir, "Fonts", "STXINGKA.TTF")
+            ),
+            "sha256": (
+                "7f901dfb0526d542740264fb5ba8dfe48"
+                "3293ad060270d273593e2f04a69d080"
+            ),
+            "face_index": 0,
+            "family": "STXingkai",
+            "subfamily": "Regular",
+            "weight": "regular",
+            "weight_class": 400,
+            "style_class": "calligraphic",
+            "style_class_provenance": "curated_windows_target_face_v1",
+            "source": "installed_windows_font_exact_identity",
+        }
+    ]
+
+
+def _font_name_values(font: Any, name_id: int) -> list[str]:
+    table = font.get("name") if font is not None else None
+    values: list[str] = []
+    if table is None:
+        return values
+    for record in table.names:
+        if int(getattr(record, "nameID", -1)) != int(name_id):
+            continue
+        try:
+            value = str(record.toUnicode() or "").strip()
+        except Exception:
+            continue
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _matching_font_name(expected: str, values: Sequence[str]) -> str:
+    expected_key = str(expected or "").strip().casefold()
+    for value in values:
+        if str(value or "").strip().casefold() == expected_key:
+            return str(value)
+    return ""
+
+
+def _weight_class_is_exact(weight: str, weight_class: int) -> bool:
+    expected = {
+        "regular": 400,
+        "medium": 500,
+        "semibold": 600,
+        "bold": 700,
+        "black": 900,
+    }
+    return int(weight_class) == int(expected.get(str(weight or ""), -1))
+
+
+def _contains_complex_script(text: str) -> bool:
+    ranges = (
+        (0x0590, 0x08FF),  # Hebrew, Arabic, Syriac, and related scripts.
+        (0x0900, 0x0DFF),  # Indic scripts.
+        (0x0E00, 0x0E7F),  # Thai.
+        (0x1000, 0x109F),  # Myanmar.
+        (0x1780, 0x17FF),  # Khmer.
+    )
+    return any(
+        start <= ord(char) <= end
+        for char in str(text or "")
+        for start, end in ranges
+    )
+
+
 def _normalize_weight(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"700", "800", "900"}:
@@ -1004,13 +1533,149 @@ def _unique_chars(text: str) -> list[str]:
     return chars
 
 
+def _font_resolution_chain(resolution: FontResolution) -> list[FontFace]:
+    chain: list[FontFace] = []
+    if resolution.primary_face is not None:
+        chain.append(resolution.primary_face)
+    chain.extend(
+        face
+        for face in resolution.fallback_faces
+        if face is not None and all(face.face_id != item.face_id for item in chain)
+    )
+    return chain
+
+
+def _first_covering_face(
+    manager: FontManager,
+    chain: Sequence[FontFace],
+    text: str,
+) -> tuple[int, FontFace, GlyphCoverage] | None:
+    for index, face in enumerate(chain):
+        coverage = manager.coverage_for_text(face, text)
+        if coverage.supports_text:
+            return index, face, coverage
+    return None
+
+
+def _preferred_sequence_chain(chain: Sequence[FontFace], text: str) -> list[FontFace]:
+    faces = list(chain)
+    if not _requires_emoji_sequence_face(text):
+        return faces
+    return sorted(
+        faces,
+        key=lambda face: (
+            0 if face.style_class == "emoji_fallback" else 1,
+            faces.index(face),
+        ),
+    )
+
+
+def _requires_emoji_sequence_face(text: str) -> bool:
+    value = str(text or "")
+    if not value:
+        return False
+    return any(
+        is_emoji_grapheme_cluster(cluster)
+        for cluster in strict_grapheme_clusters(value)
+    )
+
+
+def _font_run_must_remain_atomic(
+    *,
+    script: str,
+    direction: str,
+    role: str,
+    writing_mode: str,
+) -> bool:
+    script_key = str(script or "").strip()
+    direction_key = str(direction or "").strip().lower()
+    role_key = str(role or "").strip().lower()
+    mode_key = str(writing_mode or "").strip().lower()
+    complex_scripts = {
+        "Arab",
+        "Hebr",
+        "Deva",
+        "Beng",
+        "Guru",
+        "Gujr",
+        "Orya",
+        "Taml",
+        "Telu",
+        "Knda",
+        "Mlym",
+        "Sinh",
+        "Thai",
+    }
+    semantic_atomic_roles = {
+        "complex_script",
+        "symbol",
+        "ellipsis_sequence",
+        "dash_sequence",
+        "wave_sequence",
+        "punctuation_sequence",
+    }
+    if script_key in complex_scripts or direction_key == "rtl":
+        return True
+    if role_key in semantic_atomic_roles:
+        return True
+    return mode_key == "vertical" and role_key in {"latin_word", "numeric_token"}
+
+
+def _cluster_codepoint_offsets(clusters: Sequence[str]) -> list[int]:
+    offsets = [0]
+    for cluster in clusters:
+        offsets.append(offsets[-1] + len(cluster))
+    return offsets
+
+
+def _unresolved_font_span(
+    *,
+    logical_run_id: str,
+    span_id: str,
+    text: str,
+    grapheme_start: int,
+    grapheme_end: int,
+    codepoint_start: int,
+    codepoint_end: int,
+    missing_clusters: Sequence[str],
+    issue: str,
+) -> FontSpanResolution:
+    missing_chars = [
+        char
+        for char in _unique_chars(text)
+        if not _ignore_coverage_char(char)
+    ]
+    coverage = GlyphCoverage(
+        face_id="",
+        font_path="",
+        text=str(text or ""),
+        missing_chars=missing_chars,
+        ignored_chars=[
+            char for char in _unique_chars(text) if _ignore_coverage_char(char)
+        ],
+    )
+    return FontSpanResolution(
+        logical_run_id=logical_run_id,
+        span_id=span_id,
+        text=str(text or ""),
+        source_grapheme_start=int(grapheme_start),
+        source_grapheme_end=int(grapheme_end),
+        source_codepoint_start=int(codepoint_start),
+        source_codepoint_end=int(codepoint_end),
+        selected_face=None,
+        coverage=coverage,
+        fallback_used=False,
+        fallback_index=-1,
+        selection_reason=str(issue or "unresolved_font_span"),
+        missing_clusters=list(missing_clusters),
+        issues=[str(issue or "unresolved_font_span")],
+    )
+
+
 def _ignore_coverage_char(char: str) -> bool:
-    if not char:
-        return True
-    if char.isspace():
-        return True
-    codepoint = ord(char)
-    return 0xFE00 <= codepoint <= 0xFE0F
+    from app.render.typesetting_text import source_char_requires_visible_glyph
+
+    return not source_char_requires_visible_glyph(char)
 
 
 def default_font_manager(*, base_dir: str | None = None) -> FontManager:

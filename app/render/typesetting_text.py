@@ -8,13 +8,39 @@ TypesettingEngine.
 from __future__ import annotations
 
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 try:
     import regex as _regex
 except Exception:  # pragma: no cover - dependency is declared for Stage 4
     _regex = None
+
+_DEFAULT_IGNORABLE_RE = (
+    _regex.compile(r"\A\p{Default_Ignorable_Code_Point}\Z")
+    if _regex is not None
+    else None
+)
+_LATIN_SCRIPT_RE = (
+    _regex.compile(r"\A\p{Script=Latin}\Z")
+    if _regex is not None
+    else None
+)
+_EXTENDED_PICTOGRAPHIC_RE = (
+    _regex.compile(r"\p{Extended_Pictographic}")
+    if _regex is not None
+    else None
+)
+_REGIONAL_INDICATOR_SEQUENCE_RE = (
+    _regex.compile(r"\A\p{Regional_Indicator}{2,}\Z")
+    if _regex is not None
+    else None
+)
+_EMOJI_KEYCAP_RE = (
+    _regex.compile(r"\A[0-9#*]\ufe0f?\u20e3\Z")
+    if _regex is not None
+    else None
+)
 
 try:
     from bidi.algorithm import get_display as _bidi_get_display
@@ -29,6 +55,30 @@ DASH_CHARS = {"-", "―", "—", "─", "︱", "ー"}
 _TYPESETTING_DASH_CHARS = DASH_CHARS.difference({"ー"})
 WAVE_DASH_CHARS = {"~", "～", "〜", "〰", "︴"}
 COMPACT_VERTICAL_PUNCTUATION_CHARS = {"!", "?", "！", "？", "︕", "︖", "‼", "⁇", "⁉", "⁈"}
+EMPHASIS_PUNCTUATION_UNIT_COUNTS = {
+    "!": 1,
+    "?": 1,
+    "！": 1,
+    "？": 1,
+    "︕": 1,
+    "︖": 1,
+    "‼": 2,
+    "⁇": 2,
+    "⁉": 2,
+    "⁈": 2,
+}
+EMPHASIS_PUNCTUATION_EXPANSIONS = {
+    "!": "!",
+    "?": "?",
+    "！": "!",
+    "？": "?",
+    "︕": "!",
+    "︖": "?",
+    "‼": "!!",
+    "⁇": "??",
+    "⁉": "!?",
+    "⁈": "?!",
+}
 VERTICAL_CENTERED_PUNCTUATION_CHARS = {
     ",",
     ".",
@@ -157,6 +207,99 @@ def grapheme_clusters(text: str) -> list[str]:
     if _regex is not None:
         return [cluster for cluster in _regex.findall(r"\X", value) if cluster]
     return [char for char in value if char]
+
+
+def strict_grapheme_clusters(text: str) -> list[str]:
+    """Return UAX #29 extended grapheme clusters or fail closed.
+
+    The compatibility helper above retains its historical codepoint fallback.
+    Font-span construction cannot use that fallback because it would permit a
+    combining sequence, variation sequence, or ZWJ sequence to be split across
+    faces.
+    """
+
+    value = str(text or "")
+    if not value:
+        return []
+    if _regex is None:
+        raise RuntimeError("uax29_grapheme_segmenter_unavailable")
+    return [cluster for cluster in _regex.findall(r"\X", value) if cluster]
+
+
+def is_default_ignorable_codepoint(char: str) -> bool:
+    """Return the Unicode Default_Ignorable_Code_Point property."""
+
+    value = str(char or "")
+    if len(value) != 1:
+        return False
+    if _DEFAULT_IGNORABLE_RE is not None:
+        return bool(_DEFAULT_IGNORABLE_RE.fullmatch(value))
+    codepoint = ord(value)
+    if unicodedata.category(value) == "Cf":
+        return True
+    return (
+        0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+        or 0xE0000 <= codepoint <= 0xE0FFF
+        or codepoint in {0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5}
+        or 0x180B <= codepoint <= 0x180F
+        or 0x1BCA0 <= codepoint <= 0x1BCA3
+    )
+
+
+def source_char_requires_visible_glyph(char: str) -> bool:
+    value = str(char or "")
+    return bool(
+        len(value) == 1
+        and not value.isspace()
+        and not is_default_ignorable_codepoint(value)
+    )
+
+
+def source_text_requires_visible_glyph(text: str) -> bool:
+    return any(source_char_requires_visible_glyph(char) for char in str(text or ""))
+
+
+def is_emoji_grapheme_cluster(cluster: str) -> bool:
+    """Return whether a cluster carries genuine emoji-presentation evidence.
+
+    ZWJ and variation selectors are format controls used by many scripts.  They
+    refine an emoji base but never establish emoji ownership by themselves.
+    Plain BMP pictographs remain symbol-font candidates unless an emoji
+    presentation selector or an emoji ZWJ sequence makes that intent explicit.
+    """
+
+    value = str(cluster or "")
+    if not value:
+        return False
+    if _EMOJI_KEYCAP_RE is not None and _EMOJI_KEYCAP_RE.fullmatch(value):
+        return True
+    if _REGIONAL_INDICATOR_SEQUENCE_RE is not None and _REGIONAL_INDICATOR_SEQUENCE_RE.fullmatch(value):
+        return True
+    contains_extended_pictographic = bool(
+        _EXTENDED_PICTOGRAPHIC_RE is not None
+        and _EXTENDED_PICTOGRAPHIC_RE.search(value)
+    )
+    if any(0x1F000 <= ord(char) <= 0x1FAFF for char in value):
+        return True
+    if contains_extended_pictographic and ("\ufe0f" in value or "\u200d" in value):
+        return True
+    codepoints = [ord(char) for char in value]
+    if (
+        len(codepoints) in {2, 3}
+        and value[0] in "0123456789#*"
+        and codepoints[-1] == 0x20E3
+    ):
+        return True
+    if len(codepoints) >= 2 and all(0x1F1E6 <= item <= 0x1F1FF for item in codepoints):
+        return True
+    return bool(
+        any(0x1F000 <= codepoint <= 0x1FAFF for codepoint in codepoints)
+        or (
+            any(0x2600 <= codepoint <= 0x27BF for codepoint in codepoints)
+            and ("\ufe0f" in value or "\u200d" in value)
+        )
+    )
 
 
 def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face) -> tuple[str, list[dict], list[dict], list[dict]]:
@@ -295,6 +438,49 @@ def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face)
             normalized_grapheme_index += len(grapheme_clusters(normalized))
             index += len(ellipsis_source)
             continue
+        emphasis_source = _match_emphasis_source_run(value, index)
+        expanded_emphasis = _expand_emphasis_punctuation(emphasis_source)
+        if len(expanded_emphasis) >= 3:
+            normalized_parts: list[str] = []
+            all_supported = True
+            for source_symbol in expanded_emphasis:
+                support = font_manager.vertical_punctuation_support(face, source_symbol)
+                normalized_parts.append(support.selected_form or source_symbol)
+                all_supported = all_supported and bool(support.supported)
+            normalized = "".join(normalized_parts)
+            emphasis_occurrence = _punctuation_occurrence(
+                emphasis_source,
+                normalized,
+                source_index=index,
+                normalized_grapheme_start=normalized_grapheme_index,
+                occurrence_index=len(punctuation),
+                supported=all_supported,
+                candidate_forms=[normalized],
+                supported_forms=[normalized] if all_supported else [],
+                writing_mode="vertical",
+            )
+            emphasis_occurrence.update(
+                {
+                    "orientation_policy": "compact_horizontal_inline_axis",
+                    "render_policy": "shaped_compact_horizontal_sequence",
+                }
+            )
+            punctuation.append(emphasis_occurrence)
+            notes.append(
+                {
+                    "type": "vertical_emphasis_run_normalized",
+                    "source": emphasis_source,
+                    "normalized": normalized,
+                    "source_index": index,
+                    "unit_count": len(expanded_emphasis),
+                    "sequence_group_count": 1,
+                    "reason": "preserve_complete_emphasis_run_for_atomic_inline_composition",
+                }
+            )
+            out.append(normalized)
+            normalized_grapheme_index += len(grapheme_clusters(normalized))
+            index += len(emphasis_source)
+            continue
         matched = ""
         for source in replacements:
             if value.startswith(source, index):
@@ -358,15 +544,21 @@ def classify_grapheme(text: str) -> str:
         return "empty"
     if cluster.isspace():
         return "space"
-    if cluster in SYMBOL_CHARS or _is_emoji(cluster):
-        return "symbol"
+    if all(is_default_ignorable_codepoint(char) for char in cluster):
+        return "format_control"
     if _is_ellipsis_sequence(cluster):
         return "ellipsis"
     if _is_dash_sequence(cluster):
         return "dash"
     if _is_wave_sequence(cluster):
         return "wave"
-    if all(_is_latin_char(char) for char in cluster):
+    if cluster in OPEN_PUNCTUATION:
+        return "open_punctuation"
+    if cluster in CLOSE_PUNCTUATION:
+        return "close_punctuation"
+    if cluster in SYMBOL_CHARS or _is_emoji(cluster):
+        return "symbol"
+    if _is_latin_grapheme(cluster):
         return "latin"
     if all(char.isdigit() for char in cluster):
         return "number"
@@ -377,10 +569,6 @@ def classify_grapheme(text: str) -> str:
     script = _script_for_char(cluster[0])
     if script in {"Hani", "Hira", "Kana", "Hang"}:
         return "cjk"
-    if cluster in OPEN_PUNCTUATION:
-        return "open_punctuation"
-    if cluster in CLOSE_PUNCTUATION:
-        return "close_punctuation"
     cat = unicodedata.category(cluster[0])
     if cat.startswith("P"):
         return "punctuation"
@@ -409,7 +597,7 @@ def segment_inline_runs(
         if kind in {"latin", "number"}:
             while index + 1 < len(clusters):
                 next_kind = classify_grapheme(clusters[index + 1])
-                if next_kind != kind:
+                if next_kind not in {kind, "format_control"}:
                     break
                 group.append(clusters[index + 1])
                 index += 1
@@ -425,6 +613,11 @@ def segment_inline_runs(
             script = _script_for_run(text_value, kind)
             while index + 1 < len(clusters):
                 next_kind = classify_grapheme(clusters[index + 1])
+                if next_kind == "format_control":
+                    group.append(clusters[index + 1])
+                    text_value = "".join(group)
+                    index += 1
+                    continue
                 next_script = _script_for_run(clusters[index + 1], next_kind)
                 if next_kind != kind or next_script != script:
                     break
@@ -470,7 +663,50 @@ def segment_inline_runs(
             )
         )
         index += 1
-    return runs
+    return _coalesce_format_control_runs(runs)
+
+
+def _coalesce_format_control_runs(runs: Sequence[InlineTextRun]) -> list[InlineTextRun]:
+    """Attach non-rendering controls to adjacent shaped runs without a cell."""
+
+    output: list[InlineTextRun] = []
+    pending: list[InlineTextRun] = []
+    for run in runs:
+        if run.role == "format_control":
+            if output:
+                previous = output[-1]
+                output[-1] = replace(
+                    previous,
+                    text=previous.text + run.text,
+                    normalized_text=previous.normalized_text + run.normalized_text,
+                    grapheme_end=run.grapheme_end,
+                    metadata={
+                        **dict(previous.metadata),
+                        "attached_default_ignorable_text": (
+                            str(previous.metadata.get("attached_default_ignorable_text") or "")
+                            + run.text
+                        ),
+                    },
+                )
+            else:
+                pending.append(run)
+            continue
+        if pending:
+            prefix = "".join(item.text for item in pending)
+            run = replace(
+                run,
+                text=prefix + run.text,
+                normalized_text=prefix + run.normalized_text,
+                grapheme_start=pending[0].grapheme_start,
+                metadata={
+                    **dict(run.metadata),
+                    "attached_default_ignorable_text": prefix,
+                },
+            )
+            pending.clear()
+        output.append(run)
+    output.extend(pending)
+    return output
 
 
 def compute_break_opportunities(runs: Sequence[InlineTextRun], *, writing_mode: str) -> list[BreakOpportunity]:
@@ -593,6 +829,8 @@ def _punctuation_occurrence(
     if kind == "ellipsis":
         record["dot_count"] = int(unit_count * 3)
         record["sequence_group_count"] = 1
+    elif kind == "emphasis_punctuation" and unit_count > 1:
+        record["sequence_group_count"] = 1
     return record
 
 
@@ -701,6 +939,11 @@ def _punctuation_unit_count(source: str, normalized: str, kind: str) -> int:
         return max(1, len([char for char in normalized if char in ELLIPSIS_CHARS]))
     if kind in {"wave", "dash"}:
         return max(1, len(grapheme_clusters(normalized)))
+    if kind == "emphasis_punctuation":
+        return max(
+            1,
+            sum(EMPHASIS_PUNCTUATION_UNIT_COUNTS.get(char, 1) for char in str(source or "")),
+        )
     return 1
 
 
@@ -722,11 +965,37 @@ def _is_latin_char(char: str) -> bool:
     if not char:
         return False
     codepoint = ord(char)
-    return (0x41 <= codepoint <= 0x5A) or (0x61 <= codepoint <= 0x7A)
+    if (0x41 <= codepoint <= 0x5A) or (0x61 <= codepoint <= 0x7A):
+        return True
+    if _LATIN_SCRIPT_RE is not None:
+        return bool(_LATIN_SCRIPT_RE.fullmatch(char))
+    return "LATIN" in unicodedata.name(char, "")
+
+
+def _is_latin_grapheme(cluster: str) -> bool:
+    has_latin_base = False
+    for char in str(cluster or ""):
+        if _is_latin_char(char):
+            has_latin_base = True
+            continue
+        if unicodedata.category(char).startswith("M"):
+            continue
+        if is_default_ignorable_codepoint(char):
+            continue
+        return False
+    return has_latin_base
 
 
 def _is_emoji(cluster: str) -> bool:
-    return any(ord(char) >= 0x1F000 for char in cluster)
+    value = str(cluster or "")
+    return bool(
+        is_emoji_grapheme_cluster(value)
+        or (
+            _EXTENDED_PICTOGRAPHIC_RE is not None
+            and _EXTENDED_PICTOGRAPHIC_RE.search(value)
+        )
+        or any(0x2600 <= ord(char) <= 0x27BF for char in value)
+    )
 
 
 def _is_ellipsis_sequence(text: str) -> bool:
@@ -800,6 +1069,22 @@ def _is_compact_vertical_punctuation_char(text: str) -> bool:
 def _is_compact_vertical_punctuation_sequence(text: str) -> bool:
     clusters = grapheme_clusters(text)
     return len(clusters) > 1 and all(_is_compact_vertical_punctuation_char(cluster) for cluster in clusters)
+
+
+def _match_emphasis_source_run(value: str, index: int) -> str:
+    matched: list[str] = []
+    for cluster in grapheme_clusters(str(value or "")[index:]):
+        if cluster not in COMPACT_VERTICAL_PUNCTUATION_CHARS:
+            break
+        matched.append(cluster)
+    return "".join(matched)
+
+
+def _expand_emphasis_punctuation(source: str) -> str:
+    return "".join(
+        EMPHASIS_PUNCTUATION_EXPANSIONS.get(cluster, cluster)
+        for cluster in grapheme_clusters(source)
+    )
 
 
 def _script_for_run(text: str, kind: str) -> str:

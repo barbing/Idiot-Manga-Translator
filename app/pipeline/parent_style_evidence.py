@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
+import json
 import os
 from typing import Any
 
@@ -31,6 +32,64 @@ _AUTHORIZED_SEMANTIC_STATES = {
     "cleanup_translate_background",
     "cleanup_translate_caption",
 }
+_PERCEPTUAL_STYLE_AXES_VERSION = "authorized_perceptual_style_axes_v2"
+_PERCEPTUAL_STYLE_PROVENANCE = "cleanup_mask_authorized_source_style_view_v1"
+_PERCEPTUAL_STYLE_FACT_SET_PREFIX = "authorized_perceptual_fact_set_v1:"
+_PERCEPTUAL_STYLE_AXES = ("fill", "outline", "shadow", "rotation")
+_ADDITIVE_FILL_MIN_CHROMA = 48.0
+_ADDITIVE_FILL_MIN_CLUSTER_PIXELS = 24
+_ADDITIVE_FILL_MIN_CLUSTER_MASK_FRACTION = 0.08
+_ADDITIVE_FILL_MIN_CORE_CHROMATIC_FRACTION = 0.38
+_ADDITIVE_FILL_MAX_COLOR_DISPERSION = 24.0
+_ADDITIVE_FILL_MAX_GLYPH_BBOX_OCCUPANCY = 0.82
+_ADDITIVE_FILL_MIN_CORE_DEPTH_RATIO = 0.58
+_ADDITIVE_FILL_MIN_CORE_BORDER_MARGIN_PX = 1
+_ADDITIVE_FILL_MIN_CORE_DEPTH_SEPARATION_PX = 0.75
+_ADDITIVE_FILL_MIN_CORE_DEPTH_SEPARATION_RATIO = 1.20
+_ADDITIVE_OUTLINE_MIN_CLUSTER_PIXELS = 24
+_ADDITIVE_OUTLINE_MIN_CLUSTER_MASK_FRACTION = 0.08
+_ADDITIVE_OUTLINE_MAX_COLOR_DISPERSION = 24.0
+_ADDITIVE_OUTLINE_MAX_COHORTS = 8
+_ADDITIVE_OUTLINE_MIN_CORE_COMPONENTS = 1
+_ADDITIVE_OUTLINE_MAX_CORE_BBOX_OCCUPANCY = 0.82
+_ADDITIVE_OUTLINE_MIN_BORDER_MARGIN_PX = 1
+_ADDITIVE_OUTLINE_MIN_RADIAL_WIDTH_PX = 1.5
+_ADDITIVE_OUTLINE_MAX_RADIAL_WIDTH_PX = 16.0
+_ADDITIVE_OUTLINE_MIN_CORE_SHELL_DEPTH_DELTA_PX = 1.5
+_ADDITIVE_OUTLINE_MIN_PAIR_MASK_FRACTION = 0.90
+_ADDITIVE_OUTLINE_MIN_SHELL_RING_RECALL = 0.88
+_ADDITIVE_OUTLINE_MIN_RING_SHELL_PRECISION = 0.80
+_ADDITIVE_OUTLINE_MIN_COLOR_DISTANCE = 32.0
+_ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS = 24
+_ADDITIVE_ROTATION_MIN_CLUSTER_MASK_FRACTION = 0.08
+_ADDITIVE_ROTATION_MAX_COLOR_DISPERSION = 24.0
+_ADDITIVE_ROTATION_MAX_COHORTS = 8
+_ADDITIVE_ROTATION_MIN_COMPONENTS = 2
+_ADDITIVE_ROTATION_MIN_COMPONENT_PIXELS = 8
+_ADDITIVE_ROTATION_MIN_BORDER_MARGIN_PX = 1
+_ADDITIVE_ROTATION_MIN_ASPECT_RATIO = 1.60
+_ADDITIVE_ROTATION_MIN_BBOX_OCCUPANCY = 0.12
+_ADDITIVE_ROTATION_MAX_BBOX_OCCUPANCY = 0.78
+_ADDITIVE_ROTATION_MIN_ABS_DEGREES = 12.0
+_ADDITIVE_ROTATION_MAX_ABS_DEGREES = 40.0
+_ADDITIVE_ROTATION_MAX_EROSION_DELTA_DEGREES = 3.0
+_ADDITIVE_ROTATION_MAX_CANDIDATE_SPREAD_DEGREES = 3.0
+_ADDITIVE_SHADOW_MIN_EFFECT_PIXELS = 24
+_ADDITIVE_SHADOW_MIN_EFFECT_MASK_FRACTION = 0.05
+_ADDITIVE_SHADOW_CORE_COLOR_DISTANCE = 24.0
+_ADDITIVE_SHADOW_MIN_EFFECT_BORDER_MARGIN_PX = 1
+_ADDITIVE_SHADOW_UNIFORM_LUMA_IQR = 8.0
+_ADDITIVE_SHADOW_CENTRAL_LUMA_PERCENTILE = 35.0
+_ADDITIVE_SHADOW_MIN_CORE_EFFECT_LUMA_DELTA = 16.0
+_ADDITIVE_SHADOW_MIN_OFFSET_PX = 5.0
+_ADDITIVE_SHADOW_MAX_OFFSET_PX = 32.0
+_ADDITIVE_SHADOW_MIN_CENTRAL_EXPLAINED_FRACTION = 0.88
+_ADDITIVE_SHADOW_COMPETING_PEAK_DISTANCE_PX = 8.0
+_ADDITIVE_SHADOW_COMPETING_PEAK_RATIO = 0.90
+_ADDITIVE_SHADOW_MIN_SPATIAL_RECALL = 0.90
+_ADDITIVE_SHADOW_MIN_SPATIAL_PRECISION = 0.85
+_ADDITIVE_SHADOW_MAX_SPREAD_RADIUS_PX = 16
+_ADDITIVE_SHADOW_BLUR_SPREAD_DIVISOR = 1.4
 
 
 @dataclass(frozen=True)
@@ -125,13 +184,28 @@ class AuthorizedStyleObservationInputs:
     support_color: str = ""
     source_cell_size_vertical_px: float = 0.0
     source_cell_size_horizontal_px: float = 0.0
+    source_cell_confidence_vertical: float = 0.0
+    source_cell_confidence_horizontal: float = 0.0
+    source_cell_support_vertical: str = ""
+    source_cell_support_horizontal: str = ""
     source_stroke_width_px: float = 0.0
     source_ink_stroke_width_px: float = 0.0
     ink_weight_class: str = ""
     ink_weight_confidence: float = 0.0
+    ink_weight_class_vertical: str = ""
+    ink_weight_confidence_vertical: float = 0.0
+    ink_weight_support_vertical: str = ""
+    ink_weight_class_horizontal: str = ""
+    ink_weight_confidence_horizontal: float = 0.0
+    ink_weight_support_horizontal: str = ""
     scale_confidence: float = 0.0
     paint_confidence: float = 0.0
     stroke_confidence: float = 0.0
+    detector_input_sha256: str = ""
+    authorized_perceptual_source_identity: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+    perceptual_axis_evidence: Mapping[str, Any] = field(default_factory=dict)
     reason_codes: tuple[str, ...] = ()
     metrics: Mapping[str, Any] = field(default_factory=dict)
 
@@ -140,14 +214,66 @@ class AuthorizedStyleObservationInputs:
         return self.primary_input is not None and self.neutral_input is not None
 
     def source_cell_size_for_direction(self, direction: str) -> float:
-        return (
-            float(self.source_cell_size_horizontal_px)
-            if str(direction or "").strip().lower() == "ltr"
-            else float(self.source_cell_size_vertical_px)
-        )
+        return self.source_cell_measurement_for_direction(direction)[0]
+
+    def source_cell_measurement_for_direction(
+        self,
+        direction: str,
+    ) -> tuple[float, float, str]:
+        normalized = str(direction or "").strip().lower()
+        if normalized == "ltr":
+            return (
+                float(self.source_cell_size_horizontal_px),
+                float(self.source_cell_confidence_horizontal),
+                "horizontal",
+            )
+        if normalized == "ttb":
+            return (
+                float(self.source_cell_size_vertical_px),
+                float(self.source_cell_confidence_vertical),
+                "vertical",
+            )
+        return 0.0, 0.0, ""
+
+    def source_cell_support_for_direction(self, direction: str) -> str:
+        normalized = str(direction or "").strip().lower()
+        if normalized == "ltr":
+            return str(self.source_cell_support_horizontal or "")
+        if normalized == "ttb":
+            return str(self.source_cell_support_vertical or "")
+        return ""
+
+    def ink_weight_measurement_for_direction(
+        self,
+        direction: str,
+    ) -> tuple[str, float, str]:
+        normalized = str(direction or "").strip().lower()
+        if normalized == "ttb" and str(self.ink_weight_support_vertical).startswith(
+            "supported_"
+        ):
+            return (
+                str(self.ink_weight_class_vertical or ""),
+                float(self.ink_weight_confidence_vertical),
+                str(self.ink_weight_support_vertical),
+            )
+        if normalized == "ltr" and str(self.ink_weight_support_horizontal).startswith(
+            "supported_"
+        ):
+            return (
+                str(self.ink_weight_class_horizontal or ""),
+                float(self.ink_weight_confidence_horizontal),
+                str(self.ink_weight_support_horizontal),
+            )
+        if self.ink_weight_class in {"regular", "bold"}:
+            return (
+                str(self.ink_weight_class),
+                float(self.ink_weight_confidence),
+                "supported_direct_ink_geometry",
+            )
+        return "", 0.0, ""
 
     def to_audit_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "observation_input_version": "authorized_style_observation_inputs_v2",
             "primary_matte": int(self.primary_matte),
             "fill_polarity": self.fill_polarity,
@@ -159,11 +285,29 @@ class AuthorizedStyleObservationInputs:
             "source_cell_size_horizontal_px": round(
                 float(self.source_cell_size_horizontal_px), 6
             ),
+            "source_cell_confidence_vertical": round(
+                float(self.source_cell_confidence_vertical), 8
+            ),
+            "source_cell_confidence_horizontal": round(
+                float(self.source_cell_confidence_horizontal), 8
+            ),
+            "source_cell_support_vertical": self.source_cell_support_vertical,
+            "source_cell_support_horizontal": self.source_cell_support_horizontal,
             "source_stroke_width_px": round(float(self.source_stroke_width_px), 6),
             "source_ink_stroke_width_px": round(
                 float(self.source_ink_stroke_width_px), 6
             ),
             "ink_weight_class": self.ink_weight_class,
+            "ink_weight_class_vertical": self.ink_weight_class_vertical,
+            "ink_weight_confidence_vertical": round(
+                float(self.ink_weight_confidence_vertical), 8
+            ),
+            "ink_weight_support_vertical": self.ink_weight_support_vertical,
+            "ink_weight_class_horizontal": self.ink_weight_class_horizontal,
+            "ink_weight_confidence_horizontal": round(
+                float(self.ink_weight_confidence_horizontal), 8
+            ),
+            "ink_weight_support_horizontal": self.ink_weight_support_horizontal,
             "axis_confidence": {
                 "scale": round(float(self.scale_confidence), 8),
                 "paint": round(float(self.paint_confidence), 8),
@@ -174,6 +318,14 @@ class AuthorizedStyleObservationInputs:
             "metrics": _json_safe_mapping(self.metrics),
             "authorized_pixels_only": True,
         }
+        if self.perceptual_axis_evidence:
+            result["authorized_perceptual_source_identity"] = _json_safe_mapping(
+                self.authorized_perceptual_source_identity
+            )
+            result["perceptual_axis_evidence"] = _json_safe_mapping(
+                self.perceptual_axis_evidence
+            )
+        return result
 
 
 def build_authorized_source_style_views(
@@ -428,6 +580,23 @@ def build_authorized_style_observation_inputs(
     primary[mask_crop] = source_crop[mask_crop]
     neutral = np.full_like(source_crop, 127, dtype=np.uint8)
     neutral[mask_crop] = source_crop[mask_crop]
+    detector_input_sha256 = _array_sha256(np.ascontiguousarray(primary))
+    perceptual_source_identity = _authorized_perceptual_source_identity(
+        view=view,
+        source_crop=source_crop,
+        mask_crop=mask_crop,
+        detector_input_sha256=detector_input_sha256,
+    )
+    try:
+        perceptual_axis_evidence = _build_additive_perceptual_carrier(
+            source_crop=source_crop,
+            mask_crop=mask_crop,
+            source_identity=perceptual_source_identity,
+        )
+    except Exception:
+        # The additive carrier is optional.  It must never make the accepted
+        # Task A detector inputs or direct measurements unavailable.
+        perceptual_axis_evidence = {}
     from PIL import Image
 
     return AuthorizedStyleObservationInputs(
@@ -443,18 +612,1386 @@ def build_authorized_style_observation_inputs(
         source_cell_size_horizontal_px=float(
             metrics.get("source_cell_size_horizontal_px") or 0.0
         ),
+        source_cell_confidence_vertical=float(
+            metrics.get("source_cell_confidence_vertical") or 0.0
+        ),
+        source_cell_confidence_horizontal=float(
+            metrics.get("source_cell_confidence_horizontal") or 0.0
+        ),
+        source_cell_support_vertical=str(
+            metrics.get("source_cell_support_vertical") or ""
+        ),
+        source_cell_support_horizontal=str(
+            metrics.get("source_cell_support_horizontal") or ""
+        ),
         source_stroke_width_px=float(metrics.get("source_stroke_width_px") or 0.0),
         source_ink_stroke_width_px=float(
             metrics.get("source_ink_stroke_width_px") or 0.0
         ),
         ink_weight_class=str(metrics.get("ink_weight_class") or ""),
         ink_weight_confidence=float(metrics.get("ink_weight_confidence") or 0.0),
+        ink_weight_class_vertical=str(
+            metrics.get("ink_weight_class_vertical") or ""
+        ),
+        ink_weight_confidence_vertical=float(
+            metrics.get("ink_weight_confidence_vertical") or 0.0
+        ),
+        ink_weight_support_vertical=str(
+            metrics.get("ink_weight_support_vertical") or ""
+        ),
+        ink_weight_class_horizontal=str(
+            metrics.get("ink_weight_class_horizontal") or ""
+        ),
+        ink_weight_confidence_horizontal=float(
+            metrics.get("ink_weight_confidence_horizontal") or 0.0
+        ),
+        ink_weight_support_horizontal=str(
+            metrics.get("ink_weight_support_horizontal") or ""
+        ),
         scale_confidence=float(metrics.get("scale_confidence") or 0.0),
         paint_confidence=float(metrics.get("paint_confidence") or 0.0),
         stroke_confidence=float(metrics.get("stroke_confidence") or 0.0),
+        detector_input_sha256=detector_input_sha256,
+        authorized_perceptual_source_identity=perceptual_source_identity,
+        perceptual_axis_evidence=perceptual_axis_evidence,
         reason_codes=tuple(metrics.get("reason_codes") or ()),
         metrics=metrics,
     )
+
+
+def _authorized_perceptual_source_identity(
+    *,
+    view: AuthorizedSourceStyleView,
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+    detector_input_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "authorized_source_style_view_version": AUTHORIZED_SOURCE_STYLE_VIEW_VERSION,
+        "page_id": view.page_id,
+        "view_id": view.view_id,
+        "bundle_id": view.bundle_id,
+        "parent_id": view.parent_id,
+        "root_id": view.root_id,
+        "content_bbox": list(view.content_bbox),
+        "analysis_bbox": list(view.analysis_bbox),
+        "cleanup_mask_ids": list(view.cleanup_mask_ids),
+        "owned_component_ids": list(view.owned_component_ids),
+        "crop_shape": [int(source_crop.shape[0]), int(source_crop.shape[1])],
+        "authorized_mask_sha256": _array_sha256(
+            np.ascontiguousarray(mask_crop, dtype=np.uint8)
+        ),
+        "authorized_pixel_sha256": _array_sha256(
+            np.ascontiguousarray(source_crop[mask_crop], dtype=np.uint8)
+        ),
+        "detector_input_sha256": detector_input_sha256,
+    }
+
+
+def _perceptual_fact_set_id(source_identity: Mapping[str, Any]) -> str:
+    try:
+        encoded = json.dumps(
+            dict(source_identity),
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ):
+        return ""
+    return (
+        f"{_PERCEPTUAL_STYLE_FACT_SET_PREFIX}"
+        f"{hashlib.sha256(encoded).hexdigest()}"
+    )
+
+
+def _perceptual_axis_record(
+    *,
+    axis: str,
+    fact_set_id: str,
+    support_status: str,
+    confidence: float,
+    reason_codes: Sequence[str],
+    support: Mapping[str, Any],
+    uncertainty: Mapping[str, Any] | None = None,
+    value: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = support_status if support_status in {"supported", "ambiguous"} else "unavailable"
+    record: dict[str, Any] = {
+        "support_status": status,
+        "confidence": round(max(0.0, min(1.0, float(confidence))), 8),
+        "provenance": _PERCEPTUAL_STYLE_PROVENANCE,
+        "fact_set_id": fact_set_id,
+        "reason_codes": _unique([str(item) for item in reason_codes if str(item)]),
+        "support": _json_safe_mapping(support),
+        "conflict": {
+            "status": (
+                "clear"
+                if status == "supported"
+                else "ambiguous"
+                if status == "ambiguous"
+                else "unavailable"
+            )
+        },
+        "uncertainty": _json_safe_mapping(uncertainty),
+    }
+    if status == "supported" and value:
+        record["value"] = _json_safe_mapping(value)
+    return record
+
+
+def _build_additive_perceptual_carrier(
+    *,
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+    source_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build positive-only sibling paint/effect facts without touching Task A.
+
+    Spatial support comes only from the authorized mask.  Color is considered
+    after a glyph-interior cohort is established, so a chromatic outline or
+    backing cannot manufacture a fill core.  Outline is assessed independently
+    from immutable source pixels and must form a stable multi-pixel concentric
+    shell. Rotation is a separately isolated whole-parent geometry fact.
+    Non-supported outcomes return an empty production carrier and preserve the
+    accepted audit/style path.
+    """
+
+    try:
+        fill_observed = _observe_additive_chromatic_fill(source_crop, mask_crop)
+    except Exception:
+        fill_observed = {
+            "support_status": "unavailable",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_fill_observer_failed_closed"],
+            "support": {},
+            "uncertainty": {},
+        }
+    try:
+        outline_observed = _observe_additive_outline(source_crop, mask_crop)
+    except Exception:
+        outline_observed = {
+            "support_status": "unavailable",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_outline_observer_failed_closed"],
+            "support": {},
+            "uncertainty": {},
+        }
+    try:
+        rotation_observed = _observe_additive_rotation(source_crop, mask_crop)
+    except Exception:
+        rotation_observed = {
+            "support_status": "unavailable",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_rotation_observer_failed_closed"],
+            "support": {},
+            "uncertainty": {},
+        }
+    try:
+        shadow_observed = _observe_additive_shadow(source_crop, mask_crop)
+    except Exception:
+        shadow_observed = {
+            "support_status": "unavailable",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_shadow_observer_failed_closed"],
+            "support": {},
+            "uncertainty": {},
+        }
+    observed_by_axis: dict[str, Mapping[str, Any]] = {
+        "fill": fill_observed,
+        "outline": outline_observed,
+        "rotation": rotation_observed,
+        "shadow": shadow_observed,
+    }
+    if not any(
+        observed.get("support_status") == "supported"
+        for observed in observed_by_axis.values()
+    ):
+        return {}
+    fact_set_id = _perceptual_fact_set_id(source_identity)
+    if not fact_set_id:
+        return {}
+    records: dict[str, Any] = {}
+    for axis in _PERCEPTUAL_STYLE_AXES:
+        observed = observed_by_axis.get(axis)
+        if observed is None:
+            observed = {
+                "support_status": "unavailable",
+                "confidence": 0.0,
+                "reason_codes": (f"perceptual_{axis}_producer_not_enabled",),
+                "support": {},
+                "uncertainty": {},
+            }
+        records[axis] = _perceptual_axis_record(
+            axis=axis,
+            fact_set_id=fact_set_id,
+            support_status=str(observed.get("support_status") or "unavailable"),
+            confidence=float(observed.get("confidence") or 0.0),
+            reason_codes=tuple(observed.get("reason_codes") or ()),
+            support=(
+                observed.get("support")
+                if isinstance(observed.get("support"), Mapping)
+                else {}
+            ),
+            uncertainty=(
+                observed.get("uncertainty")
+                if isinstance(observed.get("uncertainty"), Mapping)
+                else {}
+            ),
+            value=(
+                observed.get("value")
+                if isinstance(observed.get("value"), Mapping)
+                else {}
+            ),
+        )
+    return {
+        "contract_version": _PERCEPTUAL_STYLE_AXES_VERSION,
+        "source_identity": _json_safe_mapping(source_identity),
+        "fact_set_id": fact_set_id,
+        **records,
+    }
+
+
+def _observe_additive_chromatic_fill(
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+) -> dict[str, Any]:
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    mask = np.ascontiguousarray(mask_crop, dtype=bool)
+    unavailable: dict[str, Any] = {
+        "support_status": "unavailable",
+        "confidence": 0.0,
+        "reason_codes": [],
+        "support": {
+            "authorized_pixel_count": int(np.count_nonzero(mask)),
+        },
+        "uncertainty": {},
+    }
+    if source.ndim != 3 or source.shape[2] != 3 or mask.shape != source.shape[:2]:
+        unavailable["reason_codes"].append("perceptual_fill_input_invalid")
+        return unavailable
+    pixel_count = int(np.count_nonzero(mask))
+    if pixel_count < _ADDITIVE_FILL_MIN_CLUSTER_PIXELS:
+        unavailable["reason_codes"].append("perceptual_fill_authorized_support_too_small")
+        return unavailable
+
+    selected = source[mask].astype(np.float32)
+    chroma_values = selected.max(axis=1) - selected.min(axis=1)
+    chromatic = chroma_values >= _ADDITIVE_FILL_MIN_CHROMA
+    chromatic_count = int(np.count_nonzero(chromatic))
+    unavailable["support"].update(
+        {
+            "chromatic_pixel_count": chromatic_count,
+            "chromatic_fraction": round(chromatic_count / pixel_count, 8),
+        }
+    )
+    if chromatic_count < _ADDITIVE_FILL_MIN_CLUSTER_PIXELS:
+        unavailable["reason_codes"].append("perceptual_fill_no_non_neutral_paint")
+        return unavailable
+
+    try:
+        import cv2
+    except Exception:
+        unavailable["reason_codes"].append("perceptual_fill_spatial_backend_unavailable")
+        return unavailable
+
+    chromatic_pixels = selected[chromatic]
+    all_quantized = np.clip(
+        np.floor((selected + 8.0) / 16.0), 0, 15
+    ).astype(np.uint8)
+    _, _, all_paint_counts = np.unique(
+        all_quantized, axis=0, return_inverse=True, return_counts=True
+    )
+    largest_paint_count = int(np.max(all_paint_counts))
+    largest_paint_tie_count = int(
+        np.count_nonzero(all_paint_counts == largest_paint_count)
+    )
+    unavailable["support"].update(
+        {
+            "authorized_paint_cluster_count": int(len(all_paint_counts)),
+            "largest_authorized_paint_cohort_pixels": largest_paint_count,
+            "largest_authorized_paint_cohort_fraction": round(
+                largest_paint_count / pixel_count, 8
+            ),
+            "largest_authorized_paint_cohort_tie_count": largest_paint_tie_count,
+        }
+    )
+    quantized = np.clip(
+        np.floor((chromatic_pixels + 8.0) / 16.0), 0, 15
+    ).astype(np.uint8)
+    keys, inverse, counts = np.unique(
+        quantized, axis=0, return_inverse=True, return_counts=True
+    )
+    order = sorted(
+        range(len(counts)),
+        key=lambda index: (
+            -int(counts[index]),
+            tuple(int(value) for value in keys[index]),
+        ),
+    )
+    chromatic_flat_indices = np.flatnonzero(mask)[chromatic]
+    distance = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    overall_depth = float(np.percentile(distance[mask], 75))
+    cluster_facts: list[dict[str, Any]] = []
+    for cluster_index in order:
+        cluster_pixels = chromatic_pixels[inverse == cluster_index]
+        count = int(cluster_pixels.shape[0])
+        mask_fraction = count / max(1, pixel_count)
+        chroma_fraction = count / max(1, chromatic_count)
+        if (
+            count < _ADDITIVE_FILL_MIN_CLUSTER_PIXELS
+            or mask_fraction < _ADDITIVE_FILL_MIN_CLUSTER_MASK_FRACTION
+            or chroma_fraction < _ADDITIVE_FILL_MIN_CORE_CHROMATIC_FRACTION
+        ):
+            continue
+        median = np.median(cluster_pixels, axis=0)
+        dispersion = float(
+            np.median(np.linalg.norm(cluster_pixels - median[None, :], axis=1))
+        )
+        cohort = np.zeros(mask.size, dtype=bool)
+        cohort[chromatic_flat_indices[inverse == cluster_index]] = True
+        cohort = cohort.reshape(mask.shape)
+        yy, xx = np.where(cohort)
+        width = int(xx.max() - xx.min() + 1)
+        height = int(yy.max() - yy.min() + 1)
+        occupancy = count / max(1, width * height)
+        border_margin = _mask_border_margin(cohort)
+        cohort_depth = float(np.percentile(distance[cohort], 75))
+        depth_ratio = cohort_depth / max(overall_depth, 1e-6)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(
+            cohort.astype(np.uint8), connectivity=8
+        )
+        significant = int(
+            sum(1 for row in stats[1:] if int(row[cv2.CC_STAT_AREA]) >= 8)
+        )
+        core_like = bool(
+            dispersion <= _ADDITIVE_FILL_MAX_COLOR_DISPERSION
+            and occupancy <= _ADDITIVE_FILL_MAX_GLYPH_BBOX_OCCUPANCY
+            and border_margin >= _ADDITIVE_FILL_MIN_CORE_BORDER_MARGIN_PX
+            and depth_ratio >= _ADDITIVE_FILL_MIN_CORE_DEPTH_RATIO
+            and significant >= 2
+        )
+        cluster_facts.append(
+            {
+                "color": _rgb_hex(median),
+                "pixel_count": count,
+                "mask_fraction": round(mask_fraction, 8),
+                "chromatic_fraction": round(chroma_fraction, 8),
+                "color_dispersion_rgb": round(dispersion, 8),
+                "bbox_occupancy": round(occupancy, 8),
+                "border_margin_px": border_margin,
+                "depth_p75_px": round(cohort_depth, 8),
+                "depth_ratio": round(depth_ratio, 8),
+                "significant_component_count": significant,
+                "core_like": core_like,
+            }
+        )
+
+    candidates = [item for item in cluster_facts if bool(item.get("core_like"))]
+    support = {
+        **dict(unavailable["support"]),
+        "authorized_depth_p75_px": round(overall_depth, 8),
+        "chromatic_cluster_count": int(len(counts)),
+        "spatially_analyzed_chromatic_cluster_count": len(cluster_facts),
+        "cluster_facts": cluster_facts,
+    }
+    if not candidates:
+        unavailable["support"] = support
+        unavailable["reason_codes"].append(
+            "perceptual_fill_no_spatially_supported_chromatic_core"
+        )
+        return unavailable
+    candidates.sort(
+        key=lambda item: (
+            -float(item.get("depth_p75_px") or 0.0),
+            -int(item.get("significant_component_count") or 0),
+            -int(item.get("pixel_count") or 0),
+            str(item.get("color") or ""),
+        )
+    )
+    selected_core = candidates[0]
+    if len(candidates) > 1:
+        runner_up = candidates[1]
+        depth_delta = float(selected_core["depth_p75_px"]) - float(
+            runner_up["depth_p75_px"]
+        )
+        depth_separation = float(selected_core["depth_p75_px"]) / max(
+            float(runner_up["depth_p75_px"]), 1e-6
+        )
+        support.update(
+            {
+                "core_runner_up_depth_delta_px": round(depth_delta, 8),
+                "core_runner_up_depth_ratio": round(depth_separation, 8),
+            }
+        )
+        if (
+            depth_delta < _ADDITIVE_FILL_MIN_CORE_DEPTH_SEPARATION_PX
+            and depth_separation < _ADDITIVE_FILL_MIN_CORE_DEPTH_SEPARATION_RATIO
+        ):
+            return {
+                "support_status": "ambiguous",
+                "confidence": 0.0,
+                "reason_codes": [
+                    "perceptual_fill_competing_spatially_core_like_paint_roles"
+                ],
+                "support": support,
+                "uncertainty": {
+                    "core_depth_delta_px": round(depth_delta, 8),
+                    "core_depth_ratio": round(depth_separation, 8),
+                },
+            }
+
+    selected_paint_count = int(selected_core.get("pixel_count") or 0)
+    support["selected_core_authorized_paint_fraction"] = round(
+        selected_paint_count / max(1, pixel_count), 8
+    )
+    if (
+        selected_paint_count < largest_paint_count
+        or (
+            selected_paint_count == largest_paint_count
+            and largest_paint_tie_count > 1
+        )
+    ):
+        return {
+            "support_status": "ambiguous",
+            "confidence": 0.0,
+            "reason_codes": [
+                "perceptual_fill_chromatic_role_not_unique_dominant_authorized_paint"
+            ],
+            "support": support,
+            "uncertainty": {
+                "selected_core_pixel_count": selected_paint_count,
+                "largest_authorized_paint_cohort_pixels": largest_paint_count,
+                "largest_authorized_paint_cohort_tie_count": (
+                    largest_paint_tie_count
+                ),
+            },
+        }
+
+    selected_fraction = float(selected_core.get("chromatic_fraction") or 0.0)
+    selected_depth_ratio = float(selected_core.get("depth_ratio") or 0.0)
+    selected_components = int(selected_core.get("significant_component_count") or 0)
+    support["selected_core"] = dict(selected_core)
+    return {
+        "support_status": "supported",
+        "value": {"color": str(selected_core.get("color") or "")},
+        "confidence": round(
+            min(
+                0.98,
+                0.50
+                + 0.18 * selected_fraction
+                + 0.12 * min(1.0, selected_depth_ratio)
+                + 0.10 * min(1.0, selected_components / 4.0),
+            ),
+            8,
+        ),
+        "reason_codes": ["perceptual_fill_unique_chromatic_character_core"],
+        "support": support,
+        "uncertainty": {
+            "color_dispersion_rgb": float(
+                selected_core.get("color_dispersion_rgb") or 0.0
+            )
+        },
+    }
+
+
+def _observe_additive_rotation(
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+) -> dict[str, Any]:
+    """Return one pronounced, stable whole-parent rotation fact.
+
+    Rotation is estimated from stable authorized paint cohorts rather than the
+    full union mask. This lets a complete character core vote even when an
+    optional shadow reaches the crop edge, while clipped core paint, symmetric
+    shapes, upright or merely italic glyphs, and conflicting geometry fail
+    closed. The observer never decides or changes writing mode.
+    """
+
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    mask = np.ascontiguousarray(mask_crop, dtype=bool)
+    pixel_count = int(np.count_nonzero(mask))
+    unavailable: dict[str, Any] = {
+        "support_status": "unavailable",
+        "confidence": 0.0,
+        "reason_codes": [],
+        "support": {"authorized_pixel_count": pixel_count},
+        "uncertainty": {},
+    }
+    if source.ndim != 3 or source.shape[2] != 3 or mask.shape != source.shape[:2]:
+        unavailable["reason_codes"].append("perceptual_rotation_input_invalid")
+        return unavailable
+    if pixel_count < _ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS:
+        unavailable["reason_codes"].append(
+            "perceptual_rotation_authorized_support_too_small"
+        )
+        return unavailable
+
+    try:
+        import cv2
+    except Exception:
+        unavailable["reason_codes"].append(
+            "perceptual_rotation_spatial_backend_unavailable"
+        )
+        return unavailable
+
+    selected = source[mask].astype(np.float32)
+    quantized = np.clip(np.floor((selected + 8.0) / 16.0), 0, 15).astype(
+        np.uint8
+    )
+    keys, inverse, counts = np.unique(
+        quantized, axis=0, return_inverse=True, return_counts=True
+    )
+    eligible = [
+        index
+        for index in sorted(
+            range(len(counts)),
+            key=lambda item: (
+                -int(counts[item]),
+                tuple(int(value) for value in keys[item]),
+            ),
+        )
+        if int(counts[index]) >= _ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS
+        and int(counts[index]) / max(1, pixel_count)
+        >= _ADDITIVE_ROTATION_MIN_CLUSTER_MASK_FRACTION
+    ][:_ADDITIVE_ROTATION_MAX_COHORTS]
+    unavailable["support"].update(
+        {
+            "authorized_paint_cluster_count": int(len(counts)),
+            "eligible_paint_cluster_count": len(eligible),
+        }
+    )
+    if not eligible:
+        unavailable["reason_codes"].append(
+            "perceptual_rotation_stable_character_paint_unavailable"
+        )
+        return unavailable
+
+    flat_indices = np.flatnonzero(mask)
+    candidate_facts: list[dict[str, Any]] = []
+    rejected_facts: list[dict[str, Any]] = []
+    for cluster_index in eligible:
+        members = inverse == cluster_index
+        pixels = selected[members]
+        median = np.median(pixels, axis=0)
+        dispersion = float(
+            np.median(np.linalg.norm(pixels - median[None, :], axis=1))
+        )
+        cohort = np.zeros(mask.size, dtype=bool)
+        cohort[flat_indices[members]] = True
+        cohort = cohort.reshape(mask.shape)
+        fact: dict[str, Any] = {
+            "color": _rgb_hex(median),
+            "pixel_count": int(np.count_nonzero(cohort)),
+            "mask_fraction": round(
+                int(np.count_nonzero(cohort)) / max(1, pixel_count), 8
+            ),
+            "color_dispersion_rgb": round(dispersion, 8),
+            "border_margin_px": _mask_border_margin(cohort),
+        }
+        if dispersion > _ADDITIVE_ROTATION_MAX_COLOR_DISPERSION:
+            fact["rejection"] = "unstable_paint"
+            rejected_facts.append(fact)
+            continue
+
+        _, _, stats, _ = cv2.connectedComponentsWithStats(
+            cohort.astype(np.uint8), connectivity=8
+        )
+        significant_components = int(
+            sum(
+                1
+                for row in stats[1:]
+                if int(row[cv2.CC_STAT_AREA])
+                >= _ADDITIVE_ROTATION_MIN_COMPONENT_PIXELS
+            )
+        )
+        fact["significant_component_count"] = significant_components
+        if significant_components < _ADDITIVE_ROTATION_MIN_COMPONENTS:
+            fact["rejection"] = "insufficient_character_components"
+            rejected_facts.append(fact)
+            continue
+        if int(fact["border_margin_px"]) < _ADDITIVE_ROTATION_MIN_BORDER_MARGIN_PX:
+            fact["rejection"] = "character_core_truncated"
+            rejected_facts.append(fact)
+            continue
+
+        yy, xx = np.where(cohort)
+        points = np.column_stack((xx, yy)).astype(np.float32)
+        (_, _), (rect_width, rect_height), rect_angle = cv2.minAreaRect(points)
+        major = max(float(rect_width), float(rect_height))
+        minor = min(float(rect_width), float(rect_height))
+        degrees = (
+            float(rect_angle)
+            if float(rect_width) >= float(rect_height)
+            else float(rect_angle) - 90.0
+        )
+        aspect_ratio = major / max(minor, 1e-6)
+        bbox_occupancy = int(np.count_nonzero(cohort)) / max(
+            1.0, float(rect_width) * float(rect_height)
+        )
+        fact.update(
+            {
+                "degrees_clockwise": round(degrees, 8),
+                "oriented_aspect_ratio": round(aspect_ratio, 8),
+                "oriented_bbox_occupancy": round(bbox_occupancy, 8),
+            }
+        )
+        if aspect_ratio < _ADDITIVE_ROTATION_MIN_ASPECT_RATIO:
+            fact["rejection"] = "symmetric_or_non_directional_geometry"
+            rejected_facts.append(fact)
+            continue
+        if not (
+            _ADDITIVE_ROTATION_MIN_BBOX_OCCUPANCY
+            <= bbox_occupancy
+            <= _ADDITIVE_ROTATION_MAX_BBOX_OCCUPANCY
+        ):
+            fact["rejection"] = "non_character_bbox_occupancy"
+            rejected_facts.append(fact)
+            continue
+        if abs(degrees) < _ADDITIVE_ROTATION_MIN_ABS_DEGREES:
+            fact["rejection"] = "upright_or_italic_only_geometry"
+            rejected_facts.append(fact)
+            continue
+        if abs(degrees) > _ADDITIVE_ROTATION_MAX_ABS_DEGREES:
+            fact["rejection"] = "base_axis_or_rotation_ambiguous"
+            rejected_facts.append(fact)
+            continue
+
+        eroded = cv2.erode(
+            cohort.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        ).astype(bool)
+        if int(np.count_nonzero(eroded)) < _ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS:
+            fact["rejection"] = "eroded_character_geometry_unavailable"
+            rejected_facts.append(fact)
+            continue
+        eroded_y, eroded_x = np.where(eroded)
+        eroded_points = np.column_stack((eroded_x, eroded_y)).astype(np.float32)
+        (_, _), (eroded_width, eroded_height), eroded_angle = cv2.minAreaRect(
+            eroded_points
+        )
+        eroded_degrees = (
+            float(eroded_angle)
+            if float(eroded_width) >= float(eroded_height)
+            else float(eroded_angle) - 90.0
+        )
+        raw_delta = abs(degrees - eroded_degrees)
+        erosion_delta = min(raw_delta, abs(raw_delta - 90.0))
+        fact.update(
+            {
+                "eroded_degrees_clockwise": round(eroded_degrees, 8),
+                "erosion_angle_delta_degrees": round(erosion_delta, 8),
+            }
+        )
+        if erosion_delta > _ADDITIVE_ROTATION_MAX_EROSION_DELTA_DEGREES:
+            fact["rejection"] = "rotation_not_stable_under_core_erosion"
+            rejected_facts.append(fact)
+            continue
+        candidate_facts.append(fact)
+
+    support = dict(unavailable["support"])
+    support.update(
+        {
+            "candidate_count": len(candidate_facts),
+            "candidate_facts": candidate_facts,
+            "rejected_cohort_facts": rejected_facts,
+        }
+    )
+    if not candidate_facts:
+        unavailable["support"] = support
+        unavailable["reason_codes"].append(
+            "perceptual_rotation_no_unambiguous_character_core_geometry"
+        )
+        return unavailable
+
+    candidate_degrees = [
+        float(item["degrees_clockwise"]) for item in candidate_facts
+    ]
+    spread = max(candidate_degrees) - min(candidate_degrees)
+    support["candidate_spread_degrees"] = round(spread, 8)
+    if spread > _ADDITIVE_ROTATION_MAX_CANDIDATE_SPREAD_DEGREES:
+        return {
+            "support_status": "ambiguous",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_rotation_conflicting_character_axes"],
+            "support": support,
+            "uncertainty": {"candidate_spread_degrees": round(spread, 8)},
+        }
+
+    weights = np.asarray(
+        [max(1, int(item["pixel_count"])) for item in candidate_facts],
+        dtype=np.float64,
+    )
+    resolved_degrees = float(
+        np.average(np.asarray(candidate_degrees, dtype=np.float64), weights=weights)
+    )
+    minimum_aspect = min(
+        float(item["oriented_aspect_ratio"]) for item in candidate_facts
+    )
+    maximum_erosion_delta = max(
+        float(item["erosion_angle_delta_degrees"]) for item in candidate_facts
+    )
+    confidence = min(
+        0.98,
+        0.66
+        + 0.12 * min(1.0, (minimum_aspect - 1.0) / 2.0)
+        + 0.12
+        * max(
+            0.0,
+            1.0
+            - maximum_erosion_delta
+            / max(_ADDITIVE_ROTATION_MAX_EROSION_DELTA_DEGREES, 1e-6),
+        )
+        + 0.06 * min(1.0, abs(resolved_degrees) / 24.0),
+    )
+    return {
+        "support_status": "supported",
+        "confidence": round(confidence, 8),
+        "reason_codes": [
+            "perceptual_rotation_stable_whole_parent_character_axis"
+        ],
+        "support": support,
+        "uncertainty": {
+            "candidate_spread_degrees": round(spread, 8),
+            "maximum_erosion_delta_degrees": round(maximum_erosion_delta, 8),
+        },
+        "value": {
+            "degrees_clockwise": round(resolved_degrees, 8),
+            "pivot": "visual_center",
+        },
+    }
+
+
+def _observe_additive_outline(
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+) -> dict[str, Any]:
+    """Return one independently supported concentric source outline.
+
+    The observer is intentionally conservative. It only accepts two stable
+    authorized paint cohorts when one is a multi-component glyph interior and
+    the other accounts for nearly all of a multi-pixel morphological ring.
+    Color alone never establishes either role.
+    """
+
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    mask = np.ascontiguousarray(mask_crop, dtype=bool)
+    pixel_count = int(np.count_nonzero(mask))
+    unavailable: dict[str, Any] = {
+        "support_status": "unavailable",
+        "confidence": 0.0,
+        "reason_codes": [],
+        "support": {"authorized_pixel_count": pixel_count},
+        "uncertainty": {},
+    }
+    if source.ndim != 3 or source.shape[2] != 3 or mask.shape != source.shape[:2]:
+        unavailable["reason_codes"].append("perceptual_outline_input_invalid")
+        return unavailable
+    if pixel_count < _ADDITIVE_OUTLINE_MIN_CLUSTER_PIXELS * 2:
+        unavailable["reason_codes"].append(
+            "perceptual_outline_authorized_support_too_small"
+        )
+        return unavailable
+    border_margin = _mask_border_margin(mask)
+    unavailable["support"]["authorized_border_margin_px"] = border_margin
+    if border_margin < _ADDITIVE_OUTLINE_MIN_BORDER_MARGIN_PX:
+        unavailable["reason_codes"].append(
+            "perceptual_outline_authorized_support_truncated"
+        )
+        return unavailable
+
+    try:
+        import cv2
+    except Exception:
+        unavailable["reason_codes"].append(
+            "perceptual_outline_spatial_backend_unavailable"
+        )
+        return unavailable
+
+    selected = source[mask].astype(np.float32)
+    quantized = np.clip(np.floor((selected + 8.0) / 16.0), 0, 15).astype(
+        np.uint8
+    )
+    keys, inverse, counts = np.unique(
+        quantized, axis=0, return_inverse=True, return_counts=True
+    )
+    eligible = [
+        index
+        for index in sorted(
+            range(len(counts)),
+            key=lambda item: (
+                -int(counts[item]),
+                tuple(int(value) for value in keys[item]),
+            ),
+        )
+        if int(counts[index]) >= _ADDITIVE_OUTLINE_MIN_CLUSTER_PIXELS
+        and int(counts[index]) / max(1, pixel_count)
+        >= _ADDITIVE_OUTLINE_MIN_CLUSTER_MASK_FRACTION
+    ][:_ADDITIVE_OUTLINE_MAX_COHORTS]
+    unavailable["support"].update(
+        {
+            "authorized_paint_cluster_count": int(len(counts)),
+            "eligible_paint_cluster_count": len(eligible),
+        }
+    )
+    if len(eligible) < 2:
+        unavailable["reason_codes"].append(
+            "perceptual_outline_stable_paint_pair_unavailable"
+        )
+        return unavailable
+
+    authorized_distance = cv2.distanceTransform(
+        mask.astype(np.uint8), cv2.DIST_L2, 5
+    )
+    flat_indices = np.flatnonzero(mask)
+    cohorts: list[dict[str, Any]] = []
+    for cluster_index in eligible:
+        members = inverse == cluster_index
+        pixels = selected[members]
+        median = np.median(pixels, axis=0)
+        dispersion = float(
+            np.median(np.linalg.norm(pixels - median[None, :], axis=1))
+        )
+        if dispersion > _ADDITIVE_OUTLINE_MAX_COLOR_DISPERSION:
+            continue
+        cohort = np.zeros(mask.size, dtype=bool)
+        cohort[flat_indices[members]] = True
+        cohort = cohort.reshape(mask.shape)
+        yy, xx = np.where(cohort)
+        width = int(xx.max() - xx.min() + 1)
+        height = int(yy.max() - yy.min() + 1)
+        occupancy = int(np.count_nonzero(cohort)) / max(1, width * height)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(
+            cohort.astype(np.uint8), connectivity=8
+        )
+        significant_components = int(
+            sum(1 for row in stats[1:] if int(row[cv2.CC_STAT_AREA]) >= 8)
+        )
+        cohorts.append(
+            {
+                "mask": cohort,
+                "median": median,
+                "color": _rgb_hex(median),
+                "pixel_count": int(np.count_nonzero(cohort)),
+                "mask_fraction": round(
+                    int(np.count_nonzero(cohort)) / max(1, pixel_count), 8
+                ),
+                "color_dispersion_rgb": round(dispersion, 8),
+                "bbox_occupancy": round(occupancy, 8),
+                "border_margin_px": _mask_border_margin(cohort),
+                "depth_p50_px": round(
+                    float(np.percentile(authorized_distance[cohort], 50)), 8
+                ),
+                "significant_component_count": significant_components,
+            }
+        )
+    unavailable["support"]["stable_paint_cohort_count"] = len(cohorts)
+    unavailable["support"]["cohort_facts"] = [
+        {key: value for key, value in cohort.items() if key not in {"mask", "median"}}
+        for cohort in cohorts
+    ]
+    if len(cohorts) < 2:
+        unavailable["reason_codes"].append(
+            "perceptual_outline_stable_paint_pair_unavailable"
+        )
+        return unavailable
+
+    candidates: list[dict[str, Any]] = []
+    thin_shell_seen = False
+    for core in cohorts:
+        if (
+            int(core["significant_component_count"])
+            < _ADDITIVE_OUTLINE_MIN_CORE_COMPONENTS
+            or float(core["bbox_occupancy"])
+            > _ADDITIVE_OUTLINE_MAX_CORE_BBOX_OCCUPANCY
+            or int(core["border_margin_px"])
+            < _ADDITIVE_OUTLINE_MIN_BORDER_MARGIN_PX
+        ):
+            continue
+        core_mask = np.asarray(core["mask"], dtype=bool)
+        distance_to_core = cv2.distanceTransform(
+            (~core_mask).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        for shell in cohorts:
+            if shell is core:
+                continue
+            color_distance = float(
+                np.linalg.norm(
+                    np.asarray(core["median"], dtype=np.float32)
+                    - np.asarray(shell["median"], dtype=np.float32)
+                )
+            )
+            if color_distance < _ADDITIVE_OUTLINE_MIN_COLOR_DISTANCE:
+                continue
+            shell_mask = np.asarray(shell["mask"], dtype=bool)
+            pair_fraction = int(np.count_nonzero(core_mask | shell_mask)) / max(
+                1, pixel_count
+            )
+            if pair_fraction < _ADDITIVE_OUTLINE_MIN_PAIR_MASK_FRACTION:
+                continue
+            depth_delta = float(core["depth_p50_px"]) - float(
+                shell["depth_p50_px"]
+            )
+            if depth_delta < _ADDITIVE_OUTLINE_MIN_CORE_SHELL_DEPTH_DELTA_PX:
+                continue
+            radial_values = distance_to_core[shell_mask]
+            if radial_values.size <= 0:
+                continue
+            radial_p90 = float(np.percentile(radial_values, 90))
+            if radial_p90 <= _ADDITIVE_OUTLINE_MIN_RADIAL_WIDTH_PX:
+                thin_shell_seen = True
+                continue
+            if radial_p90 > _ADDITIVE_OUTLINE_MAX_RADIAL_WIDTH_PX:
+                continue
+            radius = max(2, int(round(radial_p90)))
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+            )
+            predicted_ring = (
+                cv2.dilate(core_mask.astype(np.uint8), kernel).astype(bool)
+                & ~core_mask
+            )
+            intersection = int(np.count_nonzero(predicted_ring & shell_mask))
+            shell_recall = intersection / max(1, int(np.count_nonzero(shell_mask)))
+            ring_precision = intersection / max(
+                1, int(np.count_nonzero(predicted_ring))
+            )
+            if (
+                shell_recall < _ADDITIVE_OUTLINE_MIN_SHELL_RING_RECALL
+                or ring_precision < _ADDITIVE_OUTLINE_MIN_RING_SHELL_PRECISION
+            ):
+                continue
+            candidates.append(
+                {
+                    "color": str(shell["color"]),
+                    "width_px": radial_p90,
+                    "core_color": str(core["color"]),
+                    "pair_mask_fraction": pair_fraction,
+                    "core_shell_depth_delta_px": depth_delta,
+                    "radial_distance_p90_px": radial_p90,
+                    "shell_ring_recall": shell_recall,
+                    "ring_shell_precision": ring_precision,
+                    "color_distance_rgb": color_distance,
+                }
+            )
+
+    support = dict(unavailable["support"])
+    support["candidate_count"] = len(candidates)
+    support["thin_shell_seen"] = thin_shell_seen
+    if not candidates:
+        unavailable["support"] = support
+        unavailable["reason_codes"].append(
+            "perceptual_outline_native_antialias_band_rejected"
+            if thin_shell_seen
+            else "perceptual_outline_no_independently_supported_concentric_shell"
+        )
+        return unavailable
+    if len(candidates) != 1:
+        support["candidate_facts"] = [
+            {
+                key: round(float(value), 8) if isinstance(value, float) else value
+                for key, value in candidate.items()
+            }
+            for candidate in candidates
+        ]
+        return {
+            "support_status": "ambiguous",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_outline_competing_concentric_shells"],
+            "support": support,
+            "uncertainty": {"candidate_count": len(candidates)},
+        }
+
+    candidate = candidates[0]
+    support.update(
+        {
+            "radial_distance_p90_px": round(
+                float(candidate["radial_distance_p90_px"]), 8
+            ),
+            "pair_mask_fraction": round(float(candidate["pair_mask_fraction"]), 8),
+            "core_shell_depth_delta_px": round(
+                float(candidate["core_shell_depth_delta_px"]), 8
+            ),
+            "shell_ring_recall": round(float(candidate["shell_ring_recall"]), 8),
+            "ring_shell_precision": round(
+                float(candidate["ring_shell_precision"]), 8
+            ),
+            "core_color": str(candidate["core_color"]),
+        }
+    )
+    geometric_support = min(
+        float(candidate["pair_mask_fraction"]),
+        float(candidate["shell_ring_recall"]),
+        float(candidate["ring_shell_precision"]),
+    )
+    return {
+        "support_status": "supported",
+        "confidence": round(min(0.98, 0.62 + 0.34 * geometric_support), 8),
+        "reason_codes": ["perceptual_outline_stable_concentric_shell"],
+        "support": support,
+        "uncertainty": {
+            "color_dispersion_rgb": next(
+                (
+                    float(item["color_dispersion_rgb"])
+                    for item in cohorts
+                    if str(item["color"]) == str(candidate["color"])
+                ),
+                0.0,
+            )
+        },
+        "value": {
+            "color": str(candidate["color"]),
+            "width_px": round(float(candidate["width_px"]), 8),
+        },
+    }
+
+
+def _observe_additive_shadow(
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+) -> dict[str, Any]:
+    """Return one complete displaced glyph-correlated shadow.
+
+    A previously supported chromatic character core supplies only the runtime
+    shape used for correlation. One darker authorized effect must be explained
+    by one displaced copy of that shape. Blur is then estimated from the
+    spatial support extending beyond the displaced core, not from RGB
+    dispersion. Concentric, centered, repeated, clipped, or ambiguous support
+    remains unavailable.
+    """
+
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    mask = np.ascontiguousarray(mask_crop, dtype=bool)
+    pixel_count = int(np.count_nonzero(mask))
+    unavailable: dict[str, Any] = {
+        "support_status": "unavailable",
+        "confidence": 0.0,
+        "reason_codes": [],
+        "support": {"authorized_pixel_count": pixel_count},
+        "uncertainty": {},
+    }
+    if source.ndim != 3 or source.shape[2] != 3 or mask.shape != source.shape[:2]:
+        unavailable["reason_codes"].append("perceptual_shadow_input_invalid")
+        return unavailable
+    if pixel_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS * 2:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_authorized_support_too_small"
+        )
+        return unavailable
+
+    try:
+        import cv2
+    except Exception:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_spatial_backend_unavailable"
+        )
+        return unavailable
+
+    fill = _observe_additive_chromatic_fill(source, mask)
+    if fill.get("support_status") != "supported":
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_character_core_unavailable"
+        )
+        unavailable["support"]["character_core_status"] = str(
+            fill.get("support_status") or "unavailable"
+        )
+        return unavailable
+    fill_value = fill.get("value") if isinstance(fill.get("value"), Mapping) else {}
+    fill_color = str(fill_value.get("color") or "")
+    if len(fill_color) != 7 or not fill_color.startswith("#"):
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_character_core_color_invalid"
+        )
+        return unavailable
+    try:
+        fill_rgb = np.asarray(
+            [int(fill_color[index : index + 2], 16) for index in (1, 3, 5)],
+            dtype=np.float32,
+        )
+    except (TypeError, ValueError):
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_character_core_color_invalid"
+        )
+        return unavailable
+
+    color_distance = np.linalg.norm(
+        source.astype(np.float32) - fill_rgb[None, None, :], axis=2
+    )
+    core = mask & (color_distance <= _ADDITIVE_SHADOW_CORE_COLOR_DISTANCE)
+    core_count = int(np.count_nonzero(core))
+    effect = mask & ~core
+    effect_count = int(np.count_nonzero(effect))
+    effect_fraction = effect_count / max(1, pixel_count)
+    effect_border_margin = _mask_border_margin(effect)
+    unavailable["support"].update(
+        {
+            "character_core_color": fill_color,
+            "character_core_pixel_count": core_count,
+            "effect_pixel_count": effect_count,
+            "effect_mask_fraction": round(effect_fraction, 8),
+            "effect_border_margin_px": effect_border_margin,
+        }
+    )
+    if core_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_character_core_support_too_small"
+        )
+        return unavailable
+    if (
+        effect_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS
+        or effect_fraction < _ADDITIVE_SHADOW_MIN_EFFECT_MASK_FRACTION
+    ):
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_displaced_effect_unavailable"
+        )
+        return unavailable
+    if effect_border_margin < _ADDITIVE_SHADOW_MIN_EFFECT_BORDER_MARGIN_PX:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_effect_support_truncated"
+        )
+        return unavailable
+
+    luma = (
+        source[:, :, 0].astype(np.float32) * 0.2126
+        + source[:, :, 1].astype(np.float32) * 0.7152
+        + source[:, :, 2].astype(np.float32) * 0.0722
+    )
+    effect_luma = luma[effect]
+    effect_luma_iqr = float(
+        np.percentile(effect_luma, 75) - np.percentile(effect_luma, 25)
+    )
+    if effect_luma_iqr <= _ADDITIVE_SHADOW_UNIFORM_LUMA_IQR:
+        central = effect.copy()
+        central_percentile = 100.0
+    else:
+        central_threshold = float(
+            np.percentile(effect_luma, _ADDITIVE_SHADOW_CENTRAL_LUMA_PERCENTILE)
+        )
+        central = effect & (luma <= central_threshold + 1e-6)
+        central_percentile = _ADDITIVE_SHADOW_CENTRAL_LUMA_PERCENTILE
+    central_count = int(np.count_nonzero(central))
+    core_luma_median = float(np.median(luma[core]))
+    central_luma_median = (
+        float(np.median(luma[central])) if central_count else core_luma_median
+    )
+    unavailable["support"].update(
+        {
+            "effect_luma_iqr": round(effect_luma_iqr, 8),
+            "central_effect_percentile": central_percentile,
+            "central_effect_pixel_count": central_count,
+            "character_core_luma_median": round(core_luma_median, 8),
+            "central_effect_luma_median": round(central_luma_median, 8),
+        }
+    )
+    if central_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_central_effect_support_too_small"
+        )
+        return unavailable
+    if (
+        core_luma_median - central_luma_median
+        < _ADDITIVE_SHADOW_MIN_CORE_EFFECT_LUMA_DELTA
+    ):
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_effect_role_not_darker_than_character_core"
+        )
+        return unavailable
+
+    core_y, core_x = np.where(core)
+    x0 = int(core_x.min())
+    x1 = int(core_x.max()) + 1
+    y0 = int(core_y.min())
+    y1 = int(core_y.max()) + 1
+    template = core[y0:y1, x0:x1].astype(np.float32)
+    correlation = cv2.matchTemplate(
+        central.astype(np.float32), template, cv2.TM_CCORR
+    )
+    peaks: list[dict[str, Any]] = []
+    minimum_offset_sq = _ADDITIVE_SHADOW_MIN_OFFSET_PX**2
+    maximum_offset_sq = _ADDITIVE_SHADOW_MAX_OFFSET_PX**2
+    separation_sq = _ADDITIVE_SHADOW_COMPETING_PEAK_DISTANCE_PX**2
+    for flat_index in np.argsort(correlation.ravel())[::-1]:
+        match_y, match_x = np.unravel_index(int(flat_index), correlation.shape)
+        dx = int(match_x) - x0
+        dy = int(match_y) - y0
+        offset_sq = float(dx * dx + dy * dy)
+        if offset_sq < minimum_offset_sq or offset_sq > maximum_offset_sq:
+            continue
+        overlap = float(correlation[match_y, match_x])
+        if overlap <= 0:
+            break
+        if any(
+            (dx - int(item["dx"])) ** 2 + (dy - int(item["dy"])) ** 2
+            < separation_sq
+            for item in peaks
+        ):
+            continue
+        peaks.append({"dx": dx, "dy": dy, "overlap_pixels": int(round(overlap))})
+        if len(peaks) >= 6:
+            break
+    unavailable["support"]["correlation_peaks"] = peaks
+    if not peaks:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_displaced_correlation_unavailable"
+        )
+        return unavailable
+
+    best = peaks[0]
+    best_overlap = int(best["overlap_pixels"])
+    central_explained = best_overlap / max(1, central_count)
+    competing_ratio = (
+        float(peaks[1]["overlap_pixels"]) / max(1, best_overlap)
+        if len(peaks) > 1
+        else 0.0
+    )
+    unavailable["support"].update(
+        {
+            "central_effect_explained_fraction": round(central_explained, 8),
+            "competing_peak_ratio": round(competing_ratio, 8),
+        }
+    )
+    if central_explained < _ADDITIVE_SHADOW_MIN_CENTRAL_EXPLAINED_FRACTION:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_not_explained_by_one_displaced_character_copy"
+        )
+        return unavailable
+    if competing_ratio >= _ADDITIVE_SHADOW_COMPETING_PEAK_RATIO:
+        return {
+            "support_status": "ambiguous",
+            "confidence": 0.0,
+            "reason_codes": ["perceptual_shadow_competing_displaced_offsets"],
+            "support": dict(unavailable["support"]),
+            "uncertainty": {"competing_peak_ratio": round(competing_ratio, 8)},
+        }
+
+    dx = int(best["dx"])
+    dy = int(best["dy"])
+    shifted_core = np.zeros_like(core, dtype=bool)
+    source_y0 = max(0, -dy)
+    source_y1 = min(core.shape[0], core.shape[0] - dy)
+    source_x0 = max(0, -dx)
+    source_x1 = min(core.shape[1], core.shape[1] - dx)
+    if source_y1 <= source_y0 or source_x1 <= source_x0:
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_displaced_core_outside_crop"
+        )
+        return unavailable
+    shifted_core[
+        source_y0 + dy : source_y1 + dy,
+        source_x0 + dx : source_x1 + dx,
+    ] = core[source_y0:source_y1, source_x0:source_x1]
+
+    distance_from_shifted = cv2.distanceTransform(
+        (~shifted_core).astype(np.uint8), cv2.DIST_L2, 5
+    )
+    outside_values = distance_from_shifted[effect & ~shifted_core]
+    spread_p90 = (
+        float(np.percentile(outside_values, 90)) if outside_values.size else 0.0
+    )
+    spread_p95 = (
+        float(np.percentile(outside_values, 95)) if outside_values.size else 0.0
+    )
+    spread_radius = int(min(
+        _ADDITIVE_SHADOW_MAX_SPREAD_RADIUS_PX,
+        max(0, int(np.ceil(spread_p95))),
+    ))
+    if spread_radius > 0:
+        predicted_support = cv2.dilate(
+            shifted_core.astype(np.uint8),
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (spread_radius * 2 + 1, spread_radius * 2 + 1),
+            ),
+        ).astype(bool)
+    else:
+        predicted_support = shifted_core
+    predicted_visible = predicted_support & ~core
+    spatial_intersection = int(np.count_nonzero(predicted_visible & effect))
+    spatial_recall = spatial_intersection / max(1, effect_count)
+    spatial_precision = spatial_intersection / max(
+        1, int(np.count_nonzero(predicted_visible))
+    )
+    unavailable["support"].update(
+        {
+            "offset_px": [dx, dy],
+            "spatial_spread_p90_px": round(spread_p90, 8),
+            "spatial_spread_p95_px": round(spread_p95, 8),
+            "predicted_spread_radius_px": spread_radius,
+            "spatial_effect_recall": round(spatial_recall, 8),
+            "spatial_effect_precision": round(spatial_precision, 8),
+        }
+    )
+    if (
+        spatial_recall < _ADDITIVE_SHADOW_MIN_SPATIAL_RECALL
+        or spatial_precision < _ADDITIVE_SHADOW_MIN_SPATIAL_PRECISION
+    ):
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_spatial_spread_not_glyph_correlated"
+        )
+        return unavailable
+
+    if outside_values.size == 0 or spread_p90 <= 0.75:
+        blur_radius = 0.0
+    else:
+        blur_radius = min(
+            float(_ADDITIVE_SHADOW_MAX_SPREAD_RADIUS_PX),
+            spread_p90 / _ADDITIVE_SHADOW_BLUR_SPREAD_DIVISOR,
+        )
+    darkest_threshold = float(np.percentile(luma[central], 10))
+    darkest = central & (luma <= darkest_threshold + 1e-6)
+    shadow_pixels = source[darkest] if np.any(darkest) else source[central]
+    shadow_color = _rgb_hex(np.median(shadow_pixels.astype(np.float32), axis=0))
+    geometric_support = min(
+        central_explained,
+        spatial_recall,
+        spatial_precision,
+    )
+    return {
+        "support_status": "supported",
+        "confidence": round(min(0.98, 0.62 + 0.34 * geometric_support), 8),
+        "reason_codes": [
+            "perceptual_shadow_single_displaced_glyph_correlated_effect"
+        ],
+        "support": dict(unavailable["support"]),
+        "uncertainty": {
+            "competing_peak_ratio": round(competing_ratio, 8),
+            "spatial_blur_support_p90_px": round(spread_p90, 8),
+        },
+        "value": {
+            "color": shadow_color,
+            "offset_px": [float(dx), float(dy)],
+            "blur_radius_px": round(float(blur_radius), 8),
+        },
+    }
+
+
+def _mask_border_margin(mask: np.ndarray) -> int:
+    yy, xx = np.where(mask)
+    if xx.size <= 0:
+        return 0
+    return int(
+        min(
+            int(xx.min()),
+            int(yy.min()),
+            int(mask.shape[1] - 1 - xx.max()),
+            int(mask.shape[0] - 1 - yy.max()),
+        )
+    )
+
+
+def _rgb_hex(value: Any) -> str:
+    rgb = np.clip(np.rint(np.asarray(value, dtype=np.float32)), 0, 255).astype(
+        np.uint8
+    )
+    if rgb.size != 3:
+        return ""
+    return "#" + "".join(f"{int(channel):02X}" for channel in rgb.tolist())
 
 
 def _measure_authorized_style_crop(
@@ -532,22 +2069,57 @@ def _measure_authorized_style_crop(
     x_spans = _projection_spans(fill, axis=0)
     y_spans = _projection_spans(fill, axis=1)
     component_size, component_count, component_mad = _character_component_size(mask_binary)
-    vertical_size, vertical_confidence = _source_cell_size_from_geometry(
+    legacy_vertical_size, legacy_vertical_confidence = _source_cell_size_from_geometry(
         x_spans,
         component_size=component_size,
         component_count=component_count,
         component_mad=component_mad,
     )
-    horizontal_size, horizontal_confidence = _source_cell_size_from_geometry(
+    legacy_horizontal_size, legacy_horizontal_confidence = _source_cell_size_from_geometry(
         y_spans,
         component_size=component_size,
         component_count=component_count,
         component_mad=component_mad,
     )
+    fill_component_sizes = _fill_component_cell_sizes(fill)
+    (
+        vertical_size,
+        vertical_confidence,
+        vertical_support,
+        vertical_qualification,
+    ) = _qualify_source_cell_measurement(
+        fill,
+        axis=0,
+        spans=x_spans,
+        legacy_size=legacy_vertical_size,
+        legacy_confidence=legacy_vertical_confidence,
+        fill_component_sizes=fill_component_sizes,
+    )
+    (
+        horizontal_size,
+        horizontal_confidence,
+        horizontal_support,
+        horizontal_qualification,
+    ) = _qualify_source_cell_measurement(
+        fill,
+        axis=1,
+        spans=y_spans,
+        legacy_size=legacy_horizontal_size,
+        legacy_confidence=legacy_horizontal_confidence,
+        fill_component_sizes=fill_component_sizes,
+    )
     if vertical_size > 0 or horizontal_size > 0:
         reasons.append("source_cell_scale_measured_from_authorized_geometry")
     else:
         reasons.append("source_cell_scale_unavailable")
+    reasons.extend(
+        reason
+        for reason in (
+            vertical_support,
+            horizontal_support,
+        )
+        if reason
+    )
 
     fill_distances = distance[fill]
     fill_distance_p25 = (
@@ -607,6 +2179,16 @@ def _measure_authorized_style_crop(
         and support_iqr <= 44.0
         and support_opposite_fraction >= 0.88
     )
+    outlined_weight_qualification: dict[str, Any] = {
+        "status": "not_applicable_no_visible_support_transition",
+        "directions": {},
+    }
+    ink_weight_class_vertical = ""
+    ink_weight_confidence_vertical = 0.0
+    ink_weight_support_vertical = ""
+    ink_weight_class_horizontal = ""
+    ink_weight_confidence_horizontal = 0.0
+    ink_weight_support_horizontal = ""
     if visible_support_transition:
         stroke_width = min(
             max(1.0, float(round(scale_for_stroke * 0.055))),
@@ -619,7 +2201,53 @@ def _measure_authorized_style_crop(
             + min(0.18, support_iqr / 255.0),
         )
         reasons.append("source_visible_support_stroke_measured")
-        if ink_weight_class:
+        _, _, outlined_weight_qualification = _qualify_outlined_ink_weight(
+            fill,
+            source_cell_size_vertical_px=vertical_size,
+            source_cell_size_horizontal_px=horizontal_size,
+        )
+        outlined_directions = dict(
+            outlined_weight_qualification.get("directions") or {}
+        )
+        vertical_weight = dict(outlined_directions.get("vertical") or {})
+        horizontal_weight = dict(outlined_directions.get("horizontal") or {})
+        if str(vertical_weight.get("status") or "").startswith("supported_"):
+            ink_weight_class_vertical = str(
+                vertical_weight.get("weight_class") or ""
+            )
+            ink_weight_confidence_vertical = float(
+                vertical_weight.get("confidence") or 0.0
+            )
+            ink_weight_support_vertical = str(vertical_weight.get("status") or "")
+        if str(horizontal_weight.get("status") or "").startswith("supported_"):
+            ink_weight_class_horizontal = str(
+                horizontal_weight.get("weight_class") or ""
+            )
+            ink_weight_confidence_horizontal = float(
+                horizontal_weight.get("confidence") or 0.0
+            )
+            ink_weight_support_horizontal = str(
+                horizontal_weight.get("status") or ""
+            )
+        if ink_weight_class_vertical or ink_weight_class_horizontal:
+            reasons = [
+                reason
+                for reason in reasons
+                if not reason.startswith("source_ink_weight_")
+            ]
+            ink_weight_class = ""
+            ink_weight_confidence = 0.0
+            if ink_weight_class_vertical:
+                reasons.append(
+                    "source_ink_weight_"
+                    f"{ink_weight_class_vertical}_supported_outlined_vertical_cell_cohort"
+                )
+            if ink_weight_class_horizontal:
+                reasons.append(
+                    "source_ink_weight_"
+                    f"{ink_weight_class_horizontal}_supported_outlined_horizontal_cell_cohort"
+                )
+        elif ink_weight_class:
             reasons = [
                 reason
                 for reason in reasons
@@ -650,10 +2278,24 @@ def _measure_authorized_style_crop(
         "support_color": support_color,
         "source_cell_size_vertical_px": round(vertical_size, 6),
         "source_cell_size_horizontal_px": round(horizontal_size, 6),
+        "source_cell_confidence_vertical": round(vertical_confidence, 8),
+        "source_cell_confidence_horizontal": round(horizontal_confidence, 8),
+        "source_cell_support_vertical": vertical_support,
+        "source_cell_support_horizontal": horizontal_support,
         "source_stroke_width_px": round(stroke_width, 6),
         "source_ink_stroke_width_px": round(source_ink_stroke_width, 6),
         "ink_weight_class": ink_weight_class,
         "ink_weight_confidence": round(ink_weight_confidence, 8),
+        "ink_weight_class_vertical": ink_weight_class_vertical,
+        "ink_weight_confidence_vertical": round(
+            ink_weight_confidence_vertical, 8
+        ),
+        "ink_weight_support_vertical": ink_weight_support_vertical,
+        "ink_weight_class_horizontal": ink_weight_class_horizontal,
+        "ink_weight_confidence_horizontal": round(
+            ink_weight_confidence_horizontal, 8
+        ),
+        "ink_weight_support_horizontal": ink_weight_support_horizontal,
         "scale_confidence": round(scale_confidence, 8),
         "paint_confidence": round(paint_confidence, 8),
         "stroke_confidence": round(stroke_confidence, 8),
@@ -669,8 +2311,20 @@ def _measure_authorized_style_crop(
         "support_opposite_fraction": round(support_opposite_fraction, 8),
         "visible_support_transition": visible_support_transition,
         "uniform_support_backing": uniform_support_backing,
+        "outlined_weight_qualification": outlined_weight_qualification,
         "fill_x_spans": [round(float(value), 6) for value in x_spans],
         "fill_y_spans": [round(float(value), 6) for value in y_spans],
+        "fill_component_cell_sizes": [
+            round(float(value), 6) for value in fill_component_sizes
+        ],
+        "density_decomposition_vertical_spans": list(
+            vertical_qualification.get("density_spans") or []
+        ),
+        "density_decomposition_horizontal_spans": list(
+            horizontal_qualification.get("density_spans") or []
+        ),
+        "source_cell_qualification_vertical": vertical_qualification,
+        "source_cell_qualification_horizontal": horizontal_qualification,
         "character_component_size_p70": round(component_size, 6),
         "character_component_count": int(component_count),
         "character_component_mad": round(component_mad, 6),
@@ -696,6 +2350,363 @@ def _projection_spans(binary: np.ndarray, *, axis: int) -> list[float]:
     starts = np.where(changes == 1)[0]
     ends = np.where(changes == -1)[0]
     return [float(end - start) for start, end in zip(starts, ends) if end - start >= 2]
+
+
+def _projection_spans_at_min_occupancy(
+    binary: np.ndarray,
+    *,
+    axis: int,
+    minimum_occupancy: int,
+) -> list[float]:
+    """Return occupied-axis runs without reconnecting adjacent text columns."""
+
+    return [
+        float(end - start)
+        for start, end in _projection_runs_at_min_occupancy(
+            binary,
+            axis=axis,
+            minimum_occupancy=minimum_occupancy,
+        )
+    ]
+
+
+def _projection_runs_at_min_occupancy(
+    binary: np.ndarray,
+    *,
+    axis: int,
+    minimum_occupancy: int,
+) -> list[tuple[int, int]]:
+    counts = np.count_nonzero(np.asarray(binary, dtype=bool), axis=axis)
+    projected = (counts >= max(1, int(minimum_occupancy))).astype(np.uint8)
+    if projected.size <= 0:
+        return []
+    padded = np.pad(projected, (1, 1), constant_values=0)
+    changes = np.diff(padded.astype(np.int8))
+    starts = np.where(changes == 1)[0]
+    ends = np.where(changes == -1)[0]
+    return [
+        (int(start), int(end))
+        for start, end in zip(starts, ends)
+        if end - start >= 2
+    ]
+
+
+def _qualify_outlined_ink_weight(
+    fill: np.ndarray,
+    *,
+    source_cell_size_vertical_px: float,
+    source_cell_size_horizontal_px: float,
+) -> tuple[str, float, dict[str, Any]]:
+    """Qualify weight only when an outline covers repeated source-cell bands.
+
+    A parent-wide distance statistic is unsafe when only punctuation or one
+    fragment carries visible support. Repeated full-cell bands make the ink
+    tier a text-wide observation while leaving mixed/local support unresolved.
+    """
+
+    binary = np.asarray(fill, dtype=bool)
+    directions: dict[str, dict[str, Any]] = {}
+    supported: list[tuple[str, str, float, int, float]] = []
+    for direction, axis, cell_size in (
+        ("vertical", 0, float(source_cell_size_vertical_px)),
+        ("horizontal", 1, float(source_cell_size_horizontal_px)),
+    ):
+        record: dict[str, Any] = {
+            "cell_size_px": round(max(0.0, cell_size), 6),
+            "status": "unavailable_source_cell_scale",
+            "band_spans_px": [],
+            "band_ink_widths_px": [],
+        }
+        directions[direction] = record
+        if cell_size <= 0.0:
+            continue
+        orthogonal_extent = int(binary.shape[0] if axis == 0 else binary.shape[1])
+        runs = _projection_runs_at_min_occupancy(
+            binary,
+            axis=axis,
+            minimum_occupancy=max(2, int(round(orthogonal_extent * 0.10))),
+        )
+        full_cell_runs = [
+            (start, end)
+            for start, end in runs
+            if cell_size * 0.60 <= float(end - start) <= cell_size * 1.45
+        ]
+        record["band_spans_px"] = [
+            float(end - start) for start, end in full_cell_runs
+        ]
+        if len(full_cell_runs) < 3:
+            record["status"] = "unavailable_insufficient_full_cell_bands"
+            continue
+        ink_widths: list[float] = []
+        try:
+            import cv2
+
+            for start, end in full_cell_runs:
+                band = (
+                    binary[:, start:end]
+                    if axis == 0
+                    else binary[start:end, :]
+                )
+                distance = cv2.distanceTransform(
+                    np.asarray(band, dtype=np.uint8), cv2.DIST_L2, 5
+                )
+                values = distance[band]
+                if values.size:
+                    ink_widths.append(float(np.percentile(values, 75)) * 2.0)
+        except Exception:
+            record["status"] = "unavailable_distance_transform"
+            continue
+        record["band_ink_widths_px"] = [
+            round(float(value), 6) for value in ink_widths
+        ]
+        if len(ink_widths) < 3:
+            record["status"] = "unavailable_insufficient_ink_bands"
+            continue
+        median_width = float(np.median(np.asarray(ink_widths, dtype=np.float32)))
+        relative_mad = float(
+            np.median(np.abs(np.asarray(ink_widths) - median_width))
+            / max(1.0, median_width)
+        )
+        record["median_ink_width_px"] = round(median_width, 6)
+        record["relative_mad"] = round(relative_mad, 8)
+        if relative_mad > 0.20:
+            record["status"] = "unavailable_mixed_ink_tiers"
+            continue
+        if median_width <= 3.0:
+            weight_class = "regular"
+        elif median_width >= 3.8:
+            weight_class = "bold"
+        else:
+            record["status"] = "unavailable_transition_ink_tier"
+            continue
+        confidence = min(
+            0.94,
+            0.76
+            + min(0.10, (len(ink_widths) - 3) * 0.04)
+            + min(0.08, max(0.0, 0.20 - relative_mad) * 0.40),
+        )
+        record["status"] = "supported_outlined_cell_cohort"
+        record["weight_class"] = weight_class
+        record["confidence"] = round(confidence, 8)
+        supported.append(
+            (direction, weight_class, confidence, len(ink_widths), relative_mad)
+        )
+
+    if not supported:
+        return "", 0.0, {"status": "unavailable", "directions": directions}
+    classes = {item[1] for item in supported}
+    if len(classes) != 1:
+        return "", 0.0, {
+            "status": "unavailable_directional_weight_disagreement",
+            "directions": directions,
+        }
+    selected = max(supported, key=lambda item: (item[3], item[2], -item[4]))
+    return selected[1], float(selected[2]), {
+        "status": "supported_outlined_cell_cohort",
+        "selected_direction": selected[0],
+        "directions": directions,
+    }
+
+
+def _stable_upper_cell_cohort(
+    values: Sequence[float],
+    *,
+    minimum_count: int,
+) -> tuple[float, int, float]:
+    clean = np.asarray(
+        [float(value) for value in values if float(value) >= 3.0],
+        dtype=np.float32,
+    )
+    if clean.size < minimum_count:
+        return 0.0, int(clean.size), 0.0
+    upper_reference = float(np.percentile(clean, 75))
+    cohort = clean[clean >= max(3.0, upper_reference * 0.60)]
+    if cohort.size < minimum_count:
+        return 0.0, int(cohort.size), 0.0
+    median = float(np.median(cohort))
+    relative_mad = float(
+        np.median(np.abs(cohort - median)) / max(1.0, median)
+    )
+    if relative_mad > 0.20:
+        return 0.0, int(cohort.size), relative_mad
+    return median, int(cohort.size), relative_mad
+
+
+def _fill_component_cell_sizes(fill: np.ndarray) -> list[float]:
+    """Return glyph-like component spans from contrast-resolved fill only."""
+
+    try:
+        import cv2
+
+        count, _, stats, _ = cv2.connectedComponentsWithStats(
+            np.asarray(fill, dtype=np.uint8), connectivity=8
+        )
+    except Exception:
+        return []
+    sizes: list[float] = []
+    for index in range(1, count):
+        width = int(stats[index, 2])
+        height = int(stats[index, 3])
+        area = int(stats[index, 4])
+        short = min(width, height)
+        long = max(width, height)
+        if area < 6 or short < 3 or long / max(1, short) > 2.2:
+            continue
+        sizes.append(float(long))
+    return sizes
+
+
+def _qualify_source_cell_measurement(
+    fill: np.ndarray,
+    *,
+    axis: int,
+    spans: Sequence[float],
+    legacy_size: float,
+    legacy_confidence: float,
+    fill_component_sizes: Sequence[float],
+) -> tuple[float, float, str, dict[str, Any]]:
+    """Qualify a cell scale independently of halo/backing components.
+
+    The prior value is retained only when authorized glyph-fill projection or
+    glyph-like fill components corroborate it. Repeated fill evidence can repair
+    halo fragmentation. A parent-sized island must decompose into stable
+    occupancy bands; otherwise the scale fails closed.
+    """
+
+    binary = np.asarray(fill, dtype=bool)
+    legacy_size = max(0.0, float(legacy_size))
+    legacy_confidence = max(0.0, float(legacy_confidence))
+    raw_candidate, raw_count, raw_relative_mad = _stable_upper_cell_cohort(
+        spans,
+        minimum_count=1,
+    )
+    fill_candidate, fill_count, fill_relative_mad = _stable_upper_cell_cohort(
+        fill_component_sizes,
+        minimum_count=3,
+    )
+    axis_extent = int(binary.shape[1] if axis == 0 else binary.shape[0])
+    orthogonal_extent = int(binary.shape[0] if axis == 0 else binary.shape[1])
+    coordinates = np.where(binary)
+    orthogonal_coordinates = coordinates[0] if axis == 0 else coordinates[1]
+    filled_orthogonal_extent = (
+        int(np.ptp(orthogonal_coordinates)) + 1
+        if orthogonal_coordinates.size
+        else 0
+    )
+    raw_max = max((float(value) for value in spans), default=0.0)
+    parent_sized_island = bool(
+        axis_extent > 0
+        and orthogonal_extent > 0
+        and raw_max >= axis_extent * 0.78
+        and filled_orthogonal_extent >= orthogonal_extent * 0.78
+    )
+    density_spans: list[float] = []
+    density_candidate = 0.0
+    density_count = 0
+    density_relative_mad = 0.0
+    if parent_sized_island:
+        density_spans = _projection_spans_at_min_occupancy(
+            binary,
+            axis=axis,
+            minimum_occupancy=max(2, int(round(orthogonal_extent * 0.10))),
+        )
+        (
+            density_candidate,
+            density_count,
+            density_relative_mad,
+        ) = _stable_upper_cell_cohort(
+            density_spans,
+            minimum_count=3,
+        )
+
+    audit = {
+        "legacy_size": round(legacy_size, 6),
+        "legacy_confidence": round(legacy_confidence, 8),
+        "raw_projection_candidate": round(raw_candidate, 6),
+        "raw_projection_candidate_count": int(raw_count),
+        "raw_projection_relative_mad": round(raw_relative_mad, 8),
+        "fill_component_candidate": round(fill_candidate, 6),
+        "fill_component_candidate_count": int(fill_count),
+        "fill_component_relative_mad": round(fill_relative_mad, 8),
+        "axis_extent": axis_extent,
+        "orthogonal_extent": orthogonal_extent,
+        "filled_orthogonal_extent": filled_orthogonal_extent,
+        "parent_sized_island": parent_sized_island,
+        "density_minimum_occupancy": (
+            max(2, int(round(orthogonal_extent * 0.10)))
+            if parent_sized_island
+            else 0
+        ),
+        "density_spans": [round(float(value), 6) for value in density_spans],
+        "density_candidate": round(density_candidate, 6),
+        "density_candidate_count": int(density_count),
+        "density_relative_mad": round(density_relative_mad, 8),
+    }
+
+    if parent_sized_island:
+        if density_candidate > 0.0 and raw_max >= density_candidate * 2.2:
+            confidence = max(
+                0.72,
+                min(0.90, 0.86 - density_relative_mad * 0.40),
+            )
+            return (
+                density_candidate,
+                confidence,
+                "supported_density_decomposition",
+                audit,
+            )
+        return 0.0, 0.0, "unavailable_parent_sized_island", audit
+
+    fill_projection_agree = bool(
+        raw_candidate > 0.0
+        and fill_candidate > 0.0
+        and 0.70 <= raw_candidate / fill_candidate <= 1.35
+    )
+    if fill_projection_agree and (
+        legacy_size < min(raw_candidate, fill_candidate) * 0.65
+        or legacy_size > max(raw_candidate, fill_candidate) * 1.55
+    ):
+        repaired = float(np.median([raw_candidate, fill_candidate]))
+        confidence = max(
+            0.72,
+            min(
+                0.92,
+                0.84
+                - max(raw_relative_mad, fill_relative_mad) * 0.35
+                + min(0.06, (raw_count + fill_count) * 0.003),
+            ),
+        )
+        return (
+            repaired,
+            confidence,
+            "supported_fill_projection_override",
+            audit,
+        )
+
+    raw_matches = bool(
+        raw_candidate > 0.0
+        and 0.55 <= legacy_size / raw_candidate <= 1.65
+    )
+    fill_matches = bool(
+        fill_candidate > 0.0
+        and 0.60 <= legacy_size / fill_candidate <= 1.60
+    )
+    if legacy_size > 0.0 and legacy_confidence > 0.0 and (raw_matches or fill_matches):
+        return (
+            legacy_size,
+            legacy_confidence,
+            "supported_independent_corroboration",
+            audit,
+        )
+    if fill_projection_agree:
+        inferred = float(np.median([raw_candidate, fill_candidate]))
+        return (
+            inferred,
+            0.72,
+            "supported_fill_projection_inference",
+            audit,
+        )
+    return 0.0, 0.0, "unavailable_unqualified_geometry", audit
 
 
 def _character_component_size(mask_binary: np.ndarray) -> tuple[float, int, float]:

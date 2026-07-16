@@ -9,10 +9,22 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from decimal import Decimal, ROUND_CEILING
 from typing import Any, Mapping, Sequence
 
-from app.render.font_manager import FontManager, FontResolution, RunFontResolution
+from app.render.font_manager import (
+    FontManager,
+    FontResolution,
+    FontSpanResolution,
+    RunFontResolution,
+)
 from app.render.line_break_planner import LineBreakPlanner
+from app.render.parent_layer_effects import (
+    fit_effect_envelope,
+    outward_int_xywh,
+    resolve_parent_layer_effects,
+    shift_layout_geometry,
+)
 from app.render.text_shaper import HarfBuzzShaper, ShapedRun
 from app.render.typesetting_contracts import FitReport, GlyphPlacement, RenderLayerPlan, TypesetLayout, bbox_from_value
 from app.render.typesetting_text import (
@@ -23,6 +35,8 @@ from app.render.typesetting_text import (
     grapheme_clusters,
     normalize_for_writing_mode,
     segment_inline_runs,
+    source_char_requires_visible_glyph,
+    source_text_requires_visible_glyph,
 )
 
 
@@ -108,6 +122,15 @@ class TypesettingEngine:
         if not str(plan.translated_text or ""):
             return self._failed(plan, "empty_text", ["empty_text"], hard_bounds=hard_bounds)
 
+        parent_layer_effects = resolve_parent_layer_effects(plan.resolved_render_style)
+        if parent_layer_effects.status == "invalid":
+            return self._failed(
+                plan,
+                "invalid_parent_layer_effect_contract",
+                ["parent_layer_effect_contract_invalid", *parent_layer_effects.issues],
+                hard_bounds=hard_bounds,
+            )
+
         writing_mode, writing_policy = self._resolve_writing_mode(plan)
         preferred_font_size = _font_size_from_style(plan.resolved_render_style)
         resolved = self.font_manager.resolve_font(
@@ -124,14 +147,76 @@ class TypesettingEngine:
             self.font_manager,
             face,
         )
-        runs = segment_inline_runs(
+        logical_runs = segment_inline_runs(
             normalized,
             writing_mode=writing_mode,
             language_hint=_language_hint(plan),
             punctuation_occurrences=punctuation,
             symbol_occurrences=symbols,
         )
+        try:
+            runs, font_span_resolutions = self._expand_runs_for_font_spans(
+                logical_runs,
+                resolved,
+                writing_mode=writing_mode,
+            )
+        except RuntimeError as exc:
+            if str(exc) != "uax29_grapheme_segmenter_unavailable":
+                raise
+            return self._font_span_failure(
+                plan,
+                normalized=normalized,
+                hard_bounds=hard_bounds,
+                resolved=resolved,
+                logical_runs=logical_runs,
+                expanded_runs=logical_runs,
+                spans=[],
+                issues=["uax29_grapheme_segmenter_unavailable"],
+            )
+        font_span_text_conserved = (
+            "".join(run.normalized_text for run in runs) == normalized
+        )
+        unresolved_span_issues = _unique(
+            [
+                issue
+                for span in font_span_resolutions
+                if not span.usable
+                for issue in span.issues
+            ]
+        )
+        if not font_span_text_conserved:
+            unresolved_span_issues.append("font_span_text_not_conserved")
+        if unresolved_span_issues:
+            return self._font_span_failure(
+                plan,
+                normalized=normalized,
+                hard_bounds=hard_bounds,
+                resolved=resolved,
+                logical_runs=logical_runs,
+                expanded_runs=runs,
+                spans=font_span_resolutions,
+                issues=unresolved_span_issues,
+            )
+        font_spans_by_id = {
+            span.span_id: span for span in font_span_resolutions
+        }
         breaks = compute_break_opportunities(runs, writing_mode=writing_mode)
+        breaks = [
+            replace(
+                item,
+                allowed=False,
+                strength="forbidden",
+                reason="font_span_internal_boundary",
+                metadata={
+                    **dict(item.metadata),
+                    "shaping_safe_boundary_only": True,
+                },
+            )
+            if _logical_run_id_for(runs[index])
+            == _logical_run_id_for(runs[index + 1])
+            else item
+            for index, item in enumerate(breaks)
+        ]
         style_issues = _style_issues(runs, writing_mode, self.policy)
         script_policy = _script_policy(runs, writing_mode, self.policy)
         attempts: list[dict[str, Any]] = []
@@ -148,7 +233,22 @@ class TypesettingEngine:
                 resolved,
                 font_size,
                 writing_mode,
+                font_spans_by_id,
             )
+            notdef_run_ids = _visible_notdef_run_ids(shaped_runs)
+            if notdef_run_ids:
+                return self._font_span_failure(
+                    plan,
+                    normalized=normalized,
+                    hard_bounds=hard_bounds,
+                    resolved=resolved,
+                    logical_runs=logical_runs,
+                    expanded_runs=runs,
+                    spans=font_span_resolutions,
+                    issues=["notdef_glyph_forbidden", "shaping_missing_glyph"],
+                    shaped_runs=shaped_runs,
+                    notdef_run_ids=notdef_run_ids,
+                )
             metrics_by_face: dict[str, dict[str, Any]] = {}
             metric_faces = [face]
             metric_faces.extend(
@@ -220,11 +320,44 @@ class TypesettingEngine:
                     layout_intent_box = retry["layout_intent_box"]
                     box_model = retry["box_model"]
                     reason_codes.extend(retry["reason_codes"])
+            base_measured_bounds = list(measured_bounds)
+            base_visual_center = _center_of(base_measured_bounds)
+            parent_effect_envelope = fit_effect_envelope(
+                base_measured_bounds,
+                hard_bounds,
+                parent_layer_effects,
+                raster_guard_px=_parent_effect_raster_guard(plan.resolved_render_style),
+            )
+            if parent_layer_effects.active and fit_status == "fits":
+                if not parent_effect_envelope.contained:
+                    fit_status = "overflow"
+                    fit_issues = _unique(
+                        [
+                            *fit_issues,
+                            *parent_effect_envelope.issues,
+                            "parent_layer_effect_envelope_exceeds_hard_bounds",
+                        ]
+                    )
+                else:
+                    shift_x, shift_y = parent_effect_envelope.translation
+                    placements, lines, columns, base_measured_bounds = shift_layout_geometry(
+                        placements,
+                        lines,
+                        columns,
+                        base_measured_bounds,
+                        shift_x,
+                        shift_y,
+                    )
+                    base_visual_center = _center_of(base_measured_bounds)
+                    measured_bounds = outward_int_xywh(parent_effect_envelope.final_bounds)
             attempt = {
                 "font_size": int(font_size),
                 "fit_status": fit_status,
                 "layout_intent_box": list(layout_intent_box),
                 "measured_bounds": list(measured_bounds),
+                "base_measured_bounds": list(base_measured_bounds),
+                "base_visual_center": list(base_visual_center),
+                "parent_layer_effect_envelope": parent_effect_envelope.to_audit_dict(),
                 "issues": list(fit_issues),
                 "placements": placements,
                 "lines": lines,
@@ -253,6 +386,9 @@ class TypesettingEngine:
         lines = list(selected_attempt["lines"])
         columns = list(selected_attempt["columns"])
         measured_bounds = list(selected_attempt["measured_bounds"])
+        base_measured_bounds = list(selected_attempt["base_measured_bounds"])
+        base_visual_center = list(selected_attempt["base_visual_center"])
+        parent_effect_envelope = dict(selected_attempt["parent_layer_effect_envelope"])
         fit_status = str(selected_attempt["fit_status"])
         fit_issues = list(selected_attempt["issues"])
         box_model = dict(selected_attempt["box_model"])
@@ -260,9 +396,15 @@ class TypesettingEngine:
         break_plan = dict(selected_attempt["break_plan"])
         run_font_resolutions = list(selected_attempt["run_font_resolutions"])
         open_type_metrics_by_face = dict(selected_attempt["open_type_metrics_by_face"])
+        font_span_cluster_map = _font_span_cluster_ledger(runs, shaped_runs)
         effective_line_height = float(selected_attempt.get("effective_line_height") or _line_height(plan.resolved_render_style))
         if font_size < preferred_font_size:
             reason_codes.append("font_size_reduced_to_fit_translated_text")
+            if parent_layer_effects.active and any(
+                not bool(item["parent_layer_effect_envelope"].get("contained"))
+                for item in attempts[:-1]
+            ):
+                reason_codes.append("font_size_reduced_to_fit_parent_effect_envelope")
             if bool(plan.resolved_render_style.get("font_size_locked")):
                 reason_codes.append("font_size_lock_relaxed_for_layout_fit")
         kinsoku_adjustments = [item.to_audit_dict() for item in breaks if not item.allowed and item.reason.startswith("kinsoku")]
@@ -306,6 +448,16 @@ class TypesettingEngine:
             "shaped_runs": [run.to_audit_dict() for run in shaped_runs],
             "font_resolution": resolved.to_audit_dict(),
             "run_font_resolutions": [item.to_audit_dict() for item in run_font_resolutions],
+            "font_span_resolutions": [
+                item.to_audit_dict() for item in font_span_resolutions
+            ],
+            "font_span_text_conserved": bool(font_span_text_conserved),
+            "font_span_cluster_map": font_span_cluster_map,
+            "notdef_run_ids": [],
+            "parent_layer_effects": parent_layer_effects.to_audit_dict(),
+            "parent_layer_effect_envelope": parent_effect_envelope,
+            "base_measured_bounds": list(base_measured_bounds),
+            "base_visual_center": list(base_visual_center),
             "open_type_metrics_by_face": open_type_metrics_by_face,
             "font_size_selection": {
                 "preferred_font_size": int(preferred_font_size),
@@ -320,6 +472,9 @@ class TypesettingEngine:
                         "layout_intent_box": list(item["layout_intent_box"]),
                         "measured_bounds": list(item["measured_bounds"]),
                         "issues": list(item["issues"]),
+                        "parent_layer_effect_envelope": dict(
+                            item["parent_layer_effect_envelope"]
+                        ),
                     }
                     for item in attempts
                 ],
@@ -348,7 +503,11 @@ class TypesettingEngine:
             punctuation_placements=punctuation,
             symbol_placements=symbols,
             measured_bounds=measured_bounds,
-            visual_center=_center_of(measured_bounds),
+            visual_center=(
+                list(base_visual_center)
+                if parent_layer_effects.active
+                else _center_of(measured_bounds)
+            ),
             fit_status=fit_status,
             normalized_text=normalized,
             original_text=plan.translated_text,
@@ -389,6 +548,14 @@ class TypesettingEngine:
                 "inline_runs": metadata["inline_runs"],
                 "shaped_runs": metadata["shaped_runs"],
                 "run_font_resolutions": metadata["run_font_resolutions"],
+                "font_span_resolutions": metadata["font_span_resolutions"],
+                "font_span_text_conserved": metadata["font_span_text_conserved"],
+                "font_span_cluster_map": metadata["font_span_cluster_map"],
+                "notdef_run_ids": metadata["notdef_run_ids"],
+                "parent_layer_effects": metadata["parent_layer_effects"],
+                "parent_layer_effect_envelope": parent_effect_envelope,
+                "base_measured_bounds": list(base_measured_bounds),
+                "base_visual_center": list(base_visual_center),
                 "open_type_metrics_by_face": open_type_metrics_by_face,
                 "box_model": box_model,
             },
@@ -430,17 +597,43 @@ class TypesettingEngine:
         resolution: FontResolution,
         font_size: int,
         writing_mode: str,
+        font_spans_by_id: Mapping[str, FontSpanResolution],
     ) -> tuple[list[ShapedRun], list[RunFontResolution]]:
         shaped: list[ShapedRun] = []
         run_resolutions: list[RunFontResolution] = []
         for run in runs:
             if not run.normalized_text or run.role == "space":
                 continue
-            run_resolution = self.font_manager.resolve_run_font(
+            existing_resolution = self.font_manager.resolve_run_font(
                 resolution,
                 run.normalized_text,
                 run_id=run.run_id,
             )
+            span = font_spans_by_id.get(run.run_id)
+            use_span_resolution = bool(
+                span is not None
+                and span.selected_face is not None
+                and (
+                    span.span_id != span.logical_run_id
+                    or existing_resolution.selected_face is None
+                    or existing_resolution.selected_face.face_id
+                    != span.selected_face.face_id
+                )
+            )
+            if use_span_resolution and span is not None:
+                run_resolution = RunFontResolution(
+                    run_id=run.run_id,
+                    text=run.normalized_text,
+                    selected_face=span.selected_face,
+                    coverage=span.coverage,
+                    fallback_used=span.fallback_used,
+                    fallback_index=span.fallback_index,
+                    selection_reason=span.selection_reason,
+                    missing_glyphs=list(span.coverage.missing_chars),
+                    issues=list(span.issues),
+                )
+            else:
+                run_resolution = existing_resolution
             run_resolutions.append(run_resolution)
             face = run_resolution.selected_face or resolution.primary_face
             if face is None:
@@ -456,26 +649,143 @@ class TypesettingEngine:
                 script=run.script,
                 direction=run.direction if run.direction == "rtl" else "",
             )
-            shaped.append(
-                replace(
-                    shaped_run,
-                    metadata={
-                        **dict(shaped_run.metadata),
-                        "run_id": run.run_id,
-                        "run_role": run.role,
-                        "grapheme_start": run.grapheme_start,
-                        "grapheme_end": run.grapheme_end,
-                        "block_writing_mode": writing_mode,
-                        "shape_writing_mode": shape_writing_mode,
-                        "inline_placement_mode": placement_mode,
-                        "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
-                        "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
-                        "run_font_resolution": run_resolution.to_audit_dict(),
-                        "font_fallback_used": bool(run_resolution.fallback_used),
-                    },
+            shaped_metadata = {
+                **dict(shaped_run.metadata),
+                "run_id": run.run_id,
+                "run_role": run.role,
+                "grapheme_start": run.grapheme_start,
+                "grapheme_end": run.grapheme_end,
+                "block_writing_mode": writing_mode,
+                "shape_writing_mode": shape_writing_mode,
+                "inline_placement_mode": placement_mode,
+                "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
+                "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
+                "run_font_resolution": run_resolution.to_audit_dict(),
+                "font_fallback_used": bool(run_resolution.fallback_used),
+            }
+            if run.metadata.get("font_span_id"):
+                shaped_metadata.update(
+                    {
+                        "logical_run_id": _logical_run_id_for(run),
+                        "font_span_id": str(run.metadata.get("font_span_id")),
+                        "source_cluster_map": _shaped_source_cluster_map(
+                            run,
+                            shaped_run,
+                        ),
+                    }
                 )
-            )
+            elif run.role in {"complex_script", "symbol"}:
+                shaped_metadata["source_cluster_map"] = _shaped_source_cluster_map(
+                    run,
+                    shaped_run,
+                )
+            shaped.append(replace(shaped_run, metadata=shaped_metadata))
         return shaped, run_resolutions
+
+    def _expand_runs_for_font_spans(
+        self,
+        runs: Sequence[InlineTextRun],
+        resolution: FontResolution,
+        *,
+        writing_mode: str,
+    ) -> tuple[list[InlineTextRun], list[FontSpanResolution]]:
+        expanded: list[InlineTextRun] = []
+        span_resolutions: list[FontSpanResolution] = []
+        for run in runs:
+            spans = self.font_manager.resolve_run_font_spans(
+                resolution,
+                run.normalized_text,
+                run_id=run.run_id,
+                script=run.script,
+                direction=run.direction,
+                role=run.role,
+                writing_mode=writing_mode,
+            )
+            span_resolutions.extend(spans)
+            if (
+                len(spans) == 1
+                and spans[0].span_id == run.run_id
+                and spans[0].text == run.normalized_text
+            ):
+                expanded.append(run)
+                continue
+            for span in spans:
+                metadata = {
+                    **dict(run.metadata),
+                    "logical_run_id": run.run_id,
+                    "font_span_id": span.span_id,
+                    "font_span_source_grapheme_start": span.source_grapheme_start,
+                    "font_span_source_grapheme_end": span.source_grapheme_end,
+                    "font_span_source_codepoint_start": span.source_codepoint_start,
+                    "font_span_source_codepoint_end": span.source_codepoint_end,
+                    "font_span_selection_reason": span.selection_reason,
+                    "font_span_missing_clusters": list(span.missing_clusters),
+                }
+                expanded.append(
+                    replace(
+                        run,
+                        run_id=span.span_id,
+                        text=span.text,
+                        normalized_text=span.text,
+                        grapheme_start=(
+                            run.grapheme_start + span.source_grapheme_start
+                        ),
+                        grapheme_end=(
+                            run.grapheme_start + span.source_grapheme_end
+                        ),
+                        metadata=metadata,
+                    )
+                )
+        return expanded, span_resolutions
+
+    def _font_span_failure(
+        self,
+        plan: RenderLayerPlan,
+        *,
+        normalized: str,
+        hard_bounds: list[int],
+        resolved: FontResolution,
+        logical_runs: Sequence[InlineTextRun],
+        expanded_runs: Sequence[InlineTextRun],
+        spans: Sequence[FontSpanResolution],
+        issues: Sequence[str],
+        shaped_runs: Sequence[ShapedRun] | None = None,
+        notdef_run_ids: Sequence[str] | None = None,
+    ) -> tuple[TypesetLayout, FitReport]:
+        failure_issues = _unique(
+            ["font_span_resolution_failed", *list(issues or [])]
+        )
+        layout, report = self._failed(
+            plan,
+            "font_span_resolution_failed",
+            failure_issues,
+            hard_bounds=hard_bounds,
+        )
+        span_audit = [item.to_audit_dict() for item in spans]
+        metadata = {
+            "typesetting_engine_version": "typesetting_engine_stage4_v1",
+            "failure_status": "font_span_resolution_failed",
+            "font_resolution": resolved.to_audit_dict(),
+            "logical_inline_runs": [item.to_audit_dict() for item in logical_runs],
+            "inline_runs": [item.to_audit_dict() for item in expanded_runs],
+            "font_span_resolutions": span_audit,
+            "font_span_text_conserved": (
+                "".join(item.normalized_text for item in expanded_runs)
+                == normalized
+            ),
+            "shaped_runs": [item.to_audit_dict() for item in list(shaped_runs or [])],
+            "font_span_cluster_map": _font_span_cluster_ledger(
+                expanded_runs,
+                list(shaped_runs or []),
+            ),
+            "notdef_run_ids": _unique(list(notdef_run_ids or [])),
+        }
+        layout.normalized_text = normalized
+        layout.original_text = str(plan.translated_text or "")
+        layout.metadata = metadata
+        report.issues = failure_issues
+        report.metadata = dict(metadata)
+        return layout, report
 
     def _layout_intent_box(
         self,
@@ -708,6 +1018,14 @@ class TypesettingEngine:
                             "row_units": float(row_units),
                             "row_span": int(math.ceil(row_units)),
                             "run_id": item.get("run_id", ""),
+                            **(
+                                {
+                                    "logical_run_id": item.get("logical_run_id", ""),
+                                    "font_span_id": item.get("font_span_id", ""),
+                                }
+                                if item.get("font_span_id")
+                                else {}
+                            ),
                             "placement_mode": item.get("placement_mode", "vertical_glyph"),
                             "placement_source": "stage4_vertical_layout",
                             "shaped_glyph_id": int(shaped_glyph.glyph_id) if shaped_glyph else None,
@@ -724,6 +1042,10 @@ class TypesettingEngine:
                             "ellipsis_sequence_group_count": int(item.get("ellipsis_sequence_group_count") or 0),
                             "wave_unit_count": int(item.get("wave_unit_count") or 0),
                             "dash_unit_count": int(item.get("dash_unit_count") or 0),
+                            "emphasis_symbol_count": int(item.get("emphasis_symbol_count") or 0),
+                            "emphasis_sequence_group_count": int(
+                                item.get("emphasis_sequence_group_count") or 0
+                            ),
                             "font_face_id": str(item.get("font_face_id") or ""),
                             "font_path": str(item.get("font_path") or ""),
                             "font_fallback_used": bool(item.get("font_fallback_used")),
@@ -910,7 +1232,12 @@ class TypesettingEngine:
         dict[str, Any],
     ]:
         x, y, w, h = box
-        line_height = max(1.0, font_size * _line_height(style))
+        line_height_ratio = _line_height(style)
+        line_height = max(1.0, font_size * line_height_ratio)
+        line_pixel_extent = _horizontal_line_pixel_extent(
+            font_size,
+            line_height_ratio,
+        )
         max_lines = max(1, int(math.floor(float(h) / line_height)))
         shaped_by_run = {
             str(item.metadata.get("run_id") or ""): item
@@ -949,7 +1276,7 @@ class TypesettingEngine:
         for line_index, group in enumerate(line_groups):
             cursor_x = float(x)
             raw_y = float(y) + float(line_index) * line_height
-            placement_height = int(max(1, min(float(h), line_height)))
+            placement_height = max(1, min(int(h), line_pixel_extent))
             py = min(max(y, int(round(raw_y))), y + h - placement_height)
             for item in group:
                 run = item.get("run")
@@ -972,6 +1299,11 @@ class TypesettingEngine:
                         writing_mode="horizontal",
                         metadata={
                             "run_id": str(item.get("run_id") or ""),
+                            **(
+                                _placement_font_span_metadata(run)
+                                if isinstance(run, InlineTextRun)
+                                else {}
+                            ),
                             "line_index": line_index,
                             "space_run": bool(isinstance(run, InlineTextRun) and run.role == "space"),
                             "placement_source": "authoritative_break_opportunity_partition",
@@ -1000,7 +1332,11 @@ class TypesettingEngine:
             (sum(max(0.0, float(item.get("advance") or 0.0)) for item in group) for group in line_groups),
             default=0.0,
         )
-        required_height = float(len(line_groups)) * line_height
+        required_height = _horizontal_line_pixel_extent(
+            font_size,
+            line_height_ratio,
+            line_count=len(line_groups),
+        )
         overflow = required_width > float(w) or required_height > float(h) or bool(break_result.issues)
         if overflow:
             issues.append("layout_overflow")
@@ -1137,6 +1473,35 @@ def _line_height(style: dict[str, Any]) -> float:
         return 1.0
 
 
+def _horizontal_line_pixel_extent(
+    font_size: int,
+    line_height: float,
+    *,
+    line_count: int = 1,
+) -> int:
+    """Return the outward integer extent for horizontal line-box geometry."""
+
+    count = max(0, int(line_count))
+    if count <= 0:
+        return 0
+    pitch = Decimal(str(max(1, int(font_size)))) * Decimal(str(line_height))
+    pitch = max(Decimal("1"), pitch)
+    return int(
+        (pitch * Decimal(count)).to_integral_value(rounding=ROUND_CEILING)
+    )
+
+
+def _parent_effect_raster_guard(style: Mapping[str, Any] | None) -> float:
+    values = dict(style or {})
+    stroke_width = 0.0
+    value = values.get("stroke_width")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number):
+            stroke_width = abs(number)
+    return float(max(2, int(math.ceil(stroke_width)) + 2))
+
+
 def _style_issues(runs: Sequence[InlineTextRun], writing_mode: str, policy: TypesettingPolicy) -> list[str]:
     issues: list[str] = []
     if writing_mode == "vertical":
@@ -1162,7 +1527,9 @@ def _run_audit(run: InlineTextRun, writing_mode: str, policy: TypesettingPolicy)
     record = run.to_audit_dict()
     placement = "standard_run"
     letter_stack = False
-    if writing_mode == "vertical" and run.script == "Latn":
+    if writing_mode == "vertical" and _is_vertical_emphasis_sequence(run):
+        placement = "vertical_emphasis_sequence"
+    elif writing_mode == "vertical" and run.script == "Latn":
         count = len(grapheme_clusters(run.text))
         if count <= policy.max_tate_chu_yoko_graphemes:
             placement = "tate_chu_yoko"
@@ -1182,7 +1549,12 @@ def _shape_writing_mode_for_run(run: InlineTextRun, block_writing_mode: str, pol
     if block_writing_mode != "vertical":
         return block_writing_mode
     placement = _run_audit(run, block_writing_mode, policy)["placement_mode"]
-    if placement in {"tate_chu_yoko", "rotated_latin_run", "vertical_inline_run"}:
+    if placement in {
+        "tate_chu_yoko",
+        "rotated_latin_run",
+        "vertical_inline_run",
+        "vertical_emphasis_sequence",
+    }:
         return "horizontal"
     if run.role in {"complex_script", "symbol"}:
         return "horizontal"
@@ -1206,8 +1578,14 @@ def _natural_box_size(
             shaped_width += sum(max(0.0, float(glyph.x_advance)) for glyph in run.glyphs)
         if shaped_width > 0.0:
             shaped_width += sum(1 for cluster in grapheme_clusters(text) if cluster.isspace()) * font_size * 0.35
-            return int(math.ceil(shaped_width)), int(max(1, font_size * line_height))
-        return int(max(1, min(count, 12) * font_size * 0.75)), int(max(1, font_size * line_height))
+            return int(math.ceil(shaped_width)), _horizontal_line_pixel_extent(
+                font_size,
+                line_height,
+            )
+        return int(max(1, min(count, 12) * font_size * 0.75)), _horizontal_line_pixel_extent(
+            font_size,
+            line_height,
+        )
     inline_width = 0.0
     for run in shaped_runs or []:
         if (run.metadata or {}).get("shape_writing_mode") == "horizontal":
@@ -1588,7 +1966,12 @@ def _vertical_layout_items(
                 {
                     "text": run.text,
                     "run_id": run.run_id,
-                    "placement_mode": f"vertical_{run.role}",
+                    **_placement_font_span_metadata(run),
+                    "placement_mode": (
+                        "vertical_emphasis_sequence"
+                        if _is_vertical_emphasis_sequence(run)
+                        else f"vertical_{run.role}"
+                    ),
                     "shaped_glyph": glyphs[0] if glyphs else None,
                     "shaped_glyphs": glyphs,
                     "width": item_width,
@@ -1603,6 +1986,11 @@ def _vertical_layout_items(
                     "ellipsis_sequence_group_count": _occurrence_sequence_group_count(run, "ellipsis"),
                     "wave_unit_count": _occurrence_unit_count(run, "wave"),
                     "dash_unit_count": _occurrence_unit_count(run, "dash"),
+                    "emphasis_symbol_count": _occurrence_unit_count(run, "emphasis_punctuation"),
+                    "emphasis_sequence_group_count": _occurrence_sequence_group_count(
+                        run,
+                        "emphasis_punctuation",
+                    ),
                     "font_face_id": shaped.font_face_id if shaped else "",
                     "font_path": shaped.font_path if shaped else "",
                     "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if shaped else False,
@@ -1615,6 +2003,7 @@ def _vertical_layout_items(
                 {
                     "text": run.text,
                     "run_id": run.run_id,
+                    **_placement_font_span_metadata(run),
                     "placement_mode": _run_audit(run, "vertical", policy)["placement_mode"],
                     "shaped_glyph": glyphs[0] if glyphs else None,
                     "shaped_glyphs": glyphs,
@@ -1648,6 +2037,7 @@ def _vertical_layout_items(
                 {
                     "text": cluster,
                     "run_id": run.run_id,
+                    **_placement_font_span_metadata(run),
                     "placement_mode": placement_mode,
                     "shaped_glyph": glyph,
                     "shaped_glyphs": [glyph] if glyph else [],
@@ -1701,6 +2091,8 @@ def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: Typ
         count = max(1, len(grapheme_clusters(run.text)))
         width = float(font_size)
         height = float(font_size)
+        if _is_vertical_emphasis_sequence(run):
+            return max(1.0, width), max(1.0, height), width
         if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence"} and count > 1:
             height = float(font_size) * float(count)
         elif count > 1:
@@ -1730,6 +2122,13 @@ def _vertical_run_is_atomic(run: InlineTextRun, policy: TypesettingPolicy) -> bo
     if run.role in {"numeric_token", "complex_script", "symbol", "ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
         return True
     return False
+
+
+def _is_vertical_emphasis_sequence(run: InlineTextRun) -> bool:
+    return bool(
+        run.role == "punctuation_sequence"
+        and _occurrence_unit_count(run, "emphasis_punctuation") >= 3
+    )
 
 
 def _occurrence_unit_count(run: InlineTextRun, kind: str) -> int:
@@ -1784,6 +2183,139 @@ def _dominant_vertical_advance(shaped_runs: Sequence[ShapedRun]) -> float:
         return 1.0
     advances.sort()
     return max(1.0, advances[len(advances) // 2])
+
+
+def _logical_run_id_for(run: InlineTextRun) -> str:
+    return str(run.metadata.get("logical_run_id") or run.run_id)
+
+
+def _placement_font_span_metadata(run: InlineTextRun) -> dict[str, Any]:
+    span_id = str(run.metadata.get("font_span_id") or "")
+    if not span_id:
+        return {}
+    return {
+        "logical_run_id": _logical_run_id_for(run),
+        "font_span_id": span_id,
+    }
+
+
+def _visible_notdef_run_ids(shaped_runs: Sequence[ShapedRun]) -> list[str]:
+    run_ids: list[str] = []
+    for shaped in shaped_runs:
+        if not shaped.glyphs and source_text_requires_visible_glyph(shaped.normalized_text):
+            run_ids.append(str(shaped.metadata.get("run_id") or ""))
+            continue
+        for glyph in shaped.glyphs:
+            if int(glyph.glyph_id) != 0:
+                continue
+            if not any(
+                source_char_requires_visible_glyph(char)
+                for char in str(glyph.text or "")
+            ):
+                continue
+            run_ids.append(str(shaped.metadata.get("run_id") or ""))
+            break
+    return _unique(run_ids)
+
+
+def _shaped_source_cluster_map(
+    run: InlineTextRun,
+    shaped: ShapedRun,
+) -> list[dict[str, Any]]:
+    clusters = grapheme_clusters(run.normalized_text)
+    codepoint_offsets = [0]
+    for cluster in clusters:
+        codepoint_offsets.append(codepoint_offsets[-1] + len(cluster))
+    hb_clusters = sorted(
+        {
+            int(glyph.cluster)
+            for glyph in shaped.glyphs
+            if 0 <= int(glyph.cluster) <= len(run.normalized_text)
+        }
+    )
+    hb_ranges: list[tuple[int, int]] = []
+    for index, start in enumerate(hb_clusters):
+        end = (
+            hb_clusters[index + 1]
+            if index + 1 < len(hb_clusters)
+            else len(run.normalized_text)
+        )
+        hb_ranges.append((start, max(start, end)))
+    output: list[dict[str, Any]] = []
+    for grapheme_index, cluster in enumerate(clusters):
+        codepoint_start = codepoint_offsets[grapheme_index]
+        codepoint_end = codepoint_offsets[grapheme_index + 1]
+        anchor = hb_clusters[0] if hb_clusters else None
+        for hb_start, hb_end in hb_ranges:
+            if hb_start <= codepoint_start < max(hb_start + 1, hb_end):
+                anchor = hb_start
+                break
+            if hb_start <= codepoint_start:
+                anchor = hb_start
+        glyph_indices = (
+            [
+                index
+                for index, glyph in enumerate(shaped.glyphs)
+                if int(glyph.cluster) == int(anchor)
+            ]
+            if anchor is not None
+            else []
+        )
+        visible_glyph_required = any(
+            source_char_requires_visible_glyph(char) for char in cluster
+        )
+        output.append(
+            {
+                "logical_run_id": _logical_run_id_for(run),
+                "font_span_id": str(run.metadata.get("font_span_id") or run.run_id),
+                "span_grapheme_index": grapheme_index,
+                "source_grapheme_start": run.grapheme_start + grapheme_index,
+                "source_grapheme_end": run.grapheme_start + grapheme_index + 1,
+                "span_codepoint_start": codepoint_start,
+                "span_codepoint_end": codepoint_end,
+                "text": cluster,
+                "harfbuzz_cluster": int(anchor) if anchor is not None else None,
+                "shaped_glyph_indices": glyph_indices,
+                "visible_glyph_required": visible_glyph_required,
+                "no_ink_default_ignorable": not visible_glyph_required,
+            }
+        )
+    return output
+
+
+def _font_span_cluster_ledger(
+    runs: Sequence[InlineTextRun],
+    shaped_runs: Sequence[ShapedRun],
+) -> list[dict[str, Any]]:
+    shaped_by_run = {
+        str(item.metadata.get("run_id") or ""): item
+        for item in shaped_runs
+        if str(item.metadata.get("run_id") or "")
+    }
+    output: list[dict[str, Any]] = []
+    for run in runs:
+        shaped = shaped_by_run.get(run.run_id)
+        if shaped is not None:
+            output.extend(_shaped_source_cluster_map(run, shaped))
+            continue
+        if run.role != "space":
+            continue
+        for index, cluster in enumerate(grapheme_clusters(run.normalized_text)):
+            output.append(
+                {
+                    "logical_run_id": _logical_run_id_for(run),
+                    "font_span_id": str(run.metadata.get("font_span_id") or run.run_id),
+                    "span_grapheme_index": index,
+                    "source_grapheme_start": run.grapheme_start + index,
+                    "source_grapheme_end": run.grapheme_start + index + 1,
+                    "text": cluster,
+                    "harfbuzz_cluster": None,
+                    "shaped_glyph_indices": [],
+                    "visible_glyph_required": False,
+                    "no_ink_space": True,
+                }
+            )
+    return output
 
 
 def _unique(values: Sequence[str]) -> list[str]:
