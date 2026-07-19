@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass, field, replace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
+
+from app.render.typesetting_contracts import PunctuationToken, TextToken
 
 try:
     import regex as _regex
@@ -50,7 +52,15 @@ except Exception:  # pragma: no cover - optional until dependency install
 
 SYMBOL_CHARS = {"☆", "★", "♡", "❤", "♪"}
 LTR_COMPLEX_SCRIPTS = {"Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh", "Thai"}
-ELLIPSIS_CHARS = {"…", "︙"}
+ELLIPSIS_DOT_WEIGHTS = {
+    "…": 3,
+    "︙": 3,
+    "⋯": 3,
+    "‥": 2,
+    "︰": 2,
+}
+ELLIPSIS_CHARS = set(ELLIPSIS_DOT_WEIGHTS)
+MIDDLE_DOT_CHARS = {"・", "･"}
 DASH_CHARS = {"-", "―", "—", "─", "︱", "ー"}
 _TYPESETTING_DASH_CHARS = DASH_CHARS.difference({"ー"})
 WAVE_DASH_CHARS = {"~", "～", "〜", "〰", "︴"}
@@ -160,6 +170,12 @@ class InlineTextRun:
     language: str
     role: str
     break_class: str
+    original_text: str = ""
+    translated_start: int = 0
+    translated_end: int = 0
+    token_start: int = 0
+    token_end: int = 0
+    token_ids: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_audit_dict(self) -> dict[str, Any]:
@@ -174,6 +190,12 @@ class InlineTextRun:
             "language": self.language,
             "role": self.role,
             "break_class": self.break_class,
+            "original_text": self.original_text,
+            "translated_start": int(self.translated_start),
+            "translated_end": int(self.translated_end),
+            "token_start": int(self.token_start),
+            "token_end": int(self.token_end),
+            "token_ids": list(self.token_ids),
             "metadata": dict(self.metadata),
         }
 
@@ -302,240 +324,547 @@ def is_emoji_grapheme_cluster(cluster: str) -> bool:
     )
 
 
-def normalize_for_writing_mode(text: str, writing_mode: str, font_manager, face) -> tuple[str, list[dict], list[dict], list[dict]]:
-    value = str(text or "")
-    mode = str(writing_mode or "").lower()
-    punctuation: list[dict[str, Any]] = []
-    symbols: list[dict[str, Any]] = []
-    notes: list[dict[str, Any]] = []
-    if not mode.startswith("vert"):
-        out: list[str] = []
-        source_index = 0
-        normalized_grapheme_index = 0
-        while source_index < len(value):
-            ellipsis_source = _match_ellipsis_source_run(value, source_index)
-            if ellipsis_source:
-                normalized = _canonical_ellipsis_text(ellipsis_source)
-                punctuation.append(
-                    _punctuation_occurrence(
-                        ellipsis_source,
-                        normalized,
-                        source_index=source_index,
-                        normalized_grapheme_start=normalized_grapheme_index,
-                        occurrence_index=len(punctuation),
-                        supported=_symbol_supported(font_manager, face, normalized),
-                        candidate_forms=[normalized],
-                        supported_forms=[normalized] if _symbol_supported(font_manager, face, normalized) else [],
-                        writing_mode="horizontal",
-                    )
-                )
-                out.append(normalized)
-                normalized_grapheme_index += len(grapheme_clusters(normalized))
-                source_index += len(ellipsis_source)
-                continue
-            cluster = grapheme_clusters(value[source_index:])[0]
-            if cluster in SYMBOL_CHARS:
-                symbols.append(
-                    _symbol_occurrence(
-                        cluster,
-                        source_index=source_index,
-                        normalized_grapheme_start=normalized_grapheme_index,
-                        occurrence_index=len(symbols),
-                        font_manager=font_manager,
-                        face=face,
-                        writing_mode="horizontal",
-                    )
-                )
-            elif _is_punctuation_cluster(cluster):
-                punctuation.append(
-                    _punctuation_occurrence(
-                        cluster,
-                        cluster,
-                        source_index=source_index,
-                        normalized_grapheme_start=normalized_grapheme_index,
-                        occurrence_index=len(punctuation),
-                        supported=True,
-                        candidate_forms=[cluster],
-                        supported_forms=[cluster],
-                        writing_mode="horizontal",
-                    )
-                )
-            out.append(cluster)
-            source_index += len(cluster)
-            normalized_grapheme_index += 1
-        return "".join(out), punctuation, symbols, notes
+def build_lossless_text_tokens(
+    text: str,
+) -> list[TextToken | PunctuationToken]:
+    """Tokenize exact translated code points before presentation policy.
 
-    replacements = (
-        "！！",
-        "!!",
-        "？？",
-        "??",
-        "！？",
-        "!?",
-        "？！",
-        "?!",
-        "——",
-        "--",
-        "—",
-        "―",
-        "－",
-        "-",
-        "～",
-        "〜",
-        "〰",
-        "~",
-        "…",
-        "！",
-        "!",
-        "？",
-        "?",
-        "，",
-        ",",
-        "、",
-        "。",
-        "：",
-        ":",
-        "；",
-        ";",
-        "．",
-        ".",
-    )
-    out: list[str] = []
+    Sequence recognition is lossless: every input code point belongs to one
+    immutable token, and concatenating ``original_text`` reconstructs the
+    exact translated input.
+    """
+
+    value = str(text or "")
+    clusters = _grapheme_records(value)
+    tokens: list[TextToken | PunctuationToken] = []
+    punctuation_index = 0
+    text_index = 0
     index = 0
-    normalized_grapheme_index = 0
-    while index < len(value):
-        cluster = grapheme_clusters(value[index:])[0]
-        if cluster.isspace():
+    while index < len(clusters):
+        end, punctuation_kind = _punctuation_sequence_at(clusters, index)
+        if punctuation_kind:
+            selected = clusters[index:end]
+            original = "".join(item["text"] for item in selected)
+            dot_count = _punctuation_dot_count(original, punctuation_kind)
+            exact_multiplicity = _exact_punctuation_multiplicity(
+                original,
+                punctuation_kind,
+            )
+            unit_count = _presentation_unit_count(
+                original,
+                punctuation_kind,
+                dot_count,
+            )
+            tokens.append(
+                PunctuationToken(
+                    token_id=f"punctuation_{punctuation_index:04d}",
+                    original_text=original,
+                    translated_start=int(selected[0]["start"]),
+                    translated_end=int(selected[-1]["end"]),
+                    grapheme_start=int(selected[0]["grapheme_index"]),
+                    grapheme_end=int(selected[-1]["grapheme_index"] + 1),
+                    kind="punctuation",
+                    original_codepoints=tuple(_codepoints(original)),
+                    writing_mode="unresolved",
+                    presentation_text=original,
+                    presentation_codepoints=tuple(_codepoints(original)),
+                    presentation_grapheme_start=int(selected[0]["grapheme_index"]),
+                    presentation_grapheme_end=int(selected[-1]["grapheme_index"] + 1),
+                    atomic_break=True,
+                    orientation_policy="unresolved",
+                    render_policy="unresolved",
+                    presentation_reason="identity_frozen_before_presentation",
+                    punctuation_kind=punctuation_kind,
+                    source_class=_lossless_punctuation_source_class(
+                        original,
+                        punctuation_kind,
+                    ),
+                    exact_multiplicity=exact_multiplicity,
+                    unit_count=unit_count,
+                    dot_count=dot_count,
+                    sequence_group_count=1,
+                    candidate_forms=(original,),
+                    supported_forms=(),
+                    supported=True,
+                )
+            )
+            punctuation_index += 1
+            index = end
+            continue
+
+        item = clusters[index]
+        original = str(item["text"])
+        tokens.append(
+            TextToken(
+                token_id=f"text_{text_index:04d}",
+                original_text=original,
+                translated_start=int(item["start"]),
+                translated_end=int(item["end"]),
+                grapheme_start=int(item["grapheme_index"]),
+                grapheme_end=int(item["grapheme_index"] + 1),
+                kind=classify_grapheme(original),
+                original_codepoints=tuple(_codepoints(original)),
+                writing_mode="unresolved",
+                presentation_text=original,
+                presentation_codepoints=tuple(_codepoints(original)),
+                presentation_grapheme_start=int(item["grapheme_index"]),
+                presentation_grapheme_end=int(item["grapheme_index"] + 1),
+                atomic_break=False,
+                orientation_policy="unresolved",
+                render_policy="resolved_font_glyph",
+                presentation_reason="identity_frozen_before_presentation",
+            )
+        )
+        text_index += 1
+        index += 1
+    if tokens_original_text(tokens) != value:
+        raise RuntimeError("lossless_text_token_identity_not_conserved")
+    return tokens
+
+
+def resolve_writing_mode_presentations(
+    tokens: Sequence[TextToken | PunctuationToken],
+    *,
+    writing_mode: str,
+    font_manager,
+    face,
+) -> list[TextToken | PunctuationToken]:
+    """Attach presentation choices without mutating translated identity."""
+
+    mode = "vertical" if str(writing_mode or "").lower().startswith("vert") else "horizontal"
+    resolved: list[TextToken | PunctuationToken] = []
+    presentation_index = 0
+    for token in list(tokens or []):
+        presentation = token.original_text
+        candidate_forms = (presentation,)
+        supported_forms: tuple[str, ...] = ()
+        supported = True
+        orientation_policy = "horizontal"
+        render_policy = "resolved_font_glyph"
+        reason = "identity_presentation"
+
+        if isinstance(token, PunctuationToken):
+            presentation = _punctuation_presentation_base(token)
+            orientation_policy = _punctuation_orientation_policy(
+                token.punctuation_kind,
+                mode,
+            )
+            render_policy = _punctuation_render_policy(
+                token.punctuation_kind,
+                mode,
+            )
+            if mode == "vertical":
+                if token.punctuation_kind == "emphasis_punctuation":
+                    if (
+                        token.exact_multiplicity == 2
+                        and len(grapheme_clusters(token.original_text)) == 2
+                    ):
+                        presentation, candidate_forms, supported_forms, supported = (
+                            _resolve_vertical_punctuation_form(
+                                token.original_text,
+                                font_manager=font_manager,
+                                face=face,
+                            )
+                        )
+                    elif len(grapheme_clusters(token.original_text)) == 1:
+                        presentation, candidate_forms, supported_forms, supported = (
+                            _resolve_vertical_punctuation_form(
+                                token.original_text,
+                                font_manager=font_manager,
+                                face=face,
+                            )
+                        )
+                    else:
+                        presentation, candidate_forms, supported_forms, supported = (
+                            _resolve_each_punctuation_grapheme(
+                                _expand_emphasis_punctuation(token.original_text),
+                                font_manager=font_manager,
+                                face=face,
+                            )
+                        )
+                elif token.punctuation_kind in {"wave", "dash"}:
+                    presentation, candidate_forms, supported_forms, supported = (
+                        _resolve_each_punctuation_grapheme(
+                            token.original_text,
+                            font_manager=font_manager,
+                            face=face,
+                        )
+                    )
+                else:
+                    presentation, candidate_forms, supported_forms, supported = (
+                        _resolve_vertical_punctuation_form(
+                            presentation,
+                            font_manager=font_manager,
+                            face=face,
+                        )
+                    )
+                reason = "vertical_presentation_selected_after_identity"
+            else:
+                supported = _symbol_supported(font_manager, face, presentation)
+                supported_forms = (presentation,) if supported else ()
+                reason = "horizontal_presentation_selected_after_identity"
+            if token.punctuation_kind == "emphasis_punctuation" and token.unit_count > 1:
+                orientation_policy = "compact_horizontal_inline_axis" if mode == "vertical" else "horizontal"
+                render_policy = "shaped_compact_horizontal_sequence" if mode == "vertical" else "resolved_font_glyph"
+        elif mode == "vertical" and token.kind == "space":
+            presentation = ""
+            supported_forms = ()
+            orientation_policy = "layout_insignificant"
+            render_policy = "no_ink_space"
+            reason = "vertical_space_collapsed_after_identity"
+        elif token.kind == "symbol":
+            supported = _symbol_supported(font_manager, face, presentation)
+            supported_forms = (presentation,) if supported else ()
+            orientation_policy = "upright_resolved_face" if mode == "vertical" else "horizontal"
+
+        presentation_clusters = grapheme_clusters(presentation)
+        common = {
+            "writing_mode": mode,
+            "presentation_text": presentation,
+            "presentation_codepoints": tuple(_codepoints(presentation)),
+            "presentation_grapheme_start": presentation_index,
+            "presentation_grapheme_end": presentation_index + len(presentation_clusters),
+            "orientation_policy": orientation_policy,
+            "render_policy": render_policy,
+            "presentation_reason": reason,
+        }
+        if isinstance(token, PunctuationToken):
+            resolved.append(
+                replace(
+                    token,
+                    **common,
+                    candidate_forms=tuple(candidate_forms),
+                    supported_forms=tuple(supported_forms),
+                    supported=bool(supported),
+                )
+            )
+        else:
+            resolved.append(replace(token, **common))
+        presentation_index += len(presentation_clusters)
+    if tokens_original_text(resolved) != tokens_original_text(tokens):
+        raise RuntimeError("lossless_text_token_identity_changed_by_presentation")
+    return resolved
+
+
+def tokens_original_text(
+    tokens: Sequence[TextToken | PunctuationToken],
+) -> str:
+    return "".join(str(item.original_text) for item in list(tokens or []))
+
+
+def tokens_presentation_text(
+    tokens: Sequence[TextToken | PunctuationToken],
+) -> str:
+    return "".join(str(item.presentation_text) for item in list(tokens or []))
+
+
+def punctuation_occurrences_from_tokens(
+    tokens: Sequence[TextToken | PunctuationToken],
+) -> list[dict[str, Any]]:
+    return [
+        _punctuation_token_occurrence(item)
+        for item in list(tokens or [])
+        if isinstance(item, PunctuationToken)
+    ]
+
+
+def symbol_occurrences_from_tokens(
+    tokens: Sequence[TextToken | PunctuationToken],
+    *,
+    font_manager,
+    face,
+) -> list[dict[str, Any]]:
+    symbols: list[dict[str, Any]] = []
+    for token in list(tokens or []):
+        if isinstance(token, PunctuationToken) or token.kind != "symbol":
+            continue
+        symbols.append(
+            {
+                "occurrence_id": f"symbol_{len(symbols):04d}",
+                "token_id": token.token_id,
+                "symbol": token.original_text,
+                "source": token.original_text,
+                "normalized": token.presentation_text,
+                "source_codepoints": list(token.original_codepoints),
+                "normalized_codepoints": list(token.presentation_codepoints),
+                "source_start": int(token.translated_start),
+                "source_end": int(token.translated_end),
+                "normalized_grapheme_start": int(token.presentation_grapheme_start),
+                "normalized_grapheme_end": int(token.presentation_grapheme_end),
+                "writing_mode": token.writing_mode,
+                "kind": "symbol",
+                "source_class": _symbol_class(token.original_text),
+                "orientation_policy": token.orientation_policy,
+                "render_policy": token.render_policy,
+                "supported": _symbol_supported(font_manager, face, token.presentation_text),
+            }
+        )
+    return symbols
+
+
+def presentation_notes_from_tokens(
+    tokens: Sequence[TextToken | PunctuationToken],
+) -> list[dict[str, Any]]:
+    notes: list[dict[str, Any]] = []
+    for token in list(tokens or []):
+        if token.presentation_reason == "vertical_space_collapsed_after_identity":
             notes.append(
                 {
                     "type": "vertical_space_collapsed",
-                    "source": cluster,
-                    "source_index": index,
+                    "token_id": token.token_id,
+                    "source": token.original_text,
+                    "source_index": int(token.translated_start),
                     "reason": "layout_insignificant_vertical_space",
                 }
             )
-            index += len(cluster)
-            continue
-        ellipsis_source = _match_ellipsis_source_run(value, index)
-        if ellipsis_source:
-            canonical = _canonical_ellipsis_text(ellipsis_source)
-            support = font_manager.vertical_punctuation_support(face, canonical)
-            normalized = support.selected_form or canonical
-            punctuation.append(
-                _punctuation_occurrence(
-                    ellipsis_source,
-                    normalized,
-                    source_index=index,
-                    normalized_grapheme_start=normalized_grapheme_index,
-                    occurrence_index=len(punctuation),
-                    supported=bool(support.supported),
-                    candidate_forms=list(support.candidate_forms),
-                    supported_forms=list(support.supported_forms),
-                    writing_mode="vertical",
-                )
-            )
-            out.append(normalized)
-            normalized_grapheme_index += len(grapheme_clusters(normalized))
-            index += len(ellipsis_source)
-            continue
-        emphasis_source = _match_emphasis_source_run(value, index)
-        expanded_emphasis = _expand_emphasis_punctuation(emphasis_source)
-        if len(expanded_emphasis) >= 3:
-            normalized_parts: list[str] = []
-            all_supported = True
-            for source_symbol in expanded_emphasis:
-                support = font_manager.vertical_punctuation_support(face, source_symbol)
-                normalized_parts.append(support.selected_form or source_symbol)
-                all_supported = all_supported and bool(support.supported)
-            normalized = "".join(normalized_parts)
-            emphasis_occurrence = _punctuation_occurrence(
-                emphasis_source,
-                normalized,
-                source_index=index,
-                normalized_grapheme_start=normalized_grapheme_index,
-                occurrence_index=len(punctuation),
-                supported=all_supported,
-                candidate_forms=[normalized],
-                supported_forms=[normalized] if all_supported else [],
-                writing_mode="vertical",
-            )
-            emphasis_occurrence.update(
-                {
-                    "orientation_policy": "compact_horizontal_inline_axis",
-                    "render_policy": "shaped_compact_horizontal_sequence",
-                }
-            )
-            punctuation.append(emphasis_occurrence)
+        if (
+            isinstance(token, PunctuationToken)
+            and token.punctuation_kind == "emphasis_punctuation"
+            and token.writing_mode == "vertical"
+            and token.unit_count >= 3
+        ):
             notes.append(
                 {
                     "type": "vertical_emphasis_run_normalized",
-                    "source": emphasis_source,
-                    "normalized": normalized,
-                    "source_index": index,
-                    "unit_count": len(expanded_emphasis),
-                    "sequence_group_count": 1,
+                    "token_id": token.token_id,
+                    "source": token.original_text,
+                    "normalized": token.presentation_text,
+                    "source_index": int(token.translated_start),
+                    "unit_count": int(token.unit_count),
+                    "sequence_group_count": int(token.sequence_group_count),
                     "reason": "preserve_complete_emphasis_run_for_atomic_inline_composition",
                 }
             )
-            out.append(normalized)
-            normalized_grapheme_index += len(grapheme_clusters(normalized))
-            index += len(emphasis_source)
-            continue
-        matched = ""
-        for source in replacements:
-            if value.startswith(source, index):
-                matched = source
-                break
-        if matched:
-            support = font_manager.vertical_punctuation_support(face, matched)
-            normalized = support.selected_form or matched
-            punctuation.append(
-                _punctuation_occurrence(
-                    matched,
-                    normalized,
-                    source_index=index,
-                    normalized_grapheme_start=normalized_grapheme_index,
-                    occurrence_index=len(punctuation),
-                    supported=bool(support.supported),
-                    candidate_forms=list(support.candidate_forms),
-                    supported_forms=list(support.supported_forms),
-                    writing_mode="vertical",
-                )
+    return notes
+
+
+def normalize_for_writing_mode(
+    text: str,
+    writing_mode: str,
+    font_manager,
+    face,
+) -> tuple[str, list[dict], list[dict], list[dict]]:
+    """Compatibility view derived from the sole lossless token path."""
+
+    tokens = resolve_writing_mode_presentations(
+        build_lossless_text_tokens(text),
+        writing_mode=writing_mode,
+        font_manager=font_manager,
+        face=face,
+    )
+    return (
+        tokens_presentation_text(tokens),
+        punctuation_occurrences_from_tokens(tokens),
+        symbol_occurrences_from_tokens(tokens, font_manager=font_manager, face=face),
+        presentation_notes_from_tokens(tokens),
+    )
+
+
+def _grapheme_records(text: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    offset = 0
+    for grapheme_index, cluster in enumerate(grapheme_clusters(text)):
+        records.append(
+            {
+                "text": cluster,
+                "start": offset,
+                "end": offset + len(cluster),
+                "grapheme_index": grapheme_index,
+            }
+        )
+        offset += len(cluster)
+    return records
+
+
+def _punctuation_sequence_at(
+    records: Sequence[Mapping[str, Any]],
+    index: int,
+) -> tuple[int, str]:
+    if index < 0 or index >= len(records):
+        return index, ""
+    cluster = str(records[index].get("text") or "")
+    if cluster == ".":
+        end = index
+        while end < len(records) and str(records[end].get("text") or "") == ".":
+            end += 1
+        if end - index >= 3:
+            return end, "ellipsis"
+    if cluster in ELLIPSIS_DOT_WEIGHTS:
+        end = index + 1
+        while end < len(records) and str(records[end].get("text") or "") in ELLIPSIS_DOT_WEIGHTS:
+            end += 1
+        return end, "ellipsis"
+    if cluster in MIDDLE_DOT_CHARS:
+        end = index + 1
+        while end < len(records) and str(records[end].get("text") or "") in MIDDLE_DOT_CHARS:
+            end += 1
+        return (end, "ellipsis") if end - index > 1 else (end, "middle_dot")
+    if cluster in COMPACT_VERTICAL_PUNCTUATION_CHARS:
+        end = index + 1
+        while end < len(records) and str(records[end].get("text") or "") in COMPACT_VERTICAL_PUNCTUATION_CHARS:
+            end += 1
+        return end, "emphasis_punctuation"
+    if cluster in _TYPESETTING_DASH_CHARS:
+        end = index + 1
+        while end < len(records) and str(records[end].get("text") or "") == cluster:
+            end += 1
+        return end, "dash"
+    if cluster in WAVE_DASH_CHARS:
+        end = index + 1
+        while end < len(records) and str(records[end].get("text") or "") == cluster:
+            end += 1
+        return end, "wave"
+    kind = classify_grapheme(cluster)
+    if kind in {"open_punctuation", "close_punctuation", "punctuation"}:
+        return index + 1, kind
+    return index, ""
+
+
+def _punctuation_dot_count(source: str, punctuation_kind: str) -> int:
+    if punctuation_kind != "ellipsis":
+        return 0
+    value = str(source or "")
+    if value and all(char == "." for char in value):
+        return len(value)
+    if value and all(char in MIDDLE_DOT_CHARS for char in value):
+        return len(grapheme_clusters(value))
+    return sum(ELLIPSIS_DOT_WEIGHTS.get(char, 0) for char in value)
+
+
+def _exact_punctuation_multiplicity(source: str, punctuation_kind: str) -> int:
+    if punctuation_kind == "emphasis_punctuation":
+        return max(
+            1,
+            sum(
+                EMPHASIS_PUNCTUATION_UNIT_COUNTS.get(cluster, 1)
+                for cluster in grapheme_clusters(source)
+            ),
+        )
+    return max(1, len(grapheme_clusters(source)))
+
+
+def _presentation_unit_count(
+    source: str,
+    punctuation_kind: str,
+    dot_count: int,
+) -> int:
+    if punctuation_kind == "ellipsis":
+        return max(1, (int(dot_count) + 2) // 3)
+    if punctuation_kind == "emphasis_punctuation":
+        return _exact_punctuation_multiplicity(source, punctuation_kind)
+    return max(1, len(grapheme_clusters(source)))
+
+
+def _lossless_punctuation_source_class(source: str, punctuation_kind: str) -> str:
+    value = str(source or "")
+    if punctuation_kind == "ellipsis":
+        if value and all(char == "." for char in value):
+            return "ascii_dot_ellipsis_sequence"
+        if value and all(char in MIDDLE_DOT_CHARS for char in value):
+            return "middle_dot_ellipsis_sequence"
+        if value and all(char in ELLIPSIS_DOT_WEIGHTS for char in value):
+            return "unicode_ellipsis_sequence"
+        return "mixed_ellipsis_sequence"
+    if punctuation_kind == "middle_dot":
+        return "fullwidth_middle_dot" if value == "・" else "halfwidth_middle_dot"
+    if punctuation_kind == "wave":
+        return {
+            "~": "ascii_tilde",
+            "～": "fullwidth_tilde",
+            "〜": "wave_dash",
+            "〰": "wavy_dash",
+            "︴": "vertical_wavy_line",
+        }.get(value[:1], "mixed_wave_sequence")
+    if punctuation_kind == "dash":
+        return "dash_sequence"
+    if punctuation_kind in {"open_punctuation", "close_punctuation"}:
+        return punctuation_kind
+    if punctuation_kind == "emphasis_punctuation":
+        return "emphasis_punctuation_sequence"
+    return "punctuation"
+
+
+def _punctuation_presentation_base(token: PunctuationToken) -> str:
+    if token.punctuation_kind != "ellipsis":
+        return token.original_text
+    if token.source_class == "ascii_dot_ellipsis_sequence":
+        full_units, remainder = divmod(int(token.dot_count), 3)
+        return ("…" * full_units) + ("." * remainder)
+    return token.original_text
+
+
+def _resolve_vertical_punctuation_form(
+    source: str,
+    *,
+    font_manager,
+    face,
+) -> tuple[str, tuple[str, ...], tuple[str, ...], bool]:
+    try:
+        support = font_manager.vertical_punctuation_support(face, source)
+        candidates = tuple(str(item) for item in support.candidate_forms)
+        supported_forms = tuple(str(item) for item in support.supported_forms)
+        selected = str(support.selected_form or source)
+        return selected, candidates or (source,), supported_forms, bool(support.supported)
+    except Exception:
+        return source, (source,), (), False
+
+
+def _resolve_each_punctuation_grapheme(
+    source: str,
+    *,
+    font_manager,
+    face,
+) -> tuple[str, tuple[str, ...], tuple[str, ...], bool]:
+    selected: list[str] = []
+    supported = True
+    for cluster in grapheme_clusters(source):
+        form, _candidates, supported_forms, cluster_supported = (
+            _resolve_vertical_punctuation_form(
+                cluster,
+                font_manager=font_manager,
+                face=face,
             )
-            out.append(normalized)
-            normalized_grapheme_index += len(grapheme_clusters(normalized))
-            index += len(matched)
-            continue
-        if cluster in SYMBOL_CHARS:
-            symbols.append(
-                _symbol_occurrence(
-                    cluster,
-                    source_index=index,
-                    normalized_grapheme_start=normalized_grapheme_index,
-                    occurrence_index=len(symbols),
-                    font_manager=font_manager,
-                    face=face,
-                    writing_mode="vertical",
-                )
-            )
-        elif _is_punctuation_cluster(cluster):
-            punctuation.append(
-                _punctuation_occurrence(
-                    cluster,
-                    cluster,
-                    source_index=index,
-                    normalized_grapheme_start=normalized_grapheme_index,
-                    occurrence_index=len(punctuation),
-                    supported=_symbol_supported(font_manager, face, cluster),
-                    candidate_forms=[cluster],
-                    supported_forms=[cluster] if _symbol_supported(font_manager, face, cluster) else [],
-                    writing_mode="vertical",
-                )
-            )
-        out.append(cluster)
-        normalized_grapheme_index += 1
-        index += len(cluster)
-    return "".join(out), punctuation, symbols, notes
+        )
+        selected.append(form or cluster)
+        supported = supported and bool(cluster_supported)
+        if not supported_forms:
+            supported = False
+    presentation = "".join(selected)
+    return (
+        presentation,
+        (presentation,),
+        (presentation,) if supported else (),
+        supported,
+    )
+
+
+def _punctuation_token_occurrence(token: PunctuationToken) -> dict[str, Any]:
+    record = {
+        "occurrence_id": token.token_id,
+        "token_id": token.token_id,
+        "source": token.original_text,
+        "normalized": token.presentation_text,
+        "source_codepoints": list(token.original_codepoints),
+        "normalized_codepoints": list(token.presentation_codepoints),
+        "source_start": int(token.translated_start),
+        "source_end": int(token.translated_end),
+        "normalized_grapheme_start": int(token.presentation_grapheme_start),
+        "normalized_grapheme_end": int(token.presentation_grapheme_end),
+        "writing_mode": token.writing_mode,
+        "kind": token.punctuation_kind,
+        "source_class": token.source_class,
+        "orientation_policy": token.orientation_policy,
+        "render_policy": token.render_policy,
+        "exact_multiplicity": int(token.exact_multiplicity),
+        "unit_count": int(token.unit_count),
+        "supported": bool(token.supported),
+        "candidate_forms": list(token.candidate_forms),
+        "supported_forms": list(token.supported_forms),
+        "sequence_group_count": int(token.sequence_group_count),
+    }
+    if token.dot_count:
+        record["dot_count"] = int(token.dot_count)
+    return record
 
 
 def classify_grapheme(text: str) -> str:
@@ -578,71 +907,118 @@ def classify_grapheme(text: str) -> str:
 
 
 def segment_inline_runs(
-    text: str,
+    text: str | Sequence[TextToken | PunctuationToken],
     *,
     writing_mode: str,
     language_hint: str = "",
     punctuation_occurrences: Sequence[dict[str, Any]] | None = None,
     symbol_occurrences: Sequence[dict[str, Any]] | None = None,
 ) -> list[InlineTextRun]:
-    clusters = grapheme_clusters(text)
+    if isinstance(text, str):
+        tokens: list[TextToken | PunctuationToken] = build_lossless_text_tokens(text)
+    else:
+        tokens = list(text or [])
+        if not all(isinstance(item, (TextToken, PunctuationToken)) for item in tokens):
+            raise TypeError("segment_inline_runs_requires_text_or_lossless_tokens")
     runs: list[InlineTextRun] = []
     index = 0
-    while index < len(clusters):
-        cluster = clusters[index]
-        kind = classify_grapheme(cluster)
+    while index < len(tokens):
+        token = tokens[index]
+        kind = _token_break_class(token)
         start = index
-        group = [cluster]
-        text_value = "".join(group)
-        if kind in {"latin", "number"}:
-            while index + 1 < len(clusters):
-                next_kind = classify_grapheme(clusters[index + 1])
+        group: list[TextToken | PunctuationToken] = [token]
+        text_value = token.presentation_text
+        if isinstance(token, PunctuationToken) and token.punctuation_kind in {"wave", "dash"}:
+            while index + 1 < len(tokens):
+                next_token = tokens[index + 1]
+                if not (
+                    isinstance(next_token, PunctuationToken)
+                    and next_token.punctuation_kind == token.punctuation_kind
+                ):
+                    break
+                group.append(next_token)
+                index += 1
+        elif not isinstance(token, PunctuationToken) and kind in {"latin", "number"}:
+            while index + 1 < len(tokens):
+                next_token = tokens[index + 1]
+                if isinstance(next_token, PunctuationToken):
+                    break
+                next_kind = _token_break_class(next_token)
                 if next_kind not in {kind, "format_control"}:
                     break
-                group.append(clusters[index + 1])
+                group.append(next_token)
                 index += 1
-        elif kind in {"ellipsis", "dash", "wave"}:
-            while index + 1 < len(clusters) and classify_grapheme(clusters[index + 1]) == kind:
-                group.append(clusters[index + 1])
-                index += 1
-        elif _is_compact_vertical_punctuation_char(cluster):
-            while index + 1 < len(clusters) and _is_compact_vertical_punctuation_char(clusters[index + 1]):
-                group.append(clusters[index + 1])
-                index += 1
-        elif kind in {"rtl", "complex"}:
+        elif not isinstance(token, PunctuationToken) and kind in {"rtl", "complex"}:
             script = _script_for_run(text_value, kind)
-            while index + 1 < len(clusters):
-                next_kind = classify_grapheme(clusters[index + 1])
+            while index + 1 < len(tokens):
+                next_token = tokens[index + 1]
+                if isinstance(next_token, PunctuationToken):
+                    break
+                next_kind = _token_break_class(next_token)
                 if next_kind == "format_control":
-                    group.append(clusters[index + 1])
-                    text_value = "".join(group)
+                    group.append(next_token)
+                    text_value = "".join(item.presentation_text for item in group)
                     index += 1
                     continue
-                next_script = _script_for_run(clusters[index + 1], next_kind)
+                next_script = _script_for_run(next_token.presentation_text, next_kind)
                 if next_kind != kind or next_script != script:
                     break
-                group.append(clusters[index + 1])
-                text_value = "".join(group)
+                group.append(next_token)
+                text_value = "".join(item.presentation_text for item in group)
                 index += 1
-        text_value = "".join(group)
+        text_value = "".join(item.presentation_text for item in group)
+        original_text = "".join(item.original_text for item in group)
         script = _script_for_run(text_value, kind)
         direction = _direction_for_script(script)
-        role = _role_for_kind(kind, text_value)
-        metadata: dict[str, Any] = {}
+        role = _role_for_token_group(kind, group, text_value)
+        presentation_start = int(group[0].presentation_grapheme_start)
+        presentation_end = int(group[-1].presentation_grapheme_end)
+        metadata: dict[str, Any] = {
+            "token_ids": [item.token_id for item in group],
+            "lossless_tokens": [item.to_audit_dict() for item in group],
+            "original_text": original_text,
+            "translated_start": int(group[0].translated_start),
+            "translated_end": int(group[-1].translated_end),
+            "atomic_break": bool(group and all(item.atomic_break for item in group)),
+        }
         if role == "latin_word":
             metadata["letter_stacking_allowed"] = False
         if direction == "rtl" and _bidi_get_display is not None:
             metadata["bidi_visual_text"] = _bidi_get_display(text_value)
-        punctuation_evidence = _occurrences_for_span(
-            punctuation_occurrences,
-            start,
-            index + 1,
-        )
-        symbol_evidence = _occurrences_for_span(
-            symbol_occurrences,
-            start,
-            index + 1,
-        )
+        punctuation_evidence = [
+            _punctuation_token_occurrence(item)
+            for item in group
+            if isinstance(item, PunctuationToken)
+        ]
+        symbol_evidence = [
+            {
+                "token_id": item.token_id,
+                "symbol": item.original_text,
+                "source": item.original_text,
+                "normalized": item.presentation_text,
+                "source_codepoints": list(item.original_codepoints),
+                "normalized_codepoints": list(item.presentation_codepoints),
+                "source_start": int(item.translated_start),
+                "source_end": int(item.translated_end),
+                "normalized_grapheme_start": int(item.presentation_grapheme_start),
+                "normalized_grapheme_end": int(item.presentation_grapheme_end),
+                "kind": "symbol",
+            }
+            for item in group
+            if not isinstance(item, PunctuationToken) and item.kind == "symbol"
+        ]
+        if not punctuation_evidence and isinstance(text, str):
+            punctuation_evidence = _occurrences_for_span(
+                punctuation_occurrences,
+                presentation_start,
+                presentation_end,
+            )
+        if not symbol_evidence and isinstance(text, str):
+            symbol_evidence = _occurrences_for_span(
+                symbol_occurrences,
+                presentation_start,
+                presentation_end,
+            )
         if punctuation_evidence:
             metadata["punctuation_occurrences"] = punctuation_evidence
         if symbol_evidence:
@@ -652,18 +1028,67 @@ def segment_inline_runs(
                 run_id=f"run_{len(runs):04d}",
                 text=text_value,
                 normalized_text=text_value,
-                grapheme_start=start,
-                grapheme_end=index + 1,
+                grapheme_start=presentation_start,
+                grapheme_end=presentation_end,
                 script=script,
                 direction=direction,
                 language=_language_for_script(script, language_hint),
                 role=role,
                 break_class=kind,
+                original_text=original_text,
+                translated_start=int(group[0].translated_start),
+                translated_end=int(group[-1].translated_end),
+                token_start=start,
+                token_end=index + 1,
+                token_ids=tuple(item.token_id for item in group),
                 metadata=metadata,
             )
         )
         index += 1
     return _coalesce_format_control_runs(runs)
+
+
+def _token_break_class(token: TextToken | PunctuationToken) -> str:
+    if isinstance(token, PunctuationToken):
+        if token.punctuation_kind in {"ellipsis", "dash", "wave"}:
+            return token.punctuation_kind
+        if (
+            token.punctuation_kind == "emphasis_punctuation"
+            and len(grapheme_clusters(token.original_text)) == 1
+            and token.original_text in CLOSE_PUNCTUATION
+        ):
+            return "close_punctuation"
+        if token.punctuation_kind in {"open_punctuation", "close_punctuation"}:
+            return token.punctuation_kind
+        return "punctuation"
+    if token.kind == "space" or (
+        not token.presentation_text and token.original_text.isspace()
+    ):
+        return "space"
+    return token.kind or classify_grapheme(token.presentation_text)
+
+
+def _role_for_token_group(
+    kind: str,
+    group: Sequence[TextToken | PunctuationToken],
+    presentation_text: str,
+) -> str:
+    if group and all(isinstance(item, PunctuationToken) for item in group):
+        token = group[0]
+        if token.punctuation_kind == "ellipsis":
+            return "ellipsis_sequence"
+        if token.punctuation_kind == "dash":
+            return "dash_sequence"
+        if token.punctuation_kind == "wave":
+            return "wave_sequence"
+        if token.punctuation_kind == "emphasis_punctuation":
+            return (
+                "punctuation_sequence"
+                if len(grapheme_clusters(token.original_text)) > 1
+                else "close_punctuation"
+            )
+        return token.punctuation_kind
+    return _role_for_kind(kind, presentation_text)
 
 
 def _coalesce_format_control_runs(runs: Sequence[InlineTextRun]) -> list[InlineTextRun]:
@@ -679,9 +1104,20 @@ def _coalesce_format_control_runs(runs: Sequence[InlineTextRun]) -> list[InlineT
                     previous,
                     text=previous.text + run.text,
                     normalized_text=previous.normalized_text + run.normalized_text,
+                    original_text=previous.original_text + run.original_text,
+                    translated_end=run.translated_end,
                     grapheme_end=run.grapheme_end,
+                    token_end=run.token_end,
+                    token_ids=previous.token_ids + run.token_ids,
                     metadata={
                         **dict(previous.metadata),
+                        "token_ids": [*previous.token_ids, *run.token_ids],
+                        "lossless_tokens": [
+                            *list(previous.metadata.get("lossless_tokens") or []),
+                            *list(run.metadata.get("lossless_tokens") or []),
+                        ],
+                        "original_text": previous.original_text + run.original_text,
+                        "translated_end": run.translated_end,
                         "attached_default_ignorable_text": (
                             str(previous.metadata.get("attached_default_ignorable_text") or "")
                             + run.text
@@ -697,9 +1133,29 @@ def _coalesce_format_control_runs(runs: Sequence[InlineTextRun]) -> list[InlineT
                 run,
                 text=prefix + run.text,
                 normalized_text=prefix + run.normalized_text,
+                original_text="".join(item.original_text for item in pending) + run.original_text,
+                translated_start=pending[0].translated_start,
                 grapheme_start=pending[0].grapheme_start,
+                token_start=pending[0].token_start,
+                token_ids=tuple(
+                    token_id
+                    for item in [*pending, run]
+                    for token_id in item.token_ids
+                ),
                 metadata={
                     **dict(run.metadata),
+                    "token_ids": [
+                        token_id
+                        for item in [*pending, run]
+                        for token_id in item.token_ids
+                    ],
+                    "lossless_tokens": [
+                        token
+                        for item in [*pending, run]
+                        for token in list(item.metadata.get("lossless_tokens") or [])
+                    ],
+                    "original_text": "".join(item.original_text for item in pending) + run.original_text,
+                    "translated_start": pending[0].translated_start,
                     "attached_default_ignorable_text": prefix,
                 },
             )
@@ -760,80 +1216,6 @@ def _symbol_supported(font_manager, face, symbol: str) -> bool:
         return False
 
 
-def _symbol_occurrence(
-    symbol: str,
-    *,
-    source_index: int,
-    normalized_grapheme_start: int,
-    occurrence_index: int,
-    font_manager,
-    face,
-    writing_mode: str,
-) -> dict[str, Any]:
-    supported = _symbol_supported(font_manager, face, symbol)
-    return {
-        "occurrence_id": f"symbol_{occurrence_index:04d}",
-        "symbol": symbol,
-        "source": symbol,
-        "normalized": symbol,
-        "source_codepoints": _codepoints(symbol),
-        "normalized_codepoints": _codepoints(symbol),
-        "source_start": int(source_index),
-        "source_end": int(source_index + len(symbol)),
-        "normalized_grapheme_start": int(normalized_grapheme_start),
-        "normalized_grapheme_end": int(normalized_grapheme_start + 1),
-        "writing_mode": writing_mode,
-        "kind": "symbol",
-        "source_class": _symbol_class(symbol),
-        "orientation_policy": "upright_resolved_face" if writing_mode == "vertical" else "horizontal",
-        "render_policy": "resolved_font_glyph",
-        "supported": bool(supported),
-    }
-
-
-def _punctuation_occurrence(
-    source: str,
-    normalized: str,
-    *,
-    source_index: int,
-    normalized_grapheme_start: int,
-    occurrence_index: int,
-    supported: bool,
-    candidate_forms: Sequence[str],
-    supported_forms: Sequence[str],
-    writing_mode: str,
-) -> dict[str, Any]:
-    kind = _punctuation_kind(source)
-    normalized_count = len(grapheme_clusters(normalized))
-    unit_count = _punctuation_unit_count(source, normalized, kind)
-    record = {
-        "occurrence_id": f"punctuation_{occurrence_index:04d}",
-        "source": source,
-        "normalized": normalized,
-        "source_codepoints": _codepoints(source),
-        "normalized_codepoints": _codepoints(normalized),
-        "source_start": int(source_index),
-        "source_end": int(source_index + len(source)),
-        "normalized_grapheme_start": int(normalized_grapheme_start),
-        "normalized_grapheme_end": int(normalized_grapheme_start + normalized_count),
-        "writing_mode": writing_mode,
-        "kind": kind,
-        "source_class": _punctuation_source_class(source, kind),
-        "orientation_policy": _punctuation_orientation_policy(kind, writing_mode),
-        "render_policy": _punctuation_render_policy(kind, writing_mode),
-        "unit_count": unit_count,
-        "supported": bool(supported),
-        "candidate_forms": list(candidate_forms),
-        "supported_forms": list(supported_forms),
-    }
-    if kind == "ellipsis":
-        record["dot_count"] = int(unit_count * 3)
-        record["sequence_group_count"] = 1
-    elif kind == "emphasis_punctuation" and unit_count > 1:
-        record["sequence_group_count"] = 1
-    return record
-
-
 def _occurrences_for_span(
     occurrences: Sequence[dict[str, Any]] | None,
     start: int,
@@ -848,63 +1230,6 @@ def _occurrences_for_span(
         if item_start < end and item_end > start:
             result.append(dict(item))
     return result
-
-
-def _is_punctuation_cluster(cluster: str) -> bool:
-    return bool(cluster) and (
-        classify_grapheme(cluster) in {
-            "ellipsis",
-            "dash",
-            "wave",
-            "punctuation",
-            "open_punctuation",
-            "close_punctuation",
-        }
-        or unicodedata.category(cluster[0]).startswith("P")
-    )
-
-
-def _punctuation_kind(source: str) -> str:
-    if _ellipsis_source_unit_count(source) > 0:
-        return "ellipsis"
-    if _is_dash_sequence(source):
-        return "dash"
-    if _is_wave_sequence(source):
-        return "wave"
-    if source and all(char in COMPACT_VERTICAL_PUNCTUATION_CHARS for char in source):
-        return "emphasis_punctuation"
-    if source in OPEN_PUNCTUATION:
-        return "open_punctuation"
-    if source in CLOSE_PUNCTUATION:
-        return "close_punctuation"
-    return "punctuation"
-
-
-def _punctuation_source_class(source: str, kind: str) -> str:
-    if kind == "wave":
-        return {
-            "~": "ascii_tilde",
-            "～": "fullwidth_tilde",
-            "〜": "wave_dash",
-            "〰": "wavy_dash",
-            "︴": "vertical_wavy_line",
-        }.get(source[:1], "mixed_wave_sequence")
-    if kind == "ellipsis":
-        if source and all(char == "." for char in source):
-            units = _ellipsis_source_unit_count(source)
-            if units == 1:
-                return "ascii_three_dot_ellipsis"
-            if units == 2:
-                return "ascii_six_dot_ellipsis"
-            return "ascii_multi_unit_ellipsis"
-        if _is_ellipsis_sequence(source):
-            return "unicode_ellipsis"
-        return "mixed_ellipsis_sequence"
-    if kind == "dash":
-        return "dash_sequence"
-    if kind in {"open_punctuation", "close_punctuation"}:
-        return kind
-    return "punctuation"
 
 
 def _punctuation_orientation_policy(kind: str, writing_mode: str) -> str:
@@ -929,22 +1254,6 @@ def _punctuation_render_policy(kind: str, writing_mode: str) -> str:
     if kind in {"open_punctuation", "close_punctuation"}:
         return "font_vertical_alternate"
     return "resolved_vertical_form_glyph"
-
-
-def _punctuation_unit_count(source: str, normalized: str, kind: str) -> int:
-    if kind == "ellipsis":
-        source_units = _ellipsis_source_unit_count(source)
-        if source_units > 0:
-            return source_units
-        return max(1, len([char for char in normalized if char in ELLIPSIS_CHARS]))
-    if kind in {"wave", "dash"}:
-        return max(1, len(grapheme_clusters(normalized)))
-    if kind == "emphasis_punctuation":
-        return max(
-            1,
-            sum(EMPHASIS_PUNCTUATION_UNIT_COUNTS.get(char, 1) for char in str(source or "")),
-        )
-    return 1
 
 
 def _codepoints(text: str) -> list[str]:
@@ -1002,58 +1311,6 @@ def _is_ellipsis_sequence(text: str) -> bool:
     return bool(text) and all(char in ELLIPSIS_CHARS for char in text)
 
 
-def _ellipsis_source_unit_count(text: str) -> int:
-    value = str(text or "")
-    if not value:
-        return 0
-    units = 0
-    index = 0
-    while index < len(value):
-        char = value[index]
-        if char in ELLIPSIS_CHARS:
-            units += 1
-            index += 1
-            continue
-        if value.startswith("...", index):
-            units += 1
-            index += 3
-            continue
-        return 0
-    return units
-
-
-def _canonical_ellipsis_text(source: str) -> str:
-    return "…" * max(1, _ellipsis_source_unit_count(source))
-
-
-def _match_ellipsis_source_run(text: str, start: int) -> str:
-    value = str(text or "")
-    index = max(0, int(start))
-    end = index
-    units = 0
-    while end < len(value):
-        if value[end] in ELLIPSIS_CHARS:
-            units += 1
-            end += 1
-            continue
-        if value[end] == ".":
-            dot_end = end
-            while dot_end < len(value) and value[dot_end] == ".":
-                dot_end += 1
-            complete_length = ((dot_end - end) // 3) * 3
-            if complete_length <= 0:
-                break
-            units += complete_length // 3
-            end += complete_length
-            if end < dot_end:
-                break
-            continue
-        break
-    if units <= 0:
-        return ""
-    return value[index:end]
-
-
 def _is_dash_sequence(text: str) -> bool:
     return bool(text) and all(char in _TYPESETTING_DASH_CHARS for char in text)
 
@@ -1069,15 +1326,6 @@ def _is_compact_vertical_punctuation_char(text: str) -> bool:
 def _is_compact_vertical_punctuation_sequence(text: str) -> bool:
     clusters = grapheme_clusters(text)
     return len(clusters) > 1 and all(_is_compact_vertical_punctuation_char(cluster) for cluster in clusters)
-
-
-def _match_emphasis_source_run(value: str, index: int) -> str:
-    matched: list[str] = []
-    for cluster in grapheme_clusters(str(value or "")[index:]):
-        if cluster not in COMPACT_VERTICAL_PUNCTUATION_CHARS:
-            break
-        matched.append(cluster)
-    return "".join(matched)
 
 
 def _expand_emphasis_punctuation(source: str) -> str:

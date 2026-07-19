@@ -139,6 +139,10 @@ class FreeTypeGlyphRasterizer:
         selected = _select_glyph_sequence(shaped_glyphs, requested)
         if selected is None:
             return _failure(base_audit, "raster_glyph_sequence_mismatch")
+        if any(_as_int(item, -1) == 0 for item in requested) or any(
+            _as_int(item.get("glyph_id"), -1) == 0 for item in selected
+        ):
+            return _failure(base_audit, "raster_notdef_glyph_forbidden")
 
         try:
             face = self._face(font_path)

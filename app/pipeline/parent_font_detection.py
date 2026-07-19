@@ -15,7 +15,7 @@ import os
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -27,11 +27,22 @@ from app.models.resolution import (
 )
 from app.pipeline.parent_execution_bundle import (
     PARENT_RENDER_STYLE_VERSION,
+    PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY,
     PARENT_STYLE_ARBITRATOR_PROVIDER,
     PARENT_STYLE_ARBITRATOR_SOURCE,
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE,
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE_AUTHORITY,
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE_MAX,
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE_MIN,
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY,
+    validate_resolved_render_style,
 )
 from app.pipeline.parent_style_evidence import (
     AuthorizedSourceStyleView,
+    EXTERNAL_SOURCE_SURFACE_RING_VERSION,
+    SOURCE_STYLE_AXES,
+    SourceTextFootprint,
+    SourceStyleAxisEvidence,
     build_authorized_style_observation_inputs,
 )
 
@@ -50,6 +61,19 @@ PERCEPTUAL_STYLE_RESOLUTION_VERSION = "parent_style_perceptual_axis_resolution_v
 PERCEPTUAL_STYLE_PROVENANCE = "cleanup_mask_authorized_source_style_view_v1"
 PERCEPTUAL_STYLE_FACT_SET_PREFIX = "authorized_perceptual_fact_set_v1:"
 PERCEPTUAL_STYLE_AXES = ("fill", "outline", "shadow", "rotation")
+CORE_STYLE_AXES = ("family", "weight", "scale", "fill", "outline", "orientation")
+PEER_ASSIST_AXES = ("family", "weight", "orientation", "scale")
+DIRECT_AXIS_MIN_CONFIDENCE = 0.20
+DIRECT_PAINT_MIN_CONFIDENCE = 0.20
+DIRECT_OUTLINE_MIN_CONFIDENCE = 0.20
+PEER_DONOR_MIN_CONFIDENCE = 0.65
+PEER_TARGET_RELIABLE_CONFIDENCE = 0.65
+ORIENTATION_VOTE_MIN_CONFIDENCE = 0.60
+PEER_SCALE_MAXIMUM_RELATIVE_SPREAD = 0.18
+PEER_COMPATIBLE_SCALE_MAXIMUM_RELATIVE_SPREAD = 0.25
+PEER_MINIMUM_DONOR_COUNT = 2
+MAX_STYLE_CARRIER_DEPTH = 64
+MAX_STYLE_CARRIER_NODES = 10000
 TARGET_FONT_REQUEST_VERSION = "target_font_request_v1"
 TARGET_FONT_REQUEST_PROVENANCE = "parent_style_arbitrator_source_label_taxonomy_v1"
 OPTIONAL_TARGET_FONT_LABEL_TAXONOMY: dict[str, dict[str, str]] = {
@@ -59,6 +83,39 @@ OPTIONAL_TARGET_FONT_LABEL_TAXONOMY: dict[str, dict[str, str]] = {
         "weight": "regular",
     },
 }
+
+
+@dataclass(frozen=True)
+class _InvalidFrozenJsonValue:
+    """Non-serializable marker retained so malformed axes fail locally."""
+
+    reason: str
+
+
+class _FrozenJsonDict(dict[Any, Any]):
+    """JSON-serializable mapping that cannot be mutated through evidence aliases."""
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("frozen JSON snapshot")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+    def __copy__(self) -> dict[str, Any]:
+        return _plain_json_mapping_snapshot(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        snapshot = _plain_json_mapping_snapshot(self)
+        memo[id(self)] = snapshot
+        return snapshot
+
 
 @dataclass(frozen=True)
 class StyleEvidence:
@@ -77,6 +134,7 @@ class StyleEvidence:
     content_bbox: tuple[int, int, int, int] = ()
     analysis_bbox: tuple[int, int, int, int] = ()
     detector_input_sha256: str = ""
+    source_text_footprint: SourceTextFootprint | None = None
     authorized_perceptual_source_identity: Mapping[str, Any] = field(
         default_factory=dict
     )
@@ -111,11 +169,34 @@ class StyleEvidence:
     axis_provenance: Mapping[str, str] = field(default_factory=dict)
     observation_summary: Mapping[str, Any] = field(default_factory=dict)
     detector_variant_summary: Mapping[str, Any] = field(default_factory=dict)
-    peer_group_id: str = ""
-    peer_normalization_applied: bool = False
-    peer_normalized_axes: tuple[str, ...] = ()
-    peer_support_summary: Mapping[str, Any] = field(default_factory=dict)
     perceptual_axis_evidence: Mapping[str, Any] = field(default_factory=dict)
+    axis_evidence: tuple[SourceStyleAxisEvidence, ...] = ()
+
+    def __post_init__(self) -> None:
+        # StyleEvidence is the raw observation contract.  Snapshot and freeze
+        # every nested JSON carrier at construction so producer inputs,
+        # arbitration audit records, and bundle transport can never alias back
+        # into that evidence.  SourceTextFootprint is already a frozen typed
+        # contract and the remaining fields are scalars or immutable tuples.
+        for field_name in (
+            "authorized_perceptual_source_identity",
+            "axis_confidence",
+            "axis_provenance",
+            "observation_summary",
+            "detector_variant_summary",
+            "perceptual_axis_evidence",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _frozen_json_mapping_snapshot(getattr(self, field_name)),
+            )
+        object.__setattr__(
+            self,
+            "top_candidates",
+            _frozen_json_sequence_snapshot(self.top_candidates),
+        )
+        object.__setattr__(self, "axis_evidence", tuple(self.axis_evidence or ()))
 
     @classmethod
     def unavailable(
@@ -128,6 +209,7 @@ class StyleEvidence:
         reason_codes: Sequence[str],
         view: AuthorizedSourceStyleView | None = None,
         detector_input_sha256: str = "",
+        source_text_footprint: SourceTextFootprint | None = None,
         authorized_perceptual_source_identity: Mapping[str, Any] | None = None,
         perceptual_axis_evidence: Mapping[str, Any] | None = None,
     ) -> "StyleEvidence":
@@ -145,6 +227,7 @@ class StyleEvidence:
             content_bbox=tuple(getattr(view, "content_bbox", ()) or ()),
             analysis_bbox=tuple(getattr(view, "analysis_bbox", ()) or ()),
             detector_input_sha256=str(detector_input_sha256 or ""),
+            source_text_footprint=source_text_footprint,
             authorized_perceptual_source_identity=dict(
                 authorized_perceptual_source_identity or {}
             ),
@@ -164,6 +247,97 @@ class StyleEvidence:
         confidence: float,
         source_size_px: float,
     ) -> "StyleEvidence":
+        support_identity = {
+            "page_id": page_id,
+            "view_id": f"styleview_{page_id}_{bundle_id}",
+            "bundle_id": bundle_id,
+            "parent_id": parent_id,
+            "root_id": root_id,
+            "cleanup_mask_ids": [f"cmask_{bundle_id}"],
+            "authorized_mask_sha256": "test",
+            "authorized_pixel_sha256": "test",
+            "detector_input_sha256": "test",
+        }
+        confidence = float(confidence)
+        source_size_px = float(source_size_px)
+        axis_evidence = (
+            SourceStyleAxisEvidence(
+                axis="family",
+                status="supported",
+                value={
+                    "font_label": font_label,
+                    "font_serif": bool(font_serif),
+                    "font_language": "CJK",
+                },
+                confidence=confidence,
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+            ),
+            SourceStyleAxisEvidence(
+                axis="weight",
+                status="supported",
+                value={"class": _font_weight_from_label(font_label) or "regular"},
+                confidence=confidence,
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+            ),
+            SourceStyleAxisEvidence(
+                axis="scale",
+                status="supported",
+                value={
+                    "vertical_px": source_size_px,
+                    "vertical_confidence": confidence,
+                    "vertical_support": "supported_test_evidence",
+                    "horizontal_px": source_size_px,
+                    "horizontal_confidence": confidence,
+                    "horizontal_support": "supported_test_evidence",
+                },
+                confidence=confidence,
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+            ),
+            SourceStyleAxisEvidence(
+                axis="fill",
+                status="supported",
+                value={"color": "#111111", "support_color": "#EEEEEE"},
+                confidence=confidence,
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+            ),
+            SourceStyleAxisEvidence(
+                axis="outline",
+                status="supported",
+                value={
+                    "present": True,
+                    "kind": "outline",
+                    "color": "#EEEEEE",
+                    "width_px": max(0.0, source_size_px * 0.02),
+                },
+                confidence=confidence,
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+            ),
+            SourceStyleAxisEvidence(
+                axis="orientation",
+                status="supported",
+                value={"direction": "ttb"},
+                confidence=confidence,
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+            ),
+            SourceStyleAxisEvidence.unavailable(
+                "rotation",
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+                reason_codes=("test_rotation_unavailable",),
+            ),
+            SourceStyleAxisEvidence.unavailable(
+                "shadow",
+                provenance="test_authorized_evidence",
+                support_identity=support_identity,
+                reason_codes=("test_shadow_unavailable",),
+            ),
+        )
         return cls(
             page_id=page_id,
             bundle_id=bundle_id,
@@ -181,42 +355,45 @@ class StyleEvidence:
             evidence_provider=YUZUMARKER_PROVIDER,
             evidence_source=YUZUMARKER_STYLE_SOURCE,
             evidence_model=YUZUMARKER_PROVIDER_MODEL,
-            confidence=float(confidence),
+            confidence=confidence,
             font_label=font_label,
             font_weight=_font_weight_from_label(font_label) or "",
             font_language="CJK",
             font_serif=bool(font_serif),
             direction="ttb",
-            direction_confidence=float(confidence),
+            direction_confidence=confidence,
             text_color="#111111",
             stroke_color="#EEEEEE",
-            text_size_ratio=float(source_size_px) / 36.0,
-            source_size_px=float(source_size_px),
-            source_size_vertical_px=float(source_size_px),
-            source_size_horizontal_px=float(source_size_px),
-            source_size_confidence_vertical=float(confidence),
-            source_size_confidence_horizontal=float(confidence),
+            text_size_ratio=source_size_px / 36.0,
+            source_size_px=source_size_px,
+            source_size_vertical_px=source_size_px,
+            source_size_horizontal_px=source_size_px,
+            source_size_confidence_vertical=confidence,
+            source_size_confidence_horizontal=confidence,
             source_size_support_vertical="supported_test_evidence",
             source_size_support_horizontal="supported_test_evidence",
             source_scale_support_status="supported_test_evidence",
-            source_stroke_width_px=max(0.0, float(source_size_px) * 0.02),
-            source_ink_stroke_width_px=max(0.0, float(source_size_px) * 0.08),
+            source_stroke_width_px=max(0.0, source_size_px * 0.02),
+            source_ink_stroke_width_px=max(0.0, source_size_px * 0.08),
             stroke_width_ratio=0.02,
             line_spacing_ratio=0.05,
             axis_confidence={
-                "family": float(confidence),
-                "weight": float(confidence),
-                "scale": float(confidence),
-                "paint": float(confidence),
-                "orientation": float(confidence),
+                "family": confidence,
+                "weight": confidence,
+                "scale": confidence,
+                "fill": confidence,
+                "outline": confidence,
+                "orientation": confidence,
             },
             axis_provenance={
                 "family": "test_authorized_evidence",
                 "weight": "test_authorized_evidence",
                 "scale": "test_authorized_evidence",
-                "paint": "test_authorized_evidence",
+                "fill": "test_authorized_evidence",
+                "outline": "test_authorized_evidence",
                 "orientation": "test_authorized_evidence",
             },
+            axis_evidence=axis_evidence,
         )
 
     def source_axes(self) -> dict[str, Any]:
@@ -255,10 +432,21 @@ class StyleEvidence:
             "stroke_width_ratio": round(float(self.stroke_width_ratio), 8),
             "line_spacing_ratio": round(float(self.line_spacing_ratio), 8),
             "angle_degrees": round(float(self.angle_degrees), 8),
-            "axis_confidence": dict(self.axis_confidence),
-            "axis_provenance": dict(self.axis_provenance),
-            "observation_summary": dict(self.observation_summary),
-            "detector_variant_summary": dict(self.detector_variant_summary),
+            "axis_confidence": _plain_json_mapping_snapshot(
+                self.axis_confidence
+            ),
+            "axis_provenance": _plain_json_mapping_snapshot(
+                self.axis_provenance
+            ),
+            "observation_summary": _plain_json_mapping_snapshot(
+                self.observation_summary
+            ),
+            "detector_variant_summary": _plain_json_mapping_snapshot(
+                self.detector_variant_summary
+            ),
+            "axis_evidence": [
+                record.to_audit_dict() for record in self.axis_evidence
+            ],
         }
 
     def to_audit_dict(self) -> dict[str, Any]:
@@ -282,11 +470,14 @@ class StyleEvidence:
             "evidence_model": self.evidence_model,
             "confidence": float(self.confidence),
             "source_axes": self.source_axes(),
-            "peer_group_id": self.peer_group_id,
-            "peer_normalization_applied": bool(self.peer_normalization_applied),
-            "peer_normalized_axes": list(self.peer_normalized_axes),
-            "peer_support_summary": dict(self.peer_support_summary),
+            "axis_evidence": [
+                record.to_audit_dict() for record in self.axis_evidence
+            ],
         }
+        if self.source_text_footprint is not None:
+            result["source_text_footprint"] = (
+                self.source_text_footprint.to_audit_dict()
+            )
         if self.perceptual_axis_evidence:
             result["authorized_perceptual_source_identity"] = (
                 _json_safe_audit_mapping(
@@ -340,6 +531,78 @@ class ParentStyleEvidenceRunResult:
 class ParentStyleArbitrationResult:
     resolved_styles: dict[str, dict[str, Any]]
     records: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _AxisCandidate:
+    axis: str
+    value: Any
+    confidence: float
+    provenance: str
+    source: str
+    support_status: str = "supported"
+    reason_codes: tuple[str, ...] = ()
+    peer_support: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _AxisDecision:
+    axis: str
+    value: Any
+    status: str
+    confidence: float
+    authority: str
+    provenance: str
+    source: str
+    support_status: str = ""
+    reason_codes: tuple[str, ...] = ()
+    peer_support: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        value = self.value
+        if isinstance(value, Mapping):
+            value = dict(value)
+        return {
+            "status": self.status,
+            "value": value,
+            "confidence": round(float(self.confidence), 8),
+            "authority": self.authority,
+            "provenance": self.provenance,
+            "source": self.source,
+            "support_status": self.support_status,
+            "reason_codes": list(self.reason_codes),
+            "peer_support": dict(self.peer_support),
+        }
+
+
+@dataclass(frozen=True)
+class _ParentAxisCandidates:
+    direct: Mapping[str, _AxisCandidate] = field(default_factory=dict)
+    directional_weight: Mapping[str, _AxisCandidate] = field(default_factory=dict)
+    directional_scale: Mapping[str, _AxisCandidate] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ParentAxisDecisionSet:
+    decisions: Mapping[str, _AxisDecision]
+    peer_assisted_axes: tuple[str, ...] = ()
+    peer_support: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            axis: self.decisions[axis].to_audit_dict()
+            for axis in (
+                "family",
+                "weight",
+                "orientation",
+                "scale",
+                "fill",
+                "outline",
+                "rotation",
+                "shadow",
+            )
+            if axis in self.decisions
+        }
 
 
 @dataclass
@@ -485,6 +748,343 @@ def _scale_support_is_supported(value: str) -> bool:
     return str(value or "").startswith("supported_")
 
 
+def _observation_axis_records(
+    observation: Any,
+    *,
+    view: AuthorizedSourceStyleView,
+) -> tuple[SourceStyleAxisEvidence, ...]:
+    records = tuple(getattr(observation, "axis_evidence", ()) or ())
+    if records:
+        return records
+    footprint = getattr(observation, "source_text_footprint", None)
+    support_identity = {
+        "page_id": view.page_id,
+        "view_id": view.view_id,
+        "bundle_id": view.bundle_id,
+        "parent_id": view.parent_id,
+        "root_id": view.root_id,
+        "authorized_mask_sha256": str(
+            getattr(footprint, "authorized_mask_sha256", "") or ""
+        ),
+        "authorized_pixel_sha256": str(
+            getattr(footprint, "authorized_pixel_sha256", "") or ""
+        ),
+        "detector_input_sha256": str(
+            getattr(observation, "detector_input_sha256", "") or ""
+        ),
+    }
+
+    def unavailable(axis: str) -> SourceStyleAxisEvidence:
+        return SourceStyleAxisEvidence.unavailable(
+            axis,
+            provenance=f"authorized_source_style_view:legacy_{axis}_projection",
+            support_identity=support_identity,
+            reason_codes=(f"source_{axis}_axis_unavailable",),
+        )
+
+    scale_confidence = max(
+        float(getattr(observation, "source_cell_confidence_vertical", 0.0) or 0.0),
+        float(getattr(observation, "source_cell_confidence_horizontal", 0.0) or 0.0),
+    )
+    scale = (
+        SourceStyleAxisEvidence(
+            axis="scale",
+            status="supported",
+            value={
+                "vertical_px": float(
+                    getattr(observation, "source_cell_size_vertical_px", 0.0)
+                    or 0.0
+                ),
+                "horizontal_px": float(
+                    getattr(observation, "source_cell_size_horizontal_px", 0.0)
+                    or 0.0
+                ),
+                "vertical_confidence": float(
+                    getattr(
+                        observation,
+                        "source_cell_confidence_vertical",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "horizontal_confidence": float(
+                    getattr(
+                        observation,
+                        "source_cell_confidence_horizontal",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "vertical_support": str(
+                    getattr(observation, "source_cell_support_vertical", "")
+                    or ""
+                ),
+                "horizontal_support": str(
+                    getattr(observation, "source_cell_support_horizontal", "")
+                    or ""
+                ),
+            },
+            confidence=scale_confidence,
+            provenance="authorized_source_style_view:legacy_scale_projection",
+            support_identity=support_identity,
+        )
+        if scale_confidence > 0.0
+        else unavailable("scale")
+    )
+    fill_confidence = float(
+        getattr(observation, "paint_confidence", 0.0) or 0.0
+    )
+    fill_color = str(getattr(observation, "fill_color", "") or "")
+    fill = (
+        SourceStyleAxisEvidence(
+            axis="fill",
+            status="supported",
+            value={
+                "color": fill_color,
+                "support_color": str(
+                    getattr(observation, "support_color", "") or ""
+                ),
+                "polarity": str(
+                    getattr(observation, "fill_polarity", "") or ""
+                ),
+            },
+            confidence=fill_confidence,
+            provenance="authorized_source_style_view:legacy_fill_projection",
+            support_identity=support_identity,
+        )
+        if fill_confidence > 0.0 and fill_color
+        else unavailable("fill")
+    )
+    outline_confidence = float(
+        getattr(observation, "stroke_confidence", 0.0) or 0.0
+    )
+    outline = (
+        SourceStyleAxisEvidence(
+            axis="outline",
+            status="supported",
+            value={
+                "present": bool(
+                    float(
+                        getattr(observation, "source_stroke_width_px", 0.0)
+                        or 0.0
+                    )
+                    > 0.0
+                ),
+                "color": str(
+                    getattr(observation, "support_color", "") or ""
+                ),
+                "width_px": float(
+                    getattr(observation, "source_stroke_width_px", 0.0)
+                    or 0.0
+                ),
+            },
+            confidence=outline_confidence,
+            provenance="authorized_source_style_view:legacy_outline_projection",
+            support_identity=support_identity,
+        )
+        if outline_confidence > 0.0
+        else unavailable("outline")
+    )
+    weight_confidence = max(
+        float(getattr(observation, "ink_weight_confidence", 0.0) or 0.0),
+        float(
+            getattr(observation, "ink_weight_confidence_vertical", 0.0) or 0.0
+        ),
+        float(
+            getattr(observation, "ink_weight_confidence_horizontal", 0.0) or 0.0
+        ),
+    )
+    weight = (
+        SourceStyleAxisEvidence(
+            axis="weight",
+            status="supported",
+            value={
+                "class": str(
+                    getattr(observation, "ink_weight_class", "") or ""
+                ),
+                "confidence": float(
+                    getattr(observation, "ink_weight_confidence", 0.0) or 0.0
+                ),
+                "vertical_class": str(
+                    getattr(observation, "ink_weight_class_vertical", "") or ""
+                ),
+                "vertical_confidence": float(
+                    getattr(
+                        observation,
+                        "ink_weight_confidence_vertical",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "vertical_support": str(
+                    getattr(observation, "ink_weight_support_vertical", "") or ""
+                ),
+                "horizontal_class": str(
+                    getattr(observation, "ink_weight_class_horizontal", "") or ""
+                ),
+                "horizontal_confidence": float(
+                    getattr(
+                        observation,
+                        "ink_weight_confidence_horizontal",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "horizontal_support": str(
+                    getattr(observation, "ink_weight_support_horizontal", "") or ""
+                ),
+                "source_ink_stroke_width_px": float(
+                    getattr(observation, "source_ink_stroke_width_px", 0.0)
+                    or 0.0
+                ),
+            },
+            confidence=weight_confidence,
+            provenance="authorized_source_style_view:legacy_weight_projection",
+            support_identity=support_identity,
+        )
+        if weight_confidence > 0.0
+        else unavailable("weight")
+    )
+    return (
+        unavailable("family"),
+        weight,
+        scale,
+        fill,
+        outline,
+        unavailable("orientation"),
+        unavailable("rotation"),
+        unavailable("shadow"),
+    )
+
+
+def _replace_axis_records(
+    records: Sequence[SourceStyleAxisEvidence],
+    replacements: Mapping[str, SourceStyleAxisEvidence],
+) -> tuple[SourceStyleAxisEvidence, ...]:
+    existing = {record.axis: record for record in records}
+    existing.update(replacements)
+    return tuple(existing[axis] for axis in SOURCE_STYLE_AXES)
+
+
+def _direct_only_style_evidence(
+    *,
+    page_id: str,
+    bundle_id: str,
+    parent_id: str,
+    root_id: str,
+    view: AuthorizedSourceStyleView,
+    observation: Any,
+    detector_reason: str,
+    detector_input_sha256: str = "",
+) -> StyleEvidence | None:
+    records = _observation_axis_records(observation, view=view)
+    supported = [record for record in records if record.supported]
+    if not supported:
+        return None
+    by_axis = {record.axis: record for record in records}
+    scale = dict(by_axis["scale"].value)
+    fill = dict(by_axis["fill"].value)
+    outline = dict(by_axis["outline"].value)
+    weight = dict(by_axis["weight"].value)
+    reasons = _unique_strings(
+        [
+            "authorized_source_style_view_observed_partial_detector_unavailable",
+            detector_reason,
+            *list(getattr(observation, "reason_codes", ()) or ()),
+        ]
+    )
+    return StyleEvidence(
+        page_id=str(page_id or ""),
+        bundle_id=bundle_id,
+        parent_id=parent_id,
+        root_id=root_id,
+        status="observed",
+        vote_eligible=True,
+        reason_codes=tuple(reasons),
+        view_id=view.view_id,
+        cleanup_mask_ids=tuple(view.cleanup_mask_ids),
+        owned_component_ids=tuple(view.owned_component_ids),
+        content_bbox=tuple(view.content_bbox),
+        analysis_bbox=tuple(view.analysis_bbox),
+        detector_input_sha256=str(
+            detector_input_sha256
+            or getattr(observation, "detector_input_sha256", "")
+            or ""
+        ),
+        source_text_footprint=getattr(observation, "source_text_footprint", None),
+        evidence_provider="AuthorizedSourceStyleObserver",
+        evidence_source="authorized_source_style_view_independent_axes",
+        confidence=max(record.confidence for record in supported),
+        font_weight=str(weight.get("class") or ""),
+        direction="",
+        direction_confidence=0.0,
+        text_color=_hex_color(fill.get("color")),
+        stroke_color=_hex_color(
+            outline.get("color") or fill.get("support_color")
+        ),
+        source_size_px=0.0,
+        source_size_vertical_px=float(scale.get("vertical_px") or 0.0),
+        source_size_horizontal_px=float(scale.get("horizontal_px") or 0.0),
+        source_size_confidence_vertical=float(
+            scale.get("vertical_confidence") or 0.0
+        ),
+        source_size_confidence_horizontal=float(
+            scale.get("horizontal_confidence") or 0.0
+        ),
+        source_size_support_vertical=str(scale.get("vertical_support") or ""),
+        source_size_support_horizontal=str(
+            scale.get("horizontal_support") or ""
+        ),
+        source_stroke_width_px=float(outline.get("width_px") or 0.0),
+        source_ink_stroke_width_px=float(
+            weight.get("source_ink_stroke_width_px") or 0.0
+        ),
+        axis_confidence={record.axis: record.confidence for record in records},
+        axis_provenance={record.axis: record.provenance for record in records},
+        observation_summary=observation.to_audit_dict(),
+        detector_variant_summary={
+            "status": "unavailable",
+            "reason": detector_reason,
+        },
+        axis_evidence=records,
+    )
+
+
+def _direct_or_unavailable_style_evidence(
+    *,
+    page_id: str,
+    bundle_id: str,
+    parent_id: str,
+    root_id: str,
+    view: AuthorizedSourceStyleView,
+    observation: Any,
+    detector_reason: str,
+    detector_input_sha256: str = "",
+) -> StyleEvidence:
+    direct = _direct_only_style_evidence(
+        page_id=page_id,
+        bundle_id=bundle_id,
+        parent_id=parent_id,
+        root_id=root_id,
+        view=view,
+        observation=observation,
+        detector_reason=detector_reason,
+        detector_input_sha256=detector_input_sha256,
+    )
+    if direct is not None:
+        return direct
+    return StyleEvidence.unavailable(
+        page_id=page_id,
+        bundle_id=bundle_id,
+        parent_id=parent_id,
+        root_id=root_id,
+        reason_codes=(detector_reason,),
+        view=view,
+        detector_input_sha256=detector_input_sha256,
+        source_text_footprint=getattr(observation, "source_text_footprint", None),
+    )
+
+
 def observe_parent_style_evidence(
     *,
     page_id: str,
@@ -576,16 +1176,20 @@ def observe_parent_style_evidence(
             )
             continue
         observation_inputs = build_authorized_style_observation_inputs(image, view)
+        source_text_footprint = getattr(
+            observation_inputs, "source_text_footprint", None
+        )
         detector_input = observation_inputs.primary_input
         if detector_input is None or not observation_inputs.available:
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=("authorized_detector_input_unavailable",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason="authorized_detector_input_unavailable",
                 )
             )
             continue
@@ -598,35 +1202,18 @@ def observe_parent_style_evidence(
             or declared_detector_input_sha256 != actual_detector_input_sha256
         ):
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=("authorized_detector_input_identity_mismatch",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason="authorized_detector_input_identity_mismatch",
                     detector_input_sha256=actual_detector_input_sha256,
                 )
             )
             continue
-        raw_perceptual_carrier = getattr(
-            observation_inputs, "perceptual_axis_evidence", {}
-        )
-        perceptual_carrier = (
-            dict(raw_perceptual_carrier)
-            if isinstance(raw_perceptual_carrier, Mapping)
-            and raw_perceptual_carrier
-            else {}
-        )
-        raw_perceptual_identity = getattr(
-            observation_inputs, "authorized_perceptual_source_identity", {}
-        )
-        trusted_perceptual_identity = (
-            dict(raw_perceptual_identity)
-            if perceptual_carrier
-            and isinstance(raw_perceptual_identity, Mapping)
-            else {}
-        )
         if (
             normalized_mode == "yuzumarker"
             and active_detector is None
@@ -647,16 +1234,15 @@ def observe_parent_style_evidence(
                 active_detector = None
         if normalized_mode == "yuzumarker" and active_detector is None:
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=("yuzumarker_detector_unavailable",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason="yuzumarker_detector_unavailable",
                     detector_input_sha256=actual_detector_input_sha256,
-                    authorized_perceptual_source_identity=trusted_perceptual_identity,
-                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -681,62 +1267,58 @@ def observe_parent_style_evidence(
                 neutral_detection = detection if isinstance(detection, Mapping) else None
         except Exception as exc:
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=(f"style_detector_failed:{type(exc).__name__}",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason=f"style_detector_failed:{type(exc).__name__}",
                     detector_input_sha256=actual_detector_input_sha256,
-                    authorized_perceptual_source_identity=trusted_perceptual_identity,
-                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
         if not isinstance(detection, Mapping):
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=("style_detector_output_contract_invalid",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason="style_detector_output_contract_invalid",
                     detector_input_sha256=actual_detector_input_sha256,
-                    authorized_perceptual_source_identity=trusted_perceptual_identity,
-                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
         confidence = _unit_interval(detection.get("confidence"))
         if confidence is None:
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=("font_model_confidence_contract_invalid",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason="font_model_confidence_contract_invalid",
                     detector_input_sha256=actual_detector_input_sha256,
-                    authorized_perceptual_source_identity=trusted_perceptual_identity,
-                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
         if confidence < MIN_STYLE_EVIDENCE_CONFIDENCE:
             result.evidence.append(
-                StyleEvidence.unavailable(
+                _direct_or_unavailable_style_evidence(
                     page_id=page_id,
                     bundle_id=bundle_id,
                     parent_id=parent_id,
                     root_id=root_id,
-                    reason_codes=("font_model_confidence_below_observation_floor",),
                     view=view,
+                    observation=observation_inputs,
+                    detector_reason="font_model_confidence_below_observation_floor",
                     detector_input_sha256=actual_detector_input_sha256,
-                    authorized_perceptual_source_identity=trusted_perceptual_identity,
-                    perceptual_axis_evidence=perceptual_carrier,
                 )
             )
             continue
@@ -840,14 +1422,14 @@ def observe_parent_style_evidence(
                 else "typesetting_default:source_scale_unavailable"
             ),
             "paint": (
-                "authorized_source_style_view:fill_support_contrast_measurement"
+                "authorized_source_style_view:authorized_core_paint_color_coherence"
                 if paint_valid
                 else "target_fallback:paint_axis_contract_invalid"
             ),
             "stroke": (
-                "authorized_source_style_view:visible_support_transition_measurement"
+                "authorized_source_style_view:canonical_external_surface_carrier"
                 if source_stroke_width_px > 0
-                else "authorized_source_style_view:uniform_support_no_visible_stroke"
+                else "authorized_source_style_view:canonical_source_carrier_absent"
                 if observation_inputs.stroke_confidence > 0.0
                 else "target_fallback:stroke_axis_not_independently_supported"
             ),
@@ -886,6 +1468,127 @@ def observe_parent_style_evidence(
             neutral_sha256=_image_sha256(observation_inputs.neutral_input),
             neutral_error=neutral_error,
         )
+        direct_axis_records = _observation_axis_records(
+            observation_inputs,
+            view=view,
+        )
+        direct_by_axis = {
+            record.axis: record for record in direct_axis_records
+        }
+        support_identity = dict(
+            direct_axis_records[0].support_identity
+            if direct_axis_records
+            else {}
+        )
+        family_axis = (
+            SourceStyleAxisEvidence(
+                axis="family",
+                status="supported",
+                value={
+                    "font_label": font_label,
+                    "font_serif": bool(font_serif),
+                    "font_language": str(detection.get("font_language") or ""),
+                    "top_candidates": _compact_candidates(
+                        detection.get("top_candidates")
+                    ),
+                },
+                confidence=family_confidence,
+                provenance=(
+                    f"{provider}:independent_primary_neutral_family_observation"
+                ),
+                support_identity=support_identity,
+                reason_codes=(family_reason,) if family_reason else (),
+                support={"detector_variant_summary": detector_variant_summary},
+            )
+            if family_confidence > 0.0
+            else SourceStyleAxisEvidence.unavailable(
+                "family",
+                provenance=(
+                    f"{provider}:independent_primary_neutral_family_observation"
+                ),
+                support_identity=support_identity,
+                reason_codes=(
+                    family_reason or "source_family_axis_unavailable",
+                ),
+                support={"detector_variant_summary": detector_variant_summary},
+            )
+        )
+        orientation_axis = (
+            SourceStyleAxisEvidence(
+                axis="orientation",
+                status="supported",
+                value={"direction": direction},
+                confidence=direction_confidence,
+                provenance=(
+                    f"{provider}:independent_primary_neutral_orientation_observation"
+                ),
+                support_identity=support_identity,
+                reason_codes=(direction_reason,) if direction_reason else (),
+                support={"detector_variant_summary": detector_variant_summary},
+            )
+            if direction in {"ltr", "ttb"} and direction_confidence > 0.0
+            else SourceStyleAxisEvidence.unavailable(
+                "orientation",
+                provenance=(
+                    f"{provider}:independent_primary_neutral_orientation_observation"
+                ),
+                support_identity=support_identity,
+                reason_codes=(
+                    direction_reason or "source_orientation_axis_unavailable",
+                ),
+                support={"detector_variant_summary": detector_variant_summary},
+            )
+        )
+        direct_weight_axis = direct_by_axis.get("weight")
+        if (
+            direct_weight_axis is not None
+            and direct_weight_axis.supported
+            and direct_weight in {"regular", "bold"}
+        ):
+            weight_axis = direct_weight_axis
+        elif parsed_weight in {"regular", "bold"} and weight_confidence > 0.0:
+            weight_axis = SourceStyleAxisEvidence(
+                axis="weight",
+                status="supported",
+                value={
+                    "class": parsed_weight,
+                    "model_class": parsed_weight,
+                },
+                confidence=weight_confidence,
+                provenance=(
+                    f"{provider}:independent_primary_neutral_weight_observation"
+                ),
+                support_identity=support_identity,
+                reason_codes=(weight_reason,) if weight_reason else (),
+                support={"detector_variant_summary": detector_variant_summary},
+            )
+        else:
+            weight_axis = SourceStyleAxisEvidence.unavailable(
+                "weight",
+                provenance=(
+                    f"{provider}:independent_primary_neutral_weight_observation"
+                ),
+                support_identity=support_identity,
+                reason_codes=(
+                    weight_reason or "source_weight_axis_unavailable",
+                ),
+                support={"detector_variant_summary": detector_variant_summary},
+            )
+        axis_evidence = _replace_axis_records(
+            direct_axis_records,
+            {
+                "family": family_axis,
+                "weight": weight_axis,
+                "orientation": orientation_axis,
+            },
+        )
+        shared_axis_confidence = {
+            record.axis: float(record.confidence)
+            for record in axis_evidence
+        }
+        axis_provenance = {
+            record.axis: record.provenance for record in axis_evidence
+        }
         result.evidence.append(
             StyleEvidence(
                 page_id=str(page_id or ""),
@@ -901,7 +1604,8 @@ def observe_parent_style_evidence(
                 content_bbox=tuple(view.content_bbox),
                 analysis_bbox=tuple(view.analysis_bbox),
                 detector_input_sha256=actual_detector_input_sha256,
-                authorized_perceptual_source_identity=trusted_perceptual_identity,
+                source_text_footprint=source_text_footprint,
+                authorized_perceptual_source_identity={},
                 evidence_provider=provider,
                 evidence_source=source,
                 evidence_model=model,
@@ -945,7 +1649,8 @@ def observe_parent_style_evidence(
                 axis_provenance=axis_provenance,
                 observation_summary=observation_inputs.to_audit_dict(),
                 detector_variant_summary=detector_variant_summary,
-                perceptual_axis_evidence=perceptual_carrier,
+                perceptual_axis_evidence={},
+                axis_evidence=axis_evidence,
             )
         )
 
@@ -1030,9 +1735,23 @@ def arbitrate_parent_styles(
             )
         identity_bound[bundle_id] = item
 
-    reconciled = _reconcile_root_local_peer_evidence(
+    candidates_by_bundle = {
+        str(getattr(bundle, "bundle_id", "") or ""): _collect_parent_axis_candidates(
+            bundle,
+            identity_bound[str(getattr(bundle, "bundle_id", "") or "")],
+        )
+        for bundle in bundles
+        if str(getattr(bundle, "bundle_id", "") or "") in identity_bound
+    }
+    local_decisions_by_bundle = {
+        bundle_id: _resolve_parent_local_axis_decisions(candidates)
+        for bundle_id, candidates in candidates_by_bundle.items()
+    }
+    reconciled_decisions_by_bundle = _reconcile_parent_axis_decisions(
         bundles=bundles,
         evidence_by_bundle=identity_bound,
+        candidates_by_bundle=candidates_by_bundle,
+        local_decisions_by_bundle=local_decisions_by_bundle,
     )
     resolved: dict[str, dict[str, Any]] = {}
     records: list[dict[str, Any]] = []
@@ -1040,7 +1759,7 @@ def arbitrate_parent_styles(
         bundle_id = str(getattr(bundle, "bundle_id", "") or "")
         if not bundle_id:
             continue
-        item = reconciled.get(bundle_id) or identity_bound.get(bundle_id)
+        item = identity_bound.get(bundle_id)
         if item is None:
             item = StyleEvidence.unavailable(
                 page_id=str(getattr(bundle, "page_id", "") or ""),
@@ -1049,29 +1768,44 @@ def arbitrate_parent_styles(
                 root_id=str(getattr(bundle, "root_id", "") or ""),
                 reason_codes=("style_evidence_missing",),
             )
-        style = _resolved_style_for_bundle(
+        candidates = candidates_by_bundle.get(bundle_id) or _collect_parent_axis_candidates(
             bundle,
             item,
+        )
+        decision_set = reconciled_decisions_by_bundle.get(
+            bundle_id,
+            local_decisions_by_bundle.get(bundle_id)
+            or _resolve_parent_local_axis_decisions(candidates),
+        )
+        style = _build_resolved_style_from_decisions(
+            bundle,
+            item,
+            decision_set,
             default_font_name=default_font_name,
             models_dir=models_dir,
         )
+        raw_evidence_audit = item.to_audit_dict()
+        bundle_evidence_snapshot = _plain_json_mapping_snapshot(
+            raw_evidence_audit
+        )
         bundle.render_style = dict(style)
         if hasattr(bundle, "style_evidence_summary"):
-            bundle.style_evidence_summary = item.to_audit_dict()
+            bundle.style_evidence_summary = bundle_evidence_snapshot
         else:
-            setattr(bundle, "style_evidence_summary", item.to_audit_dict())
+            setattr(bundle, "style_evidence_summary", bundle_evidence_snapshot)
         try:
             bundle.execution_region = bundle.to_region_record()
         except Exception:
             pass
         resolved[bundle_id] = dict(style)
-        record = item.to_audit_dict()
+        record = _plain_json_mapping_snapshot(raw_evidence_audit)
         record.update(
             {
                 "style_evidence_status": item.status,
                 "status": (
                     "applied"
-                    if item.vote_eligible or _style_has_resolved_perceptual_axis(style)
+                    if item.vote_eligible
+                    or bool(style.get("style_arbitration_peer_assisted_axes"))
                     else "fallback"
                 ),
                 "render_style_provider": style.get("render_style_provider"),
@@ -1079,6 +1813,13 @@ def arbitrate_parent_styles(
                 "style_resolution_status": style.get("style_resolution_status"),
                 "style_perceptual_axis_resolution": style.get(
                     "style_perceptual_axis_resolution"
+                ),
+                "style_axis_decisions": style.get("style_axis_decisions"),
+                "style_arbitration_peer_assisted_axes": style.get(
+                    "style_arbitration_peer_assisted_axes"
+                ),
+                "style_arbitration_peer_support": style.get(
+                    "style_arbitration_peer_support"
                 ),
                 "base_style_id": style.get("base_style_id"),
                 "font_family": style.get("font_family"),
@@ -1093,363 +1834,695 @@ def arbitrate_parent_styles(
                 "target_font_request": style.get("target_font_request"),
             }
         )
-        records.append({key: value for key, value in record.items() if value not in (None, "", [])})
+        compact_record = {
+            key: value
+            for key, value in record.items()
+            if value not in (None, "", [])
+        }
+        records.append(_plain_json_mapping_snapshot(compact_record))
     return ParentStyleArbitrationResult(resolved_styles=resolved, records=tuple(records))
 
 
-def _reconcile_root_local_peer_evidence(
-    *,
-    bundles: Sequence[Any],
-    evidence_by_bundle: Mapping[str, StyleEvidence],
-) -> dict[str, StyleEvidence]:
-    """Reconcile noisy axes only inside one visually compatible root cohort."""
+def _collect_parent_axis_candidates(
+    bundle: Any,
+    evidence: StyleEvidence,
+) -> _ParentAxisCandidates:
+    """Project typed source observations into parent-local candidates.
 
-    output = dict(evidence_by_bundle)
-    groups: dict[tuple[str, str], list[StyleEvidence]] = {}
-    for bundle_id, item in evidence_by_bundle.items():
-        if item.status != "observed" or not item.vote_eligible or not item.root_id:
-            continue
-        groups.setdefault((item.page_id, item.root_id), []).append(item)
+    `StyleEvidence.axis_evidence` is the sole observed-style input. The
+    flattened fields remain audit/transport projections and the historical
+    perceptual carrier is deliberately not consulted here.
+    """
 
-    for (page_id, root_id), members in groups.items():
-        if len(members) < 2 or not _peer_members_are_visually_compatible(members):
-            continue
-        group_id = f"root-peer:{page_id}:{root_id}"
-        member_ids = sorted(item.bundle_id for item in members)
-        family_value, family_confidence = _peer_categorical_consensus(
-            members,
-            axis="family",
-            value_getter=lambda item: "serif" if item.font_serif else "sans",
-        )
-        weight_value, weight_confidence = _peer_categorical_consensus(
-            members,
-            axis="weight",
-            value_getter=lambda item: str(item.font_weight or ""),
-        )
-        direction_value, direction_confidence = _peer_categorical_consensus(
-            members,
-            axis="orientation",
-            value_getter=lambda item: str(item.direction or ""),
-        )
-        scale_direction = (
-            str(direction_value) if direction_value in {"ltr", "ttb"} else ""
-        )
-        scale_value, scale_confidence = _peer_numeric_consensus(
-            members,
-            axis="scale",
-            value_getter=lambda item: _style_evidence_scale_for_direction(
-                item, scale_direction
-            )[0],
-            confidence_getter=lambda item: _style_evidence_scale_for_direction(
-                item, scale_direction
-            )[1],
-            maximum_relative_spread=0.18,
-        )
-        paint_member = (
-            _peer_representative_member(members, axis="paint")
-            if _peer_axis_is_supported_by_all(
-                members,
-                axis="paint",
-                value_validator=lambda item: bool(_hex_color(item.text_color)),
+    direct: dict[str, _AxisCandidate] = {}
+    directional_weight: dict[str, _AxisCandidate] = {}
+    directional_scale: dict[str, _AxisCandidate] = {}
+    records = _typed_axis_record_map(bundle=bundle, evidence=evidence)
+    family = records.get("family")
+    if family is not None and family.confidence >= DIRECT_AXIS_MIN_CONFIDENCE:
+        value = dict(family.value)
+        font_serif = value.get("font_serif")
+        if isinstance(font_serif, bool):
+            direct["family"] = _AxisCandidate(
+                axis="family",
+                value="serif" if font_serif else "sans",
+                confidence=family.confidence,
+                provenance=family.provenance,
+                source="direct",
+                support_status="supported_typed_axis_evidence",
+                reason_codes=family.reason_codes,
             )
-            else None
-        )
-        stroke_member = (
-            _peer_representative_member(members, axis="stroke")
-            if _peer_axis_is_supported_by_all(members, axis="stroke")
-            else None
-        )
-        summary = {
-            "scope": "root_local_compatible",
-            "member_bundle_ids": member_ids,
-            "family_consensus": family_value or "",
-            "weight_consensus": weight_value or "",
-            "orientation_consensus": direction_value or "",
-            "source_size_px_consensus": round(float(scale_value or 0.0), 6),
-        }
-        for item in members:
-            changes: dict[str, Any] = {}
-            normalized_axes: list[str] = []
-            axis_confidence = dict(item.axis_confidence)
-            axis_provenance = dict(item.axis_provenance)
-            if family_value in {"serif", "sans"}:
-                target_serif = family_value == "serif"
-                if bool(item.font_serif) != target_serif:
-                    changes["font_serif"] = target_serif
-                    normalized_axes.append("family")
-                axis_confidence["family"] = max(
-                    float(axis_confidence.get("family") or 0.0), family_confidence
+
+    weight = records.get("weight")
+    if weight is not None and weight.confidence >= DIRECT_AXIS_MIN_CONFIDENCE:
+        value = dict(weight.value)
+        weight_class = str(value.get("class") or "").strip().lower()
+        if weight_class in {"regular", "bold", "black"}:
+            direct["weight"] = _AxisCandidate(
+                axis="weight",
+                value=weight_class,
+                confidence=weight.confidence,
+                provenance=weight.provenance,
+                source="direct",
+                support_status="supported_typed_axis_evidence",
+                reason_codes=weight.reason_codes,
+            )
+        for direction, prefix in (("ttb", "vertical"), ("ltr", "horizontal")):
+            directional_class = str(
+                value.get(f"{prefix}_class") or ""
+            ).strip().lower()
+            directional_confidence = float(
+                _unit_interval(value.get(f"{prefix}_confidence"))
+                or weight.confidence
+            )
+            support_status = str(value.get(f"{prefix}_support") or "")
+            if (
+                directional_class in {"regular", "bold", "black"}
+                and directional_confidence >= DIRECT_AXIS_MIN_CONFIDENCE
+                and (
+                    not support_status
+                    or _scale_support_is_supported(support_status)
                 )
-                axis_provenance["family"] = "parent_style_arbitrator:root_local_peer_family"
-            if weight_value in {"regular", "bold", "black"}:
-                if str(item.font_weight or "") != weight_value:
-                    changes["font_weight"] = weight_value
-                    normalized_axes.append("weight")
-                axis_confidence["weight"] = max(
-                    float(axis_confidence.get("weight") or 0.0), weight_confidence
-                )
-                axis_provenance["weight"] = "parent_style_arbitrator:root_local_peer_weight"
-            if direction_value in {"ltr", "ttb"}:
-                if str(item.direction or "") != direction_value:
-                    changes["direction"] = direction_value
-                    changes["direction_confidence"] = direction_confidence
-                    normalized_axes.append("orientation")
-                axis_confidence["orientation"] = max(
-                    float(axis_confidence.get("orientation") or 0.0),
-                    direction_confidence,
-                )
-                axis_provenance["orientation"] = (
-                    "parent_style_arbitrator:root_local_peer_orientation"
-                )
-            if scale_value and scale_value > 0.0:
-                if abs(float(item.source_size_px) - scale_value) > 0.25:
-                    changes["source_size_px"] = scale_value
-                    analysis_width = int(item.analysis_bbox[2]) if len(item.analysis_bbox) == 4 else 0
-                    changes["text_size_ratio"] = (
-                        scale_value / float(max(1, analysis_width))
-                    )
-                    normalized_axes.append("scale")
-                changes["source_scale_support_status"] = (
-                    "supported_root_local_direction_reconciliation"
-                )
-                axis_confidence["scale"] = max(
-                    float(axis_confidence.get("scale") or 0.0), scale_confidence
-                )
-                axis_provenance["scale"] = "parent_style_arbitrator:root_local_peer_scale"
-            if paint_member is not None:
-                if item.text_color != paint_member.text_color:
-                    changes["text_color"] = paint_member.text_color
-                    normalized_axes.append("paint")
-                axis_confidence["paint"] = max(
-                    float(axis_confidence.get("paint") or 0.0),
-                    float(paint_member.axis_confidence.get("paint") or 0.0),
-                )
-                axis_provenance["paint"] = "parent_style_arbitrator:root_local_peer_paint"
-            if stroke_member is not None:
-                if (
-                    item.source_stroke_width_px != stroke_member.source_stroke_width_px
-                    or item.stroke_color != stroke_member.stroke_color
-                ):
-                    changes["source_stroke_width_px"] = stroke_member.source_stroke_width_px
-                    changes["stroke_width_ratio"] = stroke_member.stroke_width_ratio
-                    changes["stroke_color"] = stroke_member.stroke_color
-                    normalized_axes.append("stroke")
-                axis_confidence["stroke"] = max(
-                    float(axis_confidence.get("stroke") or 0.0),
-                    float(stroke_member.axis_confidence.get("stroke") or 0.0),
-                )
-                axis_provenance["stroke"] = "parent_style_arbitrator:root_local_peer_stroke"
-            changes.update(
-                {
-                    "axis_confidence": axis_confidence,
-                    "axis_provenance": axis_provenance,
-                    "peer_group_id": group_id,
-                    "peer_normalization_applied": bool(normalized_axes),
-                    "peer_normalized_axes": tuple(_unique_strings(normalized_axes)),
-                    "peer_support_summary": summary,
-                    "reason_codes": tuple(
-                        _unique_strings(
-                            [
-                                *item.reason_codes,
-                                "root_local_compatible_peer_reconciliation",
-                                *(
-                                    ["root_local_peer_axes_normalized"]
-                                    if normalized_axes
-                                    else []
-                                ),
-                            ]
-                        )
+            ):
+                directional_weight[direction] = _AxisCandidate(
+                    axis="weight",
+                    value=directional_class,
+                    confidence=directional_confidence,
+                    provenance=weight.provenance,
+                    source="direct",
+                    support_status=(
+                        support_status or "supported_typed_axis_evidence"
                     ),
-                }
+                    reason_codes=weight.reason_codes,
+                )
+
+    orientation = records.get("orientation")
+    if (
+        orientation is not None
+        and orientation.confidence >= DIRECT_AXIS_MIN_CONFIDENCE
+    ):
+        direction = str(
+            dict(orientation.value).get("direction") or ""
+        ).strip().lower()
+        if direction in {"ltr", "ttb"}:
+            direct["orientation"] = _AxisCandidate(
+                axis="orientation",
+                value=direction,
+                confidence=orientation.confidence,
+                provenance=orientation.provenance,
+                source="direct",
+                support_status="supported_typed_axis_evidence",
+                reason_codes=orientation.reason_codes,
             )
-            output[item.bundle_id] = replace(item, **changes)
-    return output
+
+    fill = records.get("fill")
+    if fill is not None and fill.confidence >= DIRECT_PAINT_MIN_CONFIDENCE:
+        fill_color = _hex_color(dict(fill.value).get("color"))
+        if fill_color:
+            direct["fill"] = _AxisCandidate(
+                axis="fill",
+                value=fill_color,
+                confidence=fill.confidence,
+                provenance=fill.provenance,
+                source="direct",
+                support_status="supported_typed_axis_evidence",
+                reason_codes=fill.reason_codes,
+            )
+
+    outline = records.get("outline")
+    if outline is not None and outline.confidence >= DIRECT_OUTLINE_MIN_CONFIDENCE:
+        value = dict(outline.value)
+        width_px = _float(value.get("width_px"))
+        present = value.get("present")
+        if isinstance(present, bool) and not present:
+            width_px = 0.0
+        outline_color = _hex_color(value.get("color"))
+        if width_px >= 0.0 and (outline_color or width_px == 0.0):
+            direct["outline"] = _AxisCandidate(
+                axis="outline",
+                value={
+                    "color": outline_color or "#FFFFFF",
+                    "width_px": max(0.0, width_px),
+                },
+                confidence=outline.confidence,
+                provenance=outline.provenance,
+                source="direct",
+                support_status="supported_typed_axis_evidence",
+                reason_codes=outline.reason_codes,
+            )
+
+    scale = records.get("scale")
+    if scale is not None and scale.confidence >= DIRECT_AXIS_MIN_CONFIDENCE:
+        value = dict(scale.value)
+        for direction, prefix in (("ttb", "vertical"), ("ltr", "horizontal")):
+            numeric_value = _float(value.get(f"{prefix}_px"))
+            numeric_confidence = float(
+                _unit_interval(value.get(f"{prefix}_confidence"))
+                or scale.confidence
+            )
+            support_status = str(value.get(f"{prefix}_support") or "")
+            if (
+                numeric_value > 0.0
+                and numeric_confidence >= DIRECT_AXIS_MIN_CONFIDENCE
+                and _scale_support_is_supported(support_status)
+            ):
+                directional_scale[direction] = _AxisCandidate(
+                    axis="scale",
+                    value=numeric_value,
+                    confidence=numeric_confidence,
+                    provenance=scale.provenance,
+                    source="direct",
+                    support_status=support_status,
+                    reason_codes=scale.reason_codes,
+                )
+
+    for axis in ("rotation", "shadow"):
+        record = records.get(axis)
+        if record is None or record.confidence < DIRECT_AXIS_MIN_CONFIDENCE:
+            continue
+        value, reasons = _validated_perceptual_axis_value(
+            axis,
+            dict(record.value),
+        )
+        if value is None or reasons:
+            continue
+        direct[axis] = _AxisCandidate(
+            axis=axis,
+            value=value,
+            confidence=record.confidence,
+            provenance=record.provenance,
+            source="direct",
+            support_status="supported_typed_axis_evidence",
+            reason_codes=record.reason_codes,
+        )
+
+    return _ParentAxisCandidates(
+        direct=direct,
+        directional_weight=directional_weight,
+        directional_scale=directional_scale,
+    )
 
 
-def _peer_members_are_visually_compatible(members: Sequence[StyleEvidence]) -> bool:
-    strong_directions = {
-        str(item.direction or "")
-        for item in members
-        if str(item.direction or "") in {"ltr", "ttb"}
-        and float(item.axis_confidence.get("orientation") or 0.0) >= 0.65
+def _typed_axis_record_map(
+    *,
+    bundle: Any,
+    evidence: StyleEvidence,
+) -> dict[str, SourceStyleAxisEvidence]:
+    if evidence.status != "observed" or not evidence.vote_eligible:
+        return {}
+    grouped: dict[str, list[SourceStyleAxisEvidence]] = {}
+    for record in tuple(evidence.axis_evidence or ()):
+        if not isinstance(record, SourceStyleAxisEvidence):
+            continue
+        if record.axis not in SOURCE_STYLE_AXES:
+            continue
+        grouped.setdefault(record.axis, []).append(record)
+    result: dict[str, SourceStyleAxisEvidence] = {}
+    for axis in SOURCE_STYLE_AXES:
+        records = grouped.get(axis, [])
+        if len(records) != 1:
+            continue
+        record = records[0]
+        if not record.supported or not record.provenance:
+            continue
+        if not _axis_support_identity_matches(
+            bundle=bundle,
+            evidence=evidence,
+            record=record,
+        ):
+            continue
+        result[axis] = record
+    return result
+
+
+def _axis_support_identity_matches(
+    *,
+    bundle: Any,
+    evidence: StyleEvidence,
+    record: SourceStyleAxisEvidence,
+) -> bool:
+    identity = record.support_identity
+    if not isinstance(identity, Mapping):
+        return False
+    expected = {
+        "page_id": str(getattr(bundle, "page_id", "") or ""),
+        "view_id": evidence.view_id,
+        "bundle_id": str(getattr(bundle, "bundle_id", "") or ""),
+        "parent_id": str(getattr(bundle, "parent_id", "") or ""),
+        "root_id": str(getattr(bundle, "root_id", "") or ""),
+        "detector_input_sha256": evidence.detector_input_sha256,
     }
-    if len(strong_directions) > 1:
-        return False
-    comparison_direction = next(iter(strong_directions), "")
-    sizes = [
-        _style_evidence_scale_for_direction(item, comparison_direction)[0]
-        for item in members
-        if _style_evidence_scale_for_direction(item, comparison_direction)[0] > 0.0
-        and _style_evidence_scale_for_direction(item, comparison_direction)[1] > 0.0
-    ]
-    if len(sizes) >= 2 and max(sizes) / max(1.0, min(sizes)) > 1.25:
-        return False
-    strong_weights = {
-        str(item.font_weight or "")
-        for item in members
-        if str(item.font_weight or "")
-        and float(item.axis_confidence.get("weight") or 0.0) >= 0.65
-    }
-    if len(strong_weights) > 1:
-        return False
-    colors = [
-        item.text_color
-        for item in members
-        if _hex_color(item.text_color)
-        and float(item.axis_confidence.get("paint") or 0.0) > 0.0
-    ]
-    if colors and any(
-        _color_distance(first, second) > 48.0
-        for index, first in enumerate(colors)
-        for second in colors[index + 1 :]
+    if any(
+        not expected_value
+        or str(identity.get(key) or "") != expected_value
+        for key, expected_value in expected.items()
     ):
         return False
-    strokes = [
-        float(item.source_stroke_width_px)
-        for item in members
-        if float(item.axis_confidence.get("stroke") or 0.0) > 0.0
-    ]
-    if len(strokes) >= 2 and max(strokes) - min(strokes) > 1.0:
+    if not str(identity.get("authorized_mask_sha256") or ""):
+        return False
+    cleanup_mask_ids = identity.get("cleanup_mask_ids")
+    if cleanup_mask_ids is not None and tuple(cleanup_mask_ids) != tuple(
+        evidence.cleanup_mask_ids
+    ):
         return False
     return True
 
 
-def _peer_categorical_consensus(
-    members: Sequence[StyleEvidence],
+def _collect_additive_axis_candidates(
     *,
-    axis: str,
-    value_getter: Any,
-) -> tuple[str | None, float]:
-    scores: dict[str, float] = {}
-    confidences: dict[str, list[float]] = {}
-    for item in members:
-        value = str(value_getter(item) or "")
-        confidence = float(item.axis_confidence.get(axis) or 0.0)
-        if not value or confidence <= 0.0:
-            continue
-        score = confidence * _peer_observation_reliability(item)
-        scores[value] = scores.get(value, 0.0) + score
-        confidences.setdefault(value, []).append(confidence)
-    if not scores:
-        return None, 0.0
-    ordered = sorted(scores, key=lambda value: (scores[value], value), reverse=True)
-    winner = ordered[0]
-    total = sum(scores.values())
-    dominance = scores[winner] / max(total, 1e-6)
-    if len(ordered) > 1 and dominance < 0.62:
-        return None, 0.0
-    winner_confidence = float(np.mean(confidences[winner])) if confidences[winner] else 0.0
-    return winner, min(1.0, winner_confidence * max(0.72, dominance))
-
-
-def _peer_numeric_consensus(
-    members: Sequence[StyleEvidence],
-    *,
-    axis: str,
-    value_getter: Any,
-    confidence_getter: Any | None = None,
-    maximum_relative_spread: float,
-) -> tuple[float | None, float]:
-    values: list[tuple[float, float, float]] = []
-    for item in members:
-        value = float(value_getter(item) or 0.0)
-        confidence = float(
-            confidence_getter(item)
-            if confidence_getter is not None
-            else item.axis_confidence.get(axis) or 0.0
+    bundle: Any,
+    evidence: StyleEvidence,
+) -> tuple[dict[str, _AxisCandidate], dict[str, Any]]:
+    raw_carrier = evidence.perceptual_axis_evidence
+    if not raw_carrier:
+        return {}, {}
+    carrier = dict(raw_carrier) if isinstance(raw_carrier, Mapping) else {}
+    global_reasons, carrier_fact_set_id = _perceptual_carrier_validation(
+        bundle=bundle,
+        evidence=evidence,
+        raw_carrier=raw_carrier,
+        carrier=carrier,
+    )
+    candidates: dict[str, _AxisCandidate] = {}
+    axis_audits: dict[str, dict[str, Any]] = {}
+    for axis in PERCEPTUAL_STYLE_AXES:
+        value, audit = _resolve_perceptual_axis(
+            axis=axis,
+            record=carrier.get(axis),
+            carrier_fact_set_id=carrier_fact_set_id,
+            global_reasons=global_reasons,
         )
-        if value <= 0.0 or confidence <= 0.0:
+        axis_audits[axis] = audit
+        if value is None:
             continue
-        values.append((value, confidence, _peer_observation_reliability(item)))
-    if not values:
-        return None, 0.0
-    raw = [value for value, _, _ in values]
-    if len(raw) >= 2 and (max(raw) - min(raw)) / max(1.0, float(np.median(raw))) > maximum_relative_spread:
-        return None, 0.0
-    weights = [confidence * reliability for _, confidence, reliability in values]
-    consensus = float(np.average(raw, weights=weights))
-    confidence = float(np.average([item[1] for item in values], weights=weights))
-    return consensus, min(1.0, confidence)
+        if axis == "fill":
+            candidate_value: Any = str(value["color"])
+        else:
+            candidate_value = dict(value)
+        candidates[axis] = _AxisCandidate(
+            axis=axis,
+            value=candidate_value,
+            confidence=float(audit.get("confidence") or 0.0),
+            provenance=str(audit.get("provenance") or ""),
+            source="additive",
+            support_status="supported",
+            reason_codes=tuple(audit.get("reason_codes") or ()),
+        )
+    resolved_axes = [axis for axis in PERCEPTUAL_STYLE_AXES if axis in candidates]
+    return candidates, {
+        "contract_version": PERCEPTUAL_STYLE_RESOLUTION_VERSION,
+        "source_contract_version": _plain_string(carrier.get("contract_version")),
+        "carrier_status": "valid" if not global_reasons else "rejected",
+        "resolved_axes": resolved_axes,
+        "unavailable_axes": [
+            axis for axis in PERCEPTUAL_STYLE_AXES if axis not in candidates
+        ],
+        **axis_audits,
+    }
 
 
-def _style_evidence_scale_for_direction(
-    item: StyleEvidence,
+def _reconcile_parent_axis_decisions(
+    *,
+    bundles: Sequence[Any],
+    evidence_by_bundle: Mapping[str, StyleEvidence],
+    candidates_by_bundle: Mapping[str, _ParentAxisCandidates],
+    local_decisions_by_bundle: Mapping[str, _ParentAxisDecisionSet],
+) -> dict[str, _ParentAxisDecisionSet]:
+    """Apply one bounded, non-cascading peer pass after local resolution."""
+
+    working: dict[str, dict[str, _AxisDecision]] = {
+        bundle_id: dict(decision_set.decisions)
+        for bundle_id, decision_set in local_decisions_by_bundle.items()
+    }
+    bundle_by_id = {
+        str(getattr(bundle, "bundle_id", "") or ""): bundle
+        for bundle in bundles
+        if str(getattr(bundle, "bundle_id", "") or "")
+    }
+    groups: dict[tuple[str, str, str], list[str]] = {}
+    for bundle_id, evidence in evidence_by_bundle.items():
+        bundle = bundle_by_id.get(bundle_id)
+        if bundle is None or not evidence.root_id:
+            continue
+        role_key = str(getattr(bundle, "role", "") or "speech").strip().lower()
+        groups.setdefault((evidence.page_id, evidence.root_id, role_key), []).append(
+            bundle_id
+        )
+
+    peer_support_by_bundle: dict[str, dict[str, Mapping[str, Any]]] = {
+        bundle_id: {} for bundle_id in working
+    }
+    for (page_id, root_id, role_key), member_ids in sorted(groups.items()):
+        if len(member_ids) < PEER_MINIMUM_DONOR_COUNT + 1:
+            continue
+        group_id = f"root-peer:{page_id}:{root_id}:{role_key}"
+        for axis in ("orientation", "family", "weight", "scale"):
+            updates: dict[str, _AxisDecision] = {}
+            for target_id in sorted(member_ids):
+                target_evidence = evidence_by_bundle.get(target_id)
+                target_candidates = candidates_by_bundle.get(target_id)
+                target_decisions = working.get(target_id)
+                if (
+                    not _peer_target_has_identity_valid_observation(target_evidence)
+                    or target_candidates is None
+                    or target_decisions is None
+                ):
+                    continue
+                target_decision = target_decisions.get(axis)
+                if not _axis_decision_needs_peer(target_decision):
+                    continue
+                donors: list[tuple[str, _AxisDecision]] = []
+                for donor_id in sorted(member_ids):
+                    if donor_id == target_id:
+                        continue
+                    donor_candidates = candidates_by_bundle.get(donor_id)
+                    donor_decisions = working.get(donor_id)
+                    if donor_candidates is None or donor_decisions is None:
+                        continue
+                    donor = donor_decisions.get(axis)
+                    if (
+                        donor is None
+                        or donor.status != "resolved"
+                        or donor.source != "direct"
+                        or donor.confidence < PEER_DONOR_MIN_CONFIDENCE
+                        or not _peer_candidates_are_compatible(
+                            target_candidates,
+                            donor_candidates,
+                            excluded_axis=axis,
+                        )
+                    ):
+                        continue
+                    if axis == "scale":
+                        target_direction = str(
+                            target_decisions["orientation"].value or ""
+                        )
+                        donor_direction = str(
+                            donor_decisions["orientation"].value or ""
+                        )
+                        if target_direction != donor_direction:
+                            continue
+                    donors.append((donor_id, donor))
+                if len(donors) < PEER_MINIMUM_DONOR_COUNT:
+                    continue
+                if not _peer_donors_are_mutually_compatible(
+                    [candidates_by_bundle[donor_id] for donor_id, _ in donors],
+                    excluded_axis=axis,
+                ):
+                    continue
+                peer_candidate = _peer_consensus_candidate(
+                    axis=axis,
+                    donors=donors,
+                    group_id=group_id,
+                    direction=str(target_decisions["orientation"].value or ""),
+                )
+                if peer_candidate is None:
+                    continue
+                updates[target_id] = _decision_from_candidate(peer_candidate)
+            for target_id, decision in updates.items():
+                working[target_id][axis] = decision
+                peer_support_by_bundle[target_id][axis] = dict(
+                    decision.peer_support
+                )
+                if axis == "orientation":
+                    _rebind_directional_local_decisions(
+                        working[target_id],
+                        candidates_by_bundle[target_id],
+                    )
+
+    reconciled: dict[str, _ParentAxisDecisionSet] = {}
+    for bundle_id, decisions in working.items():
+        peer_support = peer_support_by_bundle.get(bundle_id, {})
+        peer_axes = tuple(
+            axis for axis in PEER_ASSIST_AXES if axis in peer_support
+        )
+        reconciled[bundle_id] = _ParentAxisDecisionSet(
+            decisions=decisions,
+            peer_assisted_axes=peer_axes,
+            peer_support=peer_support,
+        )
+    return reconciled
+
+
+def _axis_decision_needs_peer(decision: _AxisDecision | None) -> bool:
+    return bool(
+        decision is None
+        or decision.status != "resolved"
+        or decision.confidence < PEER_TARGET_RELIABLE_CONFIDENCE
+    )
+
+
+def _peer_consensus_candidate(
+    *,
+    axis: str,
+    donors: Sequence[tuple[str, _AxisDecision]],
+    group_id: str,
     direction: str,
-) -> tuple[float, float, str]:
-    normalized = str(direction or "").strip().lower()
-    if normalized == "ttb":
-        value = float(item.source_size_vertical_px)
-        confidence = float(item.source_size_confidence_vertical)
-        support = str(item.source_size_support_vertical or "")
-    elif normalized == "ltr":
-        value = float(item.source_size_horizontal_px)
-        confidence = float(item.source_size_confidence_horizontal)
-        support = str(item.source_size_support_horizontal or "")
+) -> _AxisCandidate | None:
+    donor_ids = sorted(donor_id for donor_id, _ in donors)
+    if axis == "scale":
+        values = [float(decision.value) for _, decision in donors]
+        median = float(np.median(values))
+        spread = (max(values) - min(values)) / max(1.0, median)
+        if spread > PEER_SCALE_MAXIMUM_RELATIVE_SPREAD:
+            return None
+        weights = [decision.confidence for _, decision in donors]
+        value: Any = float(np.average(values, weights=weights))
+        confidence = float(np.average(weights, weights=weights))
+        reason = "root_local_same_role_peer_numeric_consensus"
+        extra_support = {
+            "relative_spread": round(spread, 8),
+            "direction": direction,
+        }
     else:
-        value = float(item.source_size_px)
-        confidence = float(item.axis_confidence.get("scale") or 0.0)
-        support = str(item.source_scale_support_status or "")
-    if value <= 0.0 or confidence <= 0.0 or not _scale_support_is_supported(support):
-        return 0.0, 0.0, support
-    return value, confidence, support
+        values = {str(decision.value) for _, decision in donors}
+        if len(values) != 1:
+            return None
+        value = donors[0][1].value
+        confidence = float(np.mean([decision.confidence for _, decision in donors]))
+        reason = "root_local_same_role_peer_consensus"
+        extra_support = {}
+    return _AxisCandidate(
+        axis=axis,
+        value=value,
+        confidence=confidence,
+        provenance="parent_style_arbitrator:root_local_peer_reconciliation",
+        source="peer",
+        support_status="supported_root_local_peer_reconciliation",
+        reason_codes=(reason,),
+        peer_support={
+            "group_id": group_id,
+            "donor_bundle_ids": donor_ids,
+            "donor_count": len(donor_ids),
+            **extra_support,
+        },
+    )
 
 
-def _peer_axis_is_supported_by_all(
-    members: Sequence[StyleEvidence],
-    *,
-    axis: str,
-    value_validator: Any | None = None,
+def _rebind_directional_local_decisions(
+    decisions: dict[str, _AxisDecision],
+    candidates: _ParentAxisCandidates,
+) -> None:
+    direction = str(decisions["orientation"].value or "ttb")
+    weight = candidates.direct.get("weight") or candidates.directional_weight.get(
+        direction
+    )
+    scale = candidates.directional_scale.get(direction)
+    decisions["weight"] = (
+        _decision_from_candidate(weight)
+        if weight is not None
+        else _fallback_axis_decision("weight", "regular")
+    )
+    decisions["scale"] = (
+        _decision_from_candidate(scale)
+        if scale is not None
+        else _fallback_axis_decision("scale", 0.0)
+    )
+
+
+def _peer_target_has_identity_valid_observation(
+    evidence: StyleEvidence | None,
 ) -> bool:
-    if not members:
+    if evidence is None:
         return False
-    return all(
-        float(item.axis_confidence.get(axis) or 0.0) > 0.0
-        and (value_validator is None or bool(value_validator(item)))
-        for item in members
+    if evidence.status == "observed":
+        return bool(
+            evidence.view_id
+            and evidence.cleanup_mask_ids
+            and evidence.detector_input_sha256
+        )
+    if evidence.status != "unavailable":
+        return False
+    # A detector/model failure can occur after the authorized view and its
+    # source geometry were bound.  That parent may receive peer help on the
+    # four basic axes; identity/view failures do not carry this footprint.
+    return bool(
+        evidence.view_id
+        and evidence.cleanup_mask_ids
+        and evidence.detector_input_sha256
+        and evidence.source_text_footprint is not None
     )
 
 
-def _peer_representative_member(
-    members: Sequence[StyleEvidence],
+def _peer_candidates_are_compatible(
+    first: _ParentAxisCandidates,
+    second: _ParentAxisCandidates,
     *,
-    axis: str,
-) -> StyleEvidence | None:
-    valid = [
-        item
-        for item in members
-        if float(item.axis_confidence.get(axis) or 0.0) > 0.0
-    ]
-    if not valid:
-        return None
-    return max(
-        valid,
-        key=lambda item: (
-            float(item.axis_confidence.get(axis) or 0.0)
-            * _peer_observation_reliability(item),
-            item.bundle_id,
-        ),
+    excluded_axis: str,
+) -> bool:
+    """Compare reliable peer axes without consulting the axis being repaired."""
+
+    for axis in ("family", "weight", "orientation"):
+        if axis == excluded_axis:
+            continue
+        first_candidate = first.direct.get(axis)
+        second_candidate = second.direct.get(axis)
+        if (
+            first_candidate is not None
+            and second_candidate is not None
+            and first_candidate.value != second_candidate.value
+        ):
+            return False
+    if excluded_axis == "scale":
+        return True
+
+    first_orientation = first.direct.get("orientation")
+    second_orientation = second.direct.get("orientation")
+    if (
+        first_orientation is None
+        or second_orientation is None
+        or first_orientation.value != second_orientation.value
+    ):
+        return True
+    direction = str(first_orientation.value or "")
+    first_scale = first.directional_scale.get(direction)
+    second_scale = second.directional_scale.get(direction)
+    if first_scale is None or second_scale is None:
+        return True
+    values = [float(first_scale.value), float(second_scale.value)]
+    relative_spread = (max(values) - min(values)) / max(
+        1.0, float(np.median(values))
+    )
+    return relative_spread <= PEER_COMPATIBLE_SCALE_MAXIMUM_RELATIVE_SPREAD
+
+
+def _peer_donors_are_mutually_compatible(
+    donors: Sequence[_ParentAxisCandidates],
+    *,
+    excluded_axis: str,
+) -> bool:
+    return all(
+        _peer_candidates_are_compatible(
+            first,
+            second,
+            excluded_axis=excluded_axis,
+        )
+        for index, first in enumerate(donors)
+        for second in donors[index + 1 :]
     )
 
 
-def _peer_observation_reliability(item: StyleEvidence) -> float:
-    component_count = len(tuple(item.owned_component_ids or ()))
-    return min(4.0, max(1.0, math.sqrt(float(max(1, component_count)))))
+def _resolve_parent_local_axis_decisions(
+    candidates: _ParentAxisCandidates,
+) -> _ParentAxisDecisionSet:
+    """Resolve every style axis once without consulting another parent."""
+
+    decisions: dict[str, _AxisDecision] = {}
+    for axis, fallback in (("family", "sans"), ("orientation", "ttb")):
+        candidate = candidates.direct.get(axis)
+        decisions[axis] = (
+            _decision_from_candidate(candidate)
+            if candidate is not None
+            else _fallback_axis_decision(axis, fallback)
+        )
+
+    resolved_direction = str(decisions["orientation"].value or "ttb")
+    weight_candidate = candidates.direct.get(
+        "weight"
+    ) or candidates.directional_weight.get(resolved_direction)
+    decisions["weight"] = (
+        _decision_from_candidate(weight_candidate)
+        if weight_candidate is not None
+        else _fallback_axis_decision("weight", "regular")
+    )
+    scale_candidate = candidates.directional_scale.get(resolved_direction)
+    decisions["scale"] = (
+        _decision_from_candidate(scale_candidate)
+        if scale_candidate is not None
+        else _fallback_axis_decision("scale", 0.0)
+    )
+
+    for axis, fallback in (
+        ("fill", "#000000"),
+        ("outline", {"color": "#FFFFFF", "width_px": 0.0}),
+    ):
+        candidate = candidates.direct.get(axis)
+        decisions[axis] = (
+            _decision_from_candidate(candidate)
+            if candidate is not None
+            else _fallback_axis_decision(axis, fallback)
+        )
+
+    for axis in ("rotation", "shadow"):
+        candidate = candidates.direct.get(axis)
+        decisions[axis] = (
+            _decision_from_candidate(candidate)
+            if candidate is not None
+            else _AxisDecision(
+                axis=axis,
+                value=None,
+                status="unavailable",
+                confidence=0.0,
+                authority="none",
+                provenance="authorized_source_style_axis_unavailable",
+                source="none",
+                reason_codes=(f"{axis}_axis_unavailable",),
+            )
+        )
+
+    return _ParentAxisDecisionSet(decisions=decisions)
 
 
-def _color_distance(first: str, second: str) -> float:
-    left = _hex_color(first)
-    right = _hex_color(second)
-    if not left or not right:
-        return float("inf")
-    left_rgb = np.asarray(
-        [int(left[index : index + 2], 16) for index in (1, 3, 5)],
-        dtype=np.float32,
+def _decision_from_candidate(candidate: _AxisCandidate) -> _AxisDecision:
+    authority = {
+        "direct": "authorized_source_style_view",
+        "peer": "parent_style_arbitrator_root_local_peer",
+    }.get(candidate.source, "unknown")
+    return _AxisDecision(
+        axis=candidate.axis,
+        value=candidate.value,
+        status="resolved",
+        confidence=float(candidate.confidence),
+        authority=authority,
+        provenance=candidate.provenance,
+        source=candidate.source,
+        support_status=candidate.support_status,
+        reason_codes=tuple(candidate.reason_codes),
+        peer_support=dict(candidate.peer_support),
     )
-    right_rgb = np.asarray(
-        [int(right[index : index + 2], 16) for index in (1, 3, 5)],
-        dtype=np.float32,
+
+
+def _fallback_axis_decision(axis: str, value: Any) -> _AxisDecision:
+    provenance = {
+        "family": "target_fallback:unresolved_source_family",
+        "weight": "target_fallback:unresolved_source_weight",
+        "orientation": "target_fallback:unresolved_source_orientation",
+        "scale": "typesetting_default:source_scale_unavailable",
+        "fill": "target_fallback:unresolved_source_fill",
+        "outline": "target_fallback:unresolved_source_outline",
+    }[axis]
+    return _AxisDecision(
+        axis=axis,
+        value=value,
+        status="fallback",
+        confidence=0.0,
+        authority="target_fallback" if axis != "scale" else "typesetting_default",
+        provenance=provenance,
+        source="fallback",
+        support_status="unavailable",
+        reason_codes=(f"{axis}_axis_unresolved",),
     )
-    return float(np.linalg.norm(left_rgb - right_rgb))
+
+
 
 
 def apply_parent_font_detection(
@@ -1552,137 +2625,127 @@ def resolve_unavailable_parent_styles(
     return result
 
 
-def _resolved_style_for_bundle(
+
+
+def _build_resolved_style_from_decisions(
     bundle: Any,
     evidence: StyleEvidence,
+    decision_set: _ParentAxisDecisionSet,
     *,
     default_font_name: str,
     models_dir: str | None,
 ) -> dict[str, Any]:
+    """Build the executable style once from immutable per-axis decisions."""
+
+    decisions = dict(decision_set.decisions)
+    family = decisions["family"]
+    weight = decisions["weight"]
+    orientation_decision = decisions["orientation"]
+    scale = decisions["scale"]
+    fill = decisions["fill"]
+    outline = decisions["outline"]
     base = _style_contract_base(bundle)
     role = str(getattr(bundle, "role", "") or "")
     semantic_style_class = _semantic_style_class(role)
-    if evidence.status != "observed" or not evidence.vote_eligible:
-        fallback_font = default_font_name or resolve_noto_cjk_sc_font_file(
-            base_dir=models_dir,
-            serif=False,
-            weight="regular",
-        ) or "Noto Sans CJK SC"
-        style = {
-            **base,
-            "render_style_version": PARENT_RENDER_STYLE_VERSION,
-            "render_style_owner": "parent_execution_bundle",
-            "render_style_source": STYLE_ARBITRATOR_SOURCE,
-            "render_style_provider": STYLE_ARBITRATOR_PROVIDER,
-            "render_style_confidence": 0.0,
-            "style_resolution_status": "unresolved",
-            "style_resolution_reason_codes": list(evidence.reason_codes),
-            "style_arbitration_decision": "authorized_evidence_unavailable",
-            "style_arbitration_peer_scope": "none",
-            "style_class": semantic_style_class,
-            "typographic_style_class": "unresolved",
-            "base_style_id": "unresolved",
-            "font_family": fallback_font,
-            "font_family_role": "fallback_sans",
-            "font_weight": "regular",
-            "fill_color": "#000000",
-            "stroke_color": "#FFFFFF",
-            "stroke_width": 0,
-            "font_size_authority": "typesetting_default",
-            "font_size_source": "typesetting_default_unresolved",
-            "font_size_locked": False,
-            "font_size_policy": "unresolved_evidence_default",
-            "source_typography_observed": False,
-            "source_typography_matched": False,
-            "style_evidence_status": "unavailable",
-            "style_evidence_view_id": evidence.view_id,
-            "style_evidence_cleanup_mask_ids": list(evidence.cleanup_mask_ids),
-            "source_visual_column_count": 0,
-            "source_visual_column_reliable": False,
-            "source_visual_column_authority": "none",
-        }
-        return _apply_additive_perceptual_style_axes(
-            bundle=bundle,
-            evidence=evidence,
-            task_a_style=style,
-        )
+    observed = evidence.status == "observed" and evidence.vote_eligible
 
-    axis_confidence = {
-        key: float(value or 0.0) for key, value in dict(evidence.axis_confidence).items()
-    }
-    family_supported = axis_confidence.get("family", 0.0) >= 0.20
-    weight_supported = (
-        str(evidence.font_weight or "") in {"regular", "bold", "black"}
-        and axis_confidence.get("weight", 0.0) >= 0.20
-    )
-    scale_supported = (
-        float(evidence.source_size_px) > 0.0
-        and axis_confidence.get("scale", 0.0) > 0.0
-        and _scale_support_is_supported(evidence.source_scale_support_status)
-    )
-    paint_supported = bool(
-        _hex_color(evidence.text_color)
-        and axis_confidence.get("paint", 0.0) > 0.0
-    )
-    stroke_supported = axis_confidence.get("stroke", 0.0) > 0.0
-    orientation_supported = (
-        str(evidence.direction or "").lower() in {"ltr", "ttb"}
-        and axis_confidence.get("orientation", 0.0) > 0.0
-    )
-    target_serif = bool(evidence.font_serif) if family_supported else False
+    target_serif = str(family.value or "sans") == "serif"
     family_role = "serif" if target_serif else "sans"
-    observed_weight = str(evidence.font_weight or "") if weight_supported else ""
-    target_weight = observed_weight or "regular"
+    target_weight = str(weight.value or "regular")
+    if target_weight not in {"regular", "bold", "black"}:
+        target_weight = "regular"
     resolved_font = resolve_noto_cjk_sc_font_file(
         base_dir=models_dir,
         serif=target_serif,
         weight=target_weight,
-    ) or default_font_name or ("Noto Serif CJK SC" if target_serif else "Noto Sans CJK SC")
-    direction = str(evidence.direction or "").lower() if orientation_supported else ""
+    ) or default_font_name or (
+        "Noto Serif CJK SC" if target_serif else "Noto Sans CJK SC"
+    )
+    direction = str(orientation_decision.value or "ttb")
+    if direction not in {"ltr", "ttb"}:
+        direction = "ttb"
     orientation = "horizontal" if direction == "ltr" else "vertical"
     preferred_size = (
-        max(1, int(round(float(evidence.source_size_px))))
-        if scale_supported
+        max(1, int(round(float(scale.value))))
+        if scale.status == "resolved" and float(scale.value or 0.0) > 0.0
         else 0
     )
-    stroke_width = (
-        max(0, int(round(float(evidence.source_stroke_width_px))))
-        if stroke_supported
-        else 0
+    outline_value = (
+        dict(outline.value) if isinstance(outline.value, Mapping) else {}
     )
+    outline_color = _hex_color(outline_value.get("color")) or "#FFFFFF"
+    raw_stroke_width = max(0.0, float(outline_value.get("width_px") or 0.0))
+    stroke_width: int | float = max(0, int(round(raw_stroke_width)))
     if preferred_size > 0:
         stroke_width = min(stroke_width, max(0, int(round(preferred_size * 0.25))))
-    else:
+    elif outline.status != "resolved":
         stroke_width = 0
-    resolution_reasons = ["per_parent_authorized_evidence"]
-    if evidence.peer_normalization_applied:
-        resolution_reasons.append("root_local_compatible_peer_reconciliation")
-    if not family_supported:
-        resolution_reasons.append("source_family_axis_unresolved_target_sans_fallback")
-    if not weight_supported:
-        resolution_reasons.append("source_weight_axis_unresolved_target_regular_fallback")
-    if not scale_supported:
-        resolution_reasons.append("source_scale_axis_unresolved_typesetting_default")
-    if not paint_supported:
-        resolution_reasons.append("source_paint_axis_unresolved_target_black_fallback")
-    if not stroke_supported:
-        resolution_reasons.append("source_stroke_axis_unresolved_zero_stroke_fallback")
-    if not orientation_supported:
-        resolution_reasons.append("source_orientation_axis_unresolved_target_vertical_fallback")
+
+    peer_axes = list(decision_set.peer_assisted_axes)
+    optional_effect_axes = [
+        axis
+        for axis in ("rotation", "shadow")
+        if decisions[axis].status == "resolved"
+    ]
+    basic_axis_resolved = any(
+        decisions[axis].status == "resolved"
+        for axis in ("family", "weight", "orientation", "scale")
+    )
+    resolution_reasons = (
+        ["per_parent_authorized_evidence"]
+        if observed
+        else list(evidence.reason_codes)
+    )
+    if peer_axes:
+        resolution_reasons.append("root_local_same_role_peer_assistance")
+    if optional_effect_axes:
+        resolution_reasons.append("authorized_optional_effect_axes_resolved")
+    fallback_reasons = {
+        "family": "source_family_axis_unresolved_target_sans_fallback",
+        "weight": "source_weight_axis_unresolved_target_regular_fallback",
+        "scale": "source_scale_axis_unresolved_arbitrator_fallback",
+        "fill": "source_fill_axis_unresolved_target_black_fallback",
+        "outline": "source_outline_axis_unresolved_zero_outline_fallback",
+        "orientation": "source_orientation_axis_unresolved_target_vertical_fallback",
+    }
+    for axis in CORE_STYLE_AXES:
+        if decisions[axis].status != "resolved":
+            resolution_reasons.append(fallback_reasons[axis])
+    resolution_reasons = _unique_strings(resolution_reasons)
     resolved_confidence = float(
         np.mean(
             [
-                axis_confidence.get("family", 0.0) if family_supported else 0.0,
-                axis_confidence.get("weight", 0.0) if weight_supported else 0.0,
-                axis_confidence.get("scale", 0.0) if scale_supported else 0.0,
-                axis_confidence.get("paint", 0.0) if paint_supported else 0.0,
-                axis_confidence.get("stroke", 0.0) if stroke_supported else 0.0,
-                axis_confidence.get("orientation", 0.0)
-                if orientation_supported
-                else 0.0,
+                decisions[axis].confidence
+                if decisions[axis].status == "resolved"
+                else 0.0
+                for axis in CORE_STYLE_AXES
             ]
         )
     )
+    peer_group_ids = _unique_strings(
+        [
+            str(value.get("group_id") or "")
+            for value in decision_set.peer_support.values()
+            if isinstance(value, Mapping)
+        ]
+    )
+    style_axis_confidence = {
+        "family": float(family.confidence),
+        "weight": float(weight.confidence),
+        "scale": float(scale.confidence),
+        "fill": float(fill.confidence),
+        "outline": float(outline.confidence),
+        "orientation": float(orientation_decision.confidence),
+    }
+    style_axis_provenance = {
+        "family": family.provenance,
+        "weight": weight.provenance,
+        "scale": scale.provenance,
+        "fill": fill.provenance,
+        "outline": outline.provenance,
+        "orientation": orientation_decision.provenance,
+    }
+
     style: dict[str, Any] = {
         **base,
         "render_style_version": PARENT_RENDER_STYLE_VERSION,
@@ -1691,211 +2754,206 @@ def _resolved_style_for_bundle(
         "render_style_provider": STYLE_ARBITRATOR_PROVIDER,
         "render_style_provider_model": evidence.evidence_model,
         "render_style_confidence": resolved_confidence,
-        "style_resolution_status": "authorized_evidence_resolved",
+        "style_resolution_status": (
+            "authorized_evidence_resolved" if observed else "unresolved"
+        ),
         "style_resolution_reason_codes": resolution_reasons,
         "style_arbitration_decision": (
-            "per_parent_authorized_evidence_with_root_peer_reconciliation"
-            if evidence.peer_normalization_applied
+            "per_parent_authorized_evidence_with_root_peer_assistance"
+            if observed and peer_axes
+            else "identity_valid_observation_with_root_peer_assistance"
+            if peer_axes
             else "per_parent_authorized_evidence"
+            if observed
+            else "authorized_evidence_unavailable"
         ),
         "style_arbitration_peer_scope": (
-            "root_local_compatible" if evidence.peer_group_id else "none"
+            "root_local_same_role" if peer_axes else "none"
         ),
-        "style_arbitration_peer_group_id": evidence.peer_group_id,
-        "style_arbitration_peer_normalized_axes": list(evidence.peer_normalized_axes),
+        "style_arbitration_peer_group_id": (
+            peer_group_ids[0] if len(peer_group_ids) == 1 else ""
+        ),
+        "style_arbitration_peer_group_ids": peer_group_ids,
+        "style_arbitration_peer_assisted_axes": peer_axes,
+        "style_arbitration_peer_support": {
+            key: dict(value) for key, value in decision_set.peer_support.items()
+        },
+        "style_axis_decisions": decision_set.to_audit_dict(),
         "style_class": semantic_style_class,
         "typographic_style_class": (
-            f"{family_role}_{observed_weight}"
-            if observed_weight
+            "unresolved"
+            if not basic_axis_resolved
+            else f"{family_role}_{target_weight}"
+            if weight.status == "resolved"
             else f"{family_role}_fallback_regular"
         ),
-        "base_style_id": f"base_{family_role}_{target_weight}_{orientation}",
+        "base_style_id": (
+            f"base_{family_role}_{target_weight}_{orientation}"
+            if basic_axis_resolved
+            else "unresolved"
+        ),
         "font_family": resolved_font,
-        "font_family_role": family_role,
-        "font_family_authority": (
-            "authorized_source_style_view"
-            if family_supported
-            else "target_fallback_unresolved_source_family"
+        "font_family_role": (
+            family_role
+            if observed or family.status == "resolved"
+            else "fallback_sans"
+        ),
+        "font_family_authority": _resolved_axis_field_authority(
+            family,
+            fallback="target_fallback_unresolved_source_family",
         ),
         "font_weight": target_weight,
-        "font_weight_authority": (
-            "authorized_source_style_view"
-            if observed_weight
-            else "target_fallback_unresolved_source_weight"
+        "font_weight_authority": _resolved_axis_field_authority(
+            weight,
+            fallback="target_fallback_unresolved_source_weight",
         ),
+        "fallback_font_chain_key": PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY,
         "target_font_mapping_source": "noto_cjk_sc_role_weight_glyph_coverage_pack",
         "target_font_mapping_family_role": family_role,
         "target_font_mapping_weight": target_weight,
-        "fill_color": evidence.text_color if paint_supported else "#000000",
-        "fill_color_authority": (
-            "authorized_source_style_view"
-            if paint_supported
-            else "target_fallback_unresolved_source_paint"
+        "fill_color": _hex_color(fill.value) or "#000000",
+        "fill_color_authority": _resolved_axis_field_authority(
+            fill,
+            fallback="target_fallback_unresolved_source_paint",
         ),
-        "stroke_color": (
-            evidence.stroke_color
-            if stroke_supported and _hex_color(evidence.stroke_color)
-            else "#FFFFFF"
-        ),
+        "stroke_color": outline_color,
         "stroke_width": stroke_width,
-        "stroke_authority": (
-            "authorized_source_style_view"
-            if stroke_supported
-            else "target_fallback_unresolved_source_stroke_zero"
+        "stroke_authority": _resolved_axis_field_authority(
+            outline,
+            fallback="target_fallback_unresolved_source_stroke_zero",
         ),
         "source_orientation": orientation,
         "wrap_mode": orientation,
-        "source_orientation_authority": (
-            "authorized_source_style_view"
-            if orientation_supported
-            else "target_fallback_unresolved_source_orientation"
+        "source_orientation_authority": _resolved_axis_field_authority(
+            orientation_decision,
+            fallback="target_fallback_unresolved_source_orientation",
         ),
-        "font_size_authority": "automated_style_arbitrator",
+        "font_size_authority": (
+            "automated_style_arbitrator"
+            if preferred_size > 0
+            else PARENT_STYLE_UNRESOLVED_FONT_SIZE_AUTHORITY
+        ),
         "font_size_locked": False,
-        "font_size_policy": "authorized_source_preferred",
+        "font_size_policy": (
+            "authorized_source_preferred"
+            if preferred_size > 0
+            else PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY
+        ),
         "font_size_fallback_policy": "typesetting_bounded_fit",
-        "source_typography_observed": True,
+        "font_size_source": (
+            "root_local_peer_assist"
+            if preferred_size > 0 and scale.source == "peer"
+            else "authorized_source_style_view"
+            if preferred_size > 0
+            else "parent_style_arbitrator_unresolved_scale_fallback"
+        ),
+        "source_typography_observed": observed,
         "source_typography_matched": False,
-        "source_typography_match_status": "mapped_to_supported_target_role",
-        "style_evidence_status": "observed",
+        "source_typography_match_status": (
+            "mapped_to_supported_target_role"
+            if observed
+            else "partial_root_peer_axes_resolved"
+            if peer_axes
+            else "unresolved"
+        ),
+        "style_evidence_status": evidence.status,
         "style_evidence_view_id": evidence.view_id,
         "style_evidence_cleanup_mask_ids": list(evidence.cleanup_mask_ids),
         "style_evidence_owned_component_ids": list(evidence.owned_component_ids),
         "style_evidence_provider": evidence.evidence_provider,
         "style_evidence_source": evidence.evidence_source,
         "style_evidence_model": evidence.evidence_model,
-        "style_axis_confidence": dict(evidence.axis_confidence),
-        "style_axis_provenance": dict(evidence.axis_provenance),
+        "style_axis_confidence": style_axis_confidence,
+        "style_axis_provenance": style_axis_provenance,
         "detector_input_sha256": evidence.detector_input_sha256,
-        "source_scale_px": round(float(evidence.source_size_px), 6),
-        "source_scale_support_status": evidence.source_scale_support_status,
-        "source_scale_conversion_count": 1 if preferred_size > 0 else 0,
-        "source_scale_source": "authorized_foreground_geometry_cell_measurement",
-        "source_ink_stroke_width_px": round(
-            float(evidence.source_ink_stroke_width_px), 6
+        "source_scale_px": (
+            round(float(scale.value), 6) if preferred_size > 0 else 0.0
         ),
-        "source_visual_column_count": 0,
-        "source_visual_column_reliable": False,
-        "source_visual_column_authority": "none",
+        "source_scale_support_status": scale.support_status,
+        "source_scale_conversion_count": 1 if preferred_size > 0 else 0,
+        "source_scale_source": (
+            "root_local_peer_directional_scale_assist"
+            if scale.source == "peer"
+            else "authorized_foreground_geometry_cell_measurement"
+            if preferred_size > 0
+            else "parent_style_arbitrator_unresolved_scale_fallback"
+        ),
+        "source_ink_stroke_width_px": round(
+            _float(evidence.source_ink_stroke_width_px), 6
+        ),
     }
-    if scale_supported and preferred_size > 0:
-        style.update(
-            {
-                "font_size": preferred_size,
-                "font_size_hint": preferred_size,
-                "font_size_min": max(1, int(round(preferred_size * 0.72))),
-                "font_size_max": preferred_size,
-                "font_size_source": "authorized_source_style_view",
-            }
-        )
-    else:
-        style.update(
-            {
-                "font_size_authority": "typesetting_default",
-                "font_size_source": "authorized_scale_unavailable",
-                "font_size_policy": "unresolved_scale_default",
-            }
-        )
+    executable_font_size = (
+        preferred_size if preferred_size > 0 else PARENT_STYLE_UNRESOLVED_FONT_SIZE
+    )
+    style.update(
+        {
+            "font_size": executable_font_size,
+            "font_size_hint": executable_font_size,
+            "font_size_min": (
+                max(1, int(round(preferred_size * 0.72)))
+                if preferred_size > 0
+                else PARENT_STYLE_UNRESOLVED_FONT_SIZE_MIN
+            ),
+            "font_size_max": (
+                preferred_size
+                if preferred_size > 0
+                else PARENT_STYLE_UNRESOLVED_FONT_SIZE_MAX
+            ),
+        }
+    )
+
     target_font_request = _optional_target_font_request(evidence)
     if target_font_request:
         style["target_font_request"] = target_font_request
-    return _apply_additive_perceptual_style_axes(
-        bundle=bundle,
-        evidence=evidence,
-        task_a_style=style,
-    )
 
-
-def _apply_additive_perceptual_style_axes(
-    *,
-    bundle: Any,
-    evidence: StyleEvidence,
-    task_a_style: dict[str, Any],
-) -> dict[str, Any]:
-    """Overlay independently resolved axes without replacing Task A style."""
-
-    raw_carrier = evidence.perceptual_axis_evidence
-    if not raw_carrier:
-        return task_a_style
-
-    carrier = dict(raw_carrier) if isinstance(raw_carrier, Mapping) else {}
-    global_reasons, carrier_fact_set_id = _perceptual_carrier_validation(
-        bundle=bundle,
-        evidence=evidence,
-        raw_carrier=raw_carrier,
-        carrier=carrier,
-    )
-    resolved_values: dict[str, dict[str, Any]] = {}
-    axis_audits: dict[str, dict[str, Any]] = {}
-    for axis in PERCEPTUAL_STYLE_AXES:
-        value, audit = _resolve_perceptual_axis(
-            axis=axis,
-            record=carrier.get(axis),
-            carrier_fact_set_id=carrier_fact_set_id,
-            global_reasons=global_reasons,
-        )
-        axis_audits[axis] = audit
-        if value is not None:
-            resolved_values[axis] = value
-
-    style = dict(task_a_style)
-    if "fill" in resolved_values:
-        style.update(
-            {
-                "fill_color": resolved_values["fill"]["color"],
-                "fill_color_authority": "authorized_perceptual_style_axis",
-            }
-        )
-    if "outline" in resolved_values:
-        style.update(
-            {
-                "stroke_color": resolved_values["outline"]["color"],
-                "stroke_width": resolved_values["outline"]["width_px"],
-                "stroke_authority": "authorized_perceptual_style_axis",
-            }
-        )
-    if "rotation" in resolved_values or "shadow" in resolved_values:
+    rotation = decisions.get("rotation")
+    shadow = decisions.get("shadow")
+    if (
+        rotation is not None
+        and rotation.status == "resolved"
+        or shadow is not None
+        and shadow.status == "resolved"
+    ):
         style["parent_layer_effects"] = {
             "contract_version": "parent_layer_effects_v1",
             "rotation": (
-                {
-                    "availability": "resolved",
-                    **resolved_values["rotation"],
-                }
-                if "rotation" in resolved_values
+                {"availability": "resolved", **dict(rotation.value)}
+                if rotation is not None and rotation.status == "resolved"
                 else {"availability": "unavailable"}
             ),
             "shadow": (
-                {
-                    "availability": "resolved",
-                    **resolved_values["shadow"],
-                }
-                if "shadow" in resolved_values
+                {"availability": "resolved", **dict(shadow.value)}
+                if shadow is not None and shadow.status == "resolved"
                 else {"availability": "unavailable"}
             ),
         }
-
-    resolved_axes = [
-        axis for axis in PERCEPTUAL_STYLE_AXES if axis in resolved_values
-    ]
-    unavailable_axes = [
-        axis for axis in PERCEPTUAL_STYLE_AXES if axis not in resolved_values
-    ]
-    style["style_perceptual_axis_resolution"] = {
-        "contract_version": PERCEPTUAL_STYLE_RESOLUTION_VERSION,
-        "source_contract_version": _plain_string(carrier.get("contract_version")),
-        "carrier_status": "valid" if not global_reasons else "rejected",
-        "resolved_axes": resolved_axes,
-        "unavailable_axes": unavailable_axes,
-        **axis_audits,
-    }
-    if resolved_axes:
+    if optional_effect_axes:
         style["style_resolution_coverage"] = (
-            "partial_authorized_perceptual_resolution"
-            if str(style.get("style_resolution_status") or "") == "unresolved"
-            else "authorized_core_plus_perceptual_resolution"
+            "authorized_core_plus_optional_effect_resolution"
+            if observed
+            else "partial_root_peer_plus_optional_effect_resolution"
+            if peer_axes
+            else "partial_optional_effect_resolution"
         )
-    return style
+    elif peer_axes and not observed:
+        style["style_resolution_coverage"] = "partial_root_peer_resolution"
+    validation = validate_resolved_render_style(style)
+    if not validation.accepted:
+        raise ValueError(
+            "parent_style_arbitrator_invalid_resolved_style:"
+            + ",".join(validation.reason_codes)
+        )
+    return validation.style
+
+
+def _resolved_axis_field_authority(
+    decision: _AxisDecision,
+    *,
+    fallback: str,
+) -> str:
+    if decision.status != "resolved":
+        return fallback
+    return decision.authority
 
 
 def _perceptual_carrier_validation(
@@ -1952,6 +3010,12 @@ def _perceptual_carrier_validation(
         "crop_shape",
         "authorized_mask_sha256",
         "authorized_pixel_sha256",
+        "external_surface_ring_version",
+        "external_surface_ring_inner_radius_px",
+        "external_surface_ring_outer_radius_px",
+        "external_surface_ring_pixel_count",
+        "external_surface_ring_mask_sha256",
+        "external_surface_ring_pixel_sha256",
     }
     trusted_source_identity = evidence.authorized_perceptual_source_identity
     trusted_identity: dict[str, Any] = {}
@@ -1960,7 +3024,9 @@ def _perceptual_carrier_validation(
     elif not _is_json_safe(trusted_source_identity):
         reasons.append("perceptual_trusted_source_identity_not_json_safe")
     else:
-        trusted_identity = dict(trusted_source_identity)
+        trusted_identity = _plain_json_mapping_snapshot(
+            trusted_source_identity
+        )
         trusted_string_keys = {
             key for key in trusted_identity if isinstance(key, str)
         }
@@ -1993,19 +3059,50 @@ def _perceptual_carrier_validation(
         for key in (
             "authorized_mask_sha256",
             "authorized_pixel_sha256",
+            "external_surface_ring_mask_sha256",
+            "external_surface_ring_pixel_sha256",
             "detector_input_sha256",
         ):
             if not _is_sha256(trusted_identity.get(key)):
                 reasons.append(
                     f"perceptual_trusted_source_identity_{key}_invalid"
                 )
+        if trusted_identity.get("external_surface_ring_version") != (
+            EXTERNAL_SOURCE_SURFACE_RING_VERSION
+        ):
+            reasons.append(
+                "perceptual_trusted_source_identity_external_surface_ring_version_invalid"
+            )
+        trusted_inner = trusted_identity.get(
+            "external_surface_ring_inner_radius_px"
+        )
+        trusted_outer = trusted_identity.get(
+            "external_surface_ring_outer_radius_px"
+        )
+        trusted_count = trusted_identity.get("external_surface_ring_pixel_count")
+        if (
+            isinstance(trusted_inner, bool)
+            or not isinstance(trusted_inner, (int, float))
+            or not math.isfinite(float(trusted_inner))
+            or float(trusted_inner) < 0.0
+            or isinstance(trusted_outer, bool)
+            or not isinstance(trusted_outer, (int, float))
+            or not math.isfinite(float(trusted_outer))
+            or float(trusted_outer) < float(trusted_inner or 0.0)
+            or isinstance(trusted_count, bool)
+            or not isinstance(trusted_count, int)
+            or trusted_count < 0
+        ):
+            reasons.append(
+                "perceptual_trusted_source_identity_external_surface_ring_geometry_invalid"
+            )
     computed_fact_set_id = ""
     if not isinstance(source_identity, Mapping):
         reasons.append("perceptual_source_identity_not_mapping")
     elif not _is_json_safe(source_identity):
         reasons.append("perceptual_source_identity_not_json_safe")
     else:
-        identity = dict(source_identity)
+        identity = _plain_json_mapping_snapshot(source_identity)
         identity_string_keys = {
             key for key in identity if isinstance(key, str)
         }
@@ -2041,10 +3138,37 @@ def _perceptual_carrier_validation(
         for key in (
             "authorized_mask_sha256",
             "authorized_pixel_sha256",
+            "external_surface_ring_mask_sha256",
+            "external_surface_ring_pixel_sha256",
             "detector_input_sha256",
         ):
             if not _is_sha256(identity.get(key)):
                 reasons.append(f"perceptual_source_identity_{key}_invalid")
+        if identity.get("external_surface_ring_version") != (
+            EXTERNAL_SOURCE_SURFACE_RING_VERSION
+        ):
+            reasons.append(
+                "perceptual_source_identity_external_surface_ring_version_invalid"
+            )
+        inner = identity.get("external_surface_ring_inner_radius_px")
+        outer = identity.get("external_surface_ring_outer_radius_px")
+        ring_count = identity.get("external_surface_ring_pixel_count")
+        if (
+            isinstance(inner, bool)
+            or not isinstance(inner, (int, float))
+            or not math.isfinite(float(inner))
+            or float(inner) < 0.0
+            or isinstance(outer, bool)
+            or not isinstance(outer, (int, float))
+            or not math.isfinite(float(outer))
+            or float(outer) < float(inner or 0.0)
+            or isinstance(ring_count, bool)
+            or not isinstance(ring_count, int)
+            or ring_count < 0
+        ):
+            reasons.append(
+                "perceptual_source_identity_external_surface_ring_geometry_invalid"
+            )
         computed_fact_set_id = _perceptual_fact_set_id(identity)
 
     carrier_fact_set_id = _plain_string(carrier.get("fact_set_id"))
@@ -2101,7 +3225,7 @@ def _resolve_perceptual_axis(
     if confidence is None or not 0.0 <= confidence <= 1.0:
         validation_reasons.append(f"perceptual_{axis}_confidence_invalid")
     reason_codes = payload.get("reason_codes")
-    if not isinstance(reason_codes, list) or any(
+    if not _is_plain_sequence(reason_codes) or any(
         not isinstance(value, str) for value in reason_codes
     ):
         validation_reasons.append(f"perceptual_{axis}_reason_codes_invalid")
@@ -2279,6 +3403,8 @@ def _perceptual_fact_set_id(source_identity: Mapping[str, Any]) -> str:
 def _json_safe_audit_mapping(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {"audit_status": "rejected_non_mapping_payload"}
+    if not _json_snapshot_shape_is_bounded(value):
+        return {"audit_status": "rejected_unbounded_json_payload"}
     try:
         encoded = json.dumps(
             dict(value),
@@ -2293,11 +3419,148 @@ def _json_safe_audit_mapping(value: Any) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {"audit_status": "rejected_payload"}
 
 
+def _plain_json_mapping_snapshot(value: Any) -> dict[str, Any]:
+    """Return an alias-free, bounded JSON mapping or an empty fail-closed view."""
+
+    if not isinstance(value, Mapping) or not _json_snapshot_shape_is_bounded(value):
+        return {}
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _frozen_json_mapping_snapshot(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        return _FrozenJsonDict()
+    frozen = _freeze_json_snapshot(value)
+    return frozen if isinstance(frozen, _FrozenJsonDict) else _FrozenJsonDict()
+
+
+def _frozen_json_sequence_snapshot(value: Any) -> tuple[Any, ...]:
+    """Return an alias-free, recursively frozen sequence."""
+
+    if not _is_plain_sequence(value):
+        return ()
+    frozen = _freeze_json_snapshot(value)
+    return frozen if isinstance(frozen, tuple) else ()
+
+
+def _freeze_json_snapshot(
+    value: Any,
+    *,
+    depth: int = 0,
+    active_containers: set[int] | None = None,
+    node_budget: list[int] | None = None,
+) -> Any:
+    """Freeze without aliasing while retaining malformed subtrees as markers.
+
+    A malformed perceptual axis must not erase valid sibling axes.  The marker
+    is intentionally not JSON serializable, so the existing axis-local
+    validators reject only the affected record.  Depth, node count, and cycles
+    fail closed without recursing through hostile payloads.
+    """
+
+    active = active_containers if active_containers is not None else set()
+    budget = node_budget if node_budget is not None else [0]
+    budget[0] += 1
+    if depth > MAX_STYLE_CARRIER_DEPTH:
+        return _InvalidFrozenJsonValue("maximum_depth_exceeded")
+    if budget[0] > MAX_STYLE_CARRIER_NODES:
+        return _InvalidFrozenJsonValue("maximum_node_count_exceeded")
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active:
+            return _InvalidFrozenJsonValue("container_cycle_detected")
+        active.add(identity)
+        try:
+            return _FrozenJsonDict(
+                {
+                    key: _freeze_json_snapshot(
+                        item,
+                        depth=depth + 1,
+                        active_containers=active,
+                        node_budget=budget,
+                    )
+                    for key, item in value.items()
+                }
+            )
+        finally:
+            active.discard(identity)
+    if _is_plain_sequence(value):
+        identity = id(value)
+        if identity in active:
+            return _InvalidFrozenJsonValue("container_cycle_detected")
+        active.add(identity)
+        try:
+            return tuple(
+                _freeze_json_snapshot(
+                    item,
+                    depth=depth + 1,
+                    active_containers=active,
+                    node_budget=budget,
+                )
+                for item in value
+            )
+        finally:
+            active.discard(identity)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return _InvalidFrozenJsonValue(
+        f"unsupported_json_value:{type(value).__name__}"
+    )
+
+
 def _is_json_safe(value: Any) -> bool:
+    if not _json_snapshot_shape_is_bounded(value):
+        return False
     try:
         json.dumps(value, ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError, RecursionError, OverflowError):
         return False
+    return True
+
+
+def _json_snapshot_shape_is_bounded(value: Any) -> bool:
+    """Bound snapshot traversal while permitting harmless repeated aliases."""
+
+    stack: list[tuple[Any, int, bool]] = [(value, 0, False)]
+    active_containers: set[int] = set()
+    node_count = 0
+    while stack:
+        current, depth, exiting = stack.pop()
+        is_container = isinstance(current, Mapping) or _is_plain_sequence(current)
+        if exiting:
+            if is_container:
+                active_containers.discard(id(current))
+            continue
+        node_count += 1
+        if depth > MAX_STYLE_CARRIER_DEPTH or node_count > MAX_STYLE_CARRIER_NODES:
+            return False
+        if not is_container:
+            continue
+        identity = id(current)
+        if identity in active_containers:
+            return False
+        active_containers.add(identity)
+        stack.append((current, depth, True))
+        if isinstance(current, Mapping):
+            for key, child in current.items():
+                stack.append((key, depth + 1, False))
+                stack.append((child, depth + 1, False))
+        else:
+            for child in current:
+                stack.append((child, depth + 1, False))
     return True
 
 
@@ -2508,9 +3771,15 @@ def _orientation_axis_from_variants(
 ) -> tuple[str, float, str]:
     primary_direction = str(primary.get("direction") or "").strip().lower()
     primary_confidence = _unit_interval(primary.get("direction_confidence")) or 0.0
-    if primary_direction not in {"ltr", "ttb"}:
-        return "", 0.0, "orientation_primary_vote_invalid"
+    primary_valid = primary_direction in {"ltr", "ttb"}
+    primary_reliable = bool(
+        primary_valid and primary_confidence >= ORIENTATION_VOTE_MIN_CONFIDENCE
+    )
     if not isinstance(neutral, Mapping):
+        if not primary_valid:
+            return "", 0.0, "orientation_primary_vote_invalid"
+        if not primary_reliable:
+            return "", 0.0, "orientation_primary_vote_below_confidence_floor"
         return (
             primary_direction,
             primary_confidence * 0.75,
@@ -2518,6 +3787,24 @@ def _orientation_axis_from_variants(
         )
     neutral_direction = str(neutral.get("direction") or "").strip().lower()
     neutral_confidence = _unit_interval(neutral.get("direction_confidence")) or 0.0
+    neutral_reliable = bool(
+        neutral_direction in {"ltr", "ttb"}
+        and neutral_confidence >= ORIENTATION_VOTE_MIN_CONFIDENCE
+    )
+    if not primary_reliable and not neutral_reliable:
+        return "", 0.0, "orientation_variant_votes_below_confidence_floor"
+    if primary_reliable and not neutral_reliable:
+        return (
+            primary_direction,
+            primary_confidence * 0.75,
+            "orientation_single_reliable_primary_vote",
+        )
+    if neutral_reliable and not primary_reliable:
+        return (
+            neutral_direction,
+            neutral_confidence * 0.75,
+            "orientation_single_reliable_neutral_vote",
+        )
     if neutral_direction == primary_direction:
         return (
             primary_direction,

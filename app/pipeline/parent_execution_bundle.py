@@ -7,18 +7,48 @@ cleanup, render eligibility, and rendering.
 """
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 
 PARENT_EXECUTION_BUNDLE_VERSION = "parent_execution_bundle_v1"
-PARENT_RENDER_STYLE_VERSION = "parent_render_style_v1"
+PARENT_RENDER_STYLE_VERSION = "parent_render_style_v2"
 PARENT_STYLE_ARBITRATOR_SOURCE = "parent_authorized_style_arbitrator"
 PARENT_STYLE_ARBITRATOR_PROVIDER = "ParentStyleArbitrator"
 PARENT_STYLE_RESOLUTION_STATUSES = {
     "authorized_evidence_resolved",
     "unresolved",
 }
+PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY = "cjk-sc"
+PARENT_STYLE_UNRESOLVED_FONT_SIZE = 24
+PARENT_STYLE_UNRESOLVED_FONT_SIZE_MIN = 17
+PARENT_STYLE_UNRESOLVED_FONT_SIZE_MAX = 24
+PARENT_STYLE_UNRESOLVED_FONT_SIZE_AUTHORITY = (
+    "parent_style_arbitrator_unresolved_scale_fallback"
+)
+PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY = (
+    "arbitrator_owned_unresolved_scale_fallback"
+)
+
+_PARENT_STYLE_FONT_WEIGHTS = {"regular", "bold", "black"}
+_PARENT_STYLE_WRITING_MODES = {"vertical", "horizontal"}
+_PARENT_STYLE_ALIGNMENTS = {"center", "left", "right", "start", "end"}
+_PARENT_STYLE_FONT_SIZE_AUTHORITIES = {
+    "automated_style_arbitrator",
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE_AUTHORITY,
+}
+_PARENT_STYLE_FONT_SIZE_POLICIES = {
+    "authorized_source_preferred",
+    PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY,
+}
+_PARENT_STYLE_FONT_SIZE_SOURCES = {
+    "root_local_peer_assist",
+    "authorized_source_style_view",
+    "parent_style_arbitrator_unresolved_scale_fallback",
+}
+_HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 _RENDER_STYLE_FLAT_FIELDS = {
     "font_family": "font",
@@ -40,6 +70,25 @@ _RENDER_STYLE_FLAT_FIELDS = {
     "font_weight": "font_weight",
     "spacing_profile": "spacing_profile",
 }
+
+
+@dataclass(frozen=True)
+class ResolvedRenderStyleValidation:
+    """Central acceptance result for an executable parent render style."""
+
+    status: str
+    style: dict[str, Any] = field(default_factory=dict)
+    reason_codes: tuple[str, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return self.status == "accepted" and bool(self.style)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason_codes": list(self.reason_codes),
+        }
 
 
 @dataclass
@@ -147,7 +196,9 @@ class ParentExecutionBundle:
             "renderer_audit_id": self.renderer_audit_id,
             "style_evidence_summary": _copy_jsonish(self.style_evidence_summary),
             "render_layout_summary": _copy_jsonish(self.render_layout_summary),
-            "render_style": _copy_jsonish(_resolved_render_style_contract(self.render_style)),
+            "render_style": _copy_jsonish(
+                resolved_render_style_contract(self.render_style)
+            ),
             "execution_region": self.to_region_record(),
             "reading_order_index": int(self.reading_order_index),
         }
@@ -176,7 +227,7 @@ class ParentExecutionBundle:
         container_type = self.text_area_container_type or _container_type_for_role(self.role)
         semantic_kind = _semantic_kind_for_role(self.role)
         cleanup_authorization = _cleanup_authorization_for_role(self.role)
-        render_style = _resolved_render_style_contract(self.render_style)
+        render_style = resolved_render_style_contract(self.render_style)
         record = {
             "region_id": self.bundle_id,
             "page_id": self.page_id,
@@ -468,7 +519,7 @@ def sync_bundles_from_region_records(
         resolved_style = _resolved_render_style_from_region(record)
         if resolved_style:
             bundle.render_style = resolved_style
-        elif not _resolved_render_style_contract(bundle.render_style):
+        elif not resolved_render_style_contract(bundle.render_style):
             bundle.render_style = {}
         bundle.source_contract_owner = str(record.get("source_contract_owner") or bundle.source_contract_owner or "")
         bundle.source_contract_region_id = str(record.get("source_contract_region_id") or bundle.source_contract_region_id or "")
@@ -550,7 +601,7 @@ def parent_execution_bundles_from_audit_records(
                     else {}
                 )
             ),
-            render_style=_resolved_render_style_contract(record.get("render_style")),
+            render_style=resolved_render_style_contract(record.get("render_style")),
             execution_region=_copy_region_record(record.get("execution_region") or {}),
             reading_order_index=int(record.get("reading_order_index") or record.get("order_index") or 0),
         )
@@ -967,7 +1018,7 @@ def _sync_execution_region_from_bundle(
     record["source_region_evidence_only"] = True
     _clear_executable_style_fields(record)
     _clear_executable_style_fields(render)
-    render_style = _resolved_render_style_contract(bundle.render_style)
+    render_style = resolved_render_style_contract(bundle.render_style)
     bundle.render_style = _copy_jsonish(render_style)
     if render_style:
         record.update(_render_style_record_fields(render_style))
@@ -1085,33 +1136,154 @@ def _resolved_render_style_from_region(record: Mapping[str, Any]) -> dict[str, A
         record.get("render_style"),
         render.get("render_style") if isinstance(render, Mapping) else None,
     ):
-        style = _resolved_render_style_contract(value)
+        style = resolved_render_style_contract(value)
         if style:
             return style
     return {}
 
 
-def _resolved_render_style_contract(value: Any) -> dict[str, Any]:
-    """Accept only a complete style stamped by the current arbitrator."""
+def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
+    """Validate and copy the complete executable style owned by the arbitrator.
+
+    This is the only resolved-style acceptance gate shared by bundle persistence
+    and the renderer adapter.  It deliberately validates Stage A executable
+    axes only; punctuation and symbol policy remain separate typesetting work.
+    """
 
     if not isinstance(value, Mapping):
-        return {}
+        return ResolvedRenderStyleValidation(
+            status="rejected",
+            reason_codes=("resolved_render_style_not_mapping",),
+        )
     style = _copy_jsonish(value)
     if not isinstance(style, dict):
-        return {}
-    if str(style.get("render_style_version") or "") != PARENT_RENDER_STYLE_VERSION:
-        return {}
-    if str(style.get("render_style_owner") or "") != "parent_execution_bundle":
-        return {}
-    if str(style.get("render_style_source") or "") != PARENT_STYLE_ARBITRATOR_SOURCE:
-        return {}
-    if str(style.get("render_style_provider") or "") != PARENT_STYLE_ARBITRATOR_PROVIDER:
-        return {}
+        return ResolvedRenderStyleValidation(
+            status="rejected",
+            reason_codes=("resolved_render_style_not_json_mapping",),
+        )
+
+    reasons: list[str] = []
+    expected_stamps = {
+        "render_style_version": PARENT_RENDER_STYLE_VERSION,
+        "render_style_owner": "parent_execution_bundle",
+        "render_style_source": PARENT_STYLE_ARBITRATOR_SOURCE,
+        "render_style_provider": PARENT_STYLE_ARBITRATOR_PROVIDER,
+    }
+    for field_name, expected in expected_stamps.items():
+        if str(style.get(field_name) or "") != expected:
+            reasons.append(f"resolved_render_style_invalid_{field_name}")
     if str(style.get("style_resolution_status") or "") not in PARENT_STYLE_RESOLUTION_STATUSES:
-        return {}
+        reasons.append("resolved_render_style_invalid_style_resolution_status")
     if str(style.get("style_evidence_status") or "") not in {"observed", "unavailable"}:
-        return {}
-    return style
+        reasons.append("resolved_render_style_invalid_style_evidence_status")
+    confidence = _finite_number(style.get("render_style_confidence"))
+    if confidence is None or not 0.0 <= confidence <= 1.0:
+        reasons.append("resolved_render_style_invalid_render_style_confidence")
+
+    for field_name in (
+        "font_family",
+        "style_class",
+        "fallback_font_chain_key",
+        "font_size_authority",
+        "font_size_policy",
+        "font_size_fallback_policy",
+        "font_size_source",
+    ):
+        if not str(style.get(field_name) or "").strip():
+            reasons.append(f"resolved_render_style_missing_{field_name}")
+
+    if (
+        str(style.get("fallback_font_chain_key") or "")
+        != PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY
+    ):
+        reasons.append("resolved_render_style_invalid_fallback_font_chain_key")
+    if str(style.get("font_size_authority") or "") not in (
+        _PARENT_STYLE_FONT_SIZE_AUTHORITIES
+    ):
+        reasons.append("resolved_render_style_invalid_font_size_authority")
+    if str(style.get("font_size_policy") or "") not in _PARENT_STYLE_FONT_SIZE_POLICIES:
+        reasons.append("resolved_render_style_invalid_font_size_policy")
+    if str(style.get("font_size_fallback_policy") or "") != "typesetting_bounded_fit":
+        reasons.append("resolved_render_style_invalid_font_size_fallback_policy")
+    if str(style.get("font_size_source") or "") not in _PARENT_STYLE_FONT_SIZE_SOURCES:
+        reasons.append("resolved_render_style_invalid_font_size_source")
+
+    if str(style.get("font_weight") or "") not in _PARENT_STYLE_FONT_WEIGHTS:
+        reasons.append("resolved_render_style_invalid_font_weight")
+    if not isinstance(style.get("font_size_locked"), bool):
+        reasons.append("resolved_render_style_invalid_font_size_locked")
+
+    numeric_values: dict[str, float] = {}
+    for field_name in (
+        "font_size",
+        "font_size_hint",
+        "font_size_min",
+        "font_size_max",
+        "line_height",
+    ):
+        number = _finite_number(style.get(field_name))
+        if number is None or number <= 0.0:
+            reasons.append(f"resolved_render_style_invalid_{field_name}")
+        else:
+            numeric_values[field_name] = number
+    stroke_width = _finite_number(style.get("stroke_width"))
+    if stroke_width is None or stroke_width < 0.0:
+        reasons.append("resolved_render_style_invalid_stroke_width")
+
+    font_min = numeric_values.get("font_size_min")
+    font_hint = numeric_values.get("font_size_hint")
+    font_size = numeric_values.get("font_size")
+    font_max = numeric_values.get("font_size_max")
+    if None not in (font_min, font_hint, font_size, font_max) and not (
+        font_min <= font_hint <= font_max and font_min <= font_size <= font_max
+    ):
+        reasons.append("resolved_render_style_invalid_font_size_band")
+
+    orientation = str(style.get("source_orientation") or "")
+    wrap_mode = str(style.get("wrap_mode") or "")
+    if orientation not in _PARENT_STYLE_WRITING_MODES:
+        reasons.append("resolved_render_style_invalid_source_orientation")
+    if wrap_mode not in _PARENT_STYLE_WRITING_MODES:
+        reasons.append("resolved_render_style_invalid_wrap_mode")
+    if (
+        orientation in _PARENT_STYLE_WRITING_MODES
+        and wrap_mode in _PARENT_STYLE_WRITING_MODES
+        and orientation != wrap_mode
+    ):
+        reasons.append("resolved_render_style_orientation_wrap_mismatch")
+    if str(style.get("align") or "") not in _PARENT_STYLE_ALIGNMENTS:
+        reasons.append("resolved_render_style_invalid_align")
+    for field_name in ("fill_color", "stroke_color"):
+        if not _HEX_COLOR_PATTERN.fullmatch(str(style.get(field_name) or "")):
+            reasons.append(f"resolved_render_style_invalid_{field_name}")
+
+    if reasons:
+        return ResolvedRenderStyleValidation(
+            status="rejected",
+            reason_codes=tuple(dict.fromkeys(reasons)),
+        )
+    return ResolvedRenderStyleValidation(
+        status="accepted",
+        style=style,
+        reason_codes=("resolved_render_style_contract_accepted",),
+    )
+
+
+def resolved_render_style_contract(value: Any) -> dict[str, Any]:
+    """Return an isolated executable style only when the central gate accepts it."""
+
+    validation = validate_resolved_render_style(value)
+    return validation.style if validation.accepted else {}
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _clear_executable_style_fields(record: dict[str, Any]) -> None:

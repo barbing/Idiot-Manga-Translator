@@ -17,6 +17,7 @@ from app.render.typesetting_contracts import (
     RenderLayerPlan,
     TypesetLayout,
     copy_jsonish,
+    validated_source_text_footprint_ref,
 )
 from app.render.typesetting_engine import TypesettingEngine
 
@@ -31,11 +32,12 @@ except Exception:  # pragma: no cover - optional runtime dependency
     cv2 = None
 
 
-RENDER_LAYOUT_PLANNER_VERSION = "render_layout_planner_v2"
+RENDER_LAYOUT_PLANNER_VERSION = "render_layout_planner_v4"
+PARENT_RENDER_SLOT_VERSION = "parent_render_slot_v2"
 
 _MASK_OUTSIDE_PENALTY_WEIGHT = 600.0
 _SHAPE_BALANCE_PENALTY_WEIGHT = 40.0
-_SOURCE_FIDELITY_PENALTY_WEIGHT = 55.0
+_ALIGNMENT_CENTER_PENALTY_WEIGHT = 55.0
 _SHAPE_PULL_FRACTION = 0.35
 _SHAPE_PULL_MAX_EM = 0.40
 
@@ -47,6 +49,14 @@ class RenderLayoutPlanner:
 
     def __init__(self, typesetting_engine: TypesettingEngine) -> None:
         self.typesetting_engine = typesetting_engine
+
+    def plan_page_slots(
+        self,
+        plans: Sequence[RenderLayerPlan],
+    ) -> list[RenderLayerPlan]:
+        """Project each upstream parent contract into one renderer-local slot."""
+
+        return _page_slotted_plans(plans)
 
     def plan_layer(
         self,
@@ -63,6 +73,181 @@ class RenderLayoutPlanner:
             self.typesetting_engine,
             occupied_bounds,
         )
+
+
+def _page_slotted_plans(
+    plans: Sequence[RenderLayerPlan],
+) -> list[RenderLayerPlan]:
+    input_plans = [plan for plan in plans or [] if isinstance(plan, RenderLayerPlan)]
+    return [
+        _plan_with_parent_slot(plan, _parent_local_slot(plan))
+        for plan in input_plans
+    ]
+
+
+def _parent_local_slot(plan: RenderLayerPlan) -> dict[str, Any]:
+    """Create one slot without reconstructing root or sibling topology.
+
+    Root and source boxes remain provenance/alignment evidence. Only the
+    upstream parent target, hard bounds, and render-allowed area may define
+    renderer capacity.
+    """
+
+    parent_box = _parent_anchor_box(plan)
+    hard_bounds = _parent_hard_bounds(plan) or parent_box
+    root_box = _root_evidence_box(plan)
+    return _parent_slot_record(
+        plan,
+        box=parent_box,
+        hard_bounds=hard_bounds,
+        source="parent_render_slot_parent_contract",
+        container_box=parent_box,
+        root_box=root_box,
+    )
+
+
+def _plan_with_parent_slot(
+    plan: RenderLayerPlan,
+    slot: Mapping[str, Any],
+) -> RenderLayerPlan:
+    metadata = copy_jsonish(plan.metadata) if isinstance(plan.metadata, Mapping) else {}
+    slot_record = copy_jsonish(slot) if isinstance(slot, Mapping) else {}
+    metadata["parent_render_slot"] = slot_record
+    metadata["target_box_source"] = str(
+        slot_record.get("source") or metadata.get("target_box_source") or ""
+    )
+    box = _bbox_from_value(slot_record.get("box")) or _bbox_from_value(plan.target_box)
+    hard = _bbox_from_value(slot_record.get("hard_bounds")) or _bbox_from_value(plan.hard_bounds) or box
+    alignment_kind = str(slot_record.get("alignment_anchor_kind") or "")
+    requested_center = _point_from_value(
+        slot_record.get("alignment_anchor_center")
+    )
+    metadata["visual_alignment_requested_center"] = copy_jsonish(
+        requested_center
+    )
+    metadata["visual_alignment_anchor_kind"] = alignment_kind
+    if alignment_kind in {
+        "source_text_footprint_union_bbox",
+        "source_contract_bbox",
+    } and requested_center and _point_inside_box(requested_center, hard):
+        metadata["visual_alignment_center"] = copy_jsonish(requested_center)
+        metadata["visual_alignment_policy"] = (
+            "source_text_footprint_union_center"
+            if alignment_kind == "source_text_footprint_union_bbox"
+            else "source_contract_bbox_center"
+        )
+        metadata["visual_alignment_status"] = "applied_from_parent_slot"
+    else:
+        metadata.pop("visual_alignment_center", None)
+        metadata.pop("visual_alignment_policy", None)
+        metadata["visual_alignment_status"] = (
+            "anchor_outside_hard_bounds"
+            if requested_center
+            and alignment_kind
+            in {
+                "source_text_footprint_union_bbox",
+                "source_contract_bbox",
+            }
+            else "target_box_center_default"
+        )
+    return replace(
+        plan,
+        target_box=list(box),
+        hard_bounds=list(hard),
+        metadata=metadata,
+    )
+
+
+def _parent_slot_record(
+    plan: RenderLayerPlan,
+    *,
+    box: Sequence[int],
+    hard_bounds: Sequence[int],
+    source: str,
+    container_box: Sequence[int],
+    root_box: Sequence[int],
+) -> dict[str, Any]:
+    source_box = _source_contract_box(plan)
+    footprint_box = _source_text_footprint_alignment_box(plan)
+    anchor_box, anchor_kind = _alignment_anchor_box(plan)
+    record = {
+        "render_layout_slot_version": PARENT_RENDER_SLOT_VERSION,
+        "box": _bbox_from_value(box),
+        "hard_bounds": _bbox_from_value(hard_bounds) or _bbox_from_value(box),
+        "source": str(source),
+        "source_contract_bbox": source_box,
+        "source_anchor_center": list(_center_tuple(source_box)) if source_box else [],
+        "source_text_footprint_union_bbox": footprint_box,
+        "container_bbox": _bbox_from_value(container_box),
+        "root_bbox": _bbox_from_value(root_box),
+        "sibling_count": 1,
+        "parent_id": str(plan.parent_id or ""),
+        "root_id": str(plan.root_id or ""),
+        "alignment_anchor_bbox": anchor_box,
+        "alignment_anchor_center": list(_center_tuple(anchor_box)) if anchor_box else [],
+        "alignment_anchor_kind": anchor_kind,
+    }
+    return record
+
+
+def _parent_anchor_box(plan: RenderLayerPlan) -> list[int]:
+    clipping = plan.clipping_region_ref if isinstance(plan.clipping_region_ref, Mapping) else {}
+    for value in (
+        plan.target_box,
+        plan.hard_bounds,
+        clipping.get("render_allowed_area"),
+    ):
+        box = _bbox_from_value(value)
+        if box:
+            return box
+    return []
+
+
+def _parent_hard_bounds(plan: RenderLayerPlan) -> list[int]:
+    clipping = plan.clipping_region_ref if isinstance(plan.clipping_region_ref, Mapping) else {}
+    for value in (
+        plan.hard_bounds,
+        clipping.get("render_allowed_area"),
+        plan.target_box,
+    ):
+        box = _bbox_from_value(value)
+        if box:
+            return box
+    return []
+
+
+def _root_evidence_box(plan: RenderLayerPlan) -> list[int]:
+    clipping = plan.clipping_region_ref if isinstance(plan.clipping_region_ref, Mapping) else {}
+    return _bbox_from_value(clipping.get("root_bbox"))
+
+
+def _layout_semantic_class(plan: RenderLayerPlan) -> str:
+    style = plan.resolved_render_style if isinstance(plan.resolved_render_style, Mapping) else {}
+    values = (
+        plan.role,
+        plan.state,
+        style.get("semantic_class"),
+        style.get("semantic_kind"),
+        style.get("source_role"),
+        style.get("route_intent"),
+    )
+    return " ".join(
+        dict.fromkeys(
+            text
+            for text in (str(value or "").strip().lower() for value in values)
+            if text
+        )
+    )
+
+
+def _center_tuple(box: Sequence[int]) -> tuple[float, float]:
+    bbox = _bbox_from_value(box)
+    if not bbox:
+        return (0.0, 0.0)
+    return (
+        float(bbox[0]) + float(bbox[2]) / 2.0,
+        float(bbox[1]) + float(bbox[3]) / 2.0,
+    )
 
 
 def _shape_aware_plan(page, plan: RenderLayerPlan) -> RenderLayerPlan:
@@ -99,7 +284,7 @@ def _shape_aware_plan(page, plan: RenderLayerPlan) -> RenderLayerPlan:
     return replace(
         plan,
         target_box=list(safe_box),
-        hard_bounds=list(safe_box),
+        hard_bounds=list(original_hard or original_target or safe_box),
         clipping_region_ref=clipping,
         metadata=metadata,
     )
@@ -136,7 +321,24 @@ def _visual_slot_scored_plan(
         return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "no_visual_slot_candidates"})
 
     scored: list[tuple[float, RenderLayerPlan, dict[str, Any]]] = []
-    source_box = _source_contract_box(original_plan)
+    original_metadata = (
+        original_plan.metadata
+        if isinstance(original_plan.metadata, Mapping)
+        else {}
+    )
+    slot_record = (
+        original_metadata.get("parent_render_slot")
+        if isinstance(original_metadata.get("parent_render_slot"), Mapping)
+        else {}
+    )
+    canonical_alignment_center = _point_from_value(
+        original_metadata.get("visual_alignment_center")
+    )
+    canonical_alignment_kind = str(
+        original_metadata.get("visual_alignment_anchor_kind")
+        or slot_record.get("alignment_anchor_kind")
+        or ""
+    )
     visual_center_evidence = (
         geometry.get("visual_center_evidence")
         if isinstance(geometry.get("visual_center_evidence"), Mapping)
@@ -145,7 +347,6 @@ def _visual_slot_scored_plan(
     speech_visual_center = _point_from_value(visual_center_evidence.get("center"))
     alignment_candidates = _visual_alignment_candidates(
         original_plan,
-        source_box=source_box,
         speech_visual_center=speech_visual_center,
     )
     for candidate_record in candidates:
@@ -164,7 +365,7 @@ def _visual_slot_scored_plan(
                 candidate_plan,
                 layout,
                 report,
-                source_box=source_box,
+                alignment_center=canonical_alignment_center,
                 occupied_bounds=occupied_bounds,
                 speech_visual_center=speech_visual_center,
                 speech_safe_box=_bbox_from_value(audit.get("box")),
@@ -196,10 +397,14 @@ def _visual_slot_scored_plan(
     scored.sort(key=lambda item: (item[0], _area(item[1].target_box)))
     _score, selected_plan, selected_meta = scored[0]
     rejected = [item[2] for item in scored[1:12]]
-    source_aligned = [
+    anchor_aligned = [
         item[2]
         for item in scored
-        if str(item[2].get("alignment_policy") or "") == "source_footprint_center"
+        if str(item[2].get("alignment_policy") or "")
+        in {
+            "source_text_footprint_union_center",
+            "source_contract_bbox_center",
+        }
     ]
     final_audit = {
         "applied": True,
@@ -209,12 +414,15 @@ def _visual_slot_scored_plan(
         "selected_box": list(selected_plan.target_box),
         "selected_score": selected_meta.get("score"),
         "candidate_count": len(scored),
-        "source_contract_bbox": list(source_box),
+        "alignment_anchor_kind": canonical_alignment_kind,
+        "alignment_anchor_center": copy_jsonish(canonical_alignment_center),
         "speech_component_box": copy_jsonish(audit.get("component_box")),
         "speech_safe_box": copy_jsonish(audit.get("box")),
         "speech_visual_center": copy_jsonish(speech_visual_center),
         "speech_visual_center_evidence": copy_jsonish(visual_center_evidence),
-        "source_aligned_reference": copy_jsonish(source_aligned[0]) if source_aligned else {},
+        "alignment_anchor_reference": (
+            copy_jsonish(anchor_aligned[0]) if anchor_aligned else {}
+        ),
         "selected": selected_meta,
         "rejected_candidates": rejected,
     }
@@ -241,7 +449,10 @@ def _plan_with_visual_slot_box(
     requested_center = _point_from_value(alignment.get("center"))
     applied_center: list[float] = []
     if requested_center:
-        if policy == "source_footprint_center":
+        if policy in {
+            "source_text_footprint_union_center",
+            "source_contract_bbox_center",
+        }:
             applied_center = requested_center if _point_inside_box(requested_center, target) else []
         else:
             applied_center = _clamp_point_to_box(requested_center, target)
@@ -255,57 +466,73 @@ def _plan_with_visual_slot_box(
     metadata["visual_alignment_sibling_count"] = int(alignment.get("sibling_count") or 1)
     if applied_center:
         metadata["visual_alignment_center"] = copy_jsonish(applied_center)
+        metadata["visual_alignment_status"] = (
+            "applied_from_visual_slot_scoring"
+        )
     else:
         metadata.pop("visual_alignment_center", None)
+        metadata["visual_alignment_status"] = (
+            "candidate_alignment_outside_target"
+            if requested_center
+            else "target_box_center_default"
+        )
     clipping = copy_jsonish(plan.clipping_region_ref) if isinstance(plan.clipping_region_ref, Mapping) else {}
     clipping["visual_slot_box"] = list(target)
-    return replace(plan, target_box=list(target), hard_bounds=list(target), clipping_region_ref=clipping, metadata=metadata)
+    return replace(
+        plan,
+        target_box=list(target),
+        hard_bounds=list(plan.hard_bounds or plan.target_box or target),
+        clipping_region_ref=clipping,
+        metadata=metadata,
+    )
 
 
 def _visual_alignment_candidates(
     plan: RenderLayerPlan,
     *,
-    source_box: Sequence[int],
     speech_visual_center: Sequence[float],
 ) -> list[dict[str, Any]]:
-    source_center = _center_box(source_box)
-    shape_center = _point_from_value(speech_visual_center)
     metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
-    slot = metadata.get("parent_render_slot") if isinstance(metadata.get("parent_render_slot"), Mapping) else {}
-    sibling_count = max(1, _safe_int(slot.get("sibling_count"), default=1))
+    alignment_center = _point_from_value(metadata.get("visual_alignment_center"))
+    alignment_policy = str(
+        metadata.get("visual_alignment_policy")
+        or "canonical_alignment_center"
+    )
+    shape_center = _point_from_value(speech_visual_center)
+    sibling_count = 1
     records: list[dict[str, Any]] = []
 
-    if source_center:
+    if alignment_center:
         records.append(
             {
-                "policy": "source_footprint_center",
-                "center": _round_point(source_center),
+                "policy": alignment_policy,
+                "center": _round_point(alignment_center),
                 "shift_from_source": [0.0, 0.0],
                 "source_weight": 1.0,
                 "shape_weight": 0.0,
                 "sibling_count": sibling_count,
             }
         )
-        if sibling_count == 1 and shape_center:
-            dx = float(shape_center[0]) - float(source_center[0])
-            dy = float(shape_center[1]) - float(source_center[1])
+        if shape_center:
+            dx = float(shape_center[0]) - float(alignment_center[0])
+            dy = float(shape_center[1]) - float(alignment_center[1])
             distance = math.hypot(dx, dy)
             style = plan.resolved_render_style if isinstance(plan.resolved_render_style, Mapping) else {}
             font_size = max(1.0, float(_safe_int(style.get("font_size") or style.get("font_size_hint"), default=24)))
             max_shift = float(font_size) * _SHAPE_PULL_MAX_EM
             fraction = min(_SHAPE_PULL_FRACTION, max_shift / max(1.0, distance))
             balanced = [
-                float(source_center[0]) + dx * fraction,
-                float(source_center[1]) + dy * fraction,
+                float(alignment_center[0]) + dx * fraction,
+                float(alignment_center[1]) + dy * fraction,
             ]
             shift = [
-                float(balanced[0]) - float(source_center[0]),
-                float(balanced[1]) - float(source_center[1]),
+                float(balanced[0]) - float(alignment_center[0]),
+                float(balanced[1]) - float(alignment_center[1]),
             ]
             if math.hypot(shift[0], shift[1]) >= 0.5:
                 records.append(
                     {
-                        "policy": "source_shape_balanced_center",
+                        "policy": "canonical_shape_balanced_center",
                         "center": _round_point(balanced),
                         "shift_from_source": _round_point(shift),
                         "source_weight": round(float(1.0 - fraction), 4),
@@ -349,7 +576,6 @@ def _visual_slot_candidates(
     component_box = _bbox_from_value(audit.get("component_box"))
     safe_box = _bbox_from_value(audit.get("box"))
     margin = _safe_int(audit.get("margin"), default=_shape_margin(original_plan, candidate_box or page_box))
-    source_box = _source_contract_box(original_plan)
     records: list[dict[str, Any]] = []
 
     def add(source: str, box: Sequence[int]) -> None:
@@ -370,13 +596,11 @@ def _visual_slot_candidates(
     add("current_shape_plan_box", shape_plan.target_box)
     add("original_target_box", original_plan.target_box)
 
-    component = geometry.get("component")
     safe_mask = geometry.get("safe_mask")
     local_component_box = _bbox_from_value(geometry.get("component_box_local"))
     anchor = geometry.get("anchor")
     if (
         np is not None
-        and not source_box
         and safe_mask is not None
         and local_component_box
         and isinstance(anchor, Sequence)
@@ -386,12 +610,6 @@ def _visual_slot_candidates(
         if core and candidate_box:
             add("speech_coverage_core_box", _inset_box(_local_to_page_box(core, candidate_box), margin=max(2, min(margin, 10))))
 
-    if source_box:
-        container = safe_box or component_box or candidate_box or page_box
-        add("source_footprint_padded_box", _source_padded_box(source_box, container, original_plan))
-        add("source_footprint_wide_box", _source_padded_box(source_box, container, original_plan, scale=1.8))
-    if component is not None:
-        _ = component  # Evidence exists; CleanedPage pixels are not layout authority.
     return records
 
 
@@ -400,13 +618,16 @@ def _score_visual_slot(
     layout: TypesetLayout,
     report: FitReport,
     *,
-    source_box: Sequence[int],
+    alignment_center: Sequence[float],
     occupied_bounds: Sequence[Mapping[str, Any]],
     speech_visual_center: Sequence[float] = (),
     speech_safe_box: Sequence[int] = (),
     safe_mask=None,
     mask_origin_box: Sequence[int] = (),
 ) -> tuple[float, dict[str, Any]]:
+    # Candidate quality is parent-local. Previously rendered siblings cannot
+    # change this parent's slot choice or recreate root topology by draw order.
+    del occupied_bounds
     measured = _bbox_from_value(layout.measured_bounds)
     target = _bbox_from_value(plan.target_box)
     score = 0.0
@@ -449,38 +670,41 @@ def _score_visual_slot(
         meta["speech_visual_center_distance"] = round(float(math.sqrt(shape_distance)), 4)
         meta["speech_visual_center_penalty"] = round(float(shape_penalty), 4)
 
-    if source_box:
-        source_center = _center_box(source_box)
-        if measured_center and source_center:
-            source_dx = (float(measured_center[0]) - float(source_center[0])) / max(
-                1.0, float(source_box[2]), font_size * 2.0
-            )
-            source_dy = (float(measured_center[1]) - float(source_center[1])) / max(
-                1.0, float(source_box[3]), font_size * 2.0
-            )
-            source_distance = source_dx * source_dx + source_dy * source_dy
-            source_penalty = source_distance * _SOURCE_FIDELITY_PENALTY_WEIGHT
-            score += source_penalty
-            meta["source_center_distance"] = round(float(math.sqrt(source_distance)), 4)
-            meta["source_center_penalty"] = round(float(source_penalty), 4)
-        if target:
-            area_ratio = float(_area(target)) / max(1.0, float(_area(source_box)))
-            area_penalty = max(0.0, area_ratio - 2.75) * 2.0
-            score += area_penalty
-            meta["target_to_source_area_ratio"] = round(float(area_ratio), 4)
-            meta["target_area_penalty"] = round(float(area_penalty), 4)
+    anchor_center = _point_from_value(alignment_center)
+    if measured_center and anchor_center:
+        target_box = _bbox_from_value(target)
+        normalizer_x = max(
+            1.0,
+            float(target_box[2]) if target_box else 0.0,
+            font_size * 2.0,
+        )
+        normalizer_y = max(
+            1.0,
+            float(target_box[3]) if target_box else 0.0,
+            font_size * 2.0,
+        )
+        alignment_dx = (
+            float(measured_center[0]) - float(anchor_center[0])
+        ) / normalizer_x
+        alignment_dy = (
+            float(measured_center[1]) - float(anchor_center[1])
+        ) / normalizer_y
+        alignment_distance = (
+            alignment_dx * alignment_dx + alignment_dy * alignment_dy
+        )
+        alignment_penalty = (
+            alignment_distance * _ALIGNMENT_CENTER_PENALTY_WEIGHT
+        )
+        score += alignment_penalty
+        meta["alignment_center_distance"] = round(
+            float(math.sqrt(alignment_distance)),
+            4,
+        )
+        meta["alignment_center_penalty"] = round(
+            float(alignment_penalty),
+            4,
+        )
 
-    overlap_penalty = 0.0
-    for occupied in occupied_bounds or []:
-        if str(occupied.get("root_id") or "") != str(plan.root_id or ""):
-            continue
-        other = _bbox_from_value(occupied.get("box"))
-        if not other:
-            continue
-        overlap_penalty += _box_iou(measured, other) * 420.0
-    if overlap_penalty:
-        score += overlap_penalty
-        meta["same_root_overlap_penalty"] = round(float(overlap_penalty), 4)
     return score, meta
 
 
@@ -588,17 +812,15 @@ def _speech_bubble_geometry_from_page(page, plan: RenderLayerPlan, candidate: Se
 
 def _is_shape_aware_speech_layer(plan: RenderLayerPlan) -> bool:
     style = plan.resolved_render_style if isinstance(plan.resolved_render_style, Mapping) else {}
-    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
-    slot = metadata.get("parent_render_slot") if isinstance(metadata.get("parent_render_slot"), Mapping) else {}
     text = " ".join(
         str(value or "").lower()
         for value in (
             plan.role,
+            plan.state,
             style.get("semantic_class"),
             style.get("semantic_kind"),
             style.get("source_role"),
             style.get("route_intent"),
-            slot.get("source"),
         )
     )
     if "caption" in text or "background" in text:
@@ -632,8 +854,8 @@ def _shape_anchor(plan: RenderLayerPlan, candidate_box: Sequence[int]) -> tuple[
     metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
     slot = metadata.get("parent_render_slot") if isinstance(metadata.get("parent_render_slot"), Mapping) else {}
     for value in (
-        slot.get("source_anchor_center") if isinstance(slot, Mapping) else [],
-        _center_box(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, Mapping) else []),
+        metadata.get("visual_alignment_center"),
+        slot.get("alignment_anchor_center") if isinstance(slot, Mapping) else [],
         _center_box(plan.target_box),
     ):
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and len(value) >= 2:
@@ -891,39 +1113,40 @@ def _intersect_box(box: Sequence[int], container: Sequence[int]) -> list[int]:
 
 def _source_contract_box(plan: RenderLayerPlan) -> list[int]:
     provenance = plan.source_provenance_ref if isinstance(plan.source_provenance_ref, Mapping) else {}
-    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
-    slot = metadata.get("parent_render_slot") if isinstance(metadata.get("parent_render_slot"), Mapping) else {}
-    for value in (
-        provenance.get("source_contract_bbox") if isinstance(provenance, Mapping) else [],
-        slot.get("source_contract_bbox") if isinstance(slot, Mapping) else [],
-        slot.get("source_box") if isinstance(slot, Mapping) else [],
-    ):
-        box = _bbox_from_value(value)
-        if box:
-            return box
-    return []
+    return _bbox_from_value(
+        provenance.get("source_contract_bbox")
+        if isinstance(provenance, Mapping)
+        else []
+    )
 
 
-def _source_padded_box(
-    source_box: Sequence[int],
-    container: Sequence[int],
+def _source_text_footprint_alignment_box(plan: RenderLayerPlan) -> list[int]:
+    footprint = validated_source_text_footprint_ref(plan)
+    return _bbox_from_value(footprint.get("union_bbox_page_xywh"))
+
+
+def _alignment_anchor_box(
     plan: RenderLayerPlan,
     *,
-    scale: float = 1.0,
-) -> list[int]:
-    source = _bbox_from_value(source_box)
-    bounds = _bbox_from_value(container)
-    if not source:
-        return []
-    if not bounds:
-        bounds = source
-    style = plan.resolved_render_style if isinstance(plan.resolved_render_style, Mapping) else {}
-    font_size = _safe_int(style.get("font_size") or style.get("font_size_hint"), default=24)
-    sx, sy, sw, sh = source
-    pad_x = max(6, int(round(float(font_size) * 0.65 * float(scale))), int(round(float(sw) * 0.08 * float(scale))))
-    pad_y = max(6, int(round(float(font_size) * 0.55 * float(scale))), int(round(float(sh) * 0.08 * float(scale))))
-    padded = [sx - pad_x, sy - pad_y, sw + pad_x * 2, sh + pad_y * 2]
-    return _intersect_box(padded, bounds) or _intersect_box(padded, source) or list(source)
+    preferred_kind: str = "",
+) -> tuple[list[int], str]:
+    candidates = {
+        "source_text_footprint_union_bbox": (
+            _source_text_footprint_alignment_box(plan)
+        ),
+        "source_contract_bbox": _source_contract_box(plan),
+        "parent_contract_bbox": _parent_anchor_box(plan),
+    }
+    if preferred_kind in candidates and candidates[preferred_kind]:
+        return list(candidates[preferred_kind]), preferred_kind
+    for kind in (
+        "source_text_footprint_union_bbox",
+        "source_contract_bbox",
+        "parent_contract_bbox",
+    ):
+        if candidates[kind]:
+            return list(candidates[kind]), kind
+    return [], "unavailable"
 
 
 def _same_box(first: Sequence[int], second: Sequence[int]) -> bool:
@@ -963,21 +1186,6 @@ def _mask_coverage_ratio(
     y1 = min(int(oh), int(my + mh - oy), int(mask.shape[0]))
     inside = int(mask[y0:y1, x0:x1].sum()) if x1 > x0 and y1 > y0 else 0
     return max(0.0, min(1.0, float(inside) / max(1.0, float(mw * mh))))
-
-
-def _box_iou(first: Sequence[int], second: Sequence[int]) -> float:
-    a = _bbox_from_value(first)
-    b = _bbox_from_value(second)
-    if not a or not b:
-        return 0.0
-    inter = _intersect_box(a, b)
-    if not inter:
-        return 0.0
-    inter_area = float(_area(inter))
-    union = float(_area(a) + _area(b)) - inter_area
-    if union <= 0.0:
-        return 0.0
-    return inter_area / union
 
 
 def _area(box: Sequence[int]) -> int:

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Bounded post-typeset fitting from exact shaped-ink evidence.
+"""Post-typeset containment verification for finalized layout geometry.
 
-This Stage 4.5 planner may translate an intact TypesetLayout inside its existing
-RenderLayerPlan hard bounds. It never changes font size, writing mode, breaks,
-relative glyph geometry, or parent identity.
+`TypesettingEngine` is the only fit owner. This compatibility surface verifies
+its finalized geometry and never translates glyphs, changes breaks, or mutates
+the completed layout.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from typing import Any, Mapping, Sequence
 from app.render.typesetting_contracts import FitReport, GlyphPlacement, RenderLayerPlan, TypesetLayout
 
 
-INK_BOUND_LAYOUT_FITTER_VERSION = "ink_bound_layout_fitter_v1"
-INK_BOUND_FIT_POLICY = "complete_shaped_ink_block_translation_v1"
+INK_BOUND_LAYOUT_FITTER_VERSION = "ink_bound_layout_fitter_v2"
+INK_BOUND_FIT_POLICY = "post_typeset_containment_verification_v2"
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,7 @@ class InkBoundFitResult:
 
 
 class InkBoundLayoutFitter:
-    """Translate a complete raster-evidenced block by the smallest valid delta."""
+    """Verify final layout containment without becoming a second fit owner."""
 
     version = INK_BOUND_LAYOUT_FITTER_VERSION
 
@@ -50,7 +50,7 @@ class InkBoundLayoutFitter:
             "ink_bound_layout_fitter_version": self.version,
             "policy": INK_BOUND_FIT_POLICY,
             "policy_owner": "ink_bound_layout_fitter",
-            "status": "not_required",
+            "status": "verified",
             "triggered_failure_count": len(triggered),
             "evidence_placement_count": len(ink_boxes),
             "parent_hard_bounds": list(hard_bounds),
@@ -80,44 +80,26 @@ class InkBoundLayoutFitter:
                 audit=_failed_audit(base_audit, "complete_ink_union_missing"),
             )
 
-        min_dx = int(hard_bounds[0] - ink_union[0])
-        max_dx = int(hard_bounds[2] - ink_union[2])
-        min_dy = int(hard_bounds[1] - ink_union[1])
-        max_dy = int(hard_bounds[3] - ink_union[3])
-        base_audit["allowed_shift_x"] = [min_dx, max_dx]
-        base_audit["allowed_shift_y"] = [min_dy, max_dy]
-        if min_dx > max_dx or min_dy > max_dy:
+        hard_width = max(0, int(hard_bounds[2]) - int(hard_bounds[0]))
+        hard_height = max(0, int(hard_bounds[3]) - int(hard_bounds[1]))
+        ink_width = max(0, int(ink_union[2]) - int(ink_union[0]))
+        ink_height = max(0, int(ink_union[3]) - int(ink_union[1]))
+        if ink_width > hard_width or ink_height > hard_height:
             return InkBoundFitResult(
                 layout=layout,
                 report=report,
-                audit=_failed_audit(base_audit, "complete_ink_union_exceeds_parent_hard_bounds"),
+                audit=_failed_audit(
+                    base_audit,
+                    "complete_ink_union_exceeds_parent_hard_bounds",
+                ),
             )
-
-        dx = _closest_to_zero(min_dx, max_dx)
-        dy = _closest_to_zero(min_dy, max_dy)
-        output_ink = _shift_xyxy(ink_union, dx, dy)
-        base_audit["selected_shift"] = [dx, dy]
-        base_audit["output_ink_bounds"] = output_ink
-        if not _contains(hard_bounds, output_ink):
-            return InkBoundFitResult(
-                layout=layout,
-                report=report,
-                audit=_failed_audit(base_audit, "selected_shift_does_not_contain_complete_ink"),
-            )
-        if dx == 0 and dy == 0:
-            return InkBoundFitResult(
-                layout=layout,
-                report=report,
-                audit=_failed_audit(base_audit, "hard_bound_failure_without_resolving_translation"),
-            )
-
-        base_audit["status"] = "shifted"
-        shifted_layout = _shift_layout(layout, dx, dy, base_audit)
-        shifted_report = _annotate_report(report, base_audit)
         return InkBoundFitResult(
-            layout=shifted_layout,
-            report=shifted_report,
-            audit=base_audit,
+            layout=layout,
+            report=report,
+            audit=_failed_audit(
+                base_audit,
+                "post_typeset_geometry_mutation_forbidden",
+            ),
         )
 
 

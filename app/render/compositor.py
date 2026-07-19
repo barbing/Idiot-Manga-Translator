@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import os
 import math
-import time
-from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.render.font_manager import FontManager
@@ -18,24 +16,19 @@ from app.render.glyph_rasterizer import (
     GLYPH_RASTER_AUTHORITY,
     FreeTypeGlyphRasterizer,
 )
-from app.render.ink_bound_layout_fitter import InkBoundFitResult, InkBoundLayoutFitter
-from app.render.layout_planner import RenderLayoutPlanner
 from app.render.parent_layer_effects import (
     ParentLayerEffectsResolution,
     resolve_parent_layer_effects,
     shadow_color_rgba,
 )
 from app.render.typesetting_contracts import (
+    DrawingPrimitive,
     FitReport,
     GlyphPlacement,
     RenderLayerPlan,
     TypesetLayout,
     copy_jsonish,
-    fit_reports_to_audit_dict,
-    render_layer_plans_to_audit_dict,
-    typeset_layouts_to_audit_dict,
 )
-from app.render.typesetting_engine import TypesettingEngine
 from app.render.typesetting_text import source_text_requires_visible_glyph
 
 try:
@@ -45,203 +38,37 @@ except Exception:  # pragma: no cover - optional runtime dependency
     ImageDraw = None
     ImageFilter = None
 
-RENDERER_COMPOSITOR_VERSION = "renderer_compositor_stage5_v4"
-PARENT_LAYER_COMPOSITION_VERSION = "isolated_parent_layer_atomic_effects_v2"
-
-
-@dataclass
-class CompositorResult:
-    """Audit payload returned by the Stage 5 compositor."""
-
-    cleaned_page_base_path: str
-    output_path: str
-    plans: list[RenderLayerPlan]
-    layouts: list[TypesetLayout]
-    fit_reports: list[FitReport]
-    layer_audits: list[dict[str, Any]]
-    elapsed_ms: float = 0.0
-    status: str = "not_started"
-    issues: list[str] | None = None
-    canvas_size: list[int] | None = None
-
-    def to_audit_dict(self) -> dict[str, Any]:
-        issues = list(self.issues or [])
-        drawn_layers = [item for item in self.layer_audits if item.get("drawn")]
-        return {
-            "renderer_compositor_version": RENDERER_COMPOSITOR_VERSION,
-            "status": self.status,
-            "cleaned_page_base_path": self.cleaned_page_base_path,
-            "output_path": self.output_path,
-            "elapsed_ms": round(float(self.elapsed_ms), 3),
-            "drawing_authority": "typeset_glyph_placements",
-            "raster_authority": GLYPH_RASTER_AUTHORITY,
-            "pillow_string_raster_used": False,
-            "input_authority": "parent_execution_bundle_render_layer_plan",
-            "cleanup_mutation_allowed": False,
-            "renderer_cleanup_mutation_applied": False,
-            "legacy_region_rendering_used": False,
-            "canvas_size": list(self.canvas_size or []),
-            "page_orientation": _page_orientation(self.canvas_size),
-            "page_aspect_ratio_sets_writing_mode": False,
-            "layer_count": len(self.plans),
-            "layout_count": len(self.layouts),
-            "fit_report_count": len(self.fit_reports),
-            "drawn_layer_count": len(drawn_layers),
-            "issues": issues,
-            "layers": copy_jsonish(self.layer_audits),
-            "render_layer_plans": render_layer_plans_to_audit_dict(self.plans),
-            "typeset_layouts": typeset_layouts_to_audit_dict(self.layouts),
-            "fit_reports": fit_reports_to_audit_dict(self.fit_reports),
-        }
+RENDERER_COMPOSITOR_VERSION = "renderer_compositor_stage5_v5"
+PARENT_LAYER_COMPOSITION_VERSION = "isolated_parent_layer_atomic_effects_v3"
 
 
 class RendererCompositor:
-    """Draw RenderLayerPlan records after Stage 4 typesetting."""
+    """Draw and atomically composite one completed typeset parent layer."""
 
     def __init__(
         self,
         *,
         font_manager: FontManager | None = None,
-        typesetting_engine: TypesettingEngine | None = None,
-        layout_planner: RenderLayoutPlanner | None = None,
         glyph_rasterizer: FreeTypeGlyphRasterizer | None = None,
-        ink_bound_fitter: InkBoundLayoutFitter | None = None,
     ) -> None:
         self.font_manager = font_manager or FontManager()
-        self.typesetting_engine = typesetting_engine or TypesettingEngine(self.font_manager)
-        self.layout_planner = layout_planner or RenderLayoutPlanner(self.typesetting_engine)
         self.glyph_rasterizer = glyph_rasterizer or FreeTypeGlyphRasterizer()
-        self.ink_bound_fitter = ink_bound_fitter or InkBoundLayoutFitter()
 
-    def compose(
-        self,
-        cleaned_page_base_path: str,
-        output_path: str,
-        plans: Sequence[RenderLayerPlan],
-    ) -> CompositorResult:
-        if Image is None or ImageDraw is None:
-            raise RuntimeError("Pillow is not installed.")
-        if not cleaned_page_base_path:
-            raise ValueError("cleaned_page_base_path is required")
-        if not output_path:
-            raise ValueError("output_path is required")
-
-        start = time.perf_counter()
-        ordered_plans = _ordered_plans(plans)
-        layouts: list[TypesetLayout] = []
-        reports: list[FitReport] = []
-        layer_audits: list[dict[str, Any]] = []
-        issues: list[str] = []
-
-        with Image.open(cleaned_page_base_path) as source:
-            page = source.convert("RGBA")
-        canvas_size = [int(page.size[0]), int(page.size[1])]
-        adjusted_plans: list[RenderLayerPlan] = []
-        occupied_bounds: list[dict[str, Any]] = []
-        for plan in ordered_plans:
-            adjusted_plan = self.layout_planner.plan_layer(
-                page,
-                plan,
-                occupied_bounds=occupied_bounds,
-            )
-            adjusted_plans.append(adjusted_plan)
-            layout, report = self.typesetting_engine.typeset_layer(adjusted_plan)
-            candidate_page = page.copy()
-            audit = self._draw_layout(candidate_page, adjusted_plan, layout, report)
-            parent_effects = resolve_parent_layer_effects(
-                adjusted_plan.resolved_render_style
-            )
-            if parent_effects.active:
-                fit_result = InkBoundFitResult(
-                    layout=layout,
-                    report=report,
-                    audit={
-                        "ink_bound_layout_fitter_version": self.ink_bound_fitter.version,
-                        "policy": "effect_envelope_owned_by_typesetting_engine_v1",
-                        "policy_owner": "typesetting_engine_parent_effect_envelope",
-                        "status": "not_required",
-                        "selected_shift": [0, 0],
-                        "relative_geometry_preserved": True,
-                        "font_size_changed": False,
-                        "breaks_changed": False,
-                        "writing_mode_changed": False,
-                        "reason": "active_parent_effect_envelope_already_fitted",
-                        "issues": [],
-                    },
-                )
-            else:
-                fit_result = self.ink_bound_fitter.fit(
-                    adjusted_plan,
-                    layout,
-                    report,
-                    audit.get("raster_placements") or [],
-                )
-            if fit_result.applied:
-                layout = fit_result.layout
-                report = fit_result.report
-                candidate_page = page.copy()
-                audit = self._draw_layout(candidate_page, adjusted_plan, layout, report)
-            ink_fit_audit = copy_jsonish(fit_result.audit)
-            ink_fit_audit["post_fit_failed_raster_placement_count"] = int(
-                audit.get("failed_raster_placement_count") or 0
-            )
-            ink_fit_audit["post_fit_hard_bound_containment_failure_count"] = int(
-                audit.get("hard_bound_containment_failure_count") or 0
-            )
-            audit["ink_bound_fit"] = ink_fit_audit
-            audit["issues"] = _unique_strings(
-                [
-                    *(audit.get("issues") or []),
-                    *(fit_result.audit.get("issues") or []),
-                ]
-            )
-            page = candidate_page
-            layouts.append(layout)
-            reports.append(report)
-            layer_audits.append(audit)
-            issues.extend(str(item) for item in audit.get("issues", []) or [])
-            if layout.measured_bounds and audit.get("drawn"):
-                composition = (
-                    audit.get("parent_layer_composition")
-                    if isinstance(audit.get("parent_layer_composition"), Mapping)
-                    else {}
-                )
-                occupied_box = _xyxy_to_xywh(
-                    composition.get("final_alpha_bounds") or []
-                ) or list(layout.measured_bounds)
-                occupied_bounds.append(
-                    {
-                        "root_id": str(adjusted_plan.root_id or ""),
-                        "parent_id": str(adjusted_plan.parent_id or ""),
-                        "box": occupied_box,
-                    }
-                )
-
-        out_dir = os.path.dirname(os.path.abspath(output_path))
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        _save_image(page, output_path)
-        elapsed = (time.perf_counter() - start) * 1000.0
-        return CompositorResult(
-            cleaned_page_base_path=cleaned_page_base_path,
-            output_path=output_path,
-            plans=adjusted_plans,
-            layouts=layouts,
-            fit_reports=reports,
-            layer_audits=layer_audits,
-            elapsed_ms=elapsed,
-            status="completed",
-            issues=_unique_strings(issues),
-            canvas_size=canvas_size,
-        )
-
-    def _draw_layout(
+    def compose_layer(
         self,
         page,
         plan: RenderLayerPlan,
         layout: TypesetLayout,
         report: FitReport,
     ) -> dict[str, Any]:
+        """Rasterize one completed layout and atomically composite it onto ``page``.
+
+        Page ordering, layout planning, typesetting, and ink-fit retry ownership
+        intentionally live outside this class.
+        """
+
+        if Image is None or ImageDraw is None:
+            raise RuntimeError("Pillow is not installed.")
         glyphs = [_glyph_to_dict(item) for item in layout.glyphs]
         issues = list(report.issues or [])
         parent_effects = resolve_parent_layer_effects(plan.resolved_render_style)
@@ -251,36 +78,24 @@ class RendererCompositor:
             and isinstance(layout.metadata.get("parent_layer_effect_envelope"), Mapping)
             else {}
         )
-        effect_preflight_issue = ""
-        if parent_effects.status == "invalid":
-            effect_preflight_issue = "parent_layer_effect_contract_invalid"
-        elif parent_effects.active and (
-            "parent_layer_effect_envelope_exceeds_hard_bounds"
-            in set(report.issues or [])
-        ):
-            effect_preflight_issue = "parent_layer_effect_envelope_exceeds_hard_bounds"
-        elif parent_effects.active and (
-            str(report.fit_status or "") != "fits"
-            or not bool(report.full_text_placed)
-        ):
-            effect_preflight_issue = "parent_layer_effect_base_layout_not_renderable"
-        elif parent_effects.active and not bool(effect_envelope.get("contained")):
-            effect_preflight_issue = "parent_layer_effect_envelope_exceeds_hard_bounds"
-        if effect_preflight_issue:
-            _mark_effect_render_failure(
-                layout,
-                report,
-                effect_preflight_issue,
-                overflow=(
-                    effect_preflight_issue.endswith("exceeds_hard_bounds")
-                    or str(report.fit_status or "") == "overflow"
-                ),
-            )
+        base_preflight_issue = _base_layout_preflight_issue(
+            plan,
+            layout,
+            report,
+            glyphs,
+        )
+        optional_effect_degradation = _optional_effect_degradation_reason(
+            parent_effects,
+            layout,
+            report,
+            effect_envelope,
+        )
+        if base_preflight_issue:
             raster_placements = [
-                _preflight_failed_raster_audit(glyph, effect_preflight_issue)
+                _preflight_failed_raster_audit(glyph, base_preflight_issue)
                 for glyph in glyphs
             ]
-            issues.extend([effect_preflight_issue, *parent_effects.issues])
+            issues.append(base_preflight_issue)
             return _layer_audit(
                 plan,
                 layout,
@@ -293,7 +108,37 @@ class RendererCompositor:
                     glyphs,
                     raster_placements,
                     status="rejected",
-                    rejection_reason=effect_preflight_issue,
+                    rejection_reason=base_preflight_issue,
+                    effect_resolution=parent_effects,
+                ),
+                issues=issues,
+            )
+        primitive_by_id, primitive_index_issues = _build_drawing_primitive_index(
+            layout.drawing_primitives,
+            glyphs,
+        )
+        if primitive_index_issues:
+            raster_placements = [
+                _preflight_failed_raster_audit(
+                    glyph,
+                    primitive_index_issues[0],
+                )
+                for glyph in glyphs
+            ]
+            issues.extend(primitive_index_issues)
+            return _layer_audit(
+                plan,
+                layout,
+                report,
+                drawn=False,
+                drawn_glyph_count=0,
+                raster_placements=raster_placements,
+                parent_layer_composition=_parent_layer_composition_audit(
+                    page,
+                    glyphs,
+                    raster_placements,
+                    status="rejected",
+                    rejection_reason=primitive_index_issues[0],
                     effect_resolution=parent_effects,
                 ),
                 issues=issues,
@@ -410,6 +255,7 @@ class RendererCompositor:
                 font_manager=self.font_manager,
                 glyph_rasterizer=self.glyph_rasterizer,
                 shaped_by_run=shaped_by_run,
+                primitive_by_id=primitive_by_id,
                 plan=plan,
                 layout=layout,
                 glyph=glyph,
@@ -459,12 +305,26 @@ class RendererCompositor:
 
         commit_surface = parent_surface
         final_containment = combined_containment
-        effect_application = _inactive_parent_effect_audit(
-            parent_effects,
-            parent_surface,
-            combined_containment,
-        )
-        if not rejection_reasons and expected_visible_count > 0 and parent_effects.active:
+        if optional_effect_degradation:
+            effect_application = _degraded_parent_effect_audit(
+                parent_effects,
+                parent_surface,
+                combined_containment,
+                reason=optional_effect_degradation,
+            )
+            issues.extend(effect_application.get("issues") or [])
+        else:
+            effect_application = _inactive_parent_effect_audit(
+                parent_effects,
+                parent_surface,
+                combined_containment,
+            )
+        if (
+            not rejection_reasons
+            and expected_visible_count > 0
+            and parent_effects.active
+            and not optional_effect_degradation
+        ):
             commit_surface, effect_application = _apply_parent_layer_effects(
                 page,
                 parent_surface,
@@ -480,14 +340,16 @@ class RendererCompositor:
                     effect_application.get("rejection_reason")
                     or "effect_raster_envelope_mismatch"
                 )
-                rejection_reasons.append(effect_issue)
-                issues.extend(effect_application.get("issues") or [effect_issue])
-                _mark_effect_render_failure(
-                    layout,
-                    report,
-                    effect_issue,
-                    overflow=True,
+                effect_application = _degraded_parent_effect_audit(
+                    parent_effects,
+                    parent_surface,
+                    combined_containment,
+                    reason=effect_issue,
+                    attempted=effect_application,
                 )
+                commit_surface = parent_surface
+                final_containment = combined_containment
+                issues.extend(effect_application.get("issues") or [effect_issue])
 
         committed = not rejection_reasons and expected_visible_count > 0
         no_ink_only = not rejection_reasons and expected_visible_count == 0
@@ -526,6 +388,7 @@ def _draw_glyph(
     font_manager: FontManager,
     glyph_rasterizer: FreeTypeGlyphRasterizer,
     shaped_by_run: Mapping[str, Mapping[str, Any]],
+    primitive_by_id: Mapping[str, Mapping[str, Any]],
     plan: RenderLayerPlan,
     layout: TypesetLayout,
     glyph: Mapping[str, Any],
@@ -604,22 +467,21 @@ def _draw_glyph(
         "vertical_dash_sequence",
         "vertical_wave_sequence",
     }:
-        face_id = str(metadata.get("font_face_id") or glyph.get("font_family") or layout.selected_font_face or "")
-        face = font_manager.face(face_id)
-        if face is None:
-            return _failed_raster_audit(base_audit, f"raster_primitive_font_face_missing:{face_id}")
-        font = font_manager.load_font(face, max(1, font_size))
+        primitive_id = str(metadata.get("drawing_primitive_id") or "")
+        primitive = primitive_by_id.get(primitive_id)
+        if not primitive_id or not isinstance(primitive, Mapping):
+            return _failed_raster_audit(
+                base_audit,
+                f"drawing_primitive_missing:{primitive_id or 'unbound'}",
+            )
         layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         primitive_evidence = _draw_compact_vertical_sequence(
             layer,
-            font=font,
             fill=fill,
             stroke_width=stroke_width,
             stroke_fill=stroke_fill,
-            glyph=glyph,
-            width=width,
-            height=height,
-            layout=layout,
+            primitive=primitive,
+            origin=(x0, y0),
         )
         if not primitive_evidence:
             return _failed_raster_audit(base_audit, f"raster_primitive_draw_failed:{mode}")
@@ -641,13 +503,15 @@ def _draw_glyph(
         primitive_audit = {
             **base_audit,
             **primitive_evidence,
-            "raster_authority": "renderer_punctuation_primitive",
+            "raster_authority": "typesetting_drawing_primitive_v1",
             "status": "primitive" if bool(containment.get("accepted")) else "failed",
-            "primitive_type": mode,
-            "policy_owner": "punctuation_policy_v1",
-            "position_policy": "semantic_vertical_punctuation_primitive",
-            "font_face_id": face.face_id,
-            "font_path": face.path,
+            "primitive_id": primitive_id,
+            "primitive_type": str(primitive.get("kind") or mode),
+            "policy_owner": "TypesettingEngine",
+            "geometry_owner": "TypesettingEngine",
+            "position_policy": "finalized_typeset_layout_geometry",
+            "font_face_id": str(metadata.get("font_face_id") or glyph.get("font_family") or layout.selected_font_face or ""),
+            "font_path": str(metadata.get("font_path") or ""),
             "requested_glyph_ids": shaped_ids,
             "shaped_glyph_ids": shaped_ids,
             "drawn_glyph_ids": [],
@@ -730,225 +594,371 @@ def _draw_glyph(
     return raster_audit
 
 
+_VERTICAL_PRIMITIVE_KINDS = frozenset(
+    {
+        "vertical_ellipsis_sequence",
+        "vertical_dash_sequence",
+        "vertical_wave_sequence",
+    }
+)
+
+
+def _build_drawing_primitive_index(
+    values: Sequence[DrawingPrimitive | Mapping[str, Any]],
+    glyphs: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Validate one-to-one finalized primitive consumption before drawing."""
+
+    primitive_by_id: dict[str, dict[str, Any]] = {}
+    issues: list[str] = []
+    for value in list(values or []):
+        primitive = _drawing_primitive_to_dict(value)
+        primitive_id = str(primitive.get("primitive_id") or "")
+        if not primitive_id:
+            issues.append("drawing_primitive_id_missing")
+            continue
+        if primitive_id in primitive_by_id:
+            issues.append(f"drawing_primitive_duplicate_id:{primitive_id}")
+            continue
+        primitive_by_id[primitive_id] = primitive
+        geometry_issue = _drawing_primitive_geometry_issue(primitive)
+        if geometry_issue:
+            issues.append(
+                f"drawing_primitive_geometry_invalid:{primitive_id}:{geometry_issue}"
+            )
+
+    consumed: list[str] = []
+    for index, glyph in enumerate(glyphs):
+        metadata = (
+            glyph.get("metadata")
+            if isinstance(glyph.get("metadata"), Mapping)
+            else {}
+        )
+        mode = str(metadata.get("placement_mode") or "")
+        if mode not in _VERTICAL_PRIMITIVE_KINDS:
+            continue
+        primitive_id = str(metadata.get("drawing_primitive_id") or "")
+        if not primitive_id:
+            issues.append(f"drawing_primitive_placement_id_missing:{index}")
+            continue
+        if primitive_id in consumed:
+            issues.append(f"drawing_primitive_multiple_consumers:{primitive_id}")
+            continue
+        primitive = primitive_by_id.get(primitive_id)
+        if primitive is None:
+            issues.append(f"drawing_primitive_missing:{primitive_id}")
+            continue
+        consumed.append(primitive_id)
+        contract_issue = _drawing_primitive_contract_issue(primitive, glyph)
+        if contract_issue:
+            issues.append(
+                f"drawing_primitive_contract_mismatch:{primitive_id}:{contract_issue}"
+            )
+
+    for primitive_id in primitive_by_id:
+        if primitive_id not in consumed:
+            issues.append(f"drawing_primitive_unconsumed:{primitive_id}")
+    return primitive_by_id, _unique_strings(issues)
+
+
+def _drawing_primitive_contract_issue(
+    primitive: Mapping[str, Any],
+    glyph: Mapping[str, Any],
+) -> str:
+    metadata = (
+        glyph.get("metadata")
+        if isinstance(glyph.get("metadata"), Mapping)
+        else {}
+    )
+    primitive_metadata = (
+        primitive.get("metadata")
+        if isinstance(primitive.get("metadata"), Mapping)
+        else {}
+    )
+    mode = str(metadata.get("placement_mode") or "")
+    if str(primitive.get("kind") or "") != mode:
+        return "kind"
+    if str(primitive.get("source_text") or "") != str(glyph.get("text") or ""):
+        return "source_text"
+    if _xywh_int(primitive.get("bounds")) != _xywh_int(glyph.get("bbox")):
+        return "bounds"
+    primitive_tokens = [str(item) for item in list(primitive.get("token_ids") or [])]
+    placement_tokens = [str(item) for item in list(metadata.get("token_ids") or [])]
+    if primitive_tokens != placement_tokens:
+        return "token_ids"
+    if str(primitive.get("orientation") or "") != "vertical":
+        return "orientation"
+    if str(glyph.get("writing_mode") or "") != "vertical":
+        return "placement_writing_mode"
+    if not bool(metadata.get("primitive_geometry_final")):
+        return "placement_geometry_not_final"
+    if str(primitive_metadata.get("geometry_owner") or "") != "TypesettingEngine":
+        return "geometry_owner"
+    if str(primitive_metadata.get("geometry_status") or "") != "final":
+        return "geometry_status"
+    if primitive_metadata.get("relative_geometry_recomputation_allowed") is not False:
+        return "geometry_recomputation_policy"
+
+    expected_units_key = {
+        "vertical_ellipsis_sequence": "ellipsis_unit_count",
+        "vertical_dash_sequence": "dash_unit_count",
+        "vertical_wave_sequence": "wave_unit_count",
+    }.get(mode, "")
+    expected_units = _strict_int(metadata.get(expected_units_key), default=0)
+    if expected_units > 0 and _strict_int(primitive.get("unit_count"), default=0) != expected_units:
+        return "unit_count"
+    if mode == "vertical_ellipsis_sequence":
+        expected_visible = _strict_int(metadata.get("ellipsis_dot_count"), default=0)
+        expected_groups = _strict_int(
+            metadata.get("ellipsis_sequence_group_count"),
+            default=0,
+        )
+        if expected_visible > 0 and _strict_int(primitive.get("visible_count"), default=0) != expected_visible:
+            return "visible_count"
+        if expected_groups > 0 and _strict_int(primitive.get("sequence_group_count"), default=0) != expected_groups:
+            return "sequence_group_count"
+    return ""
+
+
+def _drawing_primitive_geometry_issue(primitive: Mapping[str, Any]) -> str:
+    kind = str(primitive.get("kind") or "")
+    if kind not in _VERTICAL_PRIMITIVE_KINDS:
+        return "unsupported_kind"
+    bounds = _xywh_float(primitive.get("bounds"))
+    if not bounds:
+        return "bounds"
+    x, y, width, height = bounds
+    unit_count = _strict_int(primitive.get("unit_count"), default=0)
+    visible_count = _strict_int(primitive.get("visible_count"), default=0)
+    sequence_group_count = _strict_int(
+        primitive.get("sequence_group_count"),
+        default=0,
+    )
+    if unit_count < 1 or visible_count < 1 or sequence_group_count < 1:
+        return "counts"
+    primitive_metadata = (
+        primitive.get("metadata")
+        if isinstance(primitive.get("metadata"), Mapping)
+        else {}
+    )
+    outline_width = _strict_float(
+        primitive_metadata.get("outline_width_px"),
+        default=0.0,
+    )
+    if outline_width < 0.0:
+        return "outline_width"
+
+    if kind == "vertical_ellipsis_sequence":
+        diameter = _strict_float(primitive.get("diameter_px"), default=0.0)
+        pitch = _strict_float(primitive.get("pitch_px"), default=-1.0)
+        centers = _point_sequence(primitive.get("centers"))
+        if diameter <= 0.0 or pitch < 0.0:
+            return "ellipsis_metrics"
+        if len(centers) != visible_count:
+            return "ellipsis_center_count"
+        radius = diameter / 2.0 + outline_width
+        if any(
+            center_x - radius < x - 1e-3
+            or center_x + radius > x + width + 1e-3
+            or center_y - radius < y - 1e-3
+            or center_y + radius > y + height + 1e-3
+            for center_x, center_y in centers
+        ):
+            return "ellipsis_centers_outside_bounds"
+        if len(centers) > 1:
+            if any(abs(center_x - centers[0][0]) > 1e-3 for center_x, _ in centers):
+                return "ellipsis_multiple_columns"
+            deltas = [
+                centers[index + 1][1] - centers[index][1]
+                for index in range(len(centers) - 1)
+            ]
+            if any(delta <= 0.0 for delta in deltas):
+                return "ellipsis_nonascending_centers"
+            if any(abs(delta - pitch) > 0.02 for delta in deltas):
+                return "ellipsis_pitch"
+        return ""
+
+    line_width = _strict_float(primitive.get("line_width_px"), default=0.0)
+    points = _point_sequence(primitive.get("points"))
+    minimum_points = 2
+    if line_width <= 0.0 or len(points) < minimum_points:
+        return "line_geometry"
+    margin = line_width / 2.0 + outline_width
+    if any(
+        point_x - margin < x - 1e-3
+        or point_x + margin > x + width + 1e-3
+        or point_y - margin < y - 1e-3
+        or point_y + margin > y + height + 1e-3
+        for point_x, point_y in points
+    ):
+        return "line_points_outside_bounds"
+    return ""
+
+
 def _draw_compact_vertical_sequence(
     layer,
     *,
-    font,
     fill,
     stroke_width: int,
     stroke_fill,
-    glyph: Mapping[str, Any],
-    width: int,
-    height: int,
-    layout: TypesetLayout,
+    primitive: Mapping[str, Any],
+    origin: Sequence[int],
 ) -> dict[str, Any]:
-    if str(layout.writing_mode or "").lower() != "vertical":
+    if ImageDraw is None:
         return {}
-    metadata = glyph.get("metadata") if isinstance(glyph.get("metadata"), Mapping) else {}
-    mode = str(metadata.get("placement_mode") or "")
-    if mode not in {"vertical_ellipsis_sequence", "vertical_dash_sequence", "vertical_wave_sequence"}:
+    kind = str(primitive.get("kind") or "")
+    if kind not in _VERTICAL_PRIMITIVE_KINDS:
         return {}
-    if mode == "vertical_ellipsis_sequence":
-        return _draw_vertical_ellipsis_dots(
+    origin_x = float(origin[0])
+    origin_y = float(origin[1])
+    if kind == "vertical_ellipsis_sequence":
+        return _draw_finalized_vertical_ellipsis(
             layer,
             fill=fill,
             stroke_width=stroke_width,
             stroke_fill=stroke_fill,
-            glyph=glyph,
-            width=width,
-            height=height,
-            font_size=int(getattr(font, "size", max(width, height)) or max(width, height)),
+            primitive=primitive,
+            origin=(origin_x, origin_y),
         )
-    if mode == "vertical_dash_sequence":
-        return _draw_vertical_dash_line(
-            layer,
-            font=font,
-            fill=fill,
-            stroke_width=stroke_width,
-            stroke_fill=stroke_fill,
-            glyph=glyph,
-            width=width,
-            height=height,
-        )
-    return _draw_vertical_wave_line(
+    return _draw_finalized_vertical_line(
         layer,
-        font=font,
         fill=fill,
         stroke_width=stroke_width,
         stroke_fill=stroke_fill,
-        glyph=glyph,
-        width=width,
-        height=height,
+        primitive=primitive,
+        origin=(origin_x, origin_y),
     )
 
 
-def _draw_vertical_dash_line(
-    layer,
-    *,
-    font,
-    fill,
-    stroke_width: int,
-    stroke_fill,
-    glyph: Mapping[str, Any],
-    width: int,
-    height: int,
-) -> dict[str, Any]:
-    if ImageDraw is None:
-        return {}
-    font_size = int(getattr(font, "size", max(width, height)) or max(width, height))
-    line_width = max(2, int(round(float(font_size) * 0.09)))
-    pad_y = max(1, int(round(float(font_size) * 0.04)))
-    x = int(round((float(width) - 1.0) / 2.0))
-    y0 = max(0, pad_y)
-    y1 = min(height - 1, height - pad_y - 1)
-    if y1 <= y0:
-        return {}
-    draw = ImageDraw.Draw(layer)
-    if stroke_width > 0:
-        draw.line(
-            (x, y0, x, y1),
-            fill=stroke_fill,
-            width=max(line_width + stroke_width * 2, line_width),
-        )
-    draw.line((x, y0, x, y1), fill=fill, width=line_width)
-    metadata = glyph.get("metadata") if isinstance(glyph.get("metadata"), Mapping) else {}
-    dash_units = int(metadata.get("dash_unit_count") or max(1, len(str(glyph.get("text") or ""))))
-    return {
-        "dash_unit_count": dash_units,
-        "continuous_segment_count": 1,
-        "continuous_multi_cell_dash": True,
-    }
-
-
-def _draw_vertical_wave_line(
-    layer,
-    *,
-    font,
-    fill,
-    stroke_width: int,
-    stroke_fill,
-    glyph: Mapping[str, Any],
-    width: int,
-    height: int,
-) -> dict[str, Any]:
-    if ImageDraw is None:
-        return {}
-    font_size = int(getattr(font, "size", max(width, height)) or max(width, height))
-    line_width = max(2, int(round(float(font_size) * 0.08)))
-    amplitude = max(2.0, min(float(width) * 0.24, float(font_size) * 0.14))
-    pad_y = max(1, int(round(float(font_size) * 0.04)))
-    x_center = (float(width) - 1.0) / 2.0
-    y0 = max(0, pad_y)
-    y1 = min(height - 1, height - pad_y - 1)
-    if y1 <= y0:
-        return {}
-    height_span = max(1.0, float(y1 - y0))
-    metadata = glyph.get("metadata") if isinstance(glyph.get("metadata"), Mapping) else {}
-    wave_units = int(metadata.get("wave_unit_count") or max(1, len(str(glyph.get("text") or ""))))
-    cycles = float(max(1, wave_units))
-    points: list[tuple[float, float]] = []
-    for y in range(int(y0), int(y1) + 1):
-        t = float(y - y0) / height_span
-        phase = t * math.tau * cycles
-        x = x_center + math.sin(phase) * amplitude
-        points.append((x, float(y)))
-    if len(points) < 2:
-        return {}
-    draw = ImageDraw.Draw(layer)
-    if stroke_width > 0:
-        draw.line(points, fill=stroke_fill, width=max(line_width + stroke_width * 2, line_width), joint="curve")
-    draw.line(points, fill=fill, width=line_width, joint="curve")
-    return {
-        "wave_unit_count": wave_units,
-        "wave_cycle_count": round(cycles, 3),
-        "continuous_multi_cell_wave": True,
-        "wave_source_classes": [
-            str(item.get("source_class") or "")
-            for item in list(metadata.get("punctuation_occurrences") or [])
-            if isinstance(item, Mapping)
-        ],
-    }
-
-
-def _draw_vertical_ellipsis_dots(
+def _draw_finalized_vertical_ellipsis(
     layer,
     *,
     fill,
     stroke_width: int,
     stroke_fill,
-    glyph: Mapping[str, Any],
-    width: int,
-    height: int,
-    font_size: int,
+    primitive: Mapping[str, Any],
+    origin: Sequence[float],
 ) -> dict[str, Any]:
-    if ImageDraw is None:
-        return {}
-    metadata = glyph.get("metadata") if isinstance(glyph.get("metadata"), Mapping) else {}
-    unit_count = int(
-        metadata.get("ellipsis_unit_count")
-        or max(1, len(str(glyph.get("text") or "")))
-    )
-    unit_count = max(1, unit_count)
-    dot_count = max(1, int(metadata.get("ellipsis_dot_count") or unit_count * 3))
-    sequence_group_count = max(1, int(metadata.get("ellipsis_sequence_group_count") or 1))
-    diameter = max(2, int(round(float(font_size) * 0.12)))
-    radius = float(diameter) / 2.0
+    centers = _point_sequence(primitive.get("centers"))
+    diameter = float(primitive.get("diameter_px") or 0.0)
+    radius = diameter / 2.0
     safe_stroke = max(0, int(stroke_width))
-    center_x = (float(width) - 1.0) / 2.0
-    edge_inset = float(height) * (0.25 / float(unit_count))
-    first_center_y = edge_inset
-    last_center_y = float(height) - edge_inset
-    dot_pitch = (
-        (last_center_y - first_center_y) / float(dot_count - 1)
-        if dot_count > 1
-        else 0.0
-    )
-    centers: list[list[float]] = []
+    origin_x, origin_y = float(origin[0]), float(origin[1])
     draw = ImageDraw.Draw(layer)
-    for dot_index in range(dot_count):
-        center_y = first_center_y + dot_pitch * float(dot_index) if dot_count > 1 else float(height) / 2.0
-        centers.append([round(center_x, 3), round(center_y, 3)])
+    for center_x, center_y in centers:
+        local_x = center_x - origin_x
+        local_y = center_y - origin_y
         if safe_stroke > 0:
             outer = radius + float(safe_stroke)
             draw.ellipse(
                 (
-                    center_x - outer,
-                    center_y - outer,
-                    center_x + outer,
-                    center_y + outer,
+                    local_x - outer,
+                    local_y - outer,
+                    local_x + outer,
+                    local_y + outer,
                 ),
                 fill=stroke_fill,
             )
         draw.ellipse(
             (
-                center_x - radius,
-                center_y - radius,
-                center_x + radius,
-                center_y + radius,
+                local_x - radius,
+                local_y - radius,
+                local_x + radius,
+                local_y + radius,
             ),
             fill=fill,
         )
-    pitch_deltas = [
-        round(float(centers[index + 1][1]) - float(centers[index][1]), 3)
+    deltas = [
+        round(centers[index + 1][1] - centers[index][1], 4)
         for index in range(len(centers) - 1)
     ]
-    max_pitch_delta = (
-        max(pitch_deltas) - min(pitch_deltas)
-        if pitch_deltas
-        else 0.0
-    )
+    maximum_delta = max(deltas) - min(deltas) if deltas else 0.0
     return {
-        "ellipsis_unit_count": unit_count,
-        "dot_count": dot_count,
+        "primitive_geometry_source": "TypesetLayout.drawing_primitives",
+        "primitive_bounds": list(primitive.get("bounds") or []),
+        "ellipsis_unit_count": int(primitive.get("unit_count") or 0),
+        "dot_count": int(primitive.get("visible_count") or 0),
         "dot_column_count": 1,
-        "sequence_group_count": sequence_group_count,
-        "dot_diameter_px": diameter,
-        "dot_centers": centers,
-        "dot_pitch_px": round(dot_pitch, 3),
-        "dot_pitch_deltas": pitch_deltas,
-        "max_dot_pitch_delta_px": round(max_pitch_delta, 3),
+        "sequence_group_count": int(primitive.get("sequence_group_count") or 0),
+        "dot_diameter_px": float(diameter),
+        "dot_centers": [list(item) for item in centers],
+        "dot_pitch_px": float(primitive.get("pitch_px") or 0.0),
+        "dot_pitch_deltas": deltas,
+        "max_dot_pitch_delta_px": round(float(maximum_delta), 4),
         "ellipsis_policy": "one_continuous_uniform_dot_sequence",
     }
+
+
+def _draw_finalized_vertical_line(
+    layer,
+    *,
+    fill,
+    stroke_width: int,
+    stroke_fill,
+    primitive: Mapping[str, Any],
+    origin: Sequence[float],
+) -> dict[str, Any]:
+    points = _point_sequence(primitive.get("points"))
+    origin_x, origin_y = float(origin[0]), float(origin[1])
+    local_points = [
+        (point_x - origin_x, point_y - origin_y)
+        for point_x, point_y in points
+    ]
+    requested_width = float(primitive.get("line_width_px") or 0.0)
+    raster_width = max(1, int(round(requested_width)))
+    safe_stroke = max(0, int(stroke_width))
+    draw = ImageDraw.Draw(layer)
+    if safe_stroke > 0:
+        draw.line(
+            local_points,
+            fill=stroke_fill,
+            width=raster_width + safe_stroke * 2,
+            joint="curve",
+        )
+    draw.line(
+        local_points,
+        fill=fill,
+        width=raster_width,
+        joint="curve",
+    )
+    kind = str(primitive.get("kind") or "")
+    metadata = (
+        primitive.get("metadata")
+        if isinstance(primitive.get("metadata"), Mapping)
+        else {}
+    )
+    evidence = {
+        "primitive_geometry_source": "TypesetLayout.drawing_primitives",
+        "primitive_bounds": list(primitive.get("bounds") or []),
+        "primitive_points": [list(item) for item in points],
+        "line_width_px": float(requested_width),
+    }
+    if kind == "vertical_dash_sequence":
+        evidence.update(
+            {
+                "dash_unit_count": int(primitive.get("unit_count") or 0),
+                "continuous_segment_count": 1,
+                "continuous_multi_cell_dash": True,
+            }
+        )
+    else:
+        evidence.update(
+            {
+                "wave_unit_count": int(primitive.get("unit_count") or 0),
+                "wave_cycle_count": float(
+                    metadata.get("wave_cycle_count")
+                    or primitive.get("unit_count")
+                    or 0
+                ),
+                "continuous_multi_cell_wave": True,
+                "wave_source_classes": [
+                    str(item.get("source_class") or "")
+                    for item in list(metadata.get("punctuation_occurrences") or [])
+                    if isinstance(item, Mapping)
+                ],
+            }
+        )
+    return evidence
 
 
 def _glyph_requires_visible_ink(glyph: Mapping[str, Any]) -> bool:
@@ -957,6 +967,66 @@ def _glyph_requires_visible_ink(glyph: Mapping[str, Any]) -> bool:
     if not text or bool(metadata.get("space_run")) or text.isspace():
         return False
     return bool(source_text_requires_visible_glyph(text))
+
+
+def _base_layout_preflight_issue(
+    plan: RenderLayerPlan,
+    layout: TypesetLayout,
+    report: FitReport,
+    glyphs: Sequence[Mapping[str, Any]],
+) -> str:
+    """Return the first hard base-text failure, independent of optional effects."""
+
+    if (
+        str(report.fit_status or "") != "fits"
+        or not bool(report.full_text_placed)
+        or str(layout.fit_status or "") != "fits"
+    ):
+        return "parent_layer_base_layout_not_renderable"
+    if str(layout.original_text or "") != str(plan.translated_text or ""):
+        return "parent_layer_layout_source_text_mismatch"
+    glyph_text = "".join(str(item.get("text") or "") for item in glyphs)
+    if glyph_text != str(layout.normalized_text or ""):
+        return "parent_layer_layout_glyph_text_mismatch"
+    if (
+        bool(plan.render_required)
+        and source_text_requires_visible_glyph(str(plan.translated_text or ""))
+        and not any(_glyph_requires_visible_ink(item) for item in glyphs)
+    ):
+        return "parent_layer_visible_glyphs_missing"
+    return ""
+
+
+def _optional_effect_degradation_reason(
+    effects: ParentLayerEffectsResolution,
+    layout: TypesetLayout,
+    report: FitReport,
+    effect_envelope: Mapping[str, Any],
+) -> str:
+    """Classify an effect-only failure without changing base-text eligibility."""
+
+    metadata = layout.metadata if isinstance(layout.metadata, Mapping) else {}
+    degradation = (
+        metadata.get("optional_effect_degradation")
+        if isinstance(metadata.get("optional_effect_degradation"), Mapping)
+        else {}
+    )
+    if str(degradation.get("status") or "") == "degraded_to_base":
+        return str(degradation.get("reason") or "optional_parent_effect_unavailable")
+    if effects.status == "invalid":
+        return "parent_layer_effect_contract_invalid"
+    if effects.active and (
+        "parent_layer_effect_envelope_exceeds_hard_bounds"
+        in {str(item) for item in list(report.issues or [])}
+    ):
+        return "parent_layer_effect_envelope_exceeds_hard_bounds"
+    if (
+        effects.active
+        and effect_envelope
+        and effect_envelope.get("contained") is False
+    ):
+        return "parent_layer_effect_envelope_exceeds_hard_bounds"
+    return ""
 
 
 def _inactive_parent_effect_audit(
@@ -997,6 +1067,65 @@ def _inactive_parent_effect_audit(
         "untransformed_fallback_used": False,
         "rejection_reason": "",
         "issues": [],
+    }
+
+
+def _degraded_parent_effect_audit(
+    effects: ParentLayerEffectsResolution,
+    surface,
+    containment: Mapping[str, Any],
+    *,
+    reason: str,
+    attempted: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe a base-text commit after an optional effect could not be used."""
+
+    alpha = surface.getchannel("A")
+    bounds = list(alpha.getbbox() or [])
+    alpha_sum = int(sum(alpha.getdata()))
+    attempted_audit = dict(attempted or {})
+    shadow = effects.shadow.to_audit_dict()
+    if shadow.get("availability") == "resolved":
+        shadow["source"] = "rotated_parent_alpha"
+    accepted = bool(bounds and containment.get("accepted"))
+    return {
+        "parent_layer_effects_version": "parent_layer_effect_application_v2",
+        "status": "degraded_to_base",
+        "accepted": accepted,
+        "requested": bool(effects.requested),
+        "active": bool(effects.active),
+        "whole_parent_transform_count": 0,
+        "attempted_status": str(attempted_audit.get("status") or "not_attempted"),
+        "attempted_whole_parent_transform_count": int(
+            attempted_audit.get("whole_parent_transform_count") or 0
+        ),
+        "rotation": effects.rotation.to_audit_dict(),
+        "shadow": shadow,
+        "effect_application_order": "base_text_only_after_optional_effect_degradation",
+        "base_alpha_bounds": bounds,
+        "base_alpha_sum": alpha_sum,
+        "rotated_alpha_bounds": bounds,
+        "rotated_alpha_sum": alpha_sum,
+        "shadow_alpha_bounds": [],
+        "shadow_alpha_sum": 0,
+        "final_alpha_bounds": bounds,
+        "final_alpha_sum": alpha_sum,
+        "final_alpha_containment": copy_jsonish(containment),
+        "predicted_envelope": list(attempted_audit.get("predicted_envelope") or []),
+        "predicted_envelope_contains_actual": True,
+        "rotation_sampling": "none_committed_base",
+        "shadow_offset_sampling": "none_committed_base",
+        "untransformed_fallback_used": True,
+        "degradation_reason": str(reason or "optional_parent_effect_unavailable"),
+        "rejection_reason": "",
+        "issues": _unique_strings(
+            [
+                str(reason or "optional_parent_effect_unavailable"),
+                "optional_parent_effect_degraded_to_base",
+                *effects.issues,
+                *(attempted_audit.get("issues") or []),
+            ]
+        ),
     }
 
 
@@ -1173,24 +1302,6 @@ def _effect_pivot(layout: TypesetLayout, plan: RenderLayerPlan) -> tuple[float, 
     )
 
 
-def _mark_effect_render_failure(
-    layout: TypesetLayout,
-    report: FitReport,
-    issue: str,
-    *,
-    overflow: bool,
-) -> None:
-    status = "overflow" if overflow else "failed"
-    layout.fit_status = status
-    report.fit_status = status
-    report.natural_fit_success = False
-    report.full_text_placed = False
-    report.overflow_risk = bool(overflow)
-    report.clipping_risk = True
-    report.user_review_recommended = True
-    report.issues = _unique_strings([*(report.issues or []), issue])
-
-
 def _parent_layer_composition_audit(
     page,
     glyphs: Sequence[Mapping[str, Any]],
@@ -1233,6 +1344,13 @@ def _parent_layer_composition_audit(
     effects = effect_resolution or ParentLayerEffectsResolution()
     effects_audit = effects.to_audit_dict()
     application = dict(effect_application or {})
+    composition_issues = _unique_strings(
+        [
+            rejection_reason,
+            *effects.issues,
+            *(application.get("issues") or []),
+        ]
+    )
     if application:
         effects_status = str(application.get("status") or "rejected")
     elif effects.status == "invalid":
@@ -1314,7 +1432,20 @@ def _parent_layer_composition_audit(
         "untransformed_fallback_used": bool(
             application.get("untransformed_fallback_used", False)
         ),
+        "optional_effect_degraded": bool(
+            str(application.get("status") or "") == "degraded_to_base"
+        ),
+        "effect_degradation_reason": str(
+            application.get("degradation_reason") or ""
+        ),
+        "effect_attempted_status": str(
+            application.get("attempted_status") or "not_attempted"
+        ),
+        "effect_attempted_whole_parent_transform_count": int(
+            application.get("attempted_whole_parent_transform_count") or 0
+        ),
         "rejection_reason": str(rejection_reason or ""),
+        "issues": composition_issues,
     }
 
 
@@ -1333,6 +1464,7 @@ def _layer_audit(
     glyph_text = "".join(str(item.get("text") or "") for item in (_glyph_to_dict(g) for g in layout.glyphs))
     normalized = str(layout.normalized_text or "")
     raster_items = [dict(item) for item in list(raster_placements or [])]
+    composition = dict(parent_layer_composition or {})
     return {
         "renderer_compositor_version": RENDERER_COMPOSITOR_VERSION,
         "drawing_authority": "typeset_glyph_placements",
@@ -1364,7 +1496,9 @@ def _layer_audit(
             and not bool(item.get("hard_bound_containment", {}).get("accepted"))
             for item in raster_items
         ),
-        "parent_layer_composition": copy_jsonish(parent_layer_composition or {}),
+        "render_status": str(composition.get("status") or "rejected"),
+        "render_rejection_reason": str(composition.get("rejection_reason") or ""),
+        "parent_layer_composition": copy_jsonish(composition),
         "raster_placements": copy_jsonish(raster_items),
         "glyph_text_matches_layout": glyph_text == normalized,
         "full_text_placed": bool(report.full_text_placed),
@@ -1626,18 +1760,6 @@ def _xyxy_contains(outer: Sequence[int], inner: Sequence[int]) -> bool:
     )
 
 
-def _xyxy_to_xywh(value: Any) -> list[int]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        return []
-    try:
-        items = [int(round(float(item))) for item in list(value)[:4]]
-    except (TypeError, ValueError):
-        return []
-    if len(items) != 4 or items[2] <= items[0] or items[3] <= items[1]:
-        return []
-    return [items[0], items[1], items[2] - items[0], items[3] - items[1]]
-
-
 def _same_path(left: str, right: str) -> bool:
     if not left or not right:
         return left == right
@@ -1647,11 +1769,14 @@ def _same_path(left: str, right: str) -> bool:
         return left == right
 
 
-def _ordered_plans(plans: Sequence[RenderLayerPlan]) -> list[RenderLayerPlan]:
-    return sorted(
-        [plan for plan in plans or [] if isinstance(plan, RenderLayerPlan)],
-        key=lambda plan: (int(plan.draw_order), str(plan.layer_id)),
-    )
+def _drawing_primitive_to_dict(
+    value: DrawingPrimitive | Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(value, DrawingPrimitive):
+        return value.to_audit_dict()
+    if isinstance(value, Mapping):
+        return copy_jsonish(value)
+    return {"primitive_id": "", "kind": str(value)}
 
 
 def _glyph_to_dict(value: GlyphPlacement | Mapping[str, Any]) -> dict[str, Any]:
@@ -1660,6 +1785,73 @@ def _glyph_to_dict(value: GlyphPlacement | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     return {"text": str(value)}
+
+
+def _xywh_int(value: Any) -> list[int]:
+    if not isinstance(value, Iterable) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    output: list[int] = []
+    for item in list(value)[:4]:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(number):
+            return []
+        output.append(int(round(number)))
+    if len(output) != 4 or output[2] <= 0 or output[3] <= 0:
+        return []
+    return output
+
+
+def _xywh_float(value: Any) -> list[float]:
+    if not isinstance(value, Iterable) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    output: list[float] = []
+    for item in list(value)[:4]:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(number):
+            return []
+        output.append(number)
+    if len(output) != 4 or output[2] <= 0.0 or output[3] <= 0.0:
+        return []
+    return output
+
+
+def _strict_float(value: Any, *, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
+
+
+def _strict_int(value: Any, *, default: int) -> int:
+    number = _strict_float(value, default=float(default))
+    return int(round(number))
+
+
+def _point_sequence(value: Any) -> list[tuple[float, float]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    output: list[tuple[float, float]] = []
+    for item in value:
+        if not isinstance(item, Sequence) or isinstance(item, (str, bytes, bytearray)):
+            return []
+        values = list(item)
+        if len(values) < 2:
+            return []
+        try:
+            point = (float(values[0]), float(values[1]))
+        except (TypeError, ValueError):
+            return []
+        if not all(math.isfinite(number) for number in point):
+            return []
+        output.append(point)
+    return output
 
 
 def _glyph_bounds(value: Any) -> list[int]:
@@ -1710,31 +1902,6 @@ def _safe_int(value: Any, *, default: int) -> int:
         return int(round(float(value)))
     except Exception:
         return default
-
-
-def _page_orientation(value: Sequence[int] | None) -> str:
-    if value is None or len(value) < 2:
-        return "unknown"
-    try:
-        width = int(value[0])
-        height = int(value[1])
-    except (TypeError, ValueError, OverflowError):
-        return "unknown"
-    if width <= 0 or height <= 0:
-        return "unknown"
-    if width > height:
-        return "landscape"
-    if height > width:
-        return "portrait"
-    return "square"
-
-
-def _save_image(image, output_path: str) -> None:
-    ext = os.path.splitext(output_path)[1].lower()
-    if ext in {".jpg", ".jpeg"}:
-        image.convert("RGB").save(output_path, quality=95)
-    else:
-        image.save(output_path)
 
 
 def _unique_strings(values: Sequence[str]) -> list[str]:

@@ -26,17 +26,32 @@ from app.render.parent_layer_effects import (
     shift_layout_geometry,
 )
 from app.render.text_shaper import HarfBuzzShaper, ShapedRun
-from app.render.typesetting_contracts import FitReport, GlyphPlacement, RenderLayerPlan, TypesetLayout, bbox_from_value
+from app.render.typesetting_contracts import (
+    DrawingPrimitive,
+    FitReport,
+    GlyphPlacement,
+    PunctuationToken,
+    RenderLayerPlan,
+    TypesetLayout,
+    bbox_from_value,
+    validated_source_text_footprint_ref,
+)
 from app.render.typesetting_text import (
     BreakOpportunity,
     VERTICAL_CENTERED_PUNCTUATION_CHARS,
     InlineTextRun,
+    build_lossless_text_tokens,
     compute_break_opportunities,
     grapheme_clusters,
-    normalize_for_writing_mode,
+    presentation_notes_from_tokens,
+    punctuation_occurrences_from_tokens,
+    resolve_writing_mode_presentations,
     segment_inline_runs,
     source_char_requires_visible_glyph,
     source_text_requires_visible_glyph,
+    symbol_occurrences_from_tokens,
+    tokens_original_text,
+    tokens_presentation_text,
 )
 
 
@@ -133,26 +148,53 @@ class TypesettingEngine:
 
         writing_mode, writing_policy = self._resolve_writing_mode(plan)
         preferred_font_size = _font_size_from_style(plan.resolved_render_style)
+        if preferred_font_size <= 0:
+            return self._failed(
+                plan,
+                "invalid_resolved_render_style_font_size",
+                ["invalid_resolved_render_style_font_size"],
+                hard_bounds=hard_bounds,
+            )
         resolved = self.font_manager.resolve_font(
             plan.resolved_render_style,
+            fallback_chain_key=str(
+                plan.resolved_render_style.get("fallback_font_chain_key") or ""
+            ),
             writing_mode=writing_mode,
             text=plan.translated_text,
         )
         if not resolved.usable or resolved.primary_face is None:
             return self._failed(plan, "missing_font", list(resolved.issues or ["missing_font"]), hard_bounds=hard_bounds)
         face = resolved.primary_face
-        normalized, punctuation, symbols, normalization_notes = normalize_for_writing_mode(
-            plan.translated_text,
-            writing_mode,
-            self.font_manager,
-            face,
+        identity_tokens = build_lossless_text_tokens(plan.translated_text)
+        text_tokens = resolve_writing_mode_presentations(
+            identity_tokens,
+            writing_mode=writing_mode,
+            font_manager=self.font_manager,
+            face=face,
         )
+        token_text_conserved = tokens_original_text(text_tokens) == str(
+            plan.translated_text or ""
+        )
+        if not token_text_conserved:
+            return self._failed(
+                plan,
+                "lossless_text_token_identity_not_conserved",
+                ["lossless_text_token_identity_not_conserved"],
+                hard_bounds=hard_bounds,
+            )
+        normalized = tokens_presentation_text(text_tokens)
+        punctuation = punctuation_occurrences_from_tokens(text_tokens)
+        symbols = symbol_occurrences_from_tokens(
+            text_tokens,
+            font_manager=self.font_manager,
+            face=face,
+        )
+        normalization_notes = presentation_notes_from_tokens(text_tokens)
         logical_runs = segment_inline_runs(
-            normalized,
+            text_tokens,
             writing_mode=writing_mode,
             language_hint=_language_hint(plan),
-            punctuation_occurrences=punctuation,
-            symbol_occurrences=symbols,
         )
         try:
             runs, font_span_resolutions = self._expand_runs_for_font_spans(
@@ -161,7 +203,12 @@ class TypesettingEngine:
                 writing_mode=writing_mode,
             )
         except RuntimeError as exc:
-            if str(exc) != "uax29_grapheme_segmenter_unavailable":
+            issue = str(exc)
+            if issue not in {
+                "uax29_grapheme_segmenter_unavailable",
+                "font_span_token_provenance_missing",
+                "font_span_token_provenance_not_conserved",
+            }:
                 raise
             return self._font_span_failure(
                 plan,
@@ -171,7 +218,7 @@ class TypesettingEngine:
                 logical_runs=logical_runs,
                 expanded_runs=logical_runs,
                 spans=[],
-                issues=["uax29_grapheme_segmenter_unavailable"],
+                issues=[issue],
             )
         font_span_text_conserved = (
             "".join(run.normalized_text for run in runs) == normalized
@@ -293,6 +340,7 @@ class TypesettingEngine:
                     font_size,
                     plan.resolved_render_style,
                     plan,
+                    candidate_capacity_box=hard_bounds,
                 )
                 retry = None
                 if fit_status != "fits":
@@ -320,6 +368,14 @@ class TypesettingEngine:
                     layout_intent_box = retry["layout_intent_box"]
                     box_model = retry["box_model"]
                     reason_codes.extend(retry["reason_codes"])
+                if columns and isinstance(
+                    columns[0].get("layout_profile"),
+                    Mapping,
+                ):
+                    box_model = dict(box_model)
+                    box_model["vertical_layout_profile"] = dict(
+                        columns[0]["layout_profile"]
+                    )
             base_measured_bounds = list(measured_bounds)
             base_visual_center = _center_of(base_measured_bounds)
             parent_effect_envelope = fit_effect_envelope(
@@ -413,6 +469,11 @@ class TypesettingEngine:
         if fit_status != "fits" and writing_mode == "vertical":
             fit_issues.append("writing_mode_fit_failure")
 
+        placements, drawing_primitives = _finalize_drawing_primitives(
+            placements,
+            plan.resolved_render_style,
+        )
+
         run_font_issues = [
             issue
             for item in run_font_resolutions
@@ -420,8 +481,41 @@ class TypesettingEngine:
         ]
         all_issues = _unique([*resolved.issues, *run_font_issues, *style_issues, *fit_issues])
         full_text_placed = fit_status == "fits"
+        token_audit = [item.to_audit_dict() for item in text_tokens]
+        placed_token_ids = _unique(
+            [
+                token_id
+                for placement in placements
+                for token_id in list(placement.metadata.get("token_ids") or [])
+            ]
+        )
+        visible_token_ids = [
+            item.token_id
+            for item in text_tokens
+            if source_text_requires_visible_glyph(item.presentation_text)
+        ]
+        token_conservation = {
+            "exact_input_reconstructed": bool(token_text_conserved),
+            "translated_text": str(plan.translated_text or ""),
+            "token_original_text": tokens_original_text(text_tokens),
+            "presentation_text": tokens_presentation_text(text_tokens),
+            "logical_run_original_text": "".join(
+                item.original_text for item in logical_runs
+            ),
+            "token_count": len(text_tokens),
+            "atomic_token_ids": [
+                item.token_id for item in text_tokens if item.atomic_break
+            ],
+            "visible_token_ids": list(visible_token_ids),
+            "placed_token_ids": list(placed_token_ids),
+            "visible_tokens_placed": set(visible_token_ids).issubset(
+                set(placed_token_ids)
+            ),
+        }
         metadata = {
             "typesetting_engine_version": "typesetting_engine_stage4_v1",
+            "lossless_text_tokens": token_audit,
+            "text_token_conservation": token_conservation,
             "box_model": box_model,
             "writing_mode_policy": writing_policy,
             "inline_runs": [_run_audit(run, writing_mode, self.policy) for run in runs],
@@ -458,6 +552,10 @@ class TypesettingEngine:
             "parent_layer_effect_envelope": parent_effect_envelope,
             "base_measured_bounds": list(base_measured_bounds),
             "base_visual_center": list(base_visual_center),
+            "drawing_primitives": [
+                item.to_audit_dict() for item in drawing_primitives
+            ],
+            "drawing_primitive_geometry_final": True,
             "open_type_metrics_by_face": open_type_metrics_by_face,
             "font_size_selection": {
                 "preferred_font_size": int(preferred_font_size),
@@ -500,6 +598,7 @@ class TypesettingEngine:
             lines=lines,
             columns=columns,
             glyphs=placements,
+            drawing_primitives=drawing_primitives,
             punctuation_placements=punctuation,
             symbol_placements=symbols,
             measured_bounds=measured_bounds,
@@ -511,6 +610,7 @@ class TypesettingEngine:
             fit_status=fit_status,
             normalized_text=normalized,
             original_text=plan.translated_text,
+            lossless_text_tokens=list(text_tokens),
             metadata=metadata,
         )
         report = FitReport(
@@ -531,8 +631,11 @@ class TypesettingEngine:
             user_review_recommended=bool(all_issues),
             fit_status=fit_status,
             issues=all_issues,
+            lossless_text_tokens=list(text_tokens),
             metadata={
                 "typesetting_engine_version": "typesetting_engine_stage4_v1",
+                "lossless_text_tokens": token_audit,
+                "text_token_conservation": token_conservation,
                 "reason_codes": reason_codes,
                 "writing_mode_policy": {
                     **writing_policy,
@@ -660,6 +763,11 @@ class TypesettingEngine:
                 "inline_placement_mode": placement_mode,
                 "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
                 "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
+                "token_ids": list(run.token_ids),
+                "original_text": run.original_text,
+                "translated_start": int(run.translated_start),
+                "translated_end": int(run.translated_end),
+                "lossless_tokens": list(run.metadata.get("lossless_tokens") or []),
                 "run_font_resolution": run_resolution.to_audit_dict(),
                 "font_fallback_used": bool(run_resolution.fallback_used),
             }
@@ -710,8 +818,10 @@ class TypesettingEngine:
                 expanded.append(run)
                 continue
             for span in spans:
+                provenance = _font_span_token_provenance(run, span)
                 metadata = {
                     **dict(run.metadata),
+                    **provenance["metadata"],
                     "logical_run_id": run.run_id,
                     "font_span_id": span.span_id,
                     "font_span_source_grapheme_start": span.source_grapheme_start,
@@ -727,6 +837,12 @@ class TypesettingEngine:
                         run_id=span.span_id,
                         text=span.text,
                         normalized_text=span.text,
+                        original_text=provenance["original_text"],
+                        translated_start=provenance["translated_start"],
+                        translated_end=provenance["translated_end"],
+                        token_start=provenance["token_start"],
+                        token_end=provenance["token_end"],
+                        token_ids=provenance["token_ids"],
                         grapheme_start=(
                             run.grapheme_start + span.source_grapheme_start
                         ),
@@ -802,10 +918,46 @@ class TypesettingEngine:
         x, y, w, h = target_box
         hard_x, hard_y, hard_w, hard_h = hard_bounds
         source_box = bbox_from_value(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, dict) else [])
+        footprint_profile_selection = _source_text_footprint_profile_selection(
+            plan,
+            writing_mode,
+        )
         reason_codes: list[str] = []
         evidence = "translated_text_natural_box"
         vertical_profile: dict[str, Any] = {}
         if writing_mode == "vertical":
+            profile_items = _vertical_layout_items(
+                runs,
+                shaped_runs,
+                self.policy,
+                font_size,
+                plan.resolved_render_style,
+                plan=plan,
+            )
+            profile_content_width = max(
+                (float(item.get("width", 0.0)) for item in profile_items),
+                default=0.0,
+            )
+            profile_compact_only = _vertical_items_are_compact_sequences(
+                profile_items
+            )
+            profile_column_width = _vertical_column_pitch(
+                font_size,
+                profile_content_width,
+                compact_sequence_only=profile_compact_only,
+            )
+            profile_cell_height = max(
+                _dominant_vertical_advance(shaped_runs)
+                * _line_height(plan.resolved_render_style),
+                max(
+                    (
+                        _vertical_item_cell_height(item)
+                        for item in profile_items
+                    ),
+                    default=0.0,
+                ),
+                1.0,
+            )
             vertical_profile = _vertical_layout_profile(
                 plan=plan,
                 box=target_box,
@@ -813,6 +965,10 @@ class TypesettingEngine:
                 text=text,
                 shaped_runs=shaped_runs,
                 policy=self.policy,
+                item_count=len(profile_items),
+                item_row_units=_vertical_items_row_units(profile_items),
+                column_width=profile_column_width,
+                cell_height=profile_cell_height,
             )
             natural_w, natural_h = _natural_box_size(
                 text,
@@ -821,23 +977,13 @@ class TypesettingEngine:
                 plan.resolved_render_style,
                 shaped_runs,
                 desired_columns=int(vertical_profile.get("desired_columns") or 1),
+                item_row_units=_vertical_items_row_units(profile_items),
+                column_width=profile_column_width,
             )
-            hinted_natural_h = _vertical_source_visual_hint_natural_height(
-                runs=runs,
-                shaped_runs=shaped_runs,
-                policy=self.policy,
-                font_size=font_size,
-                plan=plan,
-                desired_columns=int(vertical_profile.get("desired_columns") or 1),
-                line_height=_line_height(plan.resolved_render_style),
-            )
-            if hinted_natural_h > natural_h:
-                natural_h = hinted_natural_h
-                reason_codes.append("source_visual_punctuation_reserved_vertical_capacity")
-            if vertical_profile.get("source_columns"):
-                reason_codes.append("source_column_structure_used_for_vertical_layout")
-            if int(vertical_profile.get("source_visual_columns") or 0) > 1:
-                reason_codes.append("source_visual_column_structure_used_for_vertical_layout")
+            if vertical_profile.get("source_text_footprint_used"):
+                reason_codes.append(
+                    "source_text_footprint_used_for_vertical_layout"
+                )
         else:
             natural_w, natural_h = _natural_box_size(text, writing_mode, font_size, plan.resolved_render_style, shaped_runs)
             if natural_w > max(1, w):
@@ -845,15 +991,6 @@ class TypesettingEngine:
                 natural_w = max(1, w)
                 natural_h = max(natural_h, int(math.ceil(float(font_size) * _line_height(plan.resolved_render_style) * estimated_lines)))
                 reason_codes.append("horizontal_wrap_capacity_reserved_from_measured_runs")
-        if writing_mode == "vertical" and vertical_profile.get("source_columns"):
-            column_w = float(vertical_profile.get("column_width") or _vertical_column_pitch(font_size, font_size))
-            source_columns = int(vertical_profile.get("source_columns") or 0)
-            max_target_columns = max(1, int(math.floor(max(1, w) / max(1.0, column_w))))
-            reserved_columns = max(1, min(source_columns, max_target_columns))
-            reserved_w = int(math.ceil(reserved_columns * column_w))
-            if reserved_w > natural_w:
-                natural_w = min(max(1, w), reserved_w)
-                reason_codes.append("source_column_capacity_reserved_for_vertical_layout_quality")
         if w > max(natural_w * 2, natural_w + font_size) or h > max(natural_h * 2, natural_h + font_size):
             reason_codes.append("oversized_parent_bbox_not_used_as_fill_box")
         visual_alignment_center: list[float] = []
@@ -890,7 +1027,7 @@ class TypesettingEngine:
                 int(natural_w),
                 int(natural_h),
             ]
-            reason_codes.append("layout_intent_centered_on_source_footprint")
+            reason_codes.append("layout_intent_centered_on_source_contract_bbox")
         else:
             intent = [
                 x + max(0, int(round((w - natural_w) / 2))),
@@ -909,6 +1046,7 @@ class TypesettingEngine:
             "source_contract_bbox_is_alignment_prior": bool(source_center and not visual_alignment_center),
             "visual_alignment_center": list(visual_alignment_center),
             "visual_alignment_center_is_layout_prior": bool(visual_alignment_center),
+            "source_text_footprint_profile_selection": footprint_profile_selection,
             "vertical_layout_profile": vertical_profile,
             "rejected_box_candidates": [],
         }, reason_codes
@@ -923,6 +1061,8 @@ class TypesettingEngine:
         font_size: int,
         style: dict[str, Any],
         plan: RenderLayerPlan,
+        *,
+        candidate_capacity_box: Sequence[int] | None = None,
     ) -> tuple[
         list[GlyphPlacement],
         list[dict[str, Any]],
@@ -934,11 +1074,26 @@ class TypesettingEngine:
     ]:
         x, y, w, h = box
         line_height = _line_height(style)
-        items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size, plan)
+        items = _vertical_layout_items(
+            runs,
+            shaped_runs,
+            self.policy,
+            font_size,
+            style,
+            plan=plan,
+        )
+        total_row_units = _vertical_items_row_units(items)
         shaped_cell_h = _dominant_vertical_advance(shaped_runs)
         cell_h = max(1.0, shaped_cell_h * line_height)
         cell_h = max(cell_h, max((_vertical_item_cell_height(item) for item in items), default=0.0))
-        column_w = _vertical_column_pitch(font_size, max((float(item.get("width", 0.0)) for item in items), default=0.0))
+        column_w = _vertical_column_pitch(
+            font_size,
+            max(
+                (float(item.get("width", 0.0)) for item in items),
+                default=0.0,
+            ),
+            compact_sequence_only=_vertical_items_are_compact_sequences(items),
+        )
         profile = _vertical_layout_profile(
             plan=plan,
             box=box,
@@ -947,13 +1102,61 @@ class TypesettingEngine:
             shaped_runs=shaped_runs,
             policy=self.policy,
             item_count=len(items),
+            item_row_units=total_row_units,
             column_width=column_w,
             cell_height=cell_h,
         )
+        profile = dict(profile)
         columns_needed = max(1, int(profile.get("desired_columns") or 1)) if items else 1
-        total_row_units = _vertical_items_row_units(items)
         max_rows = max(1, int(math.floor(h / cell_h)))
-        max_columns = max(1, int(math.floor(w / column_w)))
+        capacity_box = bbox_from_value(candidate_capacity_box) or list(box)
+        capacity_width = int(capacity_box[2]) if capacity_box else int(w)
+        layout_box_max_columns = max(1, int(math.floor(w / column_w)))
+        physical_capacity_max_columns = max(
+            1,
+            min(
+                max(1, len(items)),
+                int(math.floor(capacity_width / column_w)),
+            ),
+        )
+        source_group_upper_bound = int(
+            profile.get("source_text_footprint_cross_axis_group_upper_bound") or 0
+        )
+        source_group_reliable = bool(
+            profile.get("source_text_footprint_cross_axis_group_reliable")
+        )
+        source_group_clamped = bool(
+            source_group_reliable and source_group_upper_bound > 0
+        )
+        source_preferred_max_columns = physical_capacity_max_columns
+        if source_group_clamped:
+            source_preferred_max_columns = min(
+                physical_capacity_max_columns,
+                source_group_upper_bound,
+            )
+        minimum_hard_fit_columns = max(
+            1,
+            int(math.ceil(total_row_units / float(max_rows))),
+        )
+        max_columns = physical_capacity_max_columns
+        profile.update(
+            {
+                "layout_box_max_columns": int(layout_box_max_columns),
+                "candidate_capacity_box": list(capacity_box),
+                "candidate_physical_max_columns": int(
+                    physical_capacity_max_columns
+                ),
+                "candidate_source_preferred_max_columns": int(
+                    source_preferred_max_columns
+                ),
+                "candidate_minimum_hard_fit_columns": int(
+                    minimum_hard_fit_columns
+                ),
+                "candidate_capacity_max_columns": int(max_columns),
+                "candidate_capacity_source_group_clamped": False,
+                "candidate_capacity_reason": "physical_target_hard_capacity",
+            }
+        )
         columns_needed = min(max(1, columns_needed), max(1, len(items)), max_columns)
         rows = max(1, int(math.ceil(total_row_units / columns_needed))) if items else 1
         while rows > max_rows and columns_needed < min(max_columns, max(1, len(items))):
@@ -969,6 +1172,61 @@ class TypesettingEngine:
         )
         column_groups = break_result.groups
         grouping_meta = break_result.to_audit_dict()
+        selected_columns = max(1, len(column_groups))
+        source_preference_escape = bool(
+            source_group_clamped
+            and selected_columns > source_preferred_max_columns
+        )
+        hard_fit_required = bool(
+            source_preference_escape
+            and minimum_hard_fit_columns > source_preferred_max_columns
+        )
+        phrase_driven_expansion = bool(
+            source_preference_escape and not hard_fit_required
+        )
+        if hard_fit_required:
+            source_preference_escape_reason = (
+                "hard_fit_required_beyond_source_group_preference"
+            )
+        elif phrase_driven_expansion:
+            source_preference_escape_reason = (
+                "legal_break_quality_expansion_beyond_source_group_preference"
+            )
+        elif source_group_clamped:
+            source_preference_escape_reason = "within_source_group_preference"
+        else:
+            source_preference_escape_reason = "source_group_preference_unavailable"
+        profile.update(
+            {
+                "candidate_capacity_selected_columns": int(selected_columns),
+                "candidate_capacity_source_preference_escape": (
+                    source_preference_escape
+                ),
+                "candidate_capacity_hard_fit_escape": hard_fit_required,
+                "candidate_capacity_phrase_driven_expansion": (
+                    phrase_driven_expansion
+                ),
+                "candidate_capacity_source_preference_escape_reason": (
+                    source_preference_escape_reason
+                ),
+            }
+        )
+        grouping_meta.update(
+            {
+                "source_group_preferred_max_columns": int(
+                    source_preferred_max_columns
+                ),
+                "physical_candidate_max_columns": int(max_columns),
+                "source_group_preference_escape": source_preference_escape,
+                "source_group_hard_fit_escape": hard_fit_required,
+                "source_group_phrase_driven_expansion": (
+                    phrase_driven_expansion
+                ),
+                "source_group_preference_escape_reason": (
+                    source_preference_escape_reason
+                ),
+            }
+        )
         rows = max((int(math.ceil(_vertical_items_row_units(group))) for group in column_groups), default=rows)
         columns_needed = max(1, len(column_groups))
         required_w = int(math.ceil(columns_needed * column_w))
@@ -1018,6 +1276,11 @@ class TypesettingEngine:
                             "row_units": float(row_units),
                             "row_span": int(math.ceil(row_units)),
                             "run_id": item.get("run_id", ""),
+                            "token_ids": list(item.get("token_ids") or []),
+                            "original_text": str(item.get("original_text") or ""),
+                            "translated_start": int(item.get("translated_start") or 0),
+                            "translated_end": int(item.get("translated_end") or 0),
+                            "atomic_break": bool(item.get("atomic_break")),
                             **(
                                 {
                                     "logical_run_id": item.get("logical_run_id", ""),
@@ -1034,7 +1297,6 @@ class TypesettingEngine:
                             "shaped_x_advance_total": float(item.get("x_advance", 0.0)),
                             "shaped_y_advance": float(shaped_glyph.y_advance) if shaped_glyph else 0.0,
                             "shaped_position_authority": bool(shaped_glyph),
-                            "source_visual_hint": dict(item.get("source_visual_hint") or {}),
                             "punctuation_occurrences": list(item.get("punctuation_occurrences") or []),
                             "symbol_occurrences": list(item.get("symbol_occurrences") or []),
                             "ellipsis_unit_count": int(item.get("ellipsis_unit_count") or 0),
@@ -1049,6 +1311,32 @@ class TypesettingEngine:
                             "font_face_id": str(item.get("font_face_id") or ""),
                             "font_path": str(item.get("font_path") or ""),
                             "font_fallback_used": bool(item.get("font_fallback_used")),
+                            **(
+                                {
+                                    "source_punctuation_footprint_status": str(
+                                        item.get(
+                                            "source_punctuation_footprint_status"
+                                        )
+                                        or ""
+                                    ),
+                                    "source_punctuation_footprint_box": list(
+                                        item.get(
+                                            "source_punctuation_footprint_box"
+                                        )
+                                        or []
+                                    ),
+                                    "source_punctuation_footprint_fact_set_id": str(
+                                        item.get(
+                                            "source_punctuation_footprint_fact_set_id"
+                                        )
+                                        or ""
+                                    ),
+                                }
+                                if item.get(
+                                    "source_punctuation_footprint_status"
+                                )
+                                else {}
+                            ),
                         },
                     )
                 )
@@ -1083,12 +1371,43 @@ class TypesettingEngine:
                 }
             )
         measured = _union_bounds([item.bbox for item in placements]) or [x, y, min(w, required_w), min(h, int(rows * cell_h))]
-        alignment_center, alignment_source = _layout_alignment_center(plan, [x, y, w, h])
+        source_punctuation_boxes = [
+            bbox_from_value(item.get("source_punctuation_footprint_box"))
+            for item in items
+            if str(item.get("source_punctuation_footprint_status") or "")
+            == "applied_unambiguous_standalone_occurrence"
+        ]
+        source_punctuation_boxes = [
+            item for item in source_punctuation_boxes if item
+        ]
+        alignment_bounds = (
+            list(capacity_box)
+            if len(source_punctuation_boxes) == 1
+            else [x, y, w, h]
+        )
+        alignment_center, alignment_source = _layout_alignment_center(
+            plan,
+            alignment_bounds,
+            source_punctuation_box=(
+                source_punctuation_boxes[0]
+                if len(source_punctuation_boxes) == 1
+                else None
+            ),
+        )
         if alignment_center and measured:
-            dx, dy = _measured_alignment_shift(measured, alignment_center, [x, y, w, h])
+            dx, dy = _measured_alignment_shift(
+                measured,
+                alignment_center,
+                alignment_bounds,
+            )
             if dx or dy:
                 placements = [_shift_glyph_placement(item, dx, dy) for item in placements]
-                columns = _shift_column_records(columns, dx, dy, [x, y, w, h])
+                columns = _shift_column_records(
+                    columns,
+                    dx,
+                    dy,
+                    alignment_bounds,
+                )
                 measured = _union_bounds([item.bbox for item in placements]) or measured
             if columns:
                 for column in columns:
@@ -1126,7 +1445,14 @@ class TypesettingEngine:
         if not row_units or selected_columns <= 0:
             return None
 
-        items = _vertical_layout_items(runs, shaped_runs, self.policy, font_size, plan)
+        items = _vertical_layout_items(
+            runs,
+            shaped_runs,
+            self.policy,
+            font_size,
+            style,
+            plan=plan,
+        )
         if not items:
             return None
         shaped_advance = max(1.0, _dominant_vertical_advance(shaped_runs))
@@ -1158,7 +1484,11 @@ class TypesettingEngine:
                     reason_codes.append("line_height_compacted_for_locked_size_fit")
 
         content_width = max((float(item.get("width", 0.0)) for item in items), default=0.0)
-        column_width = _vertical_column_pitch(font_size, content_width)
+        column_width = _vertical_column_pitch(
+            font_size,
+            content_width,
+            compact_sequence_only=_vertical_items_are_compact_sequences(items),
+        )
         needed_width = int(math.ceil(float(selected_columns) * column_width))
         if needed_width > hard_w or needed_height > hard_h:
             return None
@@ -1188,6 +1518,7 @@ class TypesettingEngine:
             font_size,
             retry_style,
             plan,
+            candidate_capacity_box=hard,
         )
         if fit_status != "fits":
             return None
@@ -1389,14 +1720,14 @@ def _missing_identity(plan: RenderLayerPlan) -> list[str]:
 
 
 def _font_size_from_style(style: dict[str, Any]) -> int:
-    for key in ("font_size", "font_size_hint", "font_size_px", "size"):
-        value = style.get(key) if isinstance(style, dict) else None
-        try:
-            if value is not None and float(value) > 0:
-                return max(1, int(round(float(value))))
-        except (TypeError, ValueError):
-            continue
-    return 24
+    value = style.get("font_size") if isinstance(style, dict) else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number <= 0.0:
+        return 0
+    return max(1, int(round(number)))
 
 
 def _font_size_candidates(
@@ -1569,8 +1900,18 @@ def _natural_box_size(
     shaped_runs: Sequence[ShapedRun] | None = None,
     *,
     desired_columns: int | None = None,
+    item_row_units: float | None = None,
+    column_width: float | None = None,
 ) -> tuple[int, int]:
     count = max(1, len(grapheme_clusters(text)))
+    try:
+        vertical_units = float(
+            item_row_units if item_row_units is not None else count
+        )
+    except (TypeError, ValueError):
+        vertical_units = float(count)
+    if not math.isfinite(vertical_units) or vertical_units <= 0.0:
+        vertical_units = float(count)
     line_height = _line_height(style)
     if writing_mode == "horizontal":
         shaped_width = 0.0
@@ -1590,36 +1931,15 @@ def _natural_box_size(
     for run in shaped_runs or []:
         if (run.metadata or {}).get("shape_writing_mode") == "horizontal":
             inline_width = max(inline_width, sum(max(0.0, abs(float(glyph.x_advance))) for glyph in run.glyphs))
-    column_width = _vertical_column_pitch(font_size, inline_width)
+    resolved_column_width = float(
+        column_width or _vertical_column_pitch(font_size, inline_width)
+    )
     cell_height = max(font_size * line_height, _dominant_vertical_advance(shaped_runs or []) * line_height)
     columns = max(1, min(count, int(desired_columns or 1)))
-    rows = max(1, int(math.ceil(count / columns)))
+    rows = max(1, int(math.ceil(vertical_units / columns)))
     if columns > 1 and _text_has_no_column_start_punctuation(text):
         rows += 1
-    return int(max(1, math.ceil(columns * column_width))), int(max(1, math.ceil(rows * cell_height)))
-
-
-def _vertical_source_visual_hint_natural_height(
-    *,
-    runs: Sequence[InlineTextRun],
-    shaped_runs: Sequence[ShapedRun],
-    policy: TypesettingPolicy,
-    font_size: int,
-    plan: RenderLayerPlan,
-    desired_columns: int,
-    line_height: float,
-) -> int:
-    if not runs:
-        return 0
-    items = _vertical_layout_items(runs, shaped_runs, policy, font_size, plan)
-    if not any(item.get("source_visual_hint") for item in items):
-        return 0
-    shaped_cell_h = _dominant_vertical_advance(shaped_runs or [])
-    cell_h = max(1.0, shaped_cell_h * line_height)
-    cell_h = max(cell_h, max((_vertical_item_cell_height(item) for item in items), default=0.0))
-    columns = max(1, min(int(desired_columns or 1), len(items)))
-    rows = max(1, int(math.ceil(_vertical_items_row_units(items) / float(columns))))
-    return int(max(1, math.ceil(rows * cell_h)))
+    return int(max(1, math.ceil(columns * resolved_column_width))), int(max(1, math.ceil(rows * cell_height)))
 
 
 def _vertical_layout_profile(
@@ -1631,13 +1951,31 @@ def _vertical_layout_profile(
     shaped_runs: Sequence[ShapedRun],
     policy: TypesettingPolicy,
     item_count: int | None = None,
+    item_row_units: float | None = None,
     column_width: float | None = None,
     cell_height: float | None = None,
 ) -> dict[str, Any]:
     target = bbox_from_value(box)
     count = max(1, int(item_count if item_count is not None else len(grapheme_clusters(text))))
+    try:
+        translated_row_units = float(
+            item_row_units if item_row_units is not None else count
+        )
+    except (TypeError, ValueError):
+        translated_row_units = float(count)
+    if not math.isfinite(translated_row_units) or translated_row_units <= 0.0:
+        translated_row_units = float(count)
     if not target:
-        return {"desired_columns": 1, "source_columns": 0, "max_columns": 1, "reason": "missing_target_box"}
+        return {
+            "desired_columns": 1,
+            "max_columns": 1,
+            "max_rows": 1,
+            "item_count": int(count),
+            "translated_row_units": round(translated_row_units, 3),
+            "source_text_footprint_available": False,
+            "source_text_footprint_used": False,
+            "reason": "missing_target_box",
+        }
     _x, _y, w, h = target
     inline_width = 0.0
     for run in shaped_runs or []:
@@ -1647,78 +1985,193 @@ def _vertical_layout_profile(
     cell_h = float(cell_height or max(_dominant_vertical_advance(shaped_runs) * _line_height(plan.resolved_render_style), font_size * _line_height(plan.resolved_render_style), 1.0))
     max_columns = max(1, min(count, int(math.floor(max(1, w) / max(1.0, column_w)))))
     max_rows = max(1, int(math.floor(max(1, h) / max(1.0, cell_h))))
-    source_box = bbox_from_value(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, dict) else [])
-    geometry_source_columns = _source_vertical_column_count(source_box, font_size)
     style = dict(plan.resolved_render_style or {})
-    source_visual_columns = 0
-    source_visual_column_source = ""
-    if (
-        bool(style.get("source_visual_column_reliable"))
-        and str(style.get("source_visual_column_authority") or "")
-        == "authorized_source_style_view"
-    ):
-        source_visual_columns = max(
-            0,
-            int(style.get("source_visual_column_count") or 0),
+    footprint, axis_profile = _source_text_footprint_axis_profile(plan, "ttb")
+    footprint_available = bool(footprint)
+    source_group_reliable = bool(
+        axis_profile.get("cross_axis_group_count_reliable")
+    )
+    source_inline_reliable = bool(
+        axis_profile.get("inline_capacity_reliable")
+    )
+    try:
+        source_group_upper_bound = (
+            max(0, int(axis_profile.get("cross_axis_group_count") or 0))
+            if source_group_reliable
+            else 0
         )
-        source_visual_column_source = str(
-            style.get("source_visual_column_source") or ""
+    except (TypeError, ValueError):
+        source_group_upper_bound = 0
+        source_group_reliable = False
+    try:
+        source_inline_capacity = (
+            max(0, int(axis_profile.get("inline_capacity") or 0))
+            if source_inline_reliable
+            else 0
         )
-    source_columns = source_visual_columns or geometry_source_columns
-    source_rows = _source_vertical_row_capacity(source_box, font_size, _line_height(plan.resolved_render_style))
+    except (TypeError, ValueError):
+        source_inline_capacity = 0
+        source_inline_reliable = False
+    if source_group_reliable and source_group_upper_bound <= 0:
+        source_group_reliable = False
+    if source_inline_reliable and source_inline_capacity <= 0:
+        source_inline_reliable = False
     semantic_class = str(style.get("semantic_class") or style.get("source_role") or plan.role or "")
     source_role = str(style.get("source_role") or plan.role or "")
-    if count <= 3:
+    footprint_used = False
+    if translated_row_units <= 3.0:
         desired = 1
         reason = "short_vertical_text_single_column"
-    elif source_rows:
-        desired = int(math.ceil(float(count) / float(max(1, source_rows))))
-        if source_columns:
-            desired = min(desired, source_columns)
-        reason = "source_row_capacity_column_structure"
-    elif source_columns:
-        desired = min(source_columns, max(1, int(math.ceil(float(count) / 5.0))))
-        reason = "source_column_upper_bound"
+    elif source_inline_reliable and source_group_reliable:
+        desired = int(
+            math.ceil(
+                translated_row_units
+                / float(max(1, source_inline_capacity))
+            )
+        )
+        if source_group_reliable:
+            desired = min(desired, source_group_upper_bound)
+        reason = "source_text_footprint_inline_capacity"
+        footprint_used = True
+    elif source_group_reliable:
+        target_estimate = max(
+            1,
+            int(
+                round(
+                    math.sqrt(
+                        float(count)
+                        * max(1.0, float(w))
+                        / max(1.0, float(h))
+                    )
+                )
+            ),
+        )
+        desired = min(source_group_upper_bound, target_estimate)
+        reason = "target_aspect_source_text_footprint_group_upper_bound"
+        footprint_used = True
     else:
-        desired = max(1, int(round(math.sqrt(count * max(1.0, float(w)) / max(1.0, float(h))))))
+        desired = max(
+            1,
+            int(
+                round(
+                    math.sqrt(
+                        float(count)
+                        * max(1.0, float(w))
+                        / max(1.0, float(h))
+                    )
+                )
+            ),
+        )
         reason = "target_aspect_column_estimate"
-    if source_visual_columns > 1:
-        desired = max(desired, min(source_visual_columns, max_columns))
-        reason = f"{reason}_source_visual_structure"
     desired = min(max(1, desired), max_columns)
-    while desired < max_columns and math.ceil(count / desired) > max_rows:
+    initial_desired = desired
+    while (
+        desired < max_columns
+        and math.ceil(translated_row_units / float(desired)) > max_rows
+    ):
         desired += 1
+    expanded_for_height_fit = desired > initial_desired
+    if expanded_for_height_fit:
         reason = f"{reason}_expanded_for_height_fit"
     return {
         "desired_columns": int(max(1, desired)),
-        "source_columns": int(source_columns),
-        "geometry_source_columns": int(geometry_source_columns),
-        "source_visual_columns": int(source_visual_columns),
-        "source_visual_column_source": source_visual_column_source,
-        "source_rows": int(source_rows),
+        "initial_desired_columns": int(max(1, initial_desired)),
         "max_columns": int(max_columns),
         "max_rows": int(max_rows),
         "item_count": int(count),
+        "translated_row_units": round(translated_row_units, 3),
         "column_width": round(column_w, 3),
         "cell_height": round(cell_h, 3),
-        "source_contract_bbox": list(source_box),
+        "source_text_footprint_available": footprint_available,
+        "source_text_footprint_used": footprint_used,
+        "source_text_footprint_profile_direction": "ttb",
+        "source_text_footprint_profile_available": bool(axis_profile),
+        "source_text_footprint_cross_axis_group_upper_bound": int(
+            source_group_upper_bound
+        ),
+        "source_text_footprint_cross_axis_group_reliable": (
+            source_group_reliable
+        ),
+        "source_text_footprint_inline_capacity": int(source_inline_capacity),
+        "source_text_footprint_inline_capacity_reliable": (
+            source_inline_reliable
+        ),
+        "source_text_footprint_inline_capacity_provenance": str(
+            axis_profile.get("inline_capacity_provenance") or ""
+        ),
+        "source_text_footprint_fact_set_id": str(
+            footprint.get("fact_set_id") or ""
+        ),
+        "source_text_footprint_confidence": float(
+            axis_profile.get("confidence") or 0.0
+        ),
+        "source_text_footprint_reason": str(axis_profile.get("reason") or ""),
+        "expanded_for_height_fit": expanded_for_height_fit,
         "semantic_class": semantic_class,
         "source_role": source_role,
         "reason": reason,
     }
 
 
-def _source_vertical_column_count(source_box: Sequence[int], font_size: int) -> int:
-    source = bbox_from_value(source_box)
-    if not source:
-        return 0
-    _x, _y, w, h = source
-    if w <= 0 or h <= 0:
-        return 0
-    if w / max(1.0, float(h)) < 0.45:
-        return 1
-    pitch = _vertical_column_pitch(font_size, font_size)
-    return max(1, min(8, int(round(float(w) / pitch))))
+def _source_text_footprint_axis_profile(
+    plan: RenderLayerPlan,
+    direction: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    footprint = validated_source_text_footprint_ref(plan)
+    profiles = footprint.get("axis_profiles")
+    profile = profiles.get(direction) if isinstance(profiles, Mapping) else {}
+    if not isinstance(profile, Mapping):
+        profile = {}
+    if str(profile.get("writing_direction") or "") != direction:
+        return footprint, {}
+    return footprint, dict(profile)
+
+
+def _source_text_footprint_profile_selection(
+    plan: RenderLayerPlan,
+    writing_mode: str,
+) -> dict[str, Any]:
+    direction = {
+        "vertical": "ttb",
+        "horizontal": "ltr",
+    }.get(str(writing_mode or ""), "")
+    footprint, profile = _source_text_footprint_axis_profile(plan, direction)
+    direction_evidence = footprint.get("writing_direction_evidence")
+    selection_authority = (
+        str(direction_evidence.get("selection_authority") or "")
+        if isinstance(direction_evidence, Mapping)
+        else ""
+    )
+    if not footprint:
+        application_status = "validated_source_text_footprint_unavailable"
+    elif not profile:
+        application_status = "resolved_direction_profile_unavailable"
+    elif writing_mode == "vertical":
+        application_status = "vertical_initial_group_preference_available"
+    else:
+        application_status = (
+            "horizontal_profile_transported_line_preference_hook_unavailable"
+        )
+    return {
+        "resolved_writing_mode": str(writing_mode or ""),
+        "selected_profile_direction": direction,
+        "selection_authority": selection_authority,
+        "footprint_available": bool(footprint),
+        "profile_available": bool(profile),
+        "fact_set_id": str(footprint.get("fact_set_id") or ""),
+        "cross_axis_group_count": int(
+            profile.get("cross_axis_group_count") or 0
+        ),
+        "cross_axis_group_count_reliable": bool(
+            profile.get("cross_axis_group_count_reliable")
+        ),
+        "inline_capacity": int(profile.get("inline_capacity") or 0),
+        "inline_capacity_reliable": bool(
+            profile.get("inline_capacity_reliable")
+        ),
+        "application_status": application_status,
+        "footprint_does_not_select_writing_mode": True,
+    }
 
 
 def _expanded_box_within_hard_bounds(
@@ -1744,20 +2197,16 @@ def _expanded_box_within_hard_bounds(
     return [x, y, width, height]
 
 
-def _source_vertical_row_capacity(source_box: Sequence[int], font_size: int, line_height: float) -> int:
-    source = bbox_from_value(source_box)
-    if not source:
-        return 0
-    _x, _y, _w, h = source
-    if h <= 0:
-        return 0
-    pitch = max(1.0, float(font_size) * max(0.75, float(line_height)))
-    return max(1, min(16, int(round(float(h) / pitch))))
-
-
-def _vertical_column_pitch(font_size: int, content_width: float) -> float:
+def _vertical_column_pitch(
+    font_size: int,
+    content_width: float,
+    *,
+    compact_sequence_only: bool = False,
+) -> float:
     base = max(1.0, float(font_size))
     width = max(1.0, float(content_width or 0.0))
+    if compact_sequence_only:
+        return max(base * 0.38, width + base * 0.10)
     return max(base * 1.24, width + base * 0.2)
 
 
@@ -1771,6 +2220,14 @@ def _vertical_item_row_units(item: Mapping[str, Any]) -> float:
 
 def _vertical_items_row_units(items: Sequence[Mapping[str, Any]]) -> float:
     return sum(_vertical_item_row_units(item) for item in (items or []))
+
+
+def _vertical_items_are_compact_sequences(
+    items: Sequence[Mapping[str, Any]],
+) -> bool:
+    return bool(items) and all(
+        bool(item.get("compact_vertical_sequence")) for item in items
+    )
 
 
 def _vertical_item_cell_height(item: Mapping[str, Any]) -> float:
@@ -1856,11 +2313,20 @@ def _point_from_value(value: Any) -> list[float]:
         return []
 
 
-def _layout_alignment_center(plan: RenderLayerPlan, box: Sequence[int]) -> tuple[list[float], str]:
+def _layout_alignment_center(
+    plan: RenderLayerPlan,
+    box: Sequence[int],
+    *,
+    source_punctuation_box: Sequence[int] | None = None,
+) -> tuple[list[float], str]:
     metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
     explicit_center = _point_from_value(metadata.get("visual_alignment_center"))
     if explicit_center and _point_inside_box(explicit_center, box):
         return explicit_center, "visual_alignment_center"
+
+    punctuation_center = _center_of(source_punctuation_box or [])
+    if punctuation_center and _point_inside_box(punctuation_center, box):
+        return punctuation_center, "validated_source_punctuation_footprint_center"
 
     source_box = bbox_from_value(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, dict) else [])
     source_center = _center_of(source_box)
@@ -1931,12 +2397,105 @@ def _shift_column_records(
     return shifted
 
 
+def _source_standalone_punctuation_footprint_hint(
+    plan: RenderLayerPlan,
+    runs: Sequence[InlineTextRun],
+    run: InlineTextRun,
+) -> dict[str, Any]:
+    """Match one compact translated occurrence to one source occurrence.
+
+    The adapter owns footprint validation and the arbitrator owns style. This
+    helper supplies only an advisory inline presentation span when occurrence
+    identity is unambiguous; every other case stays on font metrics.
+    """
+
+    expected_kind = {
+        "ellipsis_sequence": "ellipsis",
+        "dash_sequence": "dash",
+        "wave_sequence": "wave",
+    }.get(str(run.role or ""), "")
+    if not expected_kind:
+        return {}
+
+    visible_runs = [
+        candidate
+        for candidate in list(runs or [])
+        if candidate.role != "space" and str(candidate.text or "").strip()
+    ]
+    if (
+        len(visible_runs) != 1
+        or str(visible_runs[0].run_id or "") != str(run.run_id or "")
+    ):
+        return {"status": "fallback_ambiguous_translated_occurrence"}
+
+    translated_occurrences = [
+        dict(item)
+        for item in list(run.metadata.get("punctuation_occurrences") or [])
+        if isinstance(item, Mapping)
+    ]
+    if (
+        len(translated_occurrences) != 1
+        or str(translated_occurrences[0].get("kind") or "") != expected_kind
+    ):
+        return {"status": "fallback_ambiguous_translated_occurrence"}
+
+    source_tokens = [
+        token
+        for token in build_lossless_text_tokens(plan.source_text_summary)
+        if str(token.original_text or "").strip()
+    ]
+    if len(source_tokens) != 1:
+        return {"status": "fallback_ambiguous_source_occurrence"}
+    source_token = source_tokens[0]
+    if not isinstance(source_token, PunctuationToken):
+        return {"status": "fallback_incompatible_source_occurrence"}
+    if str(source_token.punctuation_kind or "") != expected_kind:
+        return {"status": "fallback_incompatible_source_occurrence"}
+
+    footprint = validated_source_text_footprint_ref(plan)
+    if not footprint:
+        return {"status": "fallback_validated_source_footprint_unavailable"}
+    source_box = bbox_from_value(footprint.get("union_bbox_page_xywh"))
+    hard_bounds = bbox_from_value(plan.hard_bounds)
+    if not source_box or not hard_bounds:
+        return {"status": "fallback_source_footprint_geometry_unavailable"}
+
+    source_left, source_top, source_width, source_height = source_box
+    hard_left, hard_top, hard_width, hard_height = hard_bounds
+    bounded_left = max(source_left, hard_left)
+    bounded_top = max(source_top, hard_top)
+    bounded_right = min(
+        source_left + source_width,
+        hard_left + hard_width,
+    )
+    bounded_bottom = min(
+        source_top + source_height,
+        hard_top + hard_height,
+    )
+    if bounded_right <= bounded_left or bounded_bottom <= bounded_top:
+        return {"status": "fallback_source_footprint_outside_hard_bounds"}
+    bounded_box = [
+        int(bounded_left),
+        int(bounded_top),
+        int(bounded_right - bounded_left),
+        int(bounded_bottom - bounded_top),
+    ]
+    return {
+        "status": "applied_unambiguous_standalone_occurrence",
+        "box": bounded_box,
+        "inline_span_px": int(bounded_box[3]),
+        "fact_set_id": str(footprint.get("fact_set_id") or ""),
+    }
+
+
 def _vertical_layout_items(
     runs: Sequence[InlineTextRun],
     shaped_runs: Sequence[ShapedRun],
     policy: TypesettingPolicy,
     font_size: int,
-    plan: RenderLayerPlan | None = None,
+    style: Mapping[str, Any] | None = None,
+    *,
+    plan: RenderLayerPlan,
 ) -> list[dict[str, Any]]:
     shaped_by_run = {
         str(run.metadata.get("run_id") or ""): run
@@ -1944,24 +2503,32 @@ def _vertical_layout_items(
         if str(run.metadata.get("run_id") or "")
     }
     items: list[dict[str, Any]] = []
-    dash_hints = _source_visual_units_by_kind(plan, "dash")
-    dash_ordinal = 0
     for run in runs:
         if run.role == "space":
             continue
         shaped = shaped_by_run.get(run.run_id)
         glyphs = list(shaped.glyphs if shaped else [])
         if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
-            item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
+            item_width, item_height, x_advance = _vertical_atomic_size(
+                run,
+                glyphs,
+                policy,
+                font_size,
+                style,
+            )
+            source_footprint_hint = _source_standalone_punctuation_footprint_hint(
+                plan,
+                runs,
+                run,
+            )
+            if source_footprint_hint.get("status") == (
+                "applied_unambiguous_standalone_occurrence"
+            ):
+                item_height = max(
+                    float(item_height),
+                    float(source_footprint_hint.get("inline_span_px") or 0.0),
+                )
             row_units = _vertical_sequence_row_units(run)
-            visual_hint: dict[str, Any] = {}
-            if run.role == "dash_sequence":
-                visual_hint = dict(dash_hints.get(dash_ordinal) or {})
-                dash_ordinal += 1
-                hinted_units = float(visual_hint.get("visual_units") or 0.0)
-                if hinted_units > row_units:
-                    row_units = min(4.5, max(row_units, hinted_units))
-                    item_height = max(float(item_height), float(font_size) * float(row_units))
             items.append(
                 {
                     "text": run.text,
@@ -1977,8 +2544,11 @@ def _vertical_layout_items(
                     "width": item_width,
                     "height": item_height,
                     "row_units": row_units,
+                    "compact_vertical_sequence": bool(
+                        run.role
+                        in {"ellipsis_sequence", "dash_sequence", "wave_sequence"}
+                    ),
                     "x_advance": x_advance,
-                    "source_visual_hint": visual_hint,
                     "punctuation_occurrences": list(run.metadata.get("punctuation_occurrences") or []),
                     "symbol_occurrences": list(run.metadata.get("symbol_occurrences") or []),
                     "ellipsis_unit_count": _occurrence_unit_count(run, "ellipsis"),
@@ -1994,11 +2564,32 @@ def _vertical_layout_items(
                     "font_face_id": shaped.font_face_id if shaped else "",
                     "font_path": shaped.font_path if shaped else "",
                     "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if shaped else False,
+                    **(
+                        {
+                            "source_punctuation_footprint_status": str(
+                                source_footprint_hint.get("status") or ""
+                            ),
+                            "source_punctuation_footprint_box": list(
+                                source_footprint_hint.get("box") or []
+                            ),
+                            "source_punctuation_footprint_fact_set_id": str(
+                                source_footprint_hint.get("fact_set_id") or ""
+                            ),
+                        }
+                        if source_footprint_hint.get("status")
+                        else {}
+                    ),
                 }
             )
             continue
         if _vertical_run_is_atomic(run, policy):
-            item_width, item_height, x_advance = _vertical_atomic_size(run, glyphs, policy, font_size)
+            item_width, item_height, x_advance = _vertical_atomic_size(
+                run,
+                glyphs,
+                policy,
+                font_size,
+                style,
+            )
             items.append(
                 {
                     "text": run.text,
@@ -2056,45 +2647,37 @@ def _vertical_layout_items(
 
 
 def _vertical_sequence_row_units(run: InlineTextRun) -> float:
-    if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence"}:
-        return float(max(1, len(grapheme_clusters(run.text))))
+    occurrence_kind = {
+        "ellipsis_sequence": "ellipsis",
+        "dash_sequence": "dash",
+        "wave_sequence": "wave",
+    }.get(run.role)
+    if occurrence_kind:
+        return float(max(1, _occurrence_unit_count(run, occurrence_kind)))
     return 1.0
 
 
-def _source_visual_units_by_kind(plan: RenderLayerPlan | None, kind: str) -> dict[int, dict[str, Any]]:
-    if not isinstance(plan, RenderLayerPlan):
-        return {}
-    provenance = plan.source_provenance_ref if isinstance(plan.source_provenance_ref, Mapping) else {}
-    hint_record = provenance.get("source_visual_punctuation_hints") if isinstance(provenance, Mapping) else {}
-    hints = hint_record.get("hints") if isinstance(hint_record, Mapping) else []
-    result: dict[int, dict[str, Any]] = {}
-    if not isinstance(hints, Sequence) or isinstance(hints, (str, bytes, bytearray)):
-        return result
-    for item in hints:
-        if not isinstance(item, Mapping):
-            continue
-        if str(item.get("kind") or "") != kind:
-            continue
-        try:
-            ordinal = int(item.get("source_ordinal") or 0)
-            visual_units = float(item.get("visual_units") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if visual_units <= 1.0:
-            continue
-        result[ordinal] = dict(item)
-    return result
-
-
-def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: TypesettingPolicy, font_size: int) -> tuple[float, float, float]:
+def _vertical_atomic_size(
+    run: InlineTextRun,
+    glyphs: Sequence[Any],
+    policy: TypesettingPolicy,
+    font_size: int,
+    style: Mapping[str, Any] | None = None,
+) -> tuple[float, float, float]:
     if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence", "punctuation_sequence"}:
         count = max(1, len(grapheme_clusters(run.text)))
         width = float(font_size)
         height = float(font_size)
         if _is_vertical_emphasis_sequence(run):
             return max(1.0, width), max(1.0, height), width
-        if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence"} and count > 1:
-            height = float(font_size) * float(count)
+        if run.role in {"ellipsis_sequence", "dash_sequence", "wave_sequence"}:
+            row_units = _vertical_sequence_row_units(run)
+            width = _vertical_primitive_cross_axis_extent(
+                run,
+                font_size,
+                style,
+            )
+            height = float(font_size) * float(row_units)
         elif count > 1:
             height = max(height, min(float(font_size) * 1.15, float(font_size) * (0.58 * count)))
         return max(1.0, width), max(1.0, height), width
@@ -2114,6 +2697,241 @@ def _vertical_atomic_size(run: InlineTextRun, glyphs: Sequence[Any], policy: Typ
     if height <= 0.0:
         height = float(font_size)
     return max(1.0, width), max(1.0, height), width
+
+
+def _vertical_primitive_cross_axis_extent(
+    run: InlineTextRun,
+    font_size: int,
+    style: Mapping[str, Any] | None,
+) -> float:
+    try:
+        stroke_width = max(0.0, float((style or {}).get("stroke_width") or 0.0))
+    except (TypeError, ValueError):
+        stroke_width = 0.0
+    raster_guard = 1.0
+    size = max(1.0, float(font_size))
+    if run.role == "ellipsis_sequence":
+        diameter = max(2.0, float(round(size * 0.12)))
+        return diameter + 2.0 * stroke_width + 2.0 * raster_guard
+    if run.role == "dash_sequence":
+        line_width = max(2.0, float(round(size * 0.09)))
+        return line_width + 2.0 * stroke_width + 2.0 * raster_guard
+    amplitude = max(2.0, size * 0.14)
+    line_width = max(2.0, float(round(size * 0.08)))
+    return 2.0 * amplitude + line_width + 2.0 * stroke_width + 2.0 * raster_guard
+
+
+def _finalize_drawing_primitives(
+    placements: Sequence[GlyphPlacement],
+    style: Mapping[str, Any] | None,
+) -> tuple[list[GlyphPlacement], list[DrawingPrimitive]]:
+    finalized: list[GlyphPlacement] = []
+    primitives: list[DrawingPrimitive] = []
+    for index, placement in enumerate(placements):
+        metadata = dict(placement.metadata or {})
+        mode = str(metadata.get("placement_mode") or "")
+        if mode not in {
+            "vertical_ellipsis_sequence",
+            "vertical_dash_sequence",
+            "vertical_wave_sequence",
+        }:
+            finalized.append(placement)
+            continue
+        primitive_id = (
+            f"drawing_primitive_{index:04d}_"
+            f"{str(metadata.get('run_id') or 'run')}"
+        )
+        primitive = _drawing_primitive_for_placement(
+            primitive_id=primitive_id,
+            placement=placement,
+            style=style,
+        )
+        metadata["drawing_primitive_id"] = primitive_id
+        metadata["primitive_geometry_final"] = True
+        metadata["primitive_bounds"] = list(primitive.bounds)
+        finalized.append(replace(placement, metadata=metadata))
+        primitives.append(primitive)
+    return finalized, primitives
+
+
+def _drawing_primitive_for_placement(
+    *,
+    primitive_id: str,
+    placement: GlyphPlacement,
+    style: Mapping[str, Any] | None,
+) -> DrawingPrimitive:
+    metadata = dict(placement.metadata or {})
+    mode = str(metadata.get("placement_mode") or "")
+    box = bbox_from_value(placement.bbox)
+    if not box:
+        raise ValueError("drawing_primitive_missing_placement_bounds")
+    x, y, width, height = box
+    font_size = max(1.0, float(placement.font_size or 1.0))
+    try:
+        outline_width = max(
+            0.0,
+            float((style or {}).get("stroke_width") or 0.0),
+        )
+    except (TypeError, ValueError):
+        outline_width = 0.0
+    token_ids = [str(value) for value in list(metadata.get("token_ids") or [])]
+    occurrences = [
+        dict(value)
+        for value in list(metadata.get("punctuation_occurrences") or [])
+        if isinstance(value, Mapping)
+    ]
+    centers: list[list[float]] = []
+    points: list[list[float]] = []
+    diameter = 0.0
+    line_width = 0.0
+    pitch = 0.0
+    unit_count = 1
+    visible_count = 1
+    sequence_group_count = 1
+    primitive_metadata: dict[str, Any] = {
+        "geometry_owner": "TypesettingEngine",
+        "geometry_status": "final",
+        "placement_mode": mode,
+        "font_size": float(font_size),
+        "outline_width_px": float(outline_width),
+        "punctuation_occurrences": occurrences,
+        "relative_geometry_recomputation_allowed": False,
+    }
+    source_punctuation_status = str(
+        metadata.get("source_punctuation_footprint_status") or ""
+    )
+    if source_punctuation_status:
+        primitive_metadata.update(
+            {
+                "source_punctuation_footprint_status": (
+                    source_punctuation_status
+                ),
+                "source_punctuation_footprint_box": list(
+                    metadata.get("source_punctuation_footprint_box") or []
+                ),
+                "source_punctuation_footprint_fact_set_id": str(
+                    metadata.get("source_punctuation_footprint_fact_set_id")
+                    or ""
+                ),
+            }
+        )
+
+    if mode == "vertical_ellipsis_sequence":
+        unit_count = max(1, int(metadata.get("ellipsis_unit_count") or 1))
+        visible_count = max(
+            1,
+            int(metadata.get("ellipsis_dot_count") or unit_count * 3),
+        )
+        sequence_group_count = max(
+            1,
+            int(metadata.get("ellipsis_sequence_group_count") or 1),
+        )
+        desired_diameter = max(2.0, float(round(font_size * 0.12)))
+        maximum_diameter = max(1.0, float(width) - 2.0 * outline_width)
+        diameter = min(desired_diameter, maximum_diameter)
+        radius = diameter / 2.0
+        outer_radius = radius + outline_width
+        center_x = float(x) + (float(width) - 1.0) / 2.0
+        requested_inset = float(height) * (0.25 / float(unit_count))
+        edge_inset = min(
+            max(outer_radius, requested_inset),
+            max(outer_radius, float(height) / 2.0),
+        )
+        first_y = float(y) + edge_inset
+        last_y = float(y + height) - edge_inset
+        if visible_count > 1:
+            pitch = max(0.0, (last_y - first_y) / float(visible_count - 1))
+        for dot_index in range(visible_count):
+            center_y = (
+                first_y + pitch * float(dot_index)
+                if visible_count > 1
+                else float(y) + float(height) / 2.0
+            )
+            centers.append([round(center_x, 4), round(center_y, 4)])
+        primitive_metadata.update(
+            {
+                "ellipsis_policy": "one_continuous_uniform_dot_sequence",
+                "dot_column_count": 1,
+                "continuous_sequence": True,
+            }
+        )
+    elif mode == "vertical_dash_sequence":
+        unit_count = max(1, int(metadata.get("dash_unit_count") or 1))
+        line_width = max(2.0, float(round(font_size * 0.09)))
+        center_x = float(x) + (float(width) - 1.0) / 2.0
+        endpoint_radius = line_width / 2.0 + outline_width
+        pad_y = max(
+            1.0,
+            float(round(font_size * 0.04)),
+            endpoint_radius,
+        )
+        first_y = min(float(y + height - 1), float(y) + pad_y)
+        last_y = max(float(y), float(y + height - 1) - pad_y)
+        points = [
+            [round(center_x, 4), round(first_y, 4)],
+            [round(center_x, 4), round(last_y, 4)],
+        ]
+        pitch = max(0.0, last_y - first_y)
+        primitive_metadata.update(
+            {
+                "continuous_segment_count": 1,
+                "continuous_multi_cell_dash": True,
+                "endpoint_effect_inset_px": float(pad_y),
+            }
+        )
+    else:
+        unit_count = max(1, int(metadata.get("wave_unit_count") or 1))
+        line_width = max(2.0, float(round(font_size * 0.08)))
+        amplitude = max(
+            1.0,
+            min(float(width) * 0.24, font_size * 0.14),
+        )
+        endpoint_radius = line_width / 2.0 + outline_width
+        pad_y = max(
+            1.0,
+            float(round(font_size * 0.04)),
+            endpoint_radius,
+        )
+        first_y = min(float(y + height - 1), float(y) + pad_y)
+        last_y = max(float(y), float(y + height - 1) - pad_y)
+        span = max(1.0, last_y - first_y)
+        center_x = float(x) + (float(width) - 1.0) / 2.0
+        sample_step = max(1, int(math.ceil(span / 128.0)))
+        sample_ys = list(range(int(round(first_y)), int(round(last_y)) + 1, sample_step))
+        if not sample_ys or sample_ys[-1] != int(round(last_y)):
+            sample_ys.append(int(round(last_y)))
+        for sample_y in sample_ys:
+            t = max(0.0, min(1.0, (float(sample_y) - first_y) / span))
+            sample_x = center_x + math.sin(t * math.tau * float(unit_count)) * amplitude
+            points.append([round(sample_x, 4), round(float(sample_y), 4)])
+        pitch = span / float(unit_count)
+        visible_count = unit_count
+        primitive_metadata.update(
+            {
+                "wave_cycle_count": float(unit_count),
+                "path_sample_step_px": int(sample_step),
+                "continuous_multi_cell_wave": True,
+                "endpoint_effect_inset_px": float(pad_y),
+            }
+        )
+
+    return DrawingPrimitive(
+        primitive_id=primitive_id,
+        kind=mode,
+        source_text=str(placement.text or ""),
+        token_ids=token_ids,
+        orientation="vertical",
+        bounds=list(box),
+        centers=centers,
+        points=points,
+        diameter_px=float(diameter),
+        line_width_px=float(line_width),
+        pitch_px=float(pitch),
+        unit_count=int(unit_count),
+        visible_count=int(visible_count),
+        sequence_group_count=int(sequence_group_count),
+        metadata=primitive_metadata,
+    )
 
 
 def _vertical_run_is_atomic(run: InlineTextRun, policy: TypesettingPolicy) -> bool:
@@ -2190,13 +3008,23 @@ def _logical_run_id_for(run: InlineTextRun) -> str:
 
 
 def _placement_font_span_metadata(run: InlineTextRun) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "token_ids": list(run.token_ids),
+        "original_text": run.original_text,
+        "translated_start": int(run.translated_start),
+        "translated_end": int(run.translated_end),
+        "atomic_break": bool(run.metadata.get("atomic_break")),
+    }
     span_id = str(run.metadata.get("font_span_id") or "")
     if not span_id:
-        return {}
-    return {
-        "logical_run_id": _logical_run_id_for(run),
-        "font_span_id": span_id,
-    }
+        return metadata
+    metadata.update(
+        {
+            "logical_run_id": _logical_run_id_for(run),
+            "font_span_id": span_id,
+        }
+    )
+    return metadata
 
 
 def _visible_notdef_run_ids(shaped_runs: Sequence[ShapedRun]) -> list[str]:
@@ -2316,6 +3144,68 @@ def _font_span_cluster_ledger(
                 }
             )
     return output
+
+
+def _font_span_token_provenance(
+    run: InlineTextRun,
+    span: FontSpanResolution,
+) -> dict[str, Any]:
+    raw_tokens = list(run.metadata.get("lossless_tokens") or [])
+    span_start = int(run.grapheme_start) + int(span.source_grapheme_start)
+    span_end = int(run.grapheme_start) + int(span.source_grapheme_end)
+    selected: list[tuple[int, Mapping[str, Any]]] = []
+    for index, raw_token in enumerate(raw_tokens):
+        if not isinstance(raw_token, Mapping):
+            continue
+        token_start = int(raw_token.get("presentation_grapheme_start") or 0)
+        token_end = int(
+            raw_token.get("presentation_grapheme_end") or token_start
+        )
+        if token_start < span_end and token_end > span_start:
+            selected.append((index, raw_token))
+    if not selected:
+        raise RuntimeError("font_span_token_provenance_missing")
+
+    token_records = [dict(item) for _, item in selected]
+    presentation_text = "".join(
+        str(item.get("presentation_text") or "") for item in token_records
+    )
+    if presentation_text != str(span.text or ""):
+        raise RuntimeError("font_span_token_provenance_not_conserved")
+
+    token_ids = tuple(
+        str(item.get("token_id") or "") for item in token_records
+    )
+    if not all(token_ids):
+        raise RuntimeError("font_span_token_provenance_missing")
+    original_text = "".join(
+        str(item.get("original_text") or "") for item in token_records
+    )
+    translated_start = min(
+        int(item.get("translated_start") or 0) for item in token_records
+    )
+    translated_end = max(
+        int(item.get("translated_end") or 0) for item in token_records
+    )
+    first_token_index = selected[0][0]
+    last_token_index = selected[-1][0]
+    token_start = int(run.token_start) + first_token_index
+    token_end = int(run.token_start) + last_token_index + 1
+    return {
+        "original_text": original_text,
+        "translated_start": translated_start,
+        "translated_end": translated_end,
+        "token_start": token_start,
+        "token_end": token_end,
+        "token_ids": token_ids,
+        "metadata": {
+            "token_ids": list(token_ids),
+            "lossless_tokens": token_records,
+            "original_text": original_text,
+            "translated_start": translated_start,
+            "translated_end": translated_end,
+        },
+    }
 
 
 def _unique(values: Sequence[str]) -> list[str]:
