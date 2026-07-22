@@ -14,13 +14,10 @@ from typing import Any, Mapping, Sequence
 
 
 PARENT_EXECUTION_BUNDLE_VERSION = "parent_execution_bundle_v1"
-PARENT_RENDER_STYLE_VERSION = "parent_render_style_v2"
-PARENT_STYLE_ARBITRATOR_SOURCE = "parent_authorized_style_arbitrator"
+PARENT_RENDER_STYLE_VERSION = "parent_render_style_v3"
+PARENT_STYLE_ARBITRATOR_SOURCE = "parent_authorized_style_evidence"
 PARENT_STYLE_ARBITRATOR_PROVIDER = "ParentStyleArbitrator"
-PARENT_STYLE_RESOLUTION_STATUSES = {
-    "authorized_evidence_resolved",
-    "unresolved",
-}
+PARENT_STYLE_RESOLUTION_STATUSES = {"complete"}
 PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY = "cjk-sc"
 PARENT_STYLE_UNRESOLVED_FONT_SIZE = 24
 PARENT_STYLE_UNRESOLVED_FONT_SIZE_MIN = 17
@@ -32,25 +29,40 @@ PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY = (
     "arbitrator_owned_unresolved_scale_fallback"
 )
 
-_PARENT_STYLE_FONT_WEIGHTS = {"regular", "bold", "black"}
 _PARENT_STYLE_WRITING_MODES = {"vertical", "horizontal"}
 _PARENT_STYLE_ALIGNMENTS = {"center", "left", "right", "start", "end"}
-_PARENT_STYLE_FONT_SIZE_AUTHORITIES = {
-    "automated_style_arbitrator",
-    PARENT_STYLE_UNRESOLVED_FONT_SIZE_AUTHORITY,
+_PARENT_STYLE_FAMILY_ROLES = {"sans", "serif"}
+_PARENT_STYLE_WEIGHT_TIERS = {"slender", "base", "emphasis", "heavy"}
+_PARENT_STYLE_FONT_ROLE_MATRIX = {
+    ("sans", "slender"): ("sans_regular", "registered_role"),
+    ("sans", "base"): ("sans_medium", "registered_role"),
+    ("sans", "emphasis"): ("sans_bold", "registered_role"),
+    ("sans", "heavy"): ("sans_black", "registered_role"),
+    ("serif", "slender"): ("serif_regular", "registered_role"),
+    ("serif", "base"): ("serif_semibold", "registered_role"),
+    ("serif", "emphasis"): ("serif_bold", "registered_role"),
+    ("serif", "heavy"): ("serif_bold", "degraded_registered_role"),
 }
-_PARENT_STYLE_FONT_SIZE_POLICIES = {
-    "authorized_source_preferred",
-    PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY,
+_PARENT_STYLE_ROLE_STATUSES = {
+    "registered_role",
+    "degraded_registered_role",
+    "fallback_registered_role",
 }
-_PARENT_STYLE_FONT_SIZE_SOURCES = {
-    "root_local_peer_assist",
-    "authorized_source_style_view",
-    "parent_style_arbitrator_unresolved_scale_fallback",
-}
+_PARENT_STYLE_SOURCE_CELL_STATUSES = {"direct", "peer", "unavailable"}
+_PARENT_STYLE_AXIS_NAMES = (
+    "family",
+    "weight",
+    "source_scale",
+    "fill",
+    "outline",
+    "orientation",
+    "rotation",
+    "shadow",
+)
+_PARENT_STYLE_AXIS_STATUSES = {"direct", "peer", "fallback", "unavailable"}
 _HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
-_RENDER_STYLE_FLAT_FIELDS = {
+_LEGACY_RENDER_STYLE_FLAT_FIELDS = {
     "font_family": "font",
     "font_size": "font_size",
     "font_size_hint": "source_size_hint",
@@ -69,6 +81,52 @@ _RENDER_STYLE_FLAT_FIELDS = {
     "style_class": "font_style",
     "font_weight": "font_weight",
     "spacing_profile": "spacing_profile",
+}
+_PARENT_STYLE_REQUIRED_FIELDS = {
+    "render_style_version",
+    "render_style_owner",
+    "render_style_source",
+    "render_style_provider",
+    "style_resolution_status",
+    "source_evidence_status",
+    "render_style_confidence",
+    "font_family_role",
+    "font_weight_tier",
+    "primary_font_role",
+    "primary_font_role_status",
+    "fallback_font_chain_key",
+    "source_visual_cell",
+    "target_preferred_em_px",
+    "target_preferred_em_interval_px",
+    "target_face_profile_id",
+    "target_em_conversion_audit",
+    "fill",
+    "outline",
+    "writing_mode",
+    "line_height",
+    "align",
+    "axis_authority",
+    "fallback_status",
+}
+_PARENT_STYLE_OPTIONAL_FIELDS = {
+    "parent_layer_effects",
+    "diagnostic_uncertainty",
+    "readability_diagnostic",
+}
+_PARENT_STYLE_FORBIDDEN_LEGACY_FIELDS = (
+    set(_LEGACY_RENDER_STYLE_FLAT_FIELDS) - {"line_height", "align"}
+) | {
+    "font_weight",
+    "font_size_authority",
+    "font_size_source",
+    "target_font_request",
+    "target_font_mapping_source",
+    "target_font_mapping_family_role",
+    "target_font_mapping_weight",
+    "source_scale_px",
+    "style_axis_decisions",
+    "typographic_style_class",
+    "base_style_id",
 }
 
 
@@ -140,6 +198,7 @@ class ParentExecutionBundle:
     render_decision_id: str = ""
     renderer_audit_id: str = ""
     style_evidence_summary: dict[str, Any] = field(default_factory=dict)
+    source_punctuation_geometry: dict[str, Any] = field(default_factory=dict)
     render_layout_summary: dict[str, Any] = field(default_factory=dict)
     render_style: dict[str, Any] = field(default_factory=dict)
     execution_region: dict[str, Any] = field(default_factory=dict)
@@ -195,6 +254,9 @@ class ParentExecutionBundle:
             "render_decision_id": self.render_decision_id,
             "renderer_audit_id": self.renderer_audit_id,
             "style_evidence_summary": _copy_jsonish(self.style_evidence_summary),
+            "source_punctuation_geometry": _copy_jsonish(
+                self.source_punctuation_geometry
+            ),
             "render_layout_summary": _copy_jsonish(self.render_layout_summary),
             "render_style": _copy_jsonish(
                 resolved_render_style_contract(self.render_style)
@@ -309,6 +371,9 @@ class ParentExecutionBundle:
             "cleanup_mask_ids": list(self.cleanup_mask_ids),
             "render_decision_id": self.render_decision_id,
             "renderer_audit_id": self.renderer_audit_id,
+            "source_punctuation_geometry": _copy_jsonish(
+                self.source_punctuation_geometry
+            ),
             "render_layout_summary": _copy_jsonish(self.render_layout_summary),
             "render": {
                 "parent_execution_bundle_id": self.bundle_id,
@@ -362,6 +427,9 @@ class ParentExecutionBundle:
                 "cleanup_mask_ids": list(self.cleanup_mask_ids),
                 "render_decision_id": self.render_decision_id,
                 "renderer_audit_id": self.renderer_audit_id,
+                "source_punctuation_geometry": _copy_jsonish(
+                    self.source_punctuation_geometry
+                ),
                 "render_layout_summary": _copy_jsonish(self.render_layout_summary),
                 "order_index": int(self.reading_order_index),
                 "reading_order_index": int(self.reading_order_index),
@@ -512,6 +580,11 @@ def sync_bundles_from_region_records(
         if "style_evidence_summary" in record:
             bundle.style_evidence_summary = _copy_mapping(record.get("style_evidence_summary"))
         render_record = record.get("render") if isinstance(record.get("render"), Mapping) else {}
+        if "source_punctuation_geometry" in record or "source_punctuation_geometry" in render_record:
+            bundle.source_punctuation_geometry = _copy_mapping(
+                record.get("source_punctuation_geometry")
+                or render_record.get("source_punctuation_geometry")
+            )
         bundle.render_layout_summary = _copy_mapping(
             record.get("render_layout_summary")
             or render_record.get("render_layout_summary")
@@ -592,6 +665,16 @@ def parent_execution_bundles_from_audit_records(
             render_decision_id=str(record.get("render_decision_id") or ""),
             renderer_audit_id=str(record.get("renderer_audit_id") or ""),
             style_evidence_summary=_copy_mapping(record.get("style_evidence_summary")),
+            source_punctuation_geometry=_copy_mapping(
+                record.get("source_punctuation_geometry")
+                or (
+                    (record.get("execution_region") or {}).get(
+                        "source_punctuation_geometry"
+                    )
+                    if isinstance(record.get("execution_region"), Mapping)
+                    else {}
+                )
+            ),
             render_layout_summary=_copy_mapping(
                 record.get("render_layout_summary")
                 or (
@@ -1011,6 +1094,9 @@ def _sync_execution_region_from_bundle(
     record["render_decision_id"] = bundle.render_decision_id
     record["renderer_audit_id"] = bundle.renderer_audit_id
     record["style_evidence_summary"] = _copy_jsonish(bundle.style_evidence_summary)
+    record["source_punctuation_geometry"] = _copy_jsonish(
+        bundle.source_punctuation_geometry
+    )
     record["render_layout_summary"] = _copy_jsonish(bundle.render_layout_summary)
     record["execution_region_authority"] = "parent_execution_bundle"
     record["execution_region_role"] = "parent_execution"
@@ -1057,6 +1143,9 @@ def _sync_execution_region_from_bundle(
     render["cleanup_mask_ids"] = list(bundle.cleanup_mask_ids)
     render["render_decision_id"] = bundle.render_decision_id
     render["renderer_audit_id"] = bundle.renderer_audit_id
+    render["source_punctuation_geometry"] = _copy_jsonish(
+        bundle.source_punctuation_geometry
+    )
     render["render_layout_summary"] = _copy_jsonish(bundle.render_layout_summary)
     render["execution_region_authority"] = "parent_execution_bundle"
     render["execution_region_role"] = "parent_execution"
@@ -1143,11 +1232,11 @@ def _resolved_render_style_from_region(record: Mapping[str, Any]) -> dict[str, A
 
 
 def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
-    """Validate and copy the complete executable style owned by the arbitrator.
+    """Validate and isolate the sole executable ``parent_render_style_v3``.
 
-    This is the only resolved-style acceptance gate shared by bundle persistence
-    and the renderer adapter.  It deliberately validates Stage A executable
-    axes only; punctuation and symbol policy remain separate typesetting work.
+    The gate deliberately accepts no v2 aliases or compatibility projection.
+    Style evidence and target realization belong to ``ParentStyleArbitrator``;
+    this function only enforces the complete handoff consumed by rendering.
     """
 
     if not isinstance(value, Mapping):
@@ -1163,99 +1252,188 @@ def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
         )
 
     reasons: list[str] = []
+    keys = {key for key in style if isinstance(key, str)}
+    for field_name in sorted(_PARENT_STYLE_REQUIRED_FIELDS - keys):
+        reasons.append(f"required_field_missing:{field_name}")
+    for field_name in sorted(
+        keys - _PARENT_STYLE_REQUIRED_FIELDS - _PARENT_STYLE_OPTIONAL_FIELDS
+    ):
+        reasons.append(f"unknown_field:{field_name}")
+    for field_name in sorted(_PARENT_STYLE_FORBIDDEN_LEGACY_FIELDS & keys):
+        reasons.append(f"legacy_field_forbidden:{field_name}")
+
     expected_stamps = {
         "render_style_version": PARENT_RENDER_STYLE_VERSION,
-        "render_style_owner": "parent_execution_bundle",
+        "render_style_owner": "ParentStyleArbitrator",
         "render_style_source": PARENT_STYLE_ARBITRATOR_SOURCE,
         "render_style_provider": PARENT_STYLE_ARBITRATOR_PROVIDER,
+        "style_resolution_status": "complete",
     }
     for field_name, expected in expected_stamps.items():
-        if str(style.get(field_name) or "") != expected:
-            reasons.append(f"resolved_render_style_invalid_{field_name}")
-    if str(style.get("style_resolution_status") or "") not in PARENT_STYLE_RESOLUTION_STATUSES:
-        reasons.append("resolved_render_style_invalid_style_resolution_status")
-    if str(style.get("style_evidence_status") or "") not in {"observed", "unavailable"}:
-        reasons.append("resolved_render_style_invalid_style_evidence_status")
+        if style.get(field_name) != expected:
+            reasons.append(f"{field_name}_invalid")
+    if style.get("source_evidence_status") not in {"observed", "unavailable"}:
+        reasons.append("source_evidence_status_invalid")
     confidence = _finite_number(style.get("render_style_confidence"))
     if confidence is None or not 0.0 <= confidence <= 1.0:
-        reasons.append("resolved_render_style_invalid_render_style_confidence")
+        reasons.append("render_style_confidence_invalid")
 
-    for field_name in (
-        "font_family",
-        "style_class",
-        "fallback_font_chain_key",
-        "font_size_authority",
-        "font_size_policy",
-        "font_size_fallback_policy",
-        "font_size_source",
-    ):
-        if not str(style.get(field_name) or "").strip():
-            reasons.append(f"resolved_render_style_missing_{field_name}")
-
+    family = style.get("font_family_role")
+    weight = style.get("font_weight_tier")
+    if family not in _PARENT_STYLE_FAMILY_ROLES:
+        reasons.append("font_family_role_invalid")
+    if weight not in _PARENT_STYLE_WEIGHT_TIERS:
+        reasons.append("font_weight_tier_invalid")
+    expected_role, expected_role_status = _PARENT_STYLE_FONT_ROLE_MATRIX.get(
+        (family, weight),
+        (None, None),
+    )
+    if expected_role is not None and style.get("primary_font_role") != expected_role:
+        reasons.append("primary_font_role_matrix_mismatch")
+    role_status = style.get("primary_font_role_status")
+    if role_status not in _PARENT_STYLE_ROLE_STATUSES:
+        reasons.append("primary_font_role_status_invalid")
     if (
-        str(style.get("fallback_font_chain_key") or "")
-        != PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY
+        role_status not in {None, "fallback_registered_role"}
+        and expected_role_status is not None
+        and role_status != expected_role_status
     ):
-        reasons.append("resolved_render_style_invalid_fallback_font_chain_key")
-    if str(style.get("font_size_authority") or "") not in (
-        _PARENT_STYLE_FONT_SIZE_AUTHORITIES
-    ):
-        reasons.append("resolved_render_style_invalid_font_size_authority")
-    if str(style.get("font_size_policy") or "") not in _PARENT_STYLE_FONT_SIZE_POLICIES:
-        reasons.append("resolved_render_style_invalid_font_size_policy")
-    if str(style.get("font_size_fallback_policy") or "") != "typesetting_bounded_fit":
-        reasons.append("resolved_render_style_invalid_font_size_fallback_policy")
-    if str(style.get("font_size_source") or "") not in _PARENT_STYLE_FONT_SIZE_SOURCES:
-        reasons.append("resolved_render_style_invalid_font_size_source")
+        reasons.append("primary_font_role_status_matrix_mismatch")
+    if style.get("fallback_font_chain_key") != PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY:
+        reasons.append("fallback_font_chain_key_invalid")
 
-    if str(style.get("font_weight") or "") not in _PARENT_STYLE_FONT_WEIGHTS:
-        reasons.append("resolved_render_style_invalid_font_weight")
-    if not isinstance(style.get("font_size_locked"), bool):
-        reasons.append("resolved_render_style_invalid_font_size_locked")
+    source_cell = style.get("source_visual_cell")
+    if not isinstance(source_cell, Mapping):
+        reasons.append("source_visual_cell_invalid")
+        source_cell = {}
+    source_status = source_cell.get("status")
+    if source_status not in _PARENT_STYLE_SOURCE_CELL_STATUSES:
+        reasons.append("source_visual_cell_status_invalid")
+    if source_cell.get("writing_mode") not in _PARENT_STYLE_WRITING_MODES:
+        reasons.append("source_visual_cell_writing_mode_invalid")
+    cell_confidence = _finite_number(source_cell.get("confidence"))
+    if cell_confidence is None or not 0.0 <= cell_confidence <= 1.0:
+        reasons.append("source_visual_cell_confidence_invalid")
+    if not str(source_cell.get("provenance") or ""):
+        reasons.append("source_visual_cell_provenance_missing")
+    cell_interval = tuple(
+        _finite_number(source_cell.get(name))
+        for name in ("p20_px", "median_px", "p80_px")
+    )
+    if source_status in {"direct", "peer"}:
+        if any(value is None or value <= 0.0 for value in cell_interval):
+            reasons.append("source_visual_cell_measurement_missing")
+        elif not cell_interval[0] <= cell_interval[1] <= cell_interval[2]:
+            reasons.append("source_visual_cell_interval_invalid")
+        if source_cell.get("authority") != source_status:
+            reasons.append("source_visual_cell_authority_invalid")
+    elif source_status == "unavailable":
+        if any(value is not None for value in cell_interval):
+            reasons.append("source_visual_cell_unavailable_has_measurement")
+        if source_cell.get("authority") != "fallback":
+            reasons.append("source_visual_cell_authority_invalid")
 
-    numeric_values: dict[str, float] = {}
-    for field_name in (
-        "font_size",
-        "font_size_hint",
-        "font_size_min",
-        "font_size_max",
-        "line_height",
-    ):
-        number = _finite_number(style.get(field_name))
-        if number is None or number <= 0.0:
-            reasons.append(f"resolved_render_style_invalid_{field_name}")
-        else:
-            numeric_values[field_name] = number
-    stroke_width = _finite_number(style.get("stroke_width"))
-    if stroke_width is None or stroke_width < 0.0:
-        reasons.append("resolved_render_style_invalid_stroke_width")
+    preferred_em = _finite_number(style.get("target_preferred_em_px"))
+    if preferred_em is None or preferred_em <= 0.0:
+        reasons.append("target_preferred_em_invalid")
+    interval = style.get("target_preferred_em_interval_px")
+    if not isinstance(interval, list) or len(interval) != 2:
+        reasons.append("target_preferred_em_interval_invalid")
+    else:
+        low, high = (_finite_number(interval[0]), _finite_number(interval[1]))
+        if (
+            low is None
+            or high is None
+            or low <= 0.0
+            or high < low
+            or preferred_em is None
+            or not low <= preferred_em <= high
+        ):
+            reasons.append("target_preferred_em_interval_invalid")
+    if not str(style.get("target_face_profile_id") or ""):
+        reasons.append("target_face_profile_id_missing")
+    if not isinstance(style.get("target_em_conversion_audit"), Mapping):
+        reasons.append("target_em_conversion_audit_invalid")
 
-    font_min = numeric_values.get("font_size_min")
-    font_hint = numeric_values.get("font_size_hint")
-    font_size = numeric_values.get("font_size")
-    font_max = numeric_values.get("font_size_max")
-    if None not in (font_min, font_hint, font_size, font_max) and not (
-        font_min <= font_hint <= font_max and font_min <= font_size <= font_max
+    fill = style.get("fill")
+    if not isinstance(fill, Mapping):
+        reasons.append("fill_invalid")
+    elif (
+        not _HEX_COLOR_PATTERN.fullmatch(str(fill.get("color") or ""))
+        or fill.get("polarity") not in {"dark", "light"}
     ):
-        reasons.append("resolved_render_style_invalid_font_size_band")
+        reasons.append("fill_invalid")
+    outline = style.get("outline")
+    if not isinstance(outline, Mapping):
+        reasons.append("outline_invalid")
+    else:
+        if not isinstance(outline.get("present"), bool):
+            reasons.append("outline_present_invalid")
+        if not _HEX_COLOR_PATTERN.fullmatch(str(outline.get("color") or "")):
+            reasons.append("outline_color_invalid")
+        ratio = _finite_number(outline.get("source_width_to_cell_ratio"))
+        width = _finite_number(outline.get("target_width_px"))
+        if ratio is None or ratio < 0.0 or width is None or width < 0.0:
+            reasons.append("outline_geometry_invalid")
+    if style.get("writing_mode") not in _PARENT_STYLE_WRITING_MODES:
+        reasons.append("writing_mode_invalid")
+    line_height = _finite_number(style.get("line_height"))
+    if line_height is None or line_height <= 0.0:
+        reasons.append("line_height_invalid")
+    if style.get("align") not in _PARENT_STYLE_ALIGNMENTS:
+        reasons.append("align_invalid")
 
-    orientation = str(style.get("source_orientation") or "")
-    wrap_mode = str(style.get("wrap_mode") or "")
-    if orientation not in _PARENT_STYLE_WRITING_MODES:
-        reasons.append("resolved_render_style_invalid_source_orientation")
-    if wrap_mode not in _PARENT_STYLE_WRITING_MODES:
-        reasons.append("resolved_render_style_invalid_wrap_mode")
-    if (
-        orientation in _PARENT_STYLE_WRITING_MODES
-        and wrap_mode in _PARENT_STYLE_WRITING_MODES
-        and orientation != wrap_mode
-    ):
-        reasons.append("resolved_render_style_orientation_wrap_mismatch")
-    if str(style.get("align") or "") not in _PARENT_STYLE_ALIGNMENTS:
-        reasons.append("resolved_render_style_invalid_align")
-    for field_name in ("fill_color", "stroke_color"):
-        if not _HEX_COLOR_PATTERN.fullmatch(str(style.get(field_name) or "")):
-            reasons.append(f"resolved_render_style_invalid_{field_name}")
+    authority = style.get("axis_authority")
+    fallback_axes: list[str] = []
+    if not isinstance(authority, Mapping) or set(authority) != set(_PARENT_STYLE_AXIS_NAMES):
+        reasons.append("axis_authority_inventory_invalid")
+    else:
+        for axis in _PARENT_STYLE_AXIS_NAMES:
+            record = authority.get(axis)
+            if not isinstance(record, Mapping):
+                reasons.append(f"axis_authority_invalid:{axis}")
+                continue
+            status = record.get("status")
+            if status not in _PARENT_STYLE_AXIS_STATUSES:
+                reasons.append(f"axis_authority_status_invalid:{axis}")
+            if status == "fallback":
+                fallback_axes.append(axis)
+            axis_confidence = _finite_number(record.get("confidence"))
+            if axis_confidence is None or not 0.0 <= axis_confidence <= 1.0:
+                reasons.append(f"axis_authority_confidence_invalid:{axis}")
+            if not str(record.get("provenance") or ""):
+                reasons.append(f"axis_authority_provenance_missing:{axis}")
+            if not isinstance(record.get("reason_codes"), list):
+                reasons.append(f"axis_authority_reason_codes_invalid:{axis}")
+
+    fallback_status = style.get("fallback_status")
+    if not isinstance(fallback_status, Mapping):
+        reasons.append("fallback_status_invalid")
+    else:
+        expected_fallback_axes = [
+            axis for axis in _PARENT_STYLE_AXIS_NAMES if axis in fallback_axes
+        ]
+        if list(fallback_status.get("axes") or []) != expected_fallback_axes:
+            reasons.append("fallback_axis_accounting_mismatch")
+        if bool(fallback_status.get("used")) != bool(expected_fallback_axes):
+            reasons.append("fallback_used_status_mismatch")
+        if not isinstance(fallback_status.get("reason_codes"), list):
+            reasons.append("fallback_reason_codes_invalid")
+        if role_status == "fallback_registered_role" and not any(
+            axis in expected_fallback_axes for axis in ("family", "weight")
+        ):
+            reasons.append("primary_font_role_fallback_status_unjustified")
+
+    for field_name in ("diagnostic_uncertainty", "readability_diagnostic"):
+        diagnostic = style.get(field_name)
+        if diagnostic is not None and (
+            not isinstance(diagnostic, Mapping)
+            or diagnostic.get("render_admission") is not False
+        ):
+            reasons.append(f"{field_name}_invalid")
+    effects = style.get("parent_layer_effects")
+    if effects is not None and not isinstance(effects, Mapping):
+        reasons.append("parent_layer_effects_invalid")
 
     if reasons:
         return ResolvedRenderStyleValidation(
@@ -1296,7 +1474,7 @@ def _clear_executable_style_fields(record: dict[str, Any]) -> None:
         "render_style_provider_model",
         "render_style_confidence",
         "style_resolution_status",
-        *tuple(_RENDER_STYLE_FLAT_FIELDS.values()),
+        *tuple(_LEGACY_RENDER_STYLE_FLAT_FIELDS.values()),
     ):
         record.pop(key, None)
 
@@ -1316,14 +1494,9 @@ def _render_style_record_fields(render_style: Mapping[str, Any]) -> dict[str, An
 
 
 def _render_style_flattened_fields(render_style: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(render_style, Mapping):
-        return {}
-    fields: dict[str, Any] = {}
-    for nested_key, flat_key in _RENDER_STYLE_FLAT_FIELDS.items():
-        value = render_style.get(nested_key)
-        if _style_value_present(value):
-            fields[flat_key] = value
-    return fields
+    """Do not project the v3 style back into executable v2 aliases."""
+
+    return {}
 
 
 def _style_value_present(value: Any) -> bool:

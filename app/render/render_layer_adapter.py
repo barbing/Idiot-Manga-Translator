@@ -17,6 +17,14 @@ from app.pipeline.parent_style_evidence import (
     SOURCE_TEXT_FOOTPRINT_PROFILE_SELECTION_AUTHORITY,
     SOURCE_TEXT_FOOTPRINT_VERSION,
 )
+from app.render.source_punctuation_hints import (
+    SOURCE_PUNCTUATION_CELL_CALIBRATION_VERSION,
+    SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION,
+    SOURCE_PUNCTUATION_GEOMETRY_OBSERVER_VERSION,
+    SOURCE_PUNCTUATION_GEOMETRY_SUPPORT_VERSION,
+    source_punctuation_cell_calibration_sha256,
+    source_punctuation_geometry_fact_set_id,
+)
 from app.render.typesetting_contracts import (
     RENDER_LAYER_PLAN_VERSION,
     RenderLayerPlan,
@@ -256,7 +264,555 @@ def _source_provenance_ref(bundle: Any) -> dict[str, Any]:
     record["source_text_footprint_validation"] = validation
     if footprint:
         record["source_text_footprint"] = footprint
+    punctuation, punctuation_validation = (
+        _validated_source_punctuation_geometry(bundle)
+    )
+    record["source_punctuation_geometry_validation"] = (
+        punctuation_validation
+    )
+    if punctuation:
+        record["source_punctuation_geometry"] = punctuation
     return record
+
+
+def _validated_source_punctuation_geometry(
+    bundle: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the only executable source-punctuation geometry carrier."""
+
+    raw = _field(bundle, "source_punctuation_geometry", {})
+    if raw in ({}, None):
+        return {}, _punctuation_geometry_validation_record(
+            "unavailable", ("source_punctuation_geometry_missing",)
+        )
+    if not isinstance(raw, Mapping):
+        return {}, _punctuation_geometry_validation_record(
+            "rejected", ("source_punctuation_geometry_not_mapping",)
+        )
+    evidence = copy_jsonish(raw)
+    reasons = _source_punctuation_geometry_rejection_reasons(
+        bundle=bundle,
+        evidence=evidence,
+    )
+    if reasons:
+        return {}, _punctuation_geometry_validation_record(
+            "rejected", reasons
+        )
+    fact_set_id = str(evidence.get("fact_set_id") or "")
+    if str(evidence.get("status") or "") != "observed":
+        return {}, _punctuation_geometry_validation_record(
+            "unavailable",
+            (
+                "source_punctuation_geometry_observer_abstained",
+                *tuple(str(value) for value in evidence.get("reason_codes") or []),
+            ),
+            fact_set_id=fact_set_id,
+        )
+    return evidence, _punctuation_geometry_validation_record(
+        "accepted",
+        ("source_punctuation_geometry_identity_and_fact_set_validated",),
+        fact_set_id=fact_set_id,
+    )
+
+
+def _punctuation_geometry_validation_record(
+    status: str,
+    reason_codes: Sequence[str],
+    *,
+    fact_set_id: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": str(status or "unavailable"),
+        "contract_version": SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION,
+        "reason_codes": [str(value) for value in reason_codes if str(value)],
+        "fact_set_id": str(fact_set_id or ""),
+    }
+
+
+def _source_punctuation_geometry_rejection_reasons(
+    *,
+    bundle: Any,
+    evidence: Mapping[str, Any],
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    _validate_exact_fields(
+        evidence,
+        {
+            "contract_version",
+            "observer_version",
+            "source_identity",
+            "status",
+            "view_id",
+            "support_identity",
+            "occurrences",
+            "abstention_reason",
+            "reason_codes",
+            "text_identity_authority",
+            "geometry_authority",
+            "render_admission_authority",
+            "fact_set_id",
+        },
+        reasons,
+        "source_punctuation_geometry",
+    )
+    if str(evidence.get("contract_version") or "") != (
+        SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION
+    ):
+        reasons.append("source_punctuation_geometry_version_invalid")
+    if str(evidence.get("observer_version") or "") != (
+        SOURCE_PUNCTUATION_GEOMETRY_OBSERVER_VERSION
+    ):
+        reasons.append("source_punctuation_geometry_observer_version_invalid")
+    status = str(evidence.get("status") or "")
+    if status not in {"observed", "abstained", "unavailable"}:
+        reasons.append("source_punctuation_geometry_status_invalid")
+    if str(evidence.get("text_identity_authority") or "") != (
+        "translated_lossless_tokens"
+    ):
+        reasons.append("source_punctuation_geometry_text_authority_invalid")
+    if str(evidence.get("geometry_authority") or "") != (
+        "parent_authorized_source_pixels"
+    ):
+        reasons.append("source_punctuation_geometry_pixel_authority_invalid")
+    if evidence.get("render_admission_authority") is not False:
+        reasons.append("source_punctuation_geometry_render_admission_invalid")
+    reason_codes = evidence.get("reason_codes")
+    if not isinstance(reason_codes, list) or any(
+        not isinstance(value, str) for value in reason_codes
+    ):
+        reasons.append("source_punctuation_geometry_reason_codes_invalid")
+
+    identity = evidence.get("source_identity")
+    if not isinstance(identity, Mapping):
+        reasons.append("source_punctuation_geometry_identity_not_mapping")
+        identity = {}
+    else:
+        _validate_exact_fields(
+            identity,
+            {"page_id", "bundle_id", "parent_id", "root_id"},
+            reasons,
+            "source_punctuation_geometry_identity",
+        )
+    expected_identity = {
+        "page_id": str(_field(bundle, "page_id") or ""),
+        "bundle_id": str(_field(bundle, "bundle_id") or ""),
+        "parent_id": str(_field(bundle, "parent_id") or ""),
+        "root_id": str(_field(bundle, "root_id") or ""),
+    }
+    for key, expected in expected_identity.items():
+        if str(identity.get(key) or "") != expected:
+            reasons.append(f"source_punctuation_geometry_identity_mismatch:{key}")
+
+    support = evidence.get("support_identity")
+    if not isinstance(support, Mapping):
+        reasons.append("source_punctuation_geometry_support_not_mapping")
+        support = {}
+    required_support = {
+        "contract_version",
+        "authorized_source_style_view_version",
+        "page_id",
+        "bundle_id",
+        "parent_id",
+        "root_id",
+        "view_id",
+        "cleanup_mask_ids",
+        "owned_component_ids",
+        "pixel_projection_owner",
+        "geometry_observer_owner",
+        "source_cell_calibration",
+    }
+    observed_support = {
+        "analysis_bbox_page_xywh",
+        "authorized_foreground_mask_sha256",
+        "source_pixel_crop_sha256",
+        "contrast_ink_sha256",
+    }
+    expected_support = required_support | (observed_support if status in {"observed", "abstained"} else set())
+    if isinstance(support, Mapping):
+        _validate_exact_fields(
+            support,
+            expected_support,
+            reasons,
+            "source_punctuation_geometry_support",
+        )
+    if str(support.get("contract_version") or "") != (
+        SOURCE_PUNCTUATION_GEOMETRY_SUPPORT_VERSION
+    ):
+        reasons.append("source_punctuation_geometry_support_version_invalid")
+    if str(support.get("authorized_source_style_view_version") or "") != (
+        AUTHORIZED_SOURCE_STYLE_VIEW_VERSION
+    ):
+        reasons.append("source_punctuation_geometry_style_view_version_invalid")
+    for key, expected in expected_identity.items():
+        if str(support.get(key) or "") != expected:
+            reasons.append(f"source_punctuation_geometry_support_identity_mismatch:{key}")
+    if str(support.get("view_id") or "") != str(evidence.get("view_id") or ""):
+        reasons.append("source_punctuation_geometry_view_identity_mismatch")
+    if str(support.get("pixel_projection_owner") or "") != "CleanupMask":
+        reasons.append("source_punctuation_geometry_pixel_owner_invalid")
+    if str(support.get("geometry_observer_owner") or "") != (
+        "SourcePunctuationGeometryEvidence"
+    ):
+        reasons.append("source_punctuation_geometry_observer_owner_invalid")
+    for key in ("cleanup_mask_ids", "owned_component_ids"):
+        values = support.get(key)
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            reasons.append(f"source_punctuation_geometry_support_{key}_invalid")
+    calibration_cells = _validate_source_punctuation_cell_calibration(
+        support.get("source_cell_calibration"),
+        expected_identity=expected_identity,
+        support=support,
+        reasons=reasons,
+    )
+    analysis_bbox = (
+        _strict_bbox(support.get("analysis_bbox_page_xywh"))
+        if status in {"observed", "abstained"}
+        else []
+    )
+    if status in {"observed", "abstained"} and not analysis_bbox:
+        reasons.append("source_punctuation_geometry_analysis_bbox_invalid")
+    for key in (
+        "authorized_foreground_mask_sha256",
+        "source_pixel_crop_sha256",
+        "contrast_ink_sha256",
+    ):
+        if status in {"observed", "abstained"} and not _is_sha256(support.get(key)):
+            reasons.append(f"source_punctuation_geometry_support_{key}_invalid")
+
+    occurrences = evidence.get("occurrences")
+    if not isinstance(occurrences, list):
+        reasons.append("source_punctuation_geometry_occurrences_not_list")
+        occurrences = []
+    if status == "observed" and not occurrences:
+        reasons.append("source_punctuation_geometry_observed_without_occurrences")
+    if status != "observed" and occurrences:
+        reasons.append("source_punctuation_geometry_nonobserved_with_occurrences")
+    kind_ordinals: dict[str, list[int]] = {}
+    visual_ordinals: list[int] = []
+    for index, occurrence in enumerate(occurrences):
+        if not isinstance(occurrence, Mapping):
+            reasons.append(f"source_punctuation_geometry_occurrence_not_mapping:{index}")
+            continue
+        _validate_source_punctuation_occurrence(
+            occurrence,
+            index=index,
+            analysis_bbox=analysis_bbox,
+            reasons=reasons,
+        )
+        inline_axis = str(occurrence.get("inline_axis") or "")
+        occurrence_cell = _strict_finite_number(
+            occurrence.get("source_cell_px")
+        )
+        calibration_cell = calibration_cells.get(inline_axis)
+        if (
+            occurrence_cell is None
+            or calibration_cell is None
+            or abs(occurrence_cell - calibration_cell) > 1.0e-6
+        ):
+            reasons.append(
+                f"source_punctuation_geometry_occurrence_calibration_mismatch:{index}"
+            )
+        kind = str(occurrence.get("kind") or "")
+        kind_ordinal = _strict_nonnegative_int(occurrence.get("kind_ordinal"))
+        visual_ordinal = _strict_nonnegative_int(
+            occurrence.get("visual_reading_order_ordinal")
+        )
+        if kind_ordinal is not None:
+            kind_ordinals.setdefault(kind, []).append(kind_ordinal)
+        if visual_ordinal is not None:
+            visual_ordinals.append(visual_ordinal)
+    if visual_ordinals and sorted(visual_ordinals) != list(range(len(visual_ordinals))):
+        reasons.append("source_punctuation_geometry_visual_ordinals_invalid")
+    for kind, ordinals in kind_ordinals.items():
+        if sorted(ordinals) != list(range(len(ordinals))):
+            reasons.append(f"source_punctuation_geometry_kind_ordinals_invalid:{kind}")
+
+    fact_set_id = str(evidence.get("fact_set_id") or "")
+    expected_fact_set_id = source_punctuation_geometry_fact_set_id(evidence)
+    if fact_set_id != expected_fact_set_id:
+        reasons.append("source_punctuation_geometry_fact_set_mismatch")
+    return tuple(dict.fromkeys(str(value) for value in reasons if str(value)))
+
+
+def _validate_source_punctuation_cell_calibration(
+    value: Any,
+    *,
+    expected_identity: Mapping[str, str],
+    support: Mapping[str, Any],
+    reasons: list[str],
+) -> dict[str, float]:
+    prefix = "source_punctuation_geometry_cell_calibration"
+    if not isinstance(value, Mapping):
+        reasons.append(f"{prefix}_not_mapping")
+        return {}
+    _validate_exact_fields(
+        value,
+        {
+            "contract_version",
+            "status",
+            "style_evidence_identity",
+            "source_scale_axis_sha256",
+            "axes",
+            "reason_codes",
+            "calibration_sha256",
+        },
+        reasons,
+        prefix,
+    )
+    if str(value.get("contract_version") or "") != (
+        SOURCE_PUNCTUATION_CELL_CALIBRATION_VERSION
+    ):
+        reasons.append(f"{prefix}_version_invalid")
+    status = str(value.get("status") or "")
+    if status not in {"supported", "unavailable"}:
+        reasons.append(f"{prefix}_status_invalid")
+    reason_codes = value.get("reason_codes")
+    if not isinstance(reason_codes, list) or any(
+        not isinstance(item, str) for item in reason_codes
+    ):
+        reasons.append(f"{prefix}_reason_codes_invalid")
+
+    style_identity = value.get("style_evidence_identity")
+    if not isinstance(style_identity, Mapping):
+        reasons.append(f"{prefix}_style_identity_not_mapping")
+        style_identity = {}
+    else:
+        _validate_exact_fields(
+            style_identity,
+            {
+                "page_id",
+                "bundle_id",
+                "parent_id",
+                "root_id",
+                "view_id",
+                "cleanup_mask_ids",
+                "owned_component_ids",
+                "content_bbox_xywh",
+                "analysis_bbox_xywh",
+                "style_evidence_status",
+            },
+            reasons,
+            f"{prefix}_style_identity",
+        )
+    if status == "supported":
+        for key, expected in expected_identity.items():
+            if str(style_identity.get(key) or "") != expected:
+                reasons.append(f"{prefix}_style_identity_mismatch:{key}")
+        if str(style_identity.get("view_id") or "") != str(
+            support.get("view_id") or ""
+        ):
+            reasons.append(f"{prefix}_style_view_identity_mismatch")
+        if str(style_identity.get("style_evidence_status") or "") != "observed":
+            reasons.append(f"{prefix}_style_status_invalid")
+        for key in ("cleanup_mask_ids", "owned_component_ids"):
+            if style_identity.get(key) != support.get(key):
+                reasons.append(f"{prefix}_style_identity_mismatch:{key}")
+        if not _strict_bbox(style_identity.get("content_bbox_xywh")):
+            reasons.append(f"{prefix}_content_bbox_invalid")
+        if _strict_bbox(style_identity.get("analysis_bbox_xywh")) != (
+            _strict_bbox(support.get("analysis_bbox_page_xywh"))
+        ):
+            reasons.append(f"{prefix}_analysis_bbox_mismatch")
+        if not _is_sha256(value.get("source_scale_axis_sha256")):
+            reasons.append(f"{prefix}_scale_axis_hash_invalid")
+
+    axes = value.get("axes")
+    cells: dict[str, float] = {}
+    if not isinstance(axes, Mapping):
+        reasons.append(f"{prefix}_axes_not_mapping")
+        axes = {}
+    else:
+        _validate_exact_fields(
+            axes,
+            {"ttb", "ltr"},
+            reasons,
+            f"{prefix}_axes",
+        )
+    for inline_axis, direction in (("ttb", "vertical"), ("ltr", "horizontal")):
+        axis = axes.get(inline_axis)
+        axis_prefix = f"{prefix}_axis:{inline_axis}"
+        if not isinstance(axis, Mapping):
+            reasons.append(f"{axis_prefix}_not_mapping")
+            continue
+        _validate_exact_fields(
+            axis,
+            {
+                "source_axis",
+                "source_direction",
+                "status",
+                "source_cell_px",
+                "confidence",
+                "support_status",
+                "reason",
+            },
+            reasons,
+            axis_prefix,
+        )
+        if str(axis.get("source_axis") or "") != "scale":
+            reasons.append(f"{axis_prefix}_source_axis_invalid")
+        if str(axis.get("source_direction") or "") != direction:
+            reasons.append(f"{axis_prefix}_source_direction_invalid")
+        axis_status = str(axis.get("status") or "")
+        cell = _strict_finite_number(axis.get("source_cell_px"))
+        confidence = _strict_finite_number(axis.get("confidence"))
+        if axis_status == "supported":
+            if cell is None or cell <= 0.0:
+                reasons.append(f"{axis_prefix}_cell_invalid")
+            else:
+                cells[inline_axis] = cell
+            if confidence is None or confidence <= 0.0 or confidence > 1.0:
+                reasons.append(f"{axis_prefix}_confidence_invalid")
+            if not str(axis.get("support_status") or "").startswith("supported_"):
+                reasons.append(f"{axis_prefix}_support_status_invalid")
+            if str(axis.get("reason") or ""):
+                reasons.append(f"{axis_prefix}_supported_with_reason")
+        elif axis_status == "unavailable":
+            if cell != 0.0 or confidence != 0.0:
+                reasons.append(f"{axis_prefix}_unavailable_measurement_invalid")
+            if str(axis.get("support_status") or ""):
+                reasons.append(f"{axis_prefix}_unavailable_support_invalid")
+            if not str(axis.get("reason") or ""):
+                reasons.append(f"{axis_prefix}_unavailable_reason_missing")
+        else:
+            reasons.append(f"{axis_prefix}_status_invalid")
+    if status == "supported" and not cells:
+        reasons.append(f"{prefix}_supported_without_axis")
+    if status == "unavailable" and cells:
+        reasons.append(f"{prefix}_unavailable_with_supported_axis")
+    if str(value.get("calibration_sha256") or "") != (
+        source_punctuation_cell_calibration_sha256(value)
+    ):
+        reasons.append(f"{prefix}_hash_mismatch")
+    return cells
+
+
+def _validate_source_punctuation_occurrence(
+    occurrence: Mapping[str, Any],
+    *,
+    index: int,
+    analysis_bbox: Sequence[int],
+    reasons: list[str],
+) -> None:
+    prefix = f"source_punctuation_geometry_occurrence:{index}"
+    _validate_exact_fields(
+        occurrence,
+        {
+            "occurrence_id",
+            "kind",
+            "visual_reading_order_ordinal",
+            "kind_ordinal",
+            "inline_axis",
+            "component_bboxes_local_xywh",
+            "component_bboxes_page_xywh",
+            "group_bbox_local_xywh",
+            "group_bbox_page_xywh",
+            "span_px",
+            "pitch_px",
+            "source_cell_px",
+            "normalized_span",
+            "normalized_pitch",
+            "confidence",
+            "reason_codes",
+        },
+        reasons,
+        prefix,
+    )
+    kind = str(occurrence.get("kind") or "")
+    if kind not in {"dash", "ellipsis", "wave"}:
+        reasons.append(f"{prefix}_kind_invalid")
+    if str(occurrence.get("inline_axis") or "") not in {"ttb", "ltr"}:
+        reasons.append(f"{prefix}_inline_axis_invalid")
+    if not str(occurrence.get("occurrence_id") or ""):
+        reasons.append(f"{prefix}_identity_missing")
+    if _strict_nonnegative_int(occurrence.get("visual_reading_order_ordinal")) is None:
+        reasons.append(f"{prefix}_visual_ordinal_invalid")
+    if _strict_nonnegative_int(occurrence.get("kind_ordinal")) is None:
+        reasons.append(f"{prefix}_kind_ordinal_invalid")
+    local_group = _strict_bbox(occurrence.get("group_bbox_local_xywh"))
+    page_group = _strict_bbox(occurrence.get("group_bbox_page_xywh"))
+    if not local_group or not page_group:
+        reasons.append(f"{prefix}_group_bbox_invalid")
+    elif analysis_bbox:
+        expected_page = [
+            int(analysis_bbox[0]) + local_group[0],
+            int(analysis_bbox[1]) + local_group[1],
+            local_group[2],
+            local_group[3],
+        ]
+        if page_group != expected_page:
+            reasons.append(f"{prefix}_page_local_group_mismatch")
+        local_container = [0, 0, int(analysis_bbox[2]), int(analysis_bbox[3])]
+        if not _bbox_inside(local_group, local_container):
+            reasons.append(f"{prefix}_group_outside_analysis_bbox")
+    local_components = occurrence.get("component_bboxes_local_xywh")
+    page_components = occurrence.get("component_bboxes_page_xywh")
+    if (
+        not isinstance(local_components, list)
+        or not isinstance(page_components, list)
+        or not local_components
+        or len(local_components) != len(page_components)
+    ):
+        reasons.append(f"{prefix}_component_bboxes_invalid")
+    else:
+        for component_index, (local, page) in enumerate(
+            zip(local_components, page_components)
+        ):
+            local_box = _strict_bbox(local)
+            page_box = _strict_bbox(page)
+            if not local_box or not page_box:
+                reasons.append(
+                    f"{prefix}_component_bbox_invalid:{component_index}"
+                )
+                continue
+            if local_group and not _bbox_inside(local_box, local_group):
+                reasons.append(
+                    f"{prefix}_component_outside_group:{component_index}"
+                )
+            if analysis_bbox:
+                expected_page = [
+                    int(analysis_bbox[0]) + local_box[0],
+                    int(analysis_bbox[1]) + local_box[1],
+                    local_box[2],
+                    local_box[3],
+                ]
+                if page_box != expected_page:
+                    reasons.append(
+                        f"{prefix}_page_local_component_mismatch:{component_index}"
+                    )
+    span = _strict_finite_number(occurrence.get("span_px"))
+    pitch = _strict_finite_number(occurrence.get("pitch_px"))
+    cell = _strict_finite_number(occurrence.get("source_cell_px"))
+    normalized_span = _strict_finite_number(occurrence.get("normalized_span"))
+    normalized_pitch = _strict_finite_number(occurrence.get("normalized_pitch"))
+    confidence = _strict_finite_number(occurrence.get("confidence"))
+    if span is None or span <= 0.0:
+        reasons.append(f"{prefix}_span_invalid")
+    if pitch is None or pitch <= 0.0:
+        reasons.append(f"{prefix}_pitch_invalid")
+    if cell is None or cell <= 0.0:
+        reasons.append(f"{prefix}_source_cell_invalid")
+    if normalized_span is None or normalized_span <= 0.0:
+        reasons.append(f"{prefix}_normalized_span_invalid")
+    if normalized_pitch is None or normalized_pitch <= 0.0:
+        reasons.append(f"{prefix}_normalized_pitch_invalid")
+    if confidence is None or confidence < 0.0 or confidence > 1.0:
+        reasons.append(f"{prefix}_confidence_invalid")
+    if span and cell and normalized_span is not None and abs(normalized_span - span / cell) > 1e-5:
+        reasons.append(f"{prefix}_normalized_span_mismatch")
+    if pitch and cell and normalized_pitch is not None and abs(normalized_pitch - pitch / cell) > 1e-5:
+        reasons.append(f"{prefix}_normalized_pitch_mismatch")
+    inline_axis = str(occurrence.get("inline_axis") or "")
+    if local_group and span:
+        group_span = float(local_group[3] if inline_axis == "ttb" else local_group[2])
+        if abs(group_span - span) > 1e-5:
+            reasons.append(f"{prefix}_group_span_mismatch")
+    occurrence_reasons = occurrence.get("reason_codes")
+    if not isinstance(occurrence_reasons, list) or any(
+        not isinstance(value, str) for value in occurrence_reasons
+    ):
+        reasons.append(f"{prefix}_reason_codes_invalid")
 
 
 def _validated_source_text_footprint(

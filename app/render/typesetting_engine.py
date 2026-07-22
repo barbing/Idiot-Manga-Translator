@@ -26,14 +26,18 @@ from app.render.parent_layer_effects import (
     shift_layout_geometry,
 )
 from app.render.text_shaper import HarfBuzzShaper, ShapedRun
+from app.render.target_lexical_segmenter import (
+    TargetLexicalSegmenter,
+    default_target_lexical_segmenter,
+)
 from app.render.typesetting_contracts import (
     DrawingPrimitive,
     FitReport,
     GlyphPlacement,
-    PunctuationToken,
     RenderLayerPlan,
     TypesetLayout,
     bbox_from_value,
+    validated_source_punctuation_geometry_ref,
     validated_source_text_footprint_ref,
 )
 from app.render.typesetting_text import (
@@ -120,11 +124,15 @@ class TypesettingEngine:
         shaper: HarfBuzzShaper | None = None,
         policy: TypesettingPolicy | None = None,
         break_planner: LineBreakPlanner | None = None,
+        lexical_segmenter: TargetLexicalSegmenter | None = None,
     ) -> None:
         self.font_manager = font_manager or FontManager()
         self.shaper = shaper or HarfBuzzShaper(self.font_manager)
         self.policy = policy or TypesettingPolicy()
         self.break_planner = break_planner or LineBreakPlanner()
+        self.lexical_segmenter = (
+            lexical_segmenter or default_target_lexical_segmenter()
+        )
 
     def typeset_layer(self, plan: RenderLayerPlan) -> tuple[TypesetLayout, FitReport]:
         missing = _missing_identity(plan)
@@ -167,6 +175,10 @@ class TypesettingEngine:
             return self._failed(plan, "missing_font", list(resolved.issues or ["missing_font"]), hard_bounds=hard_bounds)
         face = resolved.primary_face
         identity_tokens = build_lossless_text_tokens(plan.translated_text)
+        target_lexical_segmentation = self.lexical_segmenter.segment(
+            str(plan.translated_text or ""),
+            identity_tokens,
+        )
         text_tokens = resolve_writing_mode_presentations(
             identity_tokens,
             writing_mode=writing_mode,
@@ -247,7 +259,15 @@ class TypesettingEngine:
         font_spans_by_id = {
             span.span_id: span for span in font_span_resolutions
         }
-        breaks = compute_break_opportunities(runs, writing_mode=writing_mode)
+        breaks = compute_break_opportunities(
+            runs,
+            writing_mode=writing_mode,
+            target_lexical_spans=(
+                target_lexical_segmentation.spans
+                if target_lexical_segmentation.available
+                else None
+            ),
+        )
         breaks = [
             replace(
                 item,
@@ -264,10 +284,21 @@ class TypesettingEngine:
             else item
             for index, item in enumerate(breaks)
         ]
-        style_issues = _style_issues(runs, writing_mode, self.policy)
+        style_issues = _unique(
+            [
+                *_style_issues(runs, writing_mode, self.policy),
+                *target_lexical_segmentation.issues,
+            ]
+        )
         script_policy = _script_policy(runs, writing_mode, self.policy)
         attempts: list[dict[str, Any]] = []
         selected_attempt: dict[str, Any] | None = None
+        first_fit_within_source_interval: dict[str, Any] | None = None
+        source_preferred_interval_floor = _source_preferred_interval_floor(
+            preferred_font_size,
+            plan.resolved_render_style,
+        )
+        lexical_candidate_selection_reason = ""
         for font_size in _font_size_candidates(
             preferred_font_size,
             plan.resolved_render_style,
@@ -320,6 +351,7 @@ class TypesettingEngine:
                 runs=runs,
                 shaped_runs=shaped_runs,
             )
+            lexical_retry = None
             if writing_mode == "horizontal":
                 placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_horizontal(
                     normalized,
@@ -368,6 +400,36 @@ class TypesettingEngine:
                     layout_intent_box = retry["layout_intent_box"]
                     box_model = retry["box_model"]
                     reason_codes.extend(retry["reason_codes"])
+                if (
+                    fit_status == "fits"
+                    and _selected_intra_span_break_count(break_plan) > 0
+                ):
+                    lexical_retry = (
+                        self._retry_vertical_lexical_quality_within_hard_bounds(
+                            normalized=normalized,
+                            runs=runs,
+                            shaped_runs=shaped_runs,
+                            breaks=breaks,
+                            plan=plan,
+                            style=plan.resolved_render_style,
+                            font_size=font_size,
+                            hard_bounds=hard_bounds,
+                            layout_intent_box=layout_intent_box,
+                            box_model=box_model,
+                            break_plan=break_plan,
+                        )
+                    )
+                if lexical_retry is not None:
+                    placements = lexical_retry["placements"]
+                    lines = lexical_retry["lines"]
+                    columns = lexical_retry["columns"]
+                    measured_bounds = lexical_retry["measured_bounds"]
+                    fit_status = lexical_retry["fit_status"]
+                    fit_issues = lexical_retry["fit_issues"]
+                    break_plan = lexical_retry["break_plan"]
+                    layout_intent_box = lexical_retry["layout_intent_box"]
+                    box_model = lexical_retry["box_model"]
+                    reason_codes.extend(lexical_retry["reason_codes"])
                 if columns and isinstance(
                     columns[0].get("layout_profile"),
                     Mapping,
@@ -386,12 +448,12 @@ class TypesettingEngine:
             )
             if parent_layer_effects.active and fit_status == "fits":
                 if not parent_effect_envelope.contained:
-                    fit_status = "overflow"
                     fit_issues = _unique(
                         [
                             *fit_issues,
                             *parent_effect_envelope.issues,
                             "parent_layer_effect_envelope_exceeds_hard_bounds",
+                            "optional_parent_effect_requires_base_text_fallback",
                         ]
                     )
                 else:
@@ -429,11 +491,64 @@ class TypesettingEngine:
                     if box_model.get("effective_line_height") is not None
                     else _line_height(plan.resolved_render_style)
                 ),
+                "same_size_lexical_layout_expansion_used": bool(
+                    lexical_retry is not None
+                ),
+                "selected_intra_span_break_count": (
+                    _selected_intra_span_break_count(break_plan)
+                ),
+                "selected_lexical_integrity_penalty": (
+                    _selected_lexical_integrity_penalty(break_plan)
+                ),
             }
             attempts.append(attempt)
             selected_attempt = attempt
-            if fit_status == "fits":
+            if fit_status != "fits":
+                continue
+
+            selected_intra_span_breaks = int(
+                attempt["selected_intra_span_break_count"]
+            )
+            if selected_intra_span_breaks <= 0:
+                if bool(attempt["same_size_lexical_layout_expansion_used"]):
+                    lexical_candidate_selection_reason = (
+                        "same_size_authorized_layout_expansion"
+                    )
+                elif font_size < preferred_font_size:
+                    lexical_candidate_selection_reason = (
+                        "source_preferred_interval_size_adjustment"
+                    )
+                else:
+                    lexical_candidate_selection_reason = (
+                        "preferred_candidate_lexically_intact"
+                    )
                 break
+
+            if _font_size_is_locked(plan.resolved_render_style):
+                lexical_candidate_selection_reason = (
+                    "locked_size_intra_span_break_retained"
+                )
+                break
+            if source_preferred_interval_floor is None:
+                lexical_candidate_selection_reason = (
+                    "source_preferred_interval_unavailable_intra_span_break_retained"
+                )
+                break
+            if font_size >= source_preferred_interval_floor:
+                if first_fit_within_source_interval is None:
+                    first_fit_within_source_interval = attempt
+                if font_size > source_preferred_interval_floor:
+                    continue
+                selected_attempt = first_fit_within_source_interval
+                lexical_candidate_selection_reason = (
+                    "no_lexically_intact_candidate_within_source_preferred_interval"
+                )
+                break
+
+            lexical_candidate_selection_reason = (
+                "first_technical_fit_below_source_preferred_interval"
+            )
+            break
         if selected_attempt is None:
             return self._failed(plan, "layout_attempt_failed", ["layout_attempt_failed"], hard_bounds=hard_bounds)
         font_size = int(selected_attempt["font_size"])
@@ -455,10 +570,18 @@ class TypesettingEngine:
         font_span_cluster_map = _font_span_cluster_ledger(runs, shaped_runs)
         effective_line_height = float(selected_attempt.get("effective_line_height") or _line_height(plan.resolved_render_style))
         if font_size < preferred_font_size:
-            reason_codes.append("font_size_reduced_to_fit_translated_text")
+            if lexical_candidate_selection_reason == (
+                "source_preferred_interval_size_adjustment"
+            ):
+                reason_codes.append(
+                    "font_size_reduced_within_source_preferred_interval_for_target_lexical_integrity"
+                )
+            else:
+                reason_codes.append("font_size_reduced_to_fit_translated_text")
             if parent_layer_effects.active and any(
                 not bool(item["parent_layer_effect_envelope"].get("contained"))
-                for item in attempts[:-1]
+                for item in attempts
+                if item is not selected_attempt
             ):
                 reason_codes.append("font_size_reduced_to_fit_parent_effect_envelope")
             if bool(plan.resolved_render_style.get("font_size_locked")):
@@ -480,7 +603,6 @@ class TypesettingEngine:
             for issue in item.issues
         ]
         all_issues = _unique([*resolved.issues, *run_font_issues, *style_issues, *fit_issues])
-        full_text_placed = fit_status == "fits"
         token_audit = [item.to_audit_dict() for item in text_tokens]
         placed_token_ids = _unique(
             [
@@ -512,24 +634,96 @@ class TypesettingEngine:
                 set(placed_token_ids)
             ),
         }
+        placement_text = "".join(item.text for item in placements)
+        text_placement_complete = bool(
+            token_text_conserved
+            and font_span_text_conserved
+            and token_conservation["visible_tokens_placed"]
+            and placement_text == normalized
+        )
+        hard_bounds_contained = bool(
+            base_measured_bounds
+            and _box_inside(base_measured_bounds, hard_bounds)
+        )
+        final_scale = float(font_size) / float(max(1, preferred_font_size))
+        candidate_rank = next(
+            (
+                index
+                for index, item in enumerate(attempts)
+                if item is selected_attempt
+            ),
+            max(0, len(attempts) - 1),
+        )
+        break_count = len(list(break_plan.get("selected_breaks") or []))
+        if final_scale < 0.5 or fit_status != "fits":
+            fit_quality = "severe_scale_risk"
+        elif font_size < preferred_font_size:
+            fit_quality = "scaled"
+        elif break_count:
+            fit_quality = "reflowed"
+        else:
+            fit_quality = "preferred"
+        fit_trigger = (
+            "preferred_size_lexical_layout_expansion"
+            if (
+                font_size == preferred_font_size
+                and fit_status == "fits"
+                and bool(
+                    selected_attempt.get(
+                        "same_size_lexical_layout_expansion_used"
+                    )
+                )
+            )
+            else "lexical_integrity_within_source_preferred_interval"
+            if (
+                font_size < preferred_font_size
+                and fit_status == "fits"
+                and lexical_candidate_selection_reason
+                == "source_preferred_interval_size_adjustment"
+            )
+            else "preferred_layout"
+            if candidate_rank == 0 and fit_status == "fits"
+            else "layout_fit_pressure"
+            if fit_status == "fits"
+            else "complete_layout_scale_to_box_fallback"
+        )
+        full_text_placed = text_placement_complete
+        if not text_placement_complete:
+            all_issues = _unique(
+                [*all_issues, "required_text_placement_incomplete"]
+            )
+        if not hard_bounds_contained:
+            all_issues = _unique(
+                [*all_issues, "base_layout_hard_bounds_not_contained"]
+            )
+        if fit_quality == "severe_scale_risk":
+            all_issues = _unique([*all_issues, "severe_scale_readability_risk"])
         metadata = {
             "typesetting_engine_version": "typesetting_engine_stage4_v1",
             "lossless_text_tokens": token_audit,
             "text_token_conservation": token_conservation,
             "box_model": box_model,
             "writing_mode_policy": writing_policy,
+            "target_lexical_segmentation": (
+                target_lexical_segmentation.to_audit_dict()
+            ),
             "inline_runs": [_run_audit(run, writing_mode, self.policy) for run in runs],
             "break_opportunities": [item.to_audit_dict() for item in breaks],
             "chosen_breaks": list(break_plan.get("selected_breaks") or []),
             "break_plan": break_plan,
             "kinsoku_adjustments": kinsoku_adjustments,
             "line_break_policy": {
-                "policy_version": "line_break_policy_stage4_v2",
+                "policy_version": "line_break_policy_stage4_target_lexical_v1",
                 "locale_hint": _language_hint(plan),
                 "writing_mode": writing_mode,
                 "selection_authority": "explicit_break_opportunities",
                 "planner_version": self.break_planner.version,
-                "accepted_tailoring_rules": ["space_word_boundary", "cjk_grapheme_boundary"],
+                "accepted_tailoring_rules": [
+                    "space_word_boundary",
+                    "target_lexical_word_boundary",
+                    "target_lexical_intra_word_penalty",
+                    "cjk_grapheme_boundary_degraded_fallback",
+                ],
                 "rejected_fallback_rules": ["raw_character_count_splitting"],
             },
             "normalization_notes": normalization_notes,
@@ -559,17 +753,79 @@ class TypesettingEngine:
             "open_type_metrics_by_face": open_type_metrics_by_face,
             "font_size_selection": {
                 "preferred_font_size": int(preferred_font_size),
+                "selected_pre_scale_font_size": int(font_size),
                 "selected_font_size": int(font_size),
-                "scaling_used": round(float(font_size) / float(max(1, preferred_font_size)), 4),
+                "final_effective_font_size": float(font_size),
+                "final_scale": round(final_scale, 6),
+                "fit_trigger": fit_trigger,
+                "candidate_rank": int(candidate_rank),
+                "fit_quality": fit_quality,
+                "text_placement_complete": text_placement_complete,
+                "hard_bounds_contained": hard_bounds_contained,
+                "scaling_used": round(final_scale, 4),
                 "fallback_used": font_size != preferred_font_size,
                 "candidate_count": len(attempts),
+                "lexical_candidate_selection": {
+                    "status": "selected",
+                    "selection_reason": lexical_candidate_selection_reason,
+                    "segmenter_available": bool(
+                        target_lexical_segmentation.available
+                    ),
+                    "comparison_triggered": bool(
+                        len(attempts) > 1
+                        or any(
+                            bool(
+                                item.get(
+                                    "same_size_lexical_layout_expansion_used"
+                                )
+                            )
+                            for item in attempts
+                        )
+                    ),
+                    "source_preferred_interval_px": list(
+                        plan.resolved_render_style.get(
+                            "target_preferred_em_interval_px"
+                        )
+                        or []
+                    ),
+                    "rounded_source_preferred_interval_floor_px": (
+                        source_preferred_interval_floor
+                    ),
+                    "source_preferred_interval_is_render_admission": False,
+                    "technical_fit_continues_below_interval": True,
+                    "second_break_selector_added": False,
+                    "selected_intra_span_break_count": int(
+                        selected_attempt.get(
+                            "selected_intra_span_break_count"
+                        )
+                        or 0
+                    ),
+                    "same_size_authorized_expansion_used": bool(
+                        selected_attempt.get(
+                            "same_size_lexical_layout_expansion_used"
+                        )
+                    ),
+                },
                 "attempts": [
                     {
+                        "selected": item is selected_attempt,
                         "font_size": int(item["font_size"]),
                         "fit_status": str(item["fit_status"]),
                         "layout_intent_box": list(item["layout_intent_box"]),
                         "measured_bounds": list(item["measured_bounds"]),
                         "issues": list(item["issues"]),
+                        "selected_intra_span_break_count": int(
+                            item.get("selected_intra_span_break_count") or 0
+                        ),
+                        "selected_lexical_integrity_penalty": float(
+                            item.get("selected_lexical_integrity_penalty")
+                            or 0.0
+                        ),
+                        "same_size_lexical_layout_expansion_used": bool(
+                            item.get(
+                                "same_size_lexical_layout_expansion_used"
+                            )
+                        ),
                         "parent_layer_effect_envelope": dict(
                             item["parent_layer_effect_envelope"]
                         ),
@@ -581,9 +837,9 @@ class TypesettingEngine:
                 "line_height": plan.resolved_render_style.get("line_height"),
                 "effective_line_height": round(effective_line_height, 4),
                 "align": plan.resolved_render_style.get("align"),
-                "fill_color": plan.resolved_render_style.get("fill_color"),
-                "stroke_color": plan.resolved_render_style.get("stroke_color"),
-                "stroke_width": plan.resolved_render_style.get("stroke_width"),
+                "fill_color": _style_fill_color(plan.resolved_render_style),
+                "stroke_color": _style_outline_color(plan.resolved_render_style),
+                "stroke_width": _style_outline_width(plan.resolved_render_style),
             },
         }
         layout = TypesetLayout(
@@ -595,6 +851,9 @@ class TypesettingEngine:
             selected_font_face=face.face_id,
             selected_font_size=float(font_size),
             writing_mode=writing_mode,
+            text_placement_complete=text_placement_complete,
+            hard_bounds_contained=hard_bounds_contained,
+            fit_quality=fit_quality,
             lines=lines,
             columns=columns,
             glyphs=placements,
@@ -619,11 +878,28 @@ class TypesettingEngine:
             bundle_id=plan.bundle_id,
             parent_id=plan.parent_id,
             root_id=plan.root_id,
-            natural_fit_success=full_text_placed,
+            text_placement_complete=text_placement_complete,
+            hard_bounds_contained=hard_bounds_contained,
+            fit_quality=fit_quality,
+            preferred_font_size=float(preferred_font_size),
+            selected_pre_scale_font_size=float(font_size),
+            final_effective_font_size=float(font_size),
+            final_scale=final_scale,
+            fit_trigger=fit_trigger,
+            candidate_rank=candidate_rank,
+            natural_fit_success=(
+                candidate_rank == 0
+                and fit_status == "fits"
+                and not bool(
+                    selected_attempt.get(
+                        "same_size_lexical_layout_expansion_used"
+                    )
+                )
+            ),
             fallback_used=font_size != preferred_font_size,
-            scaling_used=float(font_size) / float(max(1, preferred_font_size)),
-            overflow_risk=fit_status != "fits",
-            clipping_risk=fit_status != "fits",
+            scaling_used=final_scale,
+            overflow_risk=not hard_bounds_contained,
+            clipping_risk=not hard_bounds_contained,
             clipped_region=[],
             full_text_placed=full_text_placed,
             punctuation_normalization_applied=punctuation,
@@ -642,6 +918,9 @@ class TypesettingEngine:
                     "block_writing_mode_flip_forbidden": True,
                 },
                 "script_policy": script_policy,
+                "target_lexical_segmentation": metadata[
+                    "target_lexical_segmentation"
+                ],
                 "line_break_policy": metadata["line_break_policy"],
                 "break_opportunities": metadata["break_opportunities"],
                 "chosen_breaks": metadata["chosen_breaks"],
@@ -661,6 +940,18 @@ class TypesettingEngine:
                 "base_visual_center": list(base_visual_center),
                 "open_type_metrics_by_face": open_type_metrics_by_face,
                 "box_model": box_model,
+                "fit_contract": {
+                    "text_placement_complete": text_placement_complete,
+                    "hard_bounds_contained": hard_bounds_contained,
+                    "fit_quality": fit_quality,
+                    "preferred_font_size": float(preferred_font_size),
+                    "selected_pre_scale_font_size": float(font_size),
+                    "final_effective_font_size": float(font_size),
+                    "final_scale": round(final_scale, 6),
+                    "fit_trigger": fit_trigger,
+                    "candidate_rank": int(candidate_rank),
+                    "readability_is_render_admission": False,
+                },
             },
         )
         return layout, report
@@ -1311,32 +1602,13 @@ class TypesettingEngine:
                             "font_face_id": str(item.get("font_face_id") or ""),
                             "font_path": str(item.get("font_path") or ""),
                             "font_fallback_used": bool(item.get("font_fallback_used")),
-                            **(
-                                {
-                                    "source_punctuation_footprint_status": str(
-                                        item.get(
-                                            "source_punctuation_footprint_status"
-                                        )
-                                        or ""
-                                    ),
-                                    "source_punctuation_footprint_box": list(
-                                        item.get(
-                                            "source_punctuation_footprint_box"
-                                        )
-                                        or []
-                                    ),
-                                    "source_punctuation_footprint_fact_set_id": str(
-                                        item.get(
-                                            "source_punctuation_footprint_fact_set_id"
-                                        )
-                                        or ""
-                                    ),
-                                }
-                                if item.get(
-                                    "source_punctuation_footprint_status"
+                            **{
+                                str(key): value
+                                for key, value in item.items()
+                                if str(key).startswith(
+                                    "source_punctuation_geometry_"
                                 )
-                                else {}
-                            ),
+                            },
                         },
                     )
                 )
@@ -1371,28 +1643,10 @@ class TypesettingEngine:
                 }
             )
         measured = _union_bounds([item.bbox for item in placements]) or [x, y, min(w, required_w), min(h, int(rows * cell_h))]
-        source_punctuation_boxes = [
-            bbox_from_value(item.get("source_punctuation_footprint_box"))
-            for item in items
-            if str(item.get("source_punctuation_footprint_status") or "")
-            == "applied_unambiguous_standalone_occurrence"
-        ]
-        source_punctuation_boxes = [
-            item for item in source_punctuation_boxes if item
-        ]
-        alignment_bounds = (
-            list(capacity_box)
-            if len(source_punctuation_boxes) == 1
-            else [x, y, w, h]
-        )
+        alignment_bounds = [x, y, w, h]
         alignment_center, alignment_source = _layout_alignment_center(
             plan,
             alignment_bounds,
-            source_punctuation_box=(
-                source_punctuation_boxes[0]
-                if len(source_punctuation_boxes) == 1
-                else None
-            ),
         )
         if alignment_center and measured:
             dx, dy = _measured_alignment_shift(
@@ -1460,11 +1714,22 @@ class TypesettingEngine:
         original_line_height = _line_height(dict(style or {}))
         effective_line_height = original_line_height
         max_row_units = max(row_units)
+        # ``_layout_vertical`` exposes capacity to the break planner as a
+        # whole-row count (``floor(box_height / cell_height)``).  Punctuation
+        # primitives may consume fractional row units, so sizing a retry box
+        # from the raw fractional total can reopen a 6.145-row partition with
+        # only six planner rows and force a different, lexically worse split.
+        # Round the selected partition up to the same whole-row capacity
+        # contract before converting it back to pixels.
+        required_row_capacity = max(
+            1,
+            int(math.ceil(max_row_units - 1e-9)),
+        )
         hard_w = int(hard[2])
         hard_h = int(hard[3])
 
         cell_height = max(shaped_advance * effective_line_height, item_cell_height)
-        needed_height = int(math.ceil(max_row_units * cell_height))
+        needed_height = int(math.ceil(required_row_capacity * cell_height))
         reason_codes = ["layout_intent_expanded_for_legal_vertical_partition"]
         if (
             needed_height > hard_h
@@ -1473,12 +1738,15 @@ class TypesettingEngine:
         ):
             compacted = min(
                 original_line_height,
-                float(hard_h) / max(1.0, max_row_units * shaped_advance),
+                float(hard_h)
+                / max(1.0, required_row_capacity * shaped_advance),
             )
             if compacted >= 1.0:
                 effective_line_height = max(1.0, compacted - 1e-6)
                 cell_height = max(shaped_advance * effective_line_height, item_cell_height)
-                needed_height = int(math.ceil(max_row_units * cell_height))
+                needed_height = int(
+                    math.ceil(required_row_capacity * cell_height)
+                )
                 reason_codes.append("line_height_compacted_for_hard_bound_fit")
                 if _font_size_is_locked(style):
                     reason_codes.append("line_height_compacted_for_locked_size_fit")
@@ -1543,6 +1811,104 @@ class TypesettingEngine:
             "box_model": updated_box_model,
             "reason_codes": reason_codes,
         }
+
+    def _retry_vertical_lexical_quality_within_hard_bounds(
+        self,
+        *,
+        normalized: str,
+        runs: Sequence[InlineTextRun],
+        shaped_runs: Sequence[ShapedRun],
+        breaks: Sequence[BreakOpportunity],
+        plan: RenderLayerPlan,
+        style: Mapping[str, Any],
+        font_size: int,
+        hard_bounds: Sequence[int],
+        layout_intent_box: Sequence[int],
+        box_model: Mapping[str, Any],
+        break_plan: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Try a minimally larger authorized intent before reducing size.
+
+        This remains orchestration around the sole ``LineBreakPlanner``.  The
+        full hard box is used only to discover whether a complete zero-intra-
+        span partition exists at the same size.  The executable retry is then
+        reduced to the smallest centered expansion that can hold that
+        partition; the upstream hard box never changes.
+        """
+
+        if _selected_intra_span_break_count(break_plan) <= 0:
+            return None
+        hard = bbox_from_value(hard_bounds)
+        current = bbox_from_value(layout_intent_box)
+        if not hard or not current:
+            return None
+        (
+            _probe_placements,
+            _probe_lines,
+            _probe_columns,
+            _probe_measured_bounds,
+            probe_fit_status,
+            _probe_fit_issues,
+            probe_break_plan,
+        ) = self._layout_vertical(
+            normalized,
+            runs,
+            shaped_runs,
+            breaks,
+            hard,
+            font_size,
+            dict(style or {}),
+            plan,
+            candidate_capacity_box=hard,
+        )
+        if (
+            probe_fit_status != "fits"
+            or _selected_intra_span_break_count(probe_break_plan) > 0
+        ):
+            return None
+
+        retry = self._retry_vertical_fit_within_hard_bounds(
+            normalized=normalized,
+            runs=runs,
+            shaped_runs=shaped_runs,
+            breaks=breaks,
+            plan=plan,
+            style=style,
+            font_size=font_size,
+            hard_bounds=hard,
+            layout_intent_box=current,
+            box_model=box_model,
+            break_plan=probe_break_plan,
+        )
+        if retry is None:
+            return None
+        if _selected_intra_span_break_count(retry["break_plan"]) > 0:
+            return None
+        retry["reason_codes"] = _unique(
+            [
+                *list(retry.get("reason_codes") or []),
+                "layout_intent_expanded_for_target_lexical_integrity",
+                "same_size_candidate_selected_before_font_reduction",
+            ]
+        )
+        retry_box_model = dict(retry.get("box_model") or {})
+        retry_box_model["lexical_quality_candidate"] = {
+            "status": "selected",
+            "selection_authority": "TypesettingEngine",
+            "break_selector": self.break_planner.version,
+            "second_break_selector_added": False,
+            "initial_intra_span_break_count": (
+                _selected_intra_span_break_count(break_plan)
+            ),
+            "selected_intra_span_break_count": 0,
+            "hard_bounds_unchanged": True,
+            "full_hard_bounds_probe_is_executable_box": False,
+            "minimal_authorized_expansion": list(
+                retry.get("layout_intent_box") or []
+            ),
+        }
+        retry["box_model"] = retry_box_model
+        return retry
 
     def _layout_horizontal(
         self,
@@ -1720,7 +2086,7 @@ def _missing_identity(plan: RenderLayerPlan) -> list[str]:
 
 
 def _font_size_from_style(style: dict[str, Any]) -> int:
-    value = style.get("font_size") if isinstance(style, dict) else None
+    value = style.get("target_preferred_em_px") if isinstance(style, dict) else None
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -1743,12 +2109,68 @@ def _font_size_candidates(
     minimum = _minimum_fit_font_size(preferred, style, policy)
     if minimum >= preferred:
         return [preferred]
-    max_steps = max(1, int(policy.max_binary_fit_steps))
-    step = max(1, int(math.ceil((preferred - minimum) / max_steps)))
-    values = list(range(preferred, minimum - 1, -step))
-    if values[-1] != minimum:
-        values.append(minimum)
-    return sorted(_unique_ints(values), reverse=True)
+    return list(range(preferred, minimum - 1, -1))
+
+
+def _source_preferred_interval_floor(
+    preferred: int,
+    style: Mapping[str, Any] | None,
+) -> int | None:
+    """Return a rounded quality-comparison floor, never a fit/admission floor."""
+
+    interval = list(dict(style or {}).get("target_preferred_em_interval_px") or [])
+    if len(interval) < 2:
+        return None
+    try:
+        lower = float(interval[0])
+        upper = float(interval[1])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(lower)
+        or not math.isfinite(upper)
+        or lower <= 0.0
+        or upper < lower
+    ):
+        return None
+    rounded_lower = int(math.floor(lower + 0.5))
+    return max(1, min(int(preferred), rounded_lower))
+
+
+def _selected_intra_span_break_count(
+    break_plan: Mapping[str, Any] | None,
+) -> int:
+    return sum(
+        1
+        for item in list(dict(break_plan or {}).get("selected_breaks") or [])
+        if str(
+            (item.get("opportunity_metadata") or {}).get(
+                "target_lexical_boundary"
+            )
+            or ""
+        )
+        == "intra_span"
+    )
+
+
+def _selected_lexical_integrity_penalty(
+    break_plan: Mapping[str, Any] | None,
+) -> float:
+    total = 0.0
+    for item in list(dict(break_plan or {}).get("selected_breaks") or []):
+        try:
+            total += max(
+                0.0,
+                float(
+                    (item.get("opportunity_metadata") or {}).get(
+                        "lexical_integrity_penalty"
+                    )
+                    or 0.0
+                ),
+            )
+        except (TypeError, ValueError):
+            continue
+    return float(total)
 
 
 def _font_size_is_locked(style: Mapping[str, Any] | None) -> bool:
@@ -1766,21 +2188,41 @@ def _font_size_is_locked(style: Mapping[str, Any] | None) -> bool:
 
 
 def _minimum_fit_font_size(preferred: int, style: dict[str, Any], policy: TypesettingPolicy) -> int:
-    preferred = max(1, int(preferred))
-    readable = int(policy.min_readable_font_size)
-    if isinstance(style, dict):
-        profile = style.get("spacing_profile") if isinstance(style.get("spacing_profile"), dict) else {}
-        for value in (
-            style.get("minimum_readable_font_size"),
-            profile.get("minimum_readable_font_size") if isinstance(profile, dict) else None,
-        ):
-            try:
-                if value is not None and float(value) > 0:
-                    readable = max(readable, int(round(float(value))))
-            except (TypeError, ValueError):
-                continue
-    proportional_floor = int(round(preferred * 0.72))
-    return min(preferred, max(int(policy.min_font_size), readable, proportional_floor))
+    """Return the technical raster minimum; readability is diagnostic only."""
+
+    return 1
+
+
+def _style_fill_color(style: Mapping[str, Any] | None) -> str:
+    values = dict(style or {})
+    fill = values.get("fill")
+    if isinstance(fill, Mapping):
+        value = str(fill.get("color") or "")
+        if value:
+            return value
+    return "#000000"
+
+
+def _style_outline_color(style: Mapping[str, Any] | None) -> str:
+    values = dict(style or {})
+    outline = values.get("outline")
+    if isinstance(outline, Mapping):
+        value = str(outline.get("color") or "")
+        if value:
+            return value
+    return "#FFFFFF"
+
+
+def _style_outline_width(style: Mapping[str, Any] | None) -> float:
+    values = dict(style or {})
+    outline = values.get("outline")
+    if not isinstance(outline, Mapping) or outline.get("present") is not True:
+        return 0.0
+    try:
+        value = float(outline.get("target_width_px") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0.0 else 0.0
 
 
 def _normalize_mode(value: Any) -> str:
@@ -1823,13 +2265,7 @@ def _horizontal_line_pixel_extent(
 
 
 def _parent_effect_raster_guard(style: Mapping[str, Any] | None) -> float:
-    values = dict(style or {})
-    stroke_width = 0.0
-    value = values.get("stroke_width")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        number = float(value)
-        if math.isfinite(number):
-            stroke_width = abs(number)
+    stroke_width = _style_outline_width(style)
     return float(max(2, int(math.ceil(stroke_width)) + 2))
 
 
@@ -2316,17 +2752,11 @@ def _point_from_value(value: Any) -> list[float]:
 def _layout_alignment_center(
     plan: RenderLayerPlan,
     box: Sequence[int],
-    *,
-    source_punctuation_box: Sequence[int] | None = None,
 ) -> tuple[list[float], str]:
     metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
     explicit_center = _point_from_value(metadata.get("visual_alignment_center"))
     if explicit_center and _point_inside_box(explicit_center, box):
         return explicit_center, "visual_alignment_center"
-
-    punctuation_center = _center_of(source_punctuation_box or [])
-    if punctuation_center and _point_inside_box(punctuation_center, box):
-        return punctuation_center, "validated_source_punctuation_footprint_center"
 
     source_box = bbox_from_value(plan.source_provenance_ref.get("source_contract_bbox") if isinstance(plan.source_provenance_ref, dict) else [])
     source_center = _center_of(source_box)
@@ -2397,17 +2827,13 @@ def _shift_column_records(
     return shifted
 
 
-def _source_standalone_punctuation_footprint_hint(
+def _source_punctuation_geometry_match(
     plan: RenderLayerPlan,
     runs: Sequence[InlineTextRun],
     run: InlineTextRun,
+    writing_mode: str,
 ) -> dict[str, Any]:
-    """Match one compact translated occurrence to one source occurrence.
-
-    The adapter owns footprint validation and the arbitrator owns style. This
-    helper supplies only an advisory inline presentation span when occurrence
-    identity is unambiguous; every other case stays on font metrics.
-    """
+    """Match a lossless target run to one validated source visual occurrence."""
 
     expected_kind = {
         "ellipsis_sequence": "ellipsis",
@@ -2416,75 +2842,84 @@ def _source_standalone_punctuation_footprint_hint(
     }.get(str(run.role or ""), "")
     if not expected_kind:
         return {}
+    inline_axis = {"vertical": "ttb", "horizontal": "ltr"}.get(
+        str(writing_mode or ""),
+        "",
+    )
+    if not inline_axis:
+        return {"status": "fallback_incompatible_writing_mode"}
 
-    visible_runs = [
-        candidate
-        for candidate in list(runs or [])
-        if candidate.role != "space" and str(candidate.text or "").strip()
-    ]
-    if (
-        len(visible_runs) != 1
-        or str(visible_runs[0].run_id or "") != str(run.run_id or "")
-    ):
-        return {"status": "fallback_ambiguous_translated_occurrence"}
-
-    translated_occurrences = [
+    evidence = validated_source_punctuation_geometry_ref(plan)
+    if not evidence:
+        return {
+            "status": "fallback_validated_source_punctuation_geometry_unavailable"
+        }
+    source_occurrences = [
         dict(item)
-        for item in list(run.metadata.get("punctuation_occurrences") or [])
+        for item in list(evidence.get("occurrences") or [])
         if isinstance(item, Mapping)
+        and str(item.get("kind") or "") == expected_kind
+        and str(item.get("inline_axis") or "") == inline_axis
     ]
-    if (
-        len(translated_occurrences) != 1
-        or str(translated_occurrences[0].get("kind") or "") != expected_kind
-    ):
-        return {"status": "fallback_ambiguous_translated_occurrence"}
-
-    source_tokens = [
-        token
-        for token in build_lossless_text_tokens(plan.source_text_summary)
-        if str(token.original_text or "").strip()
-    ]
-    if len(source_tokens) != 1:
-        return {"status": "fallback_ambiguous_source_occurrence"}
-    source_token = source_tokens[0]
-    if not isinstance(source_token, PunctuationToken):
-        return {"status": "fallback_incompatible_source_occurrence"}
-    if str(source_token.punctuation_kind or "") != expected_kind:
-        return {"status": "fallback_incompatible_source_occurrence"}
-
-    footprint = validated_source_text_footprint_ref(plan)
-    if not footprint:
-        return {"status": "fallback_validated_source_footprint_unavailable"}
-    source_box = bbox_from_value(footprint.get("union_bbox_page_xywh"))
-    hard_bounds = bbox_from_value(plan.hard_bounds)
-    if not source_box or not hard_bounds:
-        return {"status": "fallback_source_footprint_geometry_unavailable"}
-
-    source_left, source_top, source_width, source_height = source_box
-    hard_left, hard_top, hard_width, hard_height = hard_bounds
-    bounded_left = max(source_left, hard_left)
-    bounded_top = max(source_top, hard_top)
-    bounded_right = min(
-        source_left + source_width,
-        hard_left + hard_width,
+    source_occurrences.sort(
+        key=lambda item: (
+            int(item.get("kind_ordinal") or 0),
+            int(item.get("visual_reading_order_ordinal") or 0),
+        )
     )
-    bounded_bottom = min(
-        source_top + source_height,
-        hard_top + hard_height,
+
+    translated_runs: list[InlineTextRun] = []
+    for candidate in list(runs or []):
+        compatible = [
+            item
+            for item in list(candidate.metadata.get("punctuation_occurrences") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("kind") or "") == expected_kind
+        ]
+        if len(compatible) > 1:
+            return {
+                "status": "fallback_ambiguous_translated_occurrence_count"
+            }
+        if compatible:
+            translated_runs.append(candidate)
+
+    if len(source_occurrences) != len(translated_runs) or not source_occurrences:
+        return {
+            "status": "fallback_ambiguous_source_occurrence_count",
+            "source_occurrence_count": len(source_occurrences),
+            "translated_occurrence_count": len(translated_runs),
+            "fact_set_id": str(evidence.get("fact_set_id") or ""),
+        }
+    target_index = next(
+        (
+            index
+            for index, candidate in enumerate(translated_runs)
+            if str(candidate.run_id or "") == str(run.run_id or "")
+        ),
+        -1,
     )
-    if bounded_right <= bounded_left or bounded_bottom <= bounded_top:
-        return {"status": "fallback_source_footprint_outside_hard_bounds"}
-    bounded_box = [
-        int(bounded_left),
-        int(bounded_top),
-        int(bounded_right - bounded_left),
-        int(bounded_bottom - bounded_top),
-    ]
+    if target_index < 0:
+        return {"status": "fallback_translated_occurrence_not_found"}
+    occurrence = source_occurrences[target_index]
     return {
-        "status": "applied_unambiguous_standalone_occurrence",
-        "box": bounded_box,
-        "inline_span_px": int(bounded_box[3]),
-        "fact_set_id": str(footprint.get("fact_set_id") or ""),
+        "status": "applied",
+        "kind": expected_kind,
+        "inline_axis": inline_axis,
+        "occurrence_id": str(occurrence.get("occurrence_id") or ""),
+        "visual_reading_order_ordinal": int(
+            occurrence.get("visual_reading_order_ordinal") or 0
+        ),
+        "kind_ordinal": int(occurrence.get("kind_ordinal") or 0),
+        "source_span_px": float(occurrence.get("span_px") or 0.0),
+        "source_pitch_px": float(occurrence.get("pitch_px") or 0.0),
+        "source_cell_px": float(occurrence.get("source_cell_px") or 0.0),
+        "normalized_span": float(occurrence.get("normalized_span") or 0.0),
+        "normalized_pitch": float(occurrence.get("normalized_pitch") or 0.0),
+        "source_group_bbox_page_xywh": list(
+            occurrence.get("group_bbox_page_xywh") or []
+        ),
+        "confidence": float(occurrence.get("confidence") or 0.0),
+        "fact_set_id": str(evidence.get("fact_set_id") or ""),
     }
 
 
@@ -2516,19 +2951,40 @@ def _vertical_layout_items(
                 font_size,
                 style,
             )
-            source_footprint_hint = _source_standalone_punctuation_footprint_hint(
+            source_geometry_match = _source_punctuation_geometry_match(
                 plan,
                 runs,
                 run,
+                "vertical",
             )
-            if source_footprint_hint.get("status") == (
-                "applied_unambiguous_standalone_occurrence"
-            ):
-                item_height = max(
-                    float(item_height),
-                    float(source_footprint_hint.get("inline_span_px") or 0.0),
-                )
             row_units = _vertical_sequence_row_units(run)
+            if source_geometry_match.get("status") == "applied":
+                preferred_em = max(
+                    1.0,
+                    float(
+                        (style or {}).get("target_preferred_em_px")
+                        or font_size
+                    ),
+                )
+                candidate_scale = min(
+                    1.0,
+                    max(0.0, float(font_size) / preferred_em),
+                )
+                requested_source_span = max(
+                    1.0,
+                    float(source_geometry_match.get("source_span_px") or 0.0),
+                )
+                item_height = requested_source_span * candidate_scale
+                row_units = max(
+                    1.0,
+                    float(source_geometry_match.get("normalized_span") or 0.0),
+                )
+                source_geometry_match = {
+                    **source_geometry_match,
+                    "requested_span_px": requested_source_span,
+                    "candidate_span_px": float(item_height),
+                    "candidate_scale": candidate_scale,
+                }
             items.append(
                 {
                     "text": run.text,
@@ -2564,21 +3020,14 @@ def _vertical_layout_items(
                     "font_face_id": shaped.font_face_id if shaped else "",
                     "font_path": shaped.font_path if shaped else "",
                     "font_fallback_used": bool((shaped.metadata or {}).get("font_fallback_used")) if shaped else False,
-                    **(
-                        {
-                            "source_punctuation_footprint_status": str(
-                                source_footprint_hint.get("status") or ""
-                            ),
-                            "source_punctuation_footprint_box": list(
-                                source_footprint_hint.get("box") or []
-                            ),
-                            "source_punctuation_footprint_fact_set_id": str(
-                                source_footprint_hint.get("fact_set_id") or ""
-                            ),
-                        }
-                        if source_footprint_hint.get("status")
-                        else {}
-                    ),
+                    **{
+                        (
+                            "source_punctuation_geometry_match_status"
+                            if key == "status"
+                            else f"source_punctuation_geometry_{key}"
+                        ): value
+                        for key, value in source_geometry_match.items()
+                    },
                 }
             )
             continue
@@ -2705,7 +3154,7 @@ def _vertical_primitive_cross_axis_extent(
     style: Mapping[str, Any] | None,
 ) -> float:
     try:
-        stroke_width = max(0.0, float((style or {}).get("stroke_width") or 0.0))
+        stroke_width = _style_outline_width(style)
     except (TypeError, ValueError):
         stroke_width = 0.0
     raster_guard = 1.0
@@ -2770,7 +3219,7 @@ def _drawing_primitive_for_placement(
     try:
         outline_width = max(
             0.0,
-            float((style or {}).get("stroke_width") or 0.0),
+            _style_outline_width(style),
         )
     except (TypeError, ValueError):
         outline_width = 0.0
@@ -2797,24 +3246,13 @@ def _drawing_primitive_for_placement(
         "punctuation_occurrences": occurrences,
         "relative_geometry_recomputation_allowed": False,
     }
-    source_punctuation_status = str(
-        metadata.get("source_punctuation_footprint_status") or ""
+    primitive_metadata.update(
+        {
+            str(key): value
+            for key, value in metadata.items()
+            if str(key).startswith("source_punctuation_geometry_")
+        }
     )
-    if source_punctuation_status:
-        primitive_metadata.update(
-            {
-                "source_punctuation_footprint_status": (
-                    source_punctuation_status
-                ),
-                "source_punctuation_footprint_box": list(
-                    metadata.get("source_punctuation_footprint_box") or []
-                ),
-                "source_punctuation_footprint_fact_set_id": str(
-                    metadata.get("source_punctuation_footprint_fact_set_id")
-                    or ""
-                ),
-            }
-        )
 
     if mode == "vertical_ellipsis_sequence":
         unit_count = max(1, int(metadata.get("ellipsis_unit_count") or 1))
@@ -2897,9 +3335,13 @@ def _drawing_primitive_for_placement(
         span = max(1.0, last_y - first_y)
         center_x = float(x) + (float(width) - 1.0) / 2.0
         sample_step = max(1, int(math.ceil(span / 128.0)))
-        sample_ys = list(range(int(round(first_y)), int(round(last_y)) + 1, sample_step))
-        if not sample_ys or sample_ys[-1] != int(round(last_y)):
-            sample_ys.append(int(round(last_y)))
+        sample_ys = [first_y]
+        sample_y = first_y + float(sample_step)
+        while sample_y < last_y:
+            sample_ys.append(sample_y)
+            sample_y += float(sample_step)
+        if last_y > first_y:
+            sample_ys.append(last_y)
         for sample_y in sample_ys:
             t = max(0.0, min(1.0, (float(sample_y) - first_y) / span))
             sample_x = center_x + math.sin(t * math.tau * float(unit_count)) * amplitude
@@ -2912,6 +3354,44 @@ def _drawing_primitive_for_placement(
                 "path_sample_step_px": int(sample_step),
                 "continuous_multi_cell_wave": True,
                 "endpoint_effect_inset_px": float(pad_y),
+            }
+        )
+
+    requested_source_span = float(
+        primitive_metadata.get(
+            "source_punctuation_geometry_requested_span_px"
+        )
+        or 0.0
+    )
+    if mode == "vertical_ellipsis_sequence" and centers:
+        applied_source_span = (
+            float(centers[-1][1]) - float(centers[0][1]) + float(diameter)
+        )
+    elif points:
+        applied_source_span = float(points[-1][1]) - float(points[0][1])
+    else:
+        applied_source_span = 0.0
+    if requested_source_span > 0.0:
+        primitive_metadata.update(
+            {
+                "source_punctuation_geometry_applied_span_px": round(
+                    applied_source_span,
+                    6,
+                ),
+                "source_punctuation_geometry_source_span_miss_ratio": round(
+                    abs(applied_source_span - requested_source_span)
+                    / requested_source_span,
+                    6,
+                ),
+                "source_punctuation_geometry_fit_downscaled": bool(
+                    float(
+                        primitive_metadata.get(
+                            "source_punctuation_geometry_candidate_scale"
+                        )
+                        or 1.0
+                    )
+                    < 0.999999
+                ),
             }
         )
 

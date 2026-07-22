@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from app.render.typesetting_contracts import PunctuationToken, TextToken
+
+if TYPE_CHECKING:
+    from app.render.target_lexical_segmenter import TargetLexicalSpan
 
 try:
     import regex as _regex
@@ -1165,12 +1168,26 @@ def _coalesce_format_control_runs(runs: Sequence[InlineTextRun]) -> list[InlineT
     return output
 
 
-def compute_break_opportunities(runs: Sequence[InlineTextRun], *, writing_mode: str) -> list[BreakOpportunity]:
+def compute_break_opportunities(
+    runs: Sequence[InlineTextRun],
+    *,
+    writing_mode: str,
+    target_lexical_spans: Sequence["TargetLexicalSpan"] | None = None,
+) -> list[BreakOpportunity]:
     items = list(runs or [])
+    lexical_spans = list(target_lexical_spans or [])
+    lexical_evidence_supplied = target_lexical_spans is not None
     opportunities: list[BreakOpportunity] = []
     for index in range(1, len(items)):
         before = items[index - 1]
         after = items[index]
+        token_boundary = int(after.token_start)
+        covering_lexical_spans = [
+            span
+            for span in lexical_spans
+            if int(span.token_start) < token_boundary < int(span.token_end)
+            and int(span.grapheme_end) - int(span.grapheme_start) > 1
+        ]
         reason = "generic_run_boundary"
         strength = "normal"
         allowed = True
@@ -1186,8 +1203,15 @@ def compute_break_opportunities(runs: Sequence[InlineTextRun], *, writing_mode: 
             reason = "space_word_boundary"
             strength = "preferred"
         elif before.script in {"Hani", "Hira", "Kana", "Hang"} and after.script in {"Hani", "Hira", "Kana", "Hang"}:
-            reason = "cjk_grapheme_boundary"
-            strength = "normal"
+            if covering_lexical_spans:
+                reason = "target_lexical_intra_word_boundary"
+                strength = "weak"
+            elif lexical_evidence_supplied:
+                reason = "target_lexical_word_boundary"
+                strength = "preferred"
+            else:
+                reason = "cjk_grapheme_boundary"
+                strength = "normal"
         elif before.script == "Latn" and after.script == "Latn":
             reason = "latin_run_boundary"
             strength = "weak"
@@ -1203,6 +1227,23 @@ def compute_break_opportunities(runs: Sequence[InlineTextRun], *, writing_mode: 
                     "writing_mode": writing_mode,
                     "before_text": before.text,
                     "after_text": after.text,
+                    "token_boundary": token_boundary,
+                    "target_lexical_boundary": (
+                        "intra_span"
+                        if covering_lexical_spans
+                        else "between_spans"
+                        if lexical_evidence_supplied
+                        else "unavailable"
+                    ),
+                    "lexical_integrity_penalty": (
+                        1.0 if covering_lexical_spans else 0.0
+                    ),
+                    "lexical_span_ids": [
+                        span.span_id for span in covering_lexical_spans
+                    ],
+                    "lexical_span_texts": [
+                        span.text for span in covering_lexical_spans
+                    ],
                 },
             )
         )

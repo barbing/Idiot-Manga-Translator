@@ -33,31 +33,6 @@ _AUTHORIZED_SEMANTIC_STATES = {
     "cleanup_translate_background",
     "cleanup_translate_caption",
 }
-_PERCEPTUAL_STYLE_AXES_VERSION = "authorized_perceptual_style_axes_v2"
-_PERCEPTUAL_STYLE_PROVENANCE = "cleanup_mask_authorized_source_style_view_v1"
-_PERCEPTUAL_STYLE_FACT_SET_PREFIX = "authorized_perceptual_fact_set_v1:"
-_PERCEPTUAL_STYLE_AXES = ("fill", "outline", "shadow", "rotation")
-_ADDITIVE_FILL_MIN_CHROMA = 48.0
-_ADDITIVE_FILL_MIN_CLUSTER_PIXELS = 24
-_ADDITIVE_FILL_MIN_CORE_CHROMATIC_FRACTION = 0.38
-_ADDITIVE_FILL_MAX_COLOR_DISPERSION = 24.0
-_CANONICAL_ROLE_MIN_CLUSTER_PIXELS = 24
-_CANONICAL_ROLE_MAX_COLOR_DISPERSION = 24.0
-_CANONICAL_ROLE_MODE_MERGE_DISTANCE_RGB = 144.0
-_CANONICAL_ROLE_MIN_MODE_DISTANCE_RGB = 160.0
-_CANONICAL_ROLE_MAX_ASSIGNMENT_DISTANCE_RGB = 96.0
-_CANONICAL_ROLE_MIN_ASSIGNMENT_MARGIN_RGB = 12.0
-_CANONICAL_ROLE_MIN_MEDIAL_DEPTH_PX = 1.4
-_CANONICAL_ROLE_TARGET_MEDIAL_DEPTH_PX = 3.2
-_CANONICAL_ROLE_MIN_MEDIAL_PIXELS = 8
-_CANONICAL_ROLE_MIN_MEDIAL_SCORE = 0.20
-_CANONICAL_ROLE_MIN_MEDIAL_SCORE_MARGIN = 0.06
-_CANONICAL_ROLE_MIN_MEDIAL_SCORE_RATIO = 1.20
-_CANONICAL_ROLE_MIN_RADIAL_WIDTH_PX = 1.5
-_CANONICAL_ROLE_MAX_RADIAL_WIDTH_PX = 16.0
-_CANONICAL_ROLE_MIN_PAIR_MASK_FRACTION = 0.70
-_CANONICAL_ROLE_MIN_SHELL_RING_RECALL = 0.85
-_CANONICAL_ROLE_MIN_RING_SHELL_PRECISION = 0.38
 _ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS = 24
 _ADDITIVE_ROTATION_MIN_COMPONENTS = 2
 _ADDITIVE_ROTATION_MIN_COMPONENT_PIXELS = 8
@@ -90,9 +65,17 @@ _OUTLINE_SURFACE_CONTINUITY_MAX_RGB_DISTANCE = 40.0
 _OUTLINE_SURFACE_CONTINUITY_MAX_LUMA_QUANTILE_DELTA = 24.0
 _OUTLINE_BACKING_MIN_RGB_DISTANCE = 64.0
 _OUTLINE_BACKING_MIN_LUMA_QUANTILE_DELTA = 36.0
-AUTHORIZED_STYLE_SPATIAL_FACT_SET_VERSION = (
-    "authorized_style_spatial_fact_set_v1"
-)
+_GRAYSCALE_OUTLINE_MIN_CORE_SUPPORT_LUMA_DISTANCE = 48.0
+_GRAYSCALE_OUTLINE_MODERATE_SURFACE_RGB_DISTANCE = 14.0
+_GRAYSCALE_OUTLINE_MODERATE_SURFACE_LUMA_DISTANCE = 8.0
+_GRAYSCALE_OUTLINE_NARROW_SUPPORT_RATIO = 0.10
+_GRAYSCALE_OUTLINE_MAX_SUPPORT_RATIO = 0.35
+_GRAYSCALE_OUTLINE_DECISIVE_SURFACE_RATIO = 0.25
+_GRAYSCALE_PAINT_GEOMETRY_SCHEMA = "grayscale_core_support_exterior_v2"
+_OUTLINE_WIDTH_MEASUREMENT_VERSION = "radial_support_distance_to_core_v1"
+_GRAYSCALE_FILL_SCHEMA = "grayscale_core_polarity_v1"
+_GRAYSCALE_OUTLINE_SCHEMA = "grayscale_outline_geometry_v1"
+_PAINT_CORE_HYPOTHESIS_VERSION = "paint_core_component_topology_v1"
 SOURCE_TEXT_FOOTPRINT_VERSION = "authorized_source_text_footprint_v2"
 SOURCE_TEXT_FOOTPRINT_PROFILE_SELECTION_AUTHORITY = (
     "parent_style_arbitrator_resolved_writing_direction"
@@ -444,237 +427,16 @@ class SourceTextFootprint:
         return result
 
 
-@dataclass(frozen=True)
-class _SpatialPaintCohort:
-    """One immutable paint cohort shared by every source-style observer."""
-
-    cohort_index: int
-    quantized_key: tuple[int, int, int]
-    color: str
-    median_rgb: tuple[float, float, float]
-    pixel_count: int
-    mask_fraction: float
-    color_dispersion_rgb: float
-    chroma_median: float
-    chromatic_pixel_count: int
-    chromatic_fraction: float
-    bbox_xywh: tuple[int, int, int, int]
-    bbox_occupancy: float
-    border_margin_px: int
-    depth_p50_px: float
-    depth_p75_px: float
-    depth_ratio: float
-    significant_component_count: int
-    mask: Any = field(default=None, repr=False, compare=False)
-    chromatic_mask: Any = field(default=None, repr=False, compare=False)
-
-    def to_audit_dict(self) -> dict[str, Any]:
-        return {
-            "cohort_index": int(self.cohort_index),
-            "quantized_key": list(self.quantized_key),
-            "color": self.color,
-            "pixel_count": int(self.pixel_count),
-            "mask_fraction": round(float(self.mask_fraction), 8),
-            "color_dispersion_rgb": round(
-                float(self.color_dispersion_rgb), 8
-            ),
-            "chroma_median": round(float(self.chroma_median), 8),
-            "chromatic_pixel_count": int(self.chromatic_pixel_count),
-            "chromatic_fraction": round(float(self.chromatic_fraction), 8),
-            "bbox_xywh": list(self.bbox_xywh),
-            "bbox_occupancy": round(float(self.bbox_occupancy), 8),
-            "border_margin_px": int(self.border_margin_px),
-            "depth_p50_px": round(float(self.depth_p50_px), 8),
-            "depth_p75_px": round(float(self.depth_p75_px), 8),
-            "depth_ratio": round(float(self.depth_ratio), 8),
-            "significant_component_count": int(
-                self.significant_component_count
-            ),
-        }
 
 
-@dataclass(frozen=True)
-class _CanonicalPaintMode:
-    """One stable paint mode assembled from nearby authorized cohorts."""
-
-    representative_cohort_index: int
-    color: str
-    median_rgb: tuple[float, float, float]
-    pixel_count: int
-    medial_pixel_count: int
-    medial_fraction: float
-    medial_depth_p75_px: float
-    medial_score: float
-    cohort_indices: tuple[int, ...] = ()
-    mask: Any = field(default=None, repr=False, compare=False)
-
-    def to_audit_dict(self) -> dict[str, Any]:
-        return {
-            "representative_cohort_index": int(
-                self.representative_cohort_index
-            ),
-            "cohort_indices": [int(value) for value in self.cohort_indices],
-            "color": self.color,
-            "pixel_count": int(self.pixel_count),
-            "medial_pixel_count": int(self.medial_pixel_count),
-            "medial_fraction": round(float(self.medial_fraction), 8),
-            "medial_depth_p75_px": round(
-                float(self.medial_depth_p75_px), 8
-            ),
-            "medial_score": round(float(self.medial_score), 8),
-        }
 
 
-@dataclass(frozen=True)
-class _SpatialOutlineRole:
-    """One uniquely qualified core/shell relation from shared paint facts."""
-
-    core_cohort_index: int
-    shell_cohort_index: int
-    core_color: str
-    shell_color: str
-    width_px: float
-    pair_mask_fraction: float
-    core_shell_depth_delta_px: float
-    shell_ring_recall: float
-    ring_shell_precision: float
-    color_distance_rgb: float
-    confidence: float
-
-    def to_audit_dict(self) -> dict[str, Any]:
-        return {
-            "core_cohort_index": int(self.core_cohort_index),
-            "shell_cohort_index": int(self.shell_cohort_index),
-            "core_color": self.core_color,
-            "shell_color": self.shell_color,
-            "width_px": round(float(self.width_px), 8),
-            "pair_mask_fraction": round(float(self.pair_mask_fraction), 8),
-            "core_shell_depth_delta_px": round(
-                float(self.core_shell_depth_delta_px), 8
-            ),
-            "shell_ring_recall": round(float(self.shell_ring_recall), 8),
-            "ring_shell_precision": round(
-                float(self.ring_shell_precision), 8
-            ),
-            "color_distance_rgb": round(float(self.color_distance_rgb), 8),
-            "confidence": round(float(self.confidence), 8),
-        }
 
 
-@dataclass(frozen=True)
-class _CanonicalSpatialRoles:
-    """The only core/shell/effect role decision for one authorized mask."""
-
-    core_role_status: str
-    core_role_reason: str
-    core_resolution: str
-    core_color: str
-    support_color: str
-    core_mask: Any = field(default=None, repr=False, compare=False)
-    shell_mask: Any = field(default=None, repr=False, compare=False)
-    effect_mask: Any = field(default=None, repr=False, compare=False)
-    outline_role: _SpatialOutlineRole | None = None
-    outline_role_status: str = "unavailable"
-    outline_role_reason: str = ""
-    medial_threshold_px: float = 0.0
-    paint_modes: tuple[_CanonicalPaintMode, ...] = ()
-    role_support: Mapping[str, Any] = field(default_factory=dict)
-
-    def audit_dict(self) -> dict[str, Any]:
-        return {
-            "core_role_status": self.core_role_status,
-            "core_role_reason": self.core_role_reason,
-            "core_resolution": self.core_resolution,
-            "medial_threshold_px": round(
-                float(self.medial_threshold_px), 8
-            ),
-            "role_support": _json_safe_mapping(self.role_support),
-            "paint_modes": [mode.to_audit_dict() for mode in self.paint_modes],
-        }
 
 
-@dataclass(frozen=True)
-class AuthorizedStyleSpatialFactSet:
-    """Runtime-only, identity-bound spatial roles for one authorized parent.
-
-    Arrays are immutable and intentionally never serialized. All source-style
-    axes consume this same fact set; no observer may rebuild its own competing
-    paint cohorts or external carrier ring.
-    """
-
-    contract_version: str
-    fact_set_id: str
-    source_identity: Mapping[str, Any]
-    core_resolution: str
-    core_role_status: str
-    core_role_reason: str
-    core_color: str
-    support_color: str
-    fill_polarity: str
-    paint_cohorts: tuple[_SpatialPaintCohort, ...] = ()
-    outline_role: _SpatialOutlineRole | None = None
-    outline_role_status: str = "unavailable"
-    outline_role_reason: str = ""
-    core_role_support: Mapping[str, Any] = field(default_factory=dict)
-    source_rgb: Any = field(default=None, repr=False, compare=False)
-    authorized_mask: Any = field(default=None, repr=False, compare=False)
-    character_core_mask: Any = field(default=None, repr=False, compare=False)
-    concentric_shell_mask: Any = field(default=None, repr=False, compare=False)
-    displaced_effect_mask: Any = field(default=None, repr=False, compare=False)
-    external_surface_ring_mask: Any = field(
-        default=None, repr=False, compare=False
-    )
-    detector_primary_rgb: Any = field(default=None, repr=False, compare=False)
-    detector_neutral_rgb: Any = field(default=None, repr=False, compare=False)
-
-    def cohort(self, index: int) -> _SpatialPaintCohort | None:
-        return next(
-            (
-                cohort
-                for cohort in self.paint_cohorts
-                if cohort.cohort_index == int(index)
-            ),
-            None,
-        )
-
-    def audit_summary(self) -> dict[str, Any]:
-        return {
-            "contract_version": self.contract_version,
-            "fact_set_id": self.fact_set_id,
-            "core_resolution": self.core_resolution,
-            "core_role_status": self.core_role_status,
-            "core_role_reason": self.core_role_reason,
-            "core_role_support": _json_safe_mapping(self.core_role_support),
-            "core_color": self.core_color,
-            "support_color": self.support_color,
-            "fill_polarity": self.fill_polarity,
-            "paint_cohort_count": len(self.paint_cohorts),
-            "character_core_pixel_count": int(
-                np.count_nonzero(self.character_core_mask)
-            ),
-            "concentric_shell_pixel_count": int(
-                np.count_nonzero(self.concentric_shell_mask)
-            ),
-            "displaced_effect_pixel_count": int(
-                np.count_nonzero(self.displaced_effect_mask)
-            ),
-            "paint_cohorts": [
-                cohort.to_audit_dict() for cohort in self.paint_cohorts
-            ],
-            "outline_role_status": self.outline_role_status,
-            "outline_role_reason": self.outline_role_reason,
-            "outline_role": (
-                self.outline_role.to_audit_dict()
-                if self.outline_role is not None
-                else None
-            ),
-        }
 
 
-@dataclass(frozen=True)
-class _AuthorizedStyleCropMeasurement:
-    metrics: Mapping[str, Any]
-    source_text_footprint: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -1093,847 +855,16 @@ def _readonly_array(value: Any, *, dtype: Any) -> np.ndarray:
     return result
 
 
-def _spatial_paint_cohorts(
-    source: np.ndarray,
-    mask: np.ndarray,
-) -> tuple[_SpatialPaintCohort, ...]:
-    """Build the only paint-cohort inventory used by source-style axes."""
-
-    try:
-        import cv2
-    except Exception:
-        return ()
-    pixel_count = int(np.count_nonzero(mask))
-    if pixel_count <= 0:
-        return ()
-    selected = source[mask].astype(np.float32)
-    quantized = np.clip(np.floor((selected + 8.0) / 16.0), 0, 15).astype(
-        np.uint8
-    )
-    keys, inverse, counts = np.unique(
-        quantized, axis=0, return_inverse=True, return_counts=True
-    )
-    order = sorted(
-        range(len(counts)),
-        key=lambda index: (
-            -int(counts[index]),
-            tuple(int(value) for value in keys[index]),
-        ),
-    )[:16]
-    authorized_distance = cv2.distanceTransform(
-        mask.astype(np.uint8), cv2.DIST_L2, 5
-    )
-    overall_depth = float(np.percentile(authorized_distance[mask], 75))
-    flat_indices = np.flatnonzero(mask)
-    selected_chroma = selected.max(axis=1) - selected.min(axis=1)
-    total_chromatic = int(
-        np.count_nonzero(selected_chroma >= _ADDITIVE_FILL_MIN_CHROMA)
-    )
-    cohorts: list[_SpatialPaintCohort] = []
-    for cohort_index in order:
-        members = inverse == cohort_index
-        count = int(np.count_nonzero(members))
-        if count < 8:
-            continue
-        pixels = selected[members]
-        median = np.median(pixels, axis=0)
-        dispersion = float(
-            np.median(np.linalg.norm(pixels - median[None, :], axis=1))
-        )
-        cohort_mask = np.zeros(mask.size, dtype=bool)
-        cohort_mask[flat_indices[members]] = True
-        cohort_mask = cohort_mask.reshape(mask.shape)
-        chromatic_members = members & (
-            selected_chroma >= _ADDITIVE_FILL_MIN_CHROMA
-        )
-        chromatic_mask = np.zeros(mask.size, dtype=bool)
-        chromatic_mask[flat_indices[chromatic_members]] = True
-        chromatic_mask = chromatic_mask.reshape(mask.shape)
-        yy, xx = np.where(cohort_mask)
-        if xx.size <= 0 or yy.size <= 0:
-            continue
-        x0, x1 = int(xx.min()), int(xx.max()) + 1
-        y0, y1 = int(yy.min()), int(yy.max()) + 1
-        occupancy = count / max(1, (x1 - x0) * (y1 - y0))
-        _, _, stats, _ = cv2.connectedComponentsWithStats(
-            cohort_mask.astype(np.uint8), connectivity=8
-        )
-        significant = int(
-            sum(1 for row in stats[1:] if int(row[cv2.CC_STAT_AREA]) >= 8)
-        )
-        chromatic_count = int(np.count_nonzero(chromatic_mask))
-        cohorts.append(
-            _SpatialPaintCohort(
-                cohort_index=int(cohort_index),
-                quantized_key=tuple(int(value) for value in keys[cohort_index]),
-                color=_rgb_hex(median),
-                median_rgb=tuple(float(value) for value in median),
-                pixel_count=count,
-                mask_fraction=count / max(1, pixel_count),
-                color_dispersion_rgb=dispersion,
-                chroma_median=float(np.max(median) - np.min(median)),
-                chromatic_pixel_count=chromatic_count,
-                chromatic_fraction=(
-                    chromatic_count / max(1, total_chromatic)
-                ),
-                bbox_xywh=(x0, y0, x1 - x0, y1 - y0),
-                bbox_occupancy=occupancy,
-                border_margin_px=_mask_border_margin(cohort_mask),
-                depth_p50_px=float(
-                    np.percentile(authorized_distance[cohort_mask], 50)
-                ),
-                depth_p75_px=float(
-                    np.percentile(authorized_distance[cohort_mask], 75)
-                ),
-                depth_ratio=float(
-                    np.percentile(authorized_distance[cohort_mask], 75)
-                    / max(overall_depth, 1e-6)
-                ),
-                significant_component_count=significant,
-                mask=_readonly_array(cohort_mask, dtype=bool),
-                chromatic_mask=_readonly_array(chromatic_mask, dtype=bool),
-            )
-        )
-    return tuple(cohorts)
 
 
-def _canonical_paint_modes(
-    source: np.ndarray,
-    mask: np.ndarray,
-    cohorts: Sequence[_SpatialPaintCohort],
-) -> tuple[tuple[_CanonicalPaintMode, ...], float]:
-    """Group stable paint cohorts and score their medial topology."""
-
-    try:
-        import cv2
-    except Exception:
-        return (), 0.0
-    authorized_count = int(np.count_nonzero(mask))
-    if authorized_count <= 0:
-        return (), 0.0
-    authorized_distance = cv2.distanceTransform(
-        np.asarray(mask, dtype=np.uint8), cv2.DIST_L2, 5
-    )
-    authorized_depths = authorized_distance[mask]
-    if authorized_depths.size <= 0:
-        return (), 0.0
-    medial_threshold = max(
-        _CANONICAL_ROLE_MIN_MEDIAL_DEPTH_PX,
-        min(
-            _CANONICAL_ROLE_TARGET_MEDIAL_DEPTH_PX,
-            float(np.percentile(authorized_depths, 90)),
-        ),
-    )
-    stable = [
-        cohort
-        for cohort in cohorts
-        if cohort.pixel_count >= _CANONICAL_ROLE_MIN_CLUSTER_PIXELS
-        and cohort.color_dispersion_rgb
-        <= _CANONICAL_ROLE_MAX_COLOR_DISPERSION
-        and cohort.significant_component_count >= 1
-    ]
-    stable.sort(
-        key=lambda item: (
-            -item.pixel_count,
-            item.quantized_key,
-        )
-    )
-    groups: list[list[_SpatialPaintCohort]] = []
-    for cohort in stable:
-        cohort_rgb = np.asarray(cohort.median_rgb, dtype=np.float32)
-        eligible_groups: list[tuple[float, int]] = []
-        for group_index, group in enumerate(groups):
-            member_distances = [
-                float(
-                    np.linalg.norm(
-                        cohort_rgb
-                        - np.asarray(item.median_rgb, dtype=np.float32)
-                    )
-                )
-                for item in group
-            ]
-            if (
-                not member_distances
-                or max(member_distances)
-                > _CANONICAL_ROLE_MODE_MERGE_DISTANCE_RGB
-            ):
-                continue
-            weights = np.asarray(
-                [item.pixel_count for item in group], dtype=np.float32
-            )
-            colors = np.asarray(
-                [item.median_rgb for item in group], dtype=np.float32
-            )
-            group_rgb = np.average(colors, axis=0, weights=weights)
-            distance = float(np.linalg.norm(cohort_rgb - group_rgb))
-            eligible_groups.append((distance, group_index))
-        eligible_groups.sort()
-        if (
-            len(eligible_groups) == 1
-            or (
-                len(eligible_groups) > 1
-                and eligible_groups[1][0] - eligible_groups[0][0]
-                >= _CANONICAL_ROLE_MIN_ASSIGNMENT_MARGIN_RGB
-            )
-        ):
-            groups[eligible_groups[0][1]].append(cohort)
-        else:
-            groups.append([cohort])
-
-    maximum_depth = max(
-        _CANONICAL_ROLE_MIN_MEDIAL_DEPTH_PX,
-        float(np.percentile(authorized_depths, 95)),
-    )
-    authorized_medial_count = max(
-        1,
-        int(
-            np.count_nonzero(
-                mask & (authorized_distance >= medial_threshold)
-            )
-        ),
-    )
-    modes: list[_CanonicalPaintMode] = []
-    for group in groups:
-        group_mask = np.zeros(mask.shape, dtype=bool)
-        for cohort in group:
-            group_mask |= np.asarray(cohort.mask, dtype=bool)
-        group_mask &= mask
-        count = int(np.count_nonzero(group_mask))
-        if count < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS:
-            continue
-        pixels = source[group_mask].astype(np.float32)
-        median_rgb = np.median(pixels, axis=0)
-        medial = group_mask & (authorized_distance >= medial_threshold)
-        medial_count = int(np.count_nonzero(medial))
-        medial_fraction = medial_count / max(1, count)
-        medial_depth = (
-            float(np.percentile(authorized_distance[medial], 75))
-            if medial_count
-            else 0.0
-        )
-        medial_score = (
-            0.65 * medial_fraction
-            + 0.25 * min(1.0, medial_depth / max(maximum_depth, 1e-6))
-            + 0.10 * min(
-                1.0, medial_count / authorized_medial_count
-            )
-        )
-        representative = max(
-            group,
-            key=lambda item: (
-                item.pixel_count,
-                item.depth_p75_px,
-                -item.cohort_index,
-            ),
-        )
-        modes.append(
-            _CanonicalPaintMode(
-                representative_cohort_index=representative.cohort_index,
-                color=_rgb_hex(median_rgb),
-                median_rgb=tuple(float(value) for value in median_rgb),
-                pixel_count=count,
-                medial_pixel_count=medial_count,
-                medial_fraction=medial_fraction,
-                medial_depth_p75_px=medial_depth,
-                medial_score=medial_score,
-                cohort_indices=tuple(
-                    sorted(item.cohort_index for item in group)
-                ),
-                mask=_readonly_array(group_mask, dtype=bool),
-            )
-        )
-    modes.sort(
-        key=lambda item: (
-            -item.medial_score,
-            -item.medial_pixel_count,
-            -item.pixel_count,
-            item.color,
-        )
-    )
-    return tuple(modes), float(medial_threshold)
 
 
-def _canonical_mode_distance(
-    first: _CanonicalPaintMode,
-    second: _CanonicalPaintMode,
-) -> float:
-    return float(
-        np.linalg.norm(
-            np.asarray(first.median_rgb, dtype=np.float32)
-            - np.asarray(second.median_rgb, dtype=np.float32)
-        )
-    )
 
 
-def _canonical_mode_assignments(
-    source: np.ndarray,
-    mask: np.ndarray,
-    modes: Sequence[_CanonicalPaintMode],
-) -> tuple[np.ndarray, ...]:
-    """Expand raw mode support without consuming ambiguous/effect pixels."""
-
-    if not modes:
-        return ()
-    pixels = source.astype(np.float32)
-    distances = np.stack(
-        [
-            np.linalg.norm(
-                pixels
-                - np.asarray(mode.median_rgb, dtype=np.float32)[None, None, :],
-                axis=2,
-            )
-            for mode in modes
-        ],
-        axis=0,
-    )
-    nearest = np.argmin(distances, axis=0)
-    nearest_distance = np.min(distances, axis=0)
-    if len(modes) > 1:
-        second_distance = np.partition(distances, 1, axis=0)[1]
-        assignment_margin = second_distance - nearest_distance
-    else:
-        assignment_margin = np.full(mask.shape, np.inf, dtype=np.float32)
-    assignments = [
-        np.asarray(mode.mask, dtype=bool).copy() & mask for mode in modes
-    ]
-    already_claimed = np.logical_or.reduce(assignments)
-    expandable = (
-        mask
-        & ~already_claimed
-        & (
-            nearest_distance
-            <= _CANONICAL_ROLE_MAX_ASSIGNMENT_DISTANCE_RGB
-        )
-        & (
-            assignment_margin
-            >= _CANONICAL_ROLE_MIN_ASSIGNMENT_MARGIN_RGB
-        )
-    )
-    for index, assignment in enumerate(assignments):
-        assignment |= expandable & (nearest == index)
-    return tuple(
-        np.ascontiguousarray(assignment, dtype=bool)
-        for assignment in assignments
-    )
 
 
-def _canonical_shell_candidate(
-    source: np.ndarray,
-    mask: np.ndarray,
-    *,
-    core_mode: _CanonicalPaintMode,
-    shell_modes: Sequence[_CanonicalPaintMode],
-    core_mask: np.ndarray,
-    shell_mask: np.ndarray,
-) -> tuple[_SpatialOutlineRole | None, dict[str, Any]]:
-    """Qualify one aggregate shell using authorized radial topology."""
-
-    representative = max(
-        shell_modes,
-        key=lambda mode: (
-            mode.pixel_count,
-            mode.medial_pixel_count,
-            -mode.representative_cohort_index,
-        ),
-    )
-    audit: dict[str, Any] = {
-        "shell_mode_colors": [mode.color for mode in shell_modes],
-        "shell_mode_cohort_indices": [
-            int(mode.representative_cohort_index)
-            for mode in shell_modes
-        ],
-        "status": "unavailable",
-    }
-    try:
-        import cv2
-    except Exception:
-        audit["reason"] = "canonical_shell_backend_unavailable"
-        return None, audit
-    core_count = int(np.count_nonzero(core_mask))
-    shell_count = int(np.count_nonzero(shell_mask))
-    if (
-        core_count < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS
-        or shell_count < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS
-    ):
-        audit["reason"] = "canonical_shell_insufficient_paint_support"
-        return None, audit
-    shell_rgb = np.median(
-        source[shell_mask].astype(np.float32), axis=0
-    )
-    color_distance = float(
-        np.linalg.norm(
-            np.asarray(core_mode.median_rgb, dtype=np.float32)
-            - shell_rgb
-        )
-    )
-    if color_distance < _CANONICAL_ROLE_MIN_MODE_DISTANCE_RGB:
-        audit["reason"] = "canonical_shell_insufficient_color_separation"
-        return None, audit
-    distance_to_core = cv2.distanceTransform(
-        (~np.asarray(core_mask, dtype=bool)).astype(np.uint8),
-        cv2.DIST_L2,
-        5,
-    )
-    radial_values = distance_to_core[shell_mask]
-    if radial_values.size <= 0:
-        audit["reason"] = "canonical_shell_radial_support_unavailable"
-        return None, audit
-    radial_p90 = float(np.percentile(radial_values, 90))
-    audit["radial_distance_p90_px"] = round(radial_p90, 6)
-    if radial_p90 <= _CANONICAL_ROLE_MIN_RADIAL_WIDTH_PX:
-        audit["reason"] = "canonical_native_antialias_shell_rejected"
-        return None, audit
-    if radial_p90 > _CANONICAL_ROLE_MAX_RADIAL_WIDTH_PX:
-        audit["reason"] = "canonical_shell_radial_width_excessive"
-        return None, audit
-    radius = max(1, int(np.ceil(radial_p90)))
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (radius * 2 + 1, radius * 2 + 1),
-    )
-    predicted_ring = (
-        cv2.dilate(core_mask.astype(np.uint8), kernel).astype(bool)
-        & mask
-        & ~core_mask
-    )
-    intersection = int(np.count_nonzero(predicted_ring & shell_mask))
-    shell_recall = intersection / max(1, shell_count)
-    ring_precision = intersection / max(
-        1, int(np.count_nonzero(predicted_ring))
-    )
-    pair_fraction = int(
-        np.count_nonzero(core_mask | shell_mask)
-    ) / max(1, int(np.count_nonzero(mask)))
-    audit.update(
-        {
-            "pair_mask_fraction": round(pair_fraction, 8),
-            "shell_ring_recall": round(shell_recall, 8),
-            "ring_shell_precision": round(ring_precision, 8),
-            "color_distance_rgb": round(color_distance, 6),
-        }
-    )
-    if (
-        pair_fraction < _CANONICAL_ROLE_MIN_PAIR_MASK_FRACTION
-        or shell_recall < _CANONICAL_ROLE_MIN_SHELL_RING_RECALL
-        or ring_precision < _CANONICAL_ROLE_MIN_RING_SHELL_PRECISION
-    ):
-        audit["reason"] = "canonical_shell_topology_unqualified"
-        return None, audit
-    shell_depth = float(
-        np.average(
-            [mode.medial_depth_p75_px for mode in shell_modes],
-            weights=[max(1, mode.pixel_count) for mode in shell_modes],
-        )
-    )
-    depth_delta = core_mode.medial_depth_p75_px - shell_depth
-    geometric_support = min(pair_fraction, shell_recall, ring_precision)
-    role = _SpatialOutlineRole(
-        core_cohort_index=core_mode.representative_cohort_index,
-        shell_cohort_index=representative.representative_cohort_index,
-        core_color=core_mode.color,
-        shell_color=_rgb_hex(shell_rgb),
-        width_px=radial_p90,
-        pair_mask_fraction=pair_fraction,
-        core_shell_depth_delta_px=depth_delta,
-        shell_ring_recall=shell_recall,
-        ring_shell_precision=ring_precision,
-        color_distance_rgb=color_distance,
-        confidence=min(0.98, 0.62 + 0.34 * geometric_support),
-    )
-    audit["status"] = "supported"
-    audit["reason"] = "canonical_unique_concentric_shell"
-    return role, audit
-def _resolve_canonical_spatial_roles(
-    source: np.ndarray,
-    mask: np.ndarray,
-    cohorts: Sequence[_SpatialPaintCohort],
-) -> _CanonicalSpatialRoles:
-    """Resolve one topology-first core/shell/effect fact set."""
-
-    empty = np.zeros(mask.shape, dtype=bool)
-    modes, medial_threshold = _canonical_paint_modes(source, mask, cohorts)
-    supported_modes = [
-        mode
-        for mode in modes
-        if mode.medial_pixel_count >= _CANONICAL_ROLE_MIN_MEDIAL_PIXELS
-        and mode.medial_score >= _CANONICAL_ROLE_MIN_MEDIAL_SCORE
-    ]
-    base_support: dict[str, Any] = {
-        "authorized_pixel_count": int(np.count_nonzero(mask)),
-        "medial_threshold_px": round(medial_threshold, 6),
-        "supported_mode_count": len(supported_modes),
-    }
-    if not supported_modes:
-        return _CanonicalSpatialRoles(
-            core_role_status="unavailable",
-            core_role_reason="canonical_medial_paint_core_unavailable",
-            core_resolution="unresolved_canonical_medial_topology",
-            core_color="",
-            support_color="",
-            core_mask=_readonly_array(empty, dtype=bool),
-            shell_mask=_readonly_array(empty, dtype=bool),
-            effect_mask=_readonly_array(empty, dtype=bool),
-            medial_threshold_px=medial_threshold,
-            paint_modes=modes,
-            role_support=MappingProxyType(base_support),
-        )
-
-    core_mode = supported_modes[0]
-    competing_modes = [
-        mode
-        for mode in supported_modes[1:]
-        if _canonical_mode_distance(core_mode, mode)
-        >= _CANONICAL_ROLE_MIN_MODE_DISTANCE_RGB
-    ]
-    score_margin = (
-        core_mode.medial_score - competing_modes[0].medial_score
-        if competing_modes
-        else 1.0
-    )
-    score_ratio = (
-        core_mode.medial_score
-        / max(competing_modes[0].medial_score, 1e-6)
-        if competing_modes
-        else float("inf")
-    )
-    base_support.update(
-        {
-            "selected_core_color": core_mode.color,
-            "selected_core_cohort_index": int(
-                core_mode.representative_cohort_index
-            ),
-            "selected_core_medial_score": round(
-                core_mode.medial_score, 8
-            ),
-            "competing_core_color": (
-                competing_modes[0].color if competing_modes else ""
-            ),
-            "core_medial_score_margin": round(score_margin, 8),
-            "core_medial_score_ratio": (
-                round(score_ratio, 8)
-                if np.isfinite(score_ratio)
-                else "infinite"
-            ),
-        }
-    )
-    if (
-        competing_modes
-        and (
-            score_margin < _CANONICAL_ROLE_MIN_MEDIAL_SCORE_MARGIN
-            or score_ratio < _CANONICAL_ROLE_MIN_MEDIAL_SCORE_RATIO
-        )
-    ):
-        return _CanonicalSpatialRoles(
-            core_role_status="ambiguous",
-            core_role_reason="canonical_medial_paint_core_competing_modes",
-            core_resolution="unresolved_canonical_medial_topology",
-            core_color="",
-            support_color="",
-            core_mask=_readonly_array(empty, dtype=bool),
-            shell_mask=_readonly_array(empty, dtype=bool),
-            effect_mask=_readonly_array(empty, dtype=bool),
-            medial_threshold_px=medial_threshold,
-            paint_modes=modes,
-            role_support=MappingProxyType(base_support),
-        )
-
-    assignments = _canonical_mode_assignments(source, mask, modes)
-    core_index = modes.index(core_mode)
-    core_mask = np.asarray(assignments[core_index], dtype=bool).copy()
-    core_mode_indices = {core_index}
-    for mode_index, mode in enumerate(modes):
-        if (
-            mode_index != core_index
-            and _canonical_mode_distance(core_mode, mode)
-            < _CANONICAL_ROLE_MIN_MODE_DISTANCE_RGB
-        ):
-            core_mask |= np.asarray(assignments[mode_index], dtype=bool)
-            core_mode_indices.add(mode_index)
-    if int(np.count_nonzero(core_mask)) < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS:
-        return _CanonicalSpatialRoles(
-            core_role_status="unavailable",
-            core_role_reason="canonical_medial_paint_core_insufficient_support",
-            core_resolution="unresolved_canonical_medial_topology",
-            core_color="",
-            support_color="",
-            core_mask=_readonly_array(empty, dtype=bool),
-            shell_mask=_readonly_array(empty, dtype=bool),
-            effect_mask=_readonly_array(empty, dtype=bool),
-            medial_threshold_px=medial_threshold,
-            paint_modes=modes,
-            role_support=MappingProxyType(base_support),
-        )
-
-    shell_candidates: list[
-        tuple[_SpatialOutlineRole, tuple[int, ...], np.ndarray, dict[str, Any]]
-    ] = []
-    shell_audits: list[dict[str, Any]] = []
-    radial_groups: dict[str, list[int]] = {
-        "darker": [],
-        "lighter": [],
-    }
-    radial_mode_audits: list[dict[str, Any]] = []
-    try:
-        import cv2
-
-        distance_to_core = cv2.distanceTransform(
-            (~core_mask).astype(np.uint8), cv2.DIST_L2, 5
-        )
-        core_luma = float(
-            np.dot(
-                np.asarray(core_mode.median_rgb, dtype=np.float32),
-                np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32),
-            )
-        )
-        for mode_index, mode in enumerate(modes):
-            if mode_index in core_mode_indices:
-                continue
-            mode_mask = np.asarray(assignments[mode_index], dtype=bool)
-            mode_count = int(np.count_nonzero(mode_mask))
-            if mode_count < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS:
-                continue
-            radial_values = distance_to_core[mode_mask]
-            if radial_values.size <= 0:
-                continue
-            radial_p90 = float(np.percentile(radial_values, 90))
-            radius = max(1, int(np.ceil(radial_p90)))
-            predicted_ring = (
-                cv2.dilate(
-                    core_mask.astype(np.uint8),
-                    cv2.getStructuringElement(
-                        cv2.MORPH_ELLIPSE,
-                        (radius * 2 + 1, radius * 2 + 1),
-                    ),
-                ).astype(bool)
-                & mask
-                & ~core_mask
-            )
-            radial_recall = int(
-                np.count_nonzero(predicted_ring & mode_mask)
-            ) / max(1, mode_count)
-            mode_luma = float(
-                np.dot(
-                    np.asarray(mode.median_rgb, dtype=np.float32),
-                    np.asarray(
-                        (0.2126, 0.7152, 0.0722),
-                        dtype=np.float32,
-                    ),
-                )
-            )
-            polarity = "lighter" if mode_luma >= core_luma else "darker"
-            qualified = bool(
-                radial_p90 <= _CANONICAL_ROLE_MAX_RADIAL_WIDTH_PX
-                and radial_recall >= _CANONICAL_ROLE_MIN_SHELL_RING_RECALL
-            )
-            radial_mode_audits.append(
-                {
-                    "mode_color": mode.color,
-                    "mode_cohort_index": int(
-                        mode.representative_cohort_index
-                    ),
-                    "radial_polarity": polarity,
-                    "radial_distance_p90_px": round(radial_p90, 6),
-                    "radial_recall": round(radial_recall, 8),
-                    "aggregate_shell_eligible": qualified,
-                }
-            )
-            if qualified:
-                radial_groups[polarity].append(mode_index)
-    except Exception:
-        radial_mode_audits.append(
-            {
-                "aggregate_shell_eligible": False,
-                "reason": "canonical_shell_grouping_backend_unavailable",
-            }
-        )
-    base_support["radial_shell_modes"] = radial_mode_audits
-
-    for polarity, shell_indices in radial_groups.items():
-        if not shell_indices:
-            continue
-        aggregate_shell = np.logical_or.reduce(
-            [
-                np.asarray(assignments[index], dtype=bool)
-                for index in shell_indices
-            ]
-        )
-        role, audit = _canonical_shell_candidate(
-            source,
-            mask,
-            core_mode=core_mode,
-            shell_modes=[modes[index] for index in shell_indices],
-            core_mask=core_mask,
-            shell_mask=aggregate_shell,
-        )
-        audit["radial_polarity"] = polarity
-        shell_audits.append(audit)
-        if role is not None:
-            shell_candidates.append(
-                (
-                    role,
-                    tuple(shell_indices),
-                    np.asarray(aggregate_shell, dtype=bool),
-                    audit,
-                )
-            )
-    base_support["shell_candidates"] = shell_audits
-
-    outline_role: _SpatialOutlineRole | None = None
-    outline_status = "unavailable"
-    outline_reason = "canonical_shell_unavailable"
-    shell_mask = empty
-    support_color = ""
-    if len(shell_candidates) == 1:
-        outline_role, _, selected_shell, _ = shell_candidates[0]
-        shell_mask = np.asarray(selected_shell, dtype=bool)
-        support_color = outline_role.shell_color
-        outline_status = "supported"
-        outline_reason = "canonical_unique_concentric_shell"
-    elif len(shell_candidates) > 1:
-        outline_status = "ambiguous"
-        outline_reason = "canonical_competing_concentric_shells"
-    elif any(
-        str(item.get("reason") or "")
-        == "canonical_native_antialias_shell_rejected"
-        for item in shell_audits
-    ):
-        outline_reason = "canonical_native_antialias_shell_rejected"
-    elif shell_audits:
-        outline_reason = "canonical_no_concentric_shell"
-
-    effect_mask = (
-        np.zeros(mask.shape, dtype=bool)
-        if outline_status == "ambiguous"
-        else mask & ~core_mask & ~shell_mask
-    )
-    return _CanonicalSpatialRoles(
-        core_role_status="supported",
-        core_role_reason="canonical_medial_paint_core_supported",
-        core_resolution="canonical_medial_paint_core",
-        core_color=core_mode.color,
-        support_color=support_color,
-        core_mask=_readonly_array(core_mask, dtype=bool),
-        shell_mask=_readonly_array(shell_mask, dtype=bool),
-        effect_mask=_readonly_array(effect_mask, dtype=bool),
-        outline_role=outline_role,
-        outline_role_status=outline_status,
-        outline_role_reason=outline_reason,
-        medial_threshold_px=medial_threshold,
-        paint_modes=modes,
-        role_support=MappingProxyType(base_support),
-    )
 
 
-def build_authorized_style_spatial_fact_set(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
-    *,
-    view: AuthorizedSourceStyleView | None = None,
-) -> AuthorizedStyleSpatialFactSet:
-    """Build the single runtime fact set consumed by all source-style axes."""
-
-    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
-    mask = np.ascontiguousarray(mask_crop, dtype=bool)
-    external_ring, ring_facts = _external_source_surface_ring(mask)
-    cohorts = _spatial_paint_cohorts(source, mask)
-    roles = _resolve_canonical_spatial_roles(source, mask, cohorts)
-    core = np.ascontiguousarray(roles.core_mask, dtype=bool)
-    concentric_shell = np.ascontiguousarray(roles.shell_mask, dtype=bool)
-    displaced_effect = np.ascontiguousarray(roles.effect_mask, dtype=bool)
-
-    luma = (
-        source[:, :, 0].astype(np.float32) * 0.2126
-        + source[:, :, 1].astype(np.float32) * 0.7152
-        + source[:, :, 2].astype(np.float32) * 0.0722
-    )
-    core_supported = (
-        roles.core_role_status == "supported"
-        and int(np.count_nonzero(core)) >= _CANONICAL_ROLE_MIN_CLUSTER_PIXELS
-    )
-    core_luma = float(np.median(luma[core])) if core_supported else 127.0
-    # Detector matte polarity belongs only to a resolved canonical core.
-    # External pixels never vote on direct paint, scale, or weight axes.
-    fill_polarity = (
-        ("dark" if core_luma < 128.0 else "light")
-        if core_supported
-        else ""
-    )
-    primary_matte = (
-        255 if fill_polarity == "dark"
-        else 0 if fill_polarity == "light"
-        else 127
-    )
-    primary = np.full_like(source, primary_matte, dtype=np.uint8)
-    if core_supported:
-        primary[core] = source[core]
-    neutral = np.full_like(source, 127, dtype=np.uint8)
-    if core_supported:
-        neutral[core] = source[core]
-    detector_sha256 = _array_sha256(primary) if core_supported else ""
-    identity_payload = {
-        "authorized_source_style_view_version": AUTHORIZED_SOURCE_STYLE_VIEW_VERSION,
-        "page_id": view.page_id if view is not None else "",
-        "view_id": view.view_id if view is not None else "",
-        "bundle_id": view.bundle_id if view is not None else "",
-        "parent_id": view.parent_id if view is not None else "",
-        "root_id": view.root_id if view is not None else "",
-        "content_bbox": list(view.content_bbox) if view is not None else [],
-        "analysis_bbox": list(view.analysis_bbox) if view is not None else [],
-        "cleanup_mask_ids": (
-            list(view.cleanup_mask_ids) if view is not None else []
-        ),
-        "owned_component_ids": (
-            list(view.owned_component_ids) if view is not None else []
-        ),
-        "crop_shape": [int(source.shape[0]), int(source.shape[1])],
-        "authorized_mask_sha256": _array_sha256(mask),
-        "authorized_pixel_sha256": _array_sha256(source[mask]),
-        "external_surface_ring_version": EXTERNAL_SOURCE_SURFACE_RING_VERSION,
-        "external_surface_ring_inner_radius_px": float(
-            ring_facts.get("inner_radius_px") or 0.0
-        ),
-        "external_surface_ring_outer_radius_px": float(
-            ring_facts.get("outer_radius_px") or 0.0
-        ),
-        "external_surface_ring_pixel_count": int(
-            ring_facts.get("pixel_count") or 0
-        ),
-        "external_surface_ring_mask_sha256": _array_sha256(external_ring),
-        "external_surface_ring_pixel_sha256": _array_sha256(
-            source[external_ring]
-        ),
-        "detector_input_sha256": detector_sha256,
-    }
-    immutable_identity = MappingProxyType(
-        {
-            key: tuple(value) if isinstance(value, list) else value
-            for key, value in identity_payload.items()
-        }
-    )
-    return AuthorizedStyleSpatialFactSet(
-        contract_version=AUTHORIZED_STYLE_SPATIAL_FACT_SET_VERSION,
-        fact_set_id=_perceptual_fact_set_id(identity_payload),
-        source_identity=immutable_identity,
-        core_resolution=roles.core_resolution,
-        core_role_status=roles.core_role_status,
-        core_role_reason=roles.core_role_reason,
-        core_role_support=MappingProxyType(roles.audit_dict()),
-        core_color=roles.core_color,
-        support_color=roles.support_color,
-        fill_polarity=fill_polarity,
-        paint_cohorts=cohorts,
-        outline_role=roles.outline_role,
-        outline_role_status=roles.outline_role_status,
-        outline_role_reason=roles.outline_role_reason,
-        source_rgb=_readonly_array(source, dtype=np.uint8),
-        authorized_mask=_readonly_array(mask, dtype=bool),
-        character_core_mask=_readonly_array(core, dtype=bool),
-        concentric_shell_mask=_readonly_array(concentric_shell, dtype=bool),
-        displaced_effect_mask=_readonly_array(displaced_effect, dtype=bool),
-        external_surface_ring_mask=_readonly_array(external_ring, dtype=bool),
-        detector_primary_rgb=_readonly_array(primary, dtype=np.uint8),
-        detector_neutral_rgb=_readonly_array(neutral, dtype=np.uint8),
-    )
 
 
 @dataclass(frozen=True)
@@ -1955,6 +886,25 @@ class _IndependentGlyphGeometry:
 
 
 @dataclass(frozen=True)
+class _NativeAuthorizedGlyphGeometry:
+    """One native-pixel glyph hypothesis shared by scale and weight only."""
+
+    status: str
+    source: Any = field(repr=False, compare=False)
+    authorized_mask: Any = field(repr=False, compare=False)
+    glyph_mask: Any = field(repr=False, compare=False)
+    luma_strength: Any = field(repr=False, compare=False)
+    polarity: str = ""
+    component_facts: tuple[Mapping[str, Any], ...] = ()
+    reason_codes: tuple[str, ...] = ()
+    support: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def available(self) -> bool:
+        return self.status == "supported" and bool(self.component_facts)
+
+
+@dataclass(frozen=True)
 class _IndependentScaleMeasurement:
     axis_evidence: SourceStyleAxisEvidence
     glyph_mask: Any = field(repr=False, compare=False)
@@ -1966,6 +916,11 @@ class _IndependentScaleMeasurement:
     horizontal_support: str = ""
     vertical_qualification: Mapping[str, Any] = field(default_factory=dict)
     horizontal_qualification: Mapping[str, Any] = field(default_factory=dict)
+    native_geometry: _NativeAuthorizedGlyphGeometry | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -2105,435 +1060,506 @@ def _independent_glyph_geometry(
     )
 
 
-def _reference_character_component_size(
-    mask_binary: np.ndarray,
-) -> tuple[float, int, float]:
+def _native_authorized_candidate(
+    authorized_mask: np.ndarray,
+    luma: np.ndarray,
+    *,
+    polarity: str,
+    low_luma: float,
+    high_luma: float,
+) -> dict[str, Any]:
+    """Measure one contrast polarity without making a paint decision."""
+
+    mask = np.asarray(authorized_mask, dtype=bool)
+    contrast_span = max(0.0, float(high_luma) - float(low_luma))
+    reasons: list[str] = []
+    if polarity == "dark":
+        if contrast_span >= 20.0:
+            threshold = min(205.0, float(high_luma) - 20.0)
+            glyph = mask & (luma <= threshold)
+            strength = np.clip(
+                (float(high_luma) - luma) / max(20.0, contrast_span),
+                0.0,
+                1.0,
+            )
+        elif float(high_luma) <= 205.0:
+            threshold = min(205.0, float(high_luma) + 1.0)
+            glyph = mask.copy()
+            strength = np.clip((255.0 - luma) / 255.0, 0.0, 1.0)
+            reasons.append("uniform_authorized_dark_candidate")
+        else:
+            threshold = min(205.0, float(high_luma) - 20.0)
+            glyph = np.zeros_like(mask, dtype=bool)
+            strength = np.zeros_like(luma, dtype=np.float32)
+    else:
+        if contrast_span >= 20.0:
+            threshold = max(50.0, float(low_luma) + 20.0)
+            glyph = mask & (luma >= threshold)
+            strength = np.clip(
+                (luma - float(low_luma)) / max(20.0, contrast_span),
+                0.0,
+                1.0,
+            )
+        elif float(low_luma) >= 50.0:
+            threshold = max(50.0, float(low_luma) - 1.0)
+            glyph = mask.copy()
+            strength = np.clip(luma / 255.0, 0.0, 1.0)
+            reasons.append("uniform_authorized_light_candidate")
+        else:
+            threshold = max(50.0, float(low_luma) + 20.0)
+            glyph = np.zeros_like(mask, dtype=bool)
+            strength = np.zeros_like(luma, dtype=np.float32)
+
+    component_facts: list[dict[str, Any]] = []
+    rejected_fragment_count = 0
     try:
         import cv2
 
-        count, _, stats, _ = cv2.connectedComponentsWithStats(
-            np.asarray(mask_binary, dtype=np.uint8), connectivity=8
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            np.asarray(glyph, dtype=np.uint8), connectivity=8
         )
+        for index in range(1, count):
+            x0 = int(stats[index, 0])
+            y0 = int(stats[index, 1])
+            width = int(stats[index, 2])
+            height = int(stats[index, 3])
+            area = int(stats[index, 4])
+            short = min(width, height)
+            long = max(width, height)
+            if (
+                area < 6
+                or short < 2
+                or long / max(1, short) > 2.2
+            ):
+                rejected_fragment_count += 1
+                continue
+            component = np.asarray(
+                labels[y0 : y0 + height, x0 : x0 + width] == index,
+                dtype=np.uint8,
+            )
+            contours, _ = cv2.findContours(
+                component,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_NONE,
+            )
+            contour = max(contours, key=cv2.contourArea) if contours else None
+            contour_area = (
+                float(cv2.contourArea(contour))
+                if contour is not None
+                else 0.0
+            )
+            perimeter = (
+                float(cv2.arcLength(contour, True))
+                if contour is not None
+                else 0.0
+            )
+            hull = cv2.convexHull(contour) if contour is not None else None
+            hull_area = (
+                float(cv2.contourArea(hull)) if hull is not None else 0.0
+            )
+            occupancy = float(area) / float(max(1, width * height))
+            circularity = (
+                float(
+                    4.0
+                    * np.pi
+                    * contour_area
+                    / max(perimeter * perimeter, 1e-6)
+                )
+                if contour_area > 0.0 and perimeter > 0.0
+                else 0.0
+            )
+            solidity = (
+                contour_area / max(hull_area, 1e-6)
+                if hull_area > 0.0
+                else 0.0
+            )
+            normalized_compact_mark = bool(
+                long / max(1, short) <= 1.60
+                and occupancy >= 0.50
+                and circularity >= 0.50
+                and solidity >= 0.88
+            )
+            punctuation_fragment = bool(
+                normalized_compact_mark
+                and long / max(1, short) <= 1.35
+            )
+            component_pixels = (
+                labels[y0 : y0 + height, x0 : x0 + width] == index
+            )
+            weighted_ink_area = float(
+                np.sum(
+                    np.asarray(strength, dtype=np.float32)[
+                        y0 : y0 + height,
+                        x0 : x0 + width,
+                    ][component_pixels]
+                )
+            )
+            component_facts.append(
+                {
+                    "component_index": int(index),
+                    "bbox_xywh": [x0, y0, width, height],
+                    "center_xy": [
+                        round(float(centroids[index, 0]), 6),
+                        round(float(centroids[index, 1]), 6),
+                    ],
+                    "area_px": area,
+                    "weighted_ink_area_px": round(weighted_ink_area, 8),
+                    "width_px": float(width),
+                    "height_px": float(height),
+                    "long_span_px": float(long),
+                    "bbox_area_px": float(width * height),
+                    "bbox_occupancy": round(occupancy, 8),
+                    "contour_perimeter_px": round(perimeter, 8),
+                    "contour_circularity": round(circularity, 8),
+                    "contour_solidity": round(solidity, 8),
+                    "normalized_compact_mark": normalized_compact_mark,
+                    "punctuation_fragment": punctuation_fragment,
+                }
+            )
     except Exception:
-        return 0.0, 0, 0.0
-    sizes: list[float] = []
-    for index in range(1, count):
-        width = int(stats[index, 2])
-        height = int(stats[index, 3])
-        area = int(stats[index, 4])
-        short = min(width, height)
-        long = max(width, height)
-        if area < 6 or short <= 0 or long / short > 2.2:
-            continue
-        sizes.append(float(long))
-    if not sizes:
-        return 0.0, 0, 0.0
-    median = float(np.median(sizes))
-    mad = float(
-        np.median(np.abs(np.asarray(sizes, dtype=np.float32) - median))
-    )
-    return float(np.percentile(sizes, 70)), len(sizes), mad
+        labels = np.zeros_like(glyph, dtype=np.int32)
+        reasons.append("native_component_geometry_unavailable")
 
-
-def _reference_source_cell_size_from_geometry(
-    spans: Sequence[float],
-    *,
-    component_size: float,
-    component_count: int,
-    component_mad: float,
-) -> tuple[float, float]:
-    clean_spans = [float(value) for value in spans if float(value) >= 3.0]
-    span_median = float(np.median(clean_spans)) if clean_spans else 0.0
-    component_size = max(0.0, float(component_size))
-    if component_size > 0 and span_median > 0:
-        if (
-            len(clean_spans) <= 2
-            and component_count <= 6
-            and component_size < span_median * 0.65
-            and span_median <= component_size * 3.0
-        ):
-            return span_median, 0.72
-        if component_count <= 2 and component_size > span_median * 1.5:
-            return span_median, 0.74
-        compatible = [
-            value
-            for value in clean_spans
-            if component_size * 0.5 <= value <= component_size * 1.85
-        ]
-        if compatible:
-            span_value = float(np.median(compatible))
-            size = float(np.median([component_size, span_value]))
-            variability = component_mad / max(1.0, component_size)
-            confidence = max(0.62, min(0.94, 0.92 - variability * 0.35))
-            return size, confidence
-        return component_size, max(
-            0.58, min(0.86, 0.62 + component_count * 0.015)
-        )
-    if span_median > 0:
-        return span_median, 0.72 if len(clean_spans) > 1 else 0.64
-    if component_size > 0:
-        return component_size, max(
-            0.55, min(0.82, 0.58 + component_count * 0.012)
-        )
-    return 0.0, 0.0
-
-
-def _reference_stable_upper_cell_cohort(
-    values: Sequence[float],
-    *,
-    minimum_count: int,
-) -> tuple[float, int, float]:
-    clean = np.asarray(
-        [float(value) for value in values if float(value) >= 3.0],
-        dtype=np.float32,
-    )
-    if clean.size < minimum_count:
-        return 0.0, int(clean.size), 0.0
-    upper_reference = float(np.percentile(clean, 75))
-    cohort = clean[clean >= max(3.0, upper_reference * 0.60)]
-    if cohort.size < minimum_count:
-        return 0.0, int(cohort.size), 0.0
-    median = float(np.median(cohort))
-    relative_mad = float(
-        np.median(np.abs(cohort - median)) / max(1.0, median)
-    )
-    if relative_mad > 0.20:
-        return 0.0, int(cohort.size), relative_mad
-    return median, int(cohort.size), relative_mad
-
-
-def _reference_fill_component_cell_sizes(fill: np.ndarray) -> list[float]:
-    try:
-        import cv2
-
-        count, _, stats, _ = cv2.connectedComponentsWithStats(
-            np.asarray(fill, dtype=np.uint8), connectivity=8
-        )
-    except Exception:
-        return []
-    sizes: list[float] = []
-    for index in range(1, count):
-        width = int(stats[index, 2])
-        height = int(stats[index, 3])
-        area = int(stats[index, 4])
-        short = min(width, height)
-        long = max(width, height)
-        if area < 6 or short < 3 or long / max(1, short) > 2.2:
-            continue
-        sizes.append(float(long))
-    return sizes
-
-
-def _reference_qualify_source_cell_measurement(
-    fill: np.ndarray,
-    *,
-    axis: int,
-    spans: Sequence[float],
-    legacy_size: float,
-    legacy_confidence: float,
-    fill_component_sizes: Sequence[float],
-) -> tuple[float, float, str, dict[str, Any]]:
-    binary = np.asarray(fill, dtype=bool)
-    legacy_size = max(0.0, float(legacy_size))
-    legacy_confidence = max(0.0, float(legacy_confidence))
-    raw_candidate, raw_count, raw_relative_mad = (
-        _reference_stable_upper_cell_cohort(spans, minimum_count=1)
-    )
-    fill_candidate, fill_count, fill_relative_mad = (
-        _reference_stable_upper_cell_cohort(
-            fill_component_sizes, minimum_count=3
-        )
-    )
-    axis_extent = int(binary.shape[1] if axis == 0 else binary.shape[0])
-    orthogonal_extent = int(binary.shape[0] if axis == 0 else binary.shape[1])
-    coordinates = np.where(binary)
-    orthogonal_coordinates = coordinates[0] if axis == 0 else coordinates[1]
-    filled_orthogonal_extent = (
-        int(np.ptp(orthogonal_coordinates)) + 1
-        if orthogonal_coordinates.size
-        else 0
-    )
-    raw_max = max((float(value) for value in spans), default=0.0)
-    parent_sized_island = bool(
-        axis_extent > 0
-        and orthogonal_extent > 0
-        and raw_max >= axis_extent * 0.78
-        and filled_orthogonal_extent >= orthogonal_extent * 0.78
-    )
-    density_spans: list[float] = []
-    density_candidate = 0.0
-    density_count = 0
-    density_relative_mad = 0.0
-    density_minimum_occupancy = 0
-    if parent_sized_island:
-        density_minimum_occupancy = max(
-            2, int(round(orthogonal_extent * 0.10))
-        )
-        density_spans = _projection_spans_at_min_occupancy(
-            binary,
-            axis=axis,
-            minimum_occupancy=density_minimum_occupancy,
-        )
-        density_candidate, density_count, density_relative_mad = (
-            _reference_stable_upper_cell_cohort(
-                density_spans, minimum_count=3
-            )
-        )
-    audit = {
-        "legacy_size": round(legacy_size, 6),
-        "legacy_confidence": round(legacy_confidence, 8),
-        "raw_projection_candidate": round(raw_candidate, 6),
-        "raw_projection_candidate_count": int(raw_count),
-        "raw_projection_relative_mad": round(raw_relative_mad, 8),
-        "fill_component_candidate": round(fill_candidate, 6),
-        "fill_component_candidate_count": int(fill_count),
-        "fill_component_relative_mad": round(fill_relative_mad, 8),
-        "axis_extent": axis_extent,
-        "orthogonal_extent": orthogonal_extent,
-        "filled_orthogonal_extent": filled_orthogonal_extent,
-        "parent_sized_island": parent_sized_island,
-        "density_minimum_occupancy": density_minimum_occupancy,
-        "density_spans": [round(float(value), 6) for value in density_spans],
-        "density_candidate": round(density_candidate, 6),
-        "density_candidate_count": int(density_count),
-        "density_relative_mad": round(density_relative_mad, 8),
-    }
-    if parent_sized_island:
-        if density_candidate > 0.0 and raw_max >= density_candidate * 2.2:
-            confidence = max(
-                0.72, min(0.90, 0.86 - density_relative_mad * 0.40)
-            )
-            return (
-                density_candidate,
-                confidence,
-                "supported_density_decomposition",
-                audit,
-            )
-        return 0.0, 0.0, "unavailable_parent_sized_island", audit
-    fill_projection_agree = bool(
-        raw_candidate > 0.0
-        and fill_candidate > 0.0
-        and 0.70 <= raw_candidate / fill_candidate <= 1.35
-    )
-    if fill_projection_agree and (
-        legacy_size < min(raw_candidate, fill_candidate) * 0.65
-        or legacy_size > max(raw_candidate, fill_candidate) * 1.55
-    ):
-        repaired = float(np.median([raw_candidate, fill_candidate]))
-        confidence = max(
-            0.72,
-            min(
-                0.92,
-                0.84
-                - max(raw_relative_mad, fill_relative_mad) * 0.35
-                + min(0.06, (raw_count + fill_count) * 0.003),
-            ),
-        )
-        return repaired, confidence, "supported_fill_projection_override", audit
-    raw_matches = bool(
-        raw_candidate > 0.0
-        and 0.55 <= legacy_size / raw_candidate <= 1.65
-    )
-    fill_matches = bool(
-        fill_candidate > 0.0
-        and 0.60 <= legacy_size / fill_candidate <= 1.60
-    )
-    if legacy_size > 0.0 and legacy_confidence > 0.0 and (
-        raw_matches or fill_matches
-    ):
-        return (
-            legacy_size,
-            legacy_confidence,
-            "supported_independent_corroboration",
-            audit,
-        )
-    if fill_projection_agree:
-        inferred = float(np.median([raw_candidate, fill_candidate]))
-        return inferred, 0.72, "supported_fill_projection_inference", audit
-    return 0.0, 0.0, "unavailable_unqualified_geometry", audit
-
-
-def _qualify_punctuation_heavy_body_tier(
-    fill: np.ndarray,
-    *,
-    axis: int,
-    reference_size: float,
-    reference_confidence: float,
-    reference_support: str,
-    reference_audit: Mapping[str, Any],
-) -> tuple[float, float, str, dict[str, Any]]:
-    """Recover a corroborated glyph-body tier from punctuation-heavy ink.
-
-    Compact punctuation remains part of the authorized glyph mask and the
-    footprint, but it cannot set em scale when a separate body component tier
-    and projection agree.  An otherwise unavailable measurement is recovered
-    only for a parent-sized island; sparse unavailable axes remain abstentions.
-    """
-
-    binary = np.asarray(fill, dtype=bool)
-    component_facts = _fill_component_facts(binary)
-    axis_key = "width_px" if axis == 0 else "height_px"
-    punctuation_count = sum(
-        1
+    compact_marks = [
+        fact
         for fact in component_facts
-        if bool(fact.get("punctuation_fragment"))
-    )
-    body_values = [
-        float(fact.get(axis_key) or 0.0)
+        if bool(fact.get("normalized_compact_mark"))
+    ]
+    if len(compact_marks) >= 3:
+        compact_tier = float(
+            np.median(
+                [
+                    float(fact.get("long_span_px") or 0.0)
+                    for fact in compact_marks
+                ]
+            )
+        )
+        for fact in compact_marks:
+            span = float(fact.get("long_span_px") or 0.0)
+            if compact_tier > 0.0 and 0.65 <= span / compact_tier <= 1.35:
+                fact["punctuation_fragment"] = True
+
+    yy, xx = np.where(mask)
+    authorized_width = int(np.ptp(xx)) + 1 if xx.size else 0
+    authorized_height = int(np.ptp(yy)) + 1 if yy.size else 0
+    parent_sized_components = [
+        fact
+        for fact in component_facts
+        if authorized_width > 0
+        and authorized_height > 0
+        and float(fact.get("width_px") or 0.0) >= authorized_width * 0.78
+        and float(fact.get("height_px") or 0.0) >= authorized_height * 0.78
+    ]
+    body_facts = [
+        fact
         for fact in component_facts
         if not bool(fact.get("punctuation_fragment"))
-        and float(fact.get(axis_key) or 0.0) >= 3.0
     ]
-    body_candidate, body_tier_count, body_relative_mad = (
-        _stable_numeric_tier(body_values, minimum_count=1)
-    )
-    projection_spans = _projection_spans(binary, axis=axis)
-    axis_extent = int(binary.shape[1] if axis == 0 else binary.shape[0])
-    orthogonal_extent = int(
-        binary.shape[0] if axis == 0 else binary.shape[1]
-    )
-    coordinates = np.where(binary)
-    orthogonal_coordinates = (
-        coordinates[0] if axis == 0 else coordinates[1]
-    )
-    filled_orthogonal_extent = (
-        int(np.ptp(orthogonal_coordinates)) + 1
-        if orthogonal_coordinates.size
-        else 0
-    )
-    raw_max = max((float(value) for value in projection_spans), default=0.0)
-    parent_sized_island = bool(
-        axis_extent > 0
-        and orthogonal_extent > 0
-        and raw_max >= axis_extent * 0.78
-        and filled_orthogonal_extent >= orthogonal_extent * 0.78
-    )
-    density_minimum_occupancy = (
-        max(2, int(round(orthogonal_extent * 0.10)))
-        if parent_sized_island
-        else 0
-    )
-    density_spans = (
-        _projection_spans_at_min_occupancy(
-            binary,
-            axis=axis,
-            minimum_occupancy=density_minimum_occupancy,
+    if parent_sized_components:
+        status = "unavailable_merged_island_geometry"
+    elif not body_facts and compact_marks:
+        status = "unavailable_punctuation_only_geometry"
+    elif len(body_facts) < 2:
+        status = (
+            "unavailable_fragmented_geometry"
+            if rejected_fragment_count > 0
+            else "unavailable_insufficient_glyph_support"
         )
-        if density_minimum_occupancy > 0
-        else []
-    )
-    projection_matches = sorted(
-        float(value)
-        for value in [*projection_spans, *density_spans]
-        if body_candidate > 0.0
-        and float(value) >= 3.0
-        and 0.70 <= float(value) / body_candidate <= 1.35
-    )
-    reference_size = max(0.0, float(reference_size))
-    reference_confidence = max(0.0, float(reference_confidence))
-    punctuation_dominated = bool(
-        reference_size > 0.0
-        and body_candidate > 0.0
-        and reference_size < body_candidate * 0.65
-    )
-    recoverable_unavailable_island = bool(
-        reference_size <= 0.0 and parent_sized_island
-    )
-    recovery_supported = bool(
-        punctuation_count >= 3
-        and body_candidate > 0.0
-        and projection_matches
-        and (punctuation_dominated or recoverable_unavailable_island)
-    )
-    audit = {
-        **dict(reference_audit),
-        "selected_body_tier_px": round(body_candidate, 6),
-        "selected_body_tier_count": int(body_tier_count),
-        "selected_body_tier_relative_mad": round(body_relative_mad, 8),
-        "body_component_count": len(body_values),
-        "punctuation_component_count": int(punctuation_count),
-        "body_projection_matches_px": [
-            round(value, 6) for value in projection_matches
-        ],
-        "body_tier_axis_extent": axis_extent,
-        "body_tier_orthogonal_extent": orthogonal_extent,
-        "body_tier_filled_orthogonal_extent": filled_orthogonal_extent,
-        "body_tier_parent_sized_island": parent_sized_island,
-        "density_minimum_occupancy": density_minimum_occupancy,
-        "density_spans": [round(float(value), 6) for value in density_spans],
-        "body_tier_reference_size_px": round(reference_size, 6),
-        "body_tier_punctuation_dominated": punctuation_dominated,
-        "body_tier_recoverable_unavailable_island": (
-            recoverable_unavailable_island
+    else:
+        status = "supported"
+    return {
+        "status": status,
+        "polarity": polarity,
+        "glyph_mask": np.asarray(glyph, dtype=bool),
+        "luma_strength": np.asarray(strength, dtype=np.float32),
+        "component_facts": component_facts,
+        "body_component_count": len(body_facts),
+        "punctuation_component_count": sum(
+            bool(fact.get("punctuation_fragment"))
+            for fact in component_facts
         ),
-        "body_tier_recovery_applied": recovery_supported,
-    }
-    if punctuation_count > 0 and not body_values:
-        audit["body_tier_scale_abstention_reason"] = (
-            "punctuation_only_geometry_cannot_define_source_em_scale"
-        )
-        return (
-            0.0,
-            0.0,
-            "unavailable_punctuation_only_geometry",
-            audit,
-        )
-    if not recovery_supported:
-        return (
-            reference_size,
-            reference_confidence,
-            reference_support,
-            audit,
-        )
-
-    if len(body_values) >= 3:
-        confidence = max(
-            0.76,
-            min(
-                0.90,
-                0.86
-                - body_relative_mad * 0.40
-                + min(0.04, (len(body_values) - 3) * 0.01),
+        "rejected_fragment_count": rejected_fragment_count,
+        "threshold_luma": round(float(threshold), 6),
+        "reason_codes": [
+            *reasons,
+            (
+                "native_authorized_glyph_geometry_supported"
+                if status == "supported"
+                else status
             ),
-        )
-        audit["body_tier_recovery_reason"] = (
-            "repeated_body_components_with_projection_corroboration"
-        )
-        return (
-            body_candidate,
-            confidence,
-            "supported_repeated_body_component_tier",
-            audit,
-        )
+        ],
+    }
 
-    projection_candidate = min(
-        projection_matches,
-        key=lambda value: abs(value - body_candidate),
+
+def _native_authorized_glyph_geometry(
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+) -> _NativeAuthorizedGlyphGeometry:
+    """Select native glyph geometry once for source-cell and weight axes."""
+
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    mask = np.ascontiguousarray(mask_crop, dtype=bool)
+    luma = (
+        source[:, :, 0].astype(np.float32) * 0.2126
+        + source[:, :, 1].astype(np.float32) * 0.7152
+        + source[:, :, 2].astype(np.float32) * 0.0722
     )
-    relative_delta = abs(projection_candidate - body_candidate) / max(
-        1.0, body_candidate
-    )
-    confidence = max(
-        0.70,
-        min(
-            0.84,
-            0.80
-            - relative_delta * 0.24
-            + max(0, len(body_values) - 1) * 0.02,
+    authorized_luma = luma[mask]
+    if authorized_luma.size < 6:
+        empty = np.zeros_like(mask, dtype=bool)
+        return _NativeAuthorizedGlyphGeometry(
+            status="unavailable_insufficient_authorized_pixels",
+            source=_readonly_array(source, dtype=np.uint8),
+            authorized_mask=_readonly_array(mask, dtype=bool),
+            glyph_mask=_readonly_array(empty, dtype=bool),
+            luma_strength=_readonly_array(
+                np.zeros_like(luma, dtype=np.float32), dtype=np.float32
+            ),
+            reason_codes=("unavailable_insufficient_authorized_pixels",),
+        )
+    low_luma, high_luma = [
+        float(value) for value in np.percentile(authorized_luma, [10, 90])
+    ]
+    candidates = [
+        _native_authorized_candidate(
+            mask,
+            luma,
+            polarity=polarity,
+            low_luma=low_luma,
+            high_luma=high_luma,
+        )
+        for polarity in ("dark", "light")
+    ]
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate["status"] == "supported"
+        ),
+        max(
+            candidates,
+            key=lambda candidate: (
+                int(candidate.get("body_component_count") or 0),
+                int(candidate.get("punctuation_component_count") or 0),
+                candidate.get("polarity") == "dark",
+            ),
         ),
     )
-    audit["body_tier_selected_projection_px"] = round(
-        projection_candidate, 6
+    facts = tuple(
+        MappingProxyType(dict(fact))
+        for fact in selected.get("component_facts") or ()
     )
-    audit["body_tier_recovery_reason"] = (
-        "sparse_body_component_with_projection_corroboration"
+    support = {
+        "native_authorized_pixel_count": int(np.count_nonzero(mask)),
+        "native_luma_p10": round(low_luma, 6),
+        "native_luma_p90": round(high_luma, 6),
+        "selected_polarity": str(selected.get("polarity") or ""),
+        "selected_threshold_luma": float(
+            selected.get("threshold_luma") or 0.0
+        ),
+        "component_count": len(facts),
+        "body_component_count": int(
+            selected.get("body_component_count") or 0
+        ),
+        "punctuation_component_count": int(
+            selected.get("punctuation_component_count") or 0
+        ),
+        "rejected_fragment_count": int(
+            selected.get("rejected_fragment_count") or 0
+        ),
+        "candidate_statuses": {
+            str(candidate.get("polarity") or ""): str(
+                candidate.get("status") or "unavailable"
+            )
+            for candidate in candidates
+        },
+    }
+    return _NativeAuthorizedGlyphGeometry(
+        status=str(selected.get("status") or "unavailable"),
+        source=_readonly_array(source, dtype=np.uint8),
+        authorized_mask=_readonly_array(mask, dtype=bool),
+        glyph_mask=_readonly_array(
+            selected.get("glyph_mask"), dtype=bool
+        ),
+        luma_strength=_readonly_array(
+            selected.get("luma_strength"), dtype=np.float32
+        ),
+        polarity=str(selected.get("polarity") or ""),
+        component_facts=facts,
+        reason_codes=tuple(selected.get("reason_codes") or ()),
+        support=MappingProxyType(support),
     )
-    return (
-        projection_candidate,
-        confidence,
-        "supported_body_projection_component_tier",
-        audit,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _native_directional_cell_record(
+    geometry: _NativeAuthorizedGlyphGeometry,
+    *,
+    direction: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    dimension_key = "height_px" if direction == "ttb" else "width_px"
+    base_record: dict[str, Any] = {
+        "status": str(geometry.status or "unavailable"),
+        "cell_p20_px": 0.0,
+        "cell_median_px": 0.0,
+        "cell_p80_px": 0.0,
+        "confidence": 0.0,
+        "uncertainty": {
+            "relative_cell_spread": 0.0,
+            "qualified_component_count": 0,
+        },
+    }
+    qualification: dict[str, Any] = {
+        "direction": direction,
+        "dimension_key": dimension_key,
+        "density_spans": [],
+        "qualified_component_indices": [],
+        "qualified_component_spans_px": [],
+        "body_component_count": int(
+            geometry.support.get("body_component_count") or 0
+        ),
+        "punctuation_component_count": int(
+            geometry.support.get("punctuation_component_count") or 0
+        ),
+        "rejected_fragment_count": int(
+            geometry.support.get("rejected_fragment_count") or 0
+        ),
+    }
+    if not geometry.available:
+        return base_record, qualification
+
+    body_facts = [
+        fact
+        for fact in geometry.component_facts
+        if not bool(fact.get("punctuation_fragment"))
+    ]
+    long_spans = np.asarray(
+        [float(fact.get("long_span_px") or 0.0) for fact in body_facts],
+        dtype=np.float32,
     )
+    if long_spans.size < 2:
+        base_record["status"] = "unavailable_insufficient_glyph_support"
+        return base_record, qualification
+    reference = float(np.percentile(long_spans, 75))
+    lower = max(2.0, reference * 0.50)
+    upper = reference * 1.55
+    qualified = [
+        fact
+        for fact in body_facts
+        if lower
+        <= float(fact.get("long_span_px") or 0.0)
+        <= upper
+    ]
+    qualification.update(
+        {
+            "reference_long_span_p75_px": round(reference, 6),
+            "qualification_band_px": [round(lower, 6), round(upper, 6)],
+            "qualified_component_indices": [
+                int(fact.get("component_index") or 0) for fact in qualified
+            ],
+            "qualified_component_spans_px": [
+                round(float(fact.get(dimension_key) or 0.0), 6)
+                for fact in qualified
+            ],
+        }
+    )
+    if len(qualified) < 2:
+        base_record["status"] = "unavailable_fragmented_geometry"
+        return base_record, qualification
+
+    lower_fragments = [
+        fact
+        for fact in body_facts
+        if float(fact.get("long_span_px") or 0.0) < lower
+    ]
+    if len(lower_fragments) >= max(3, len(qualified)):
+        lower_median = float(
+            np.median(
+                [
+                    float(fact.get("long_span_px") or 0.0)
+                    for fact in lower_fragments
+                ]
+            )
+        )
+        if lower_median < reference * 0.45:
+            qualification["competing_lower_tier_count"] = len(
+                lower_fragments
+            )
+            qualification["competing_lower_tier_median_px"] = round(
+                lower_median, 6
+            )
+            base_record["status"] = "unavailable_competing_glyph_tiers"
+            return base_record, qualification
+
+    # Glyph widths and heights naturally vary within one source style. Judge
+    # competing tiers on direction-neutral long spans; keep directional
+    # width/height dispersion below as uncertainty instead of a style veto.
+    qualified_long_spans = np.asarray(
+        [float(fact.get("long_span_px") or 0.0) for fact in qualified],
+        dtype=np.float32,
+    )
+    long_p20, long_median, long_p80 = [
+        float(value)
+        for value in np.percentile(qualified_long_spans, [20, 50, 80])
+    ]
+    qualification_relative_spread = (
+        long_p80 - long_p20
+    ) / max(1.0, long_median)
+    qualification["qualification_relative_long_span_spread"] = round(
+        qualification_relative_spread, 8
+    )
+    if qualification_relative_spread > 0.45:
+        base_record["status"] = "unavailable_competing_glyph_tiers"
+        return base_record, qualification
+
+    values = np.asarray(
+        [float(fact.get(dimension_key) or 0.0) for fact in qualified],
+        dtype=np.float32,
+    )
+    p20, median, p80 = [
+        float(value) for value in np.percentile(values, [20, 50, 80])
+    ]
+    relative_spread = (p80 - p20) / max(1.0, median)
+    qualification["relative_cell_spread"] = round(relative_spread, 8)
+    confidence = max(
+        0.58,
+        min(
+            0.96,
+            0.70
+            + min(0.16, (len(qualified) - 2) * 0.02)
+            + min(0.10, max(0.0, 0.45 - relative_spread) * 0.22),
+        ),
+    )
+    base_record.update(
+        {
+            "status": "supported",
+            "cell_p20_px": round(p20, 6),
+            "cell_median_px": round(median, 6),
+            "cell_p80_px": round(p80, 6),
+            "confidence": round(confidence, 8),
+            "uncertainty": {
+                "relative_cell_spread": round(relative_spread, 8),
+                "qualified_component_count": len(qualified),
+                "sample_uncertainty": round(
+                    1.0 / float(np.sqrt(len(qualified))), 8
+                ),
+            },
+        }
+    )
+    return base_record, qualification
 
 
 def _measure_independent_source_scale(
@@ -2541,81 +1567,56 @@ def _measure_independent_source_scale(
     mask_crop: np.ndarray,
     *,
     support_identity: Mapping[str, Any],
+    geometry: _NativeAuthorizedGlyphGeometry | None = None,
 ) -> _IndependentScaleMeasurement:
-    geometry = _independent_glyph_geometry(source_crop, mask_crop)
-    glyph = np.asarray(geometry.glyph_mask, dtype=bool)
-    x_spans = _projection_spans(glyph, axis=0)
-    y_spans = _projection_spans(glyph, axis=1)
-    component_size, component_count, component_mad = (
-        _reference_character_component_size(
-            np.asarray(geometry.authorized_mask, dtype=np.uint8)
-        )
+    """Publish robust native source-cell distributions without recovery."""
+
+    native = geometry or _native_authorized_glyph_geometry(
+        source_crop, mask_crop
     )
-    legacy_vertical_size, legacy_vertical_confidence = (
-        _reference_source_cell_size_from_geometry(
-            x_spans,
-            component_size=component_size,
-            component_count=component_count,
-            component_mad=component_mad,
-        )
+    vertical, vertical_qualification = _native_directional_cell_record(
+        native, direction="ttb"
     )
-    legacy_horizontal_size, legacy_horizontal_confidence = (
-        _reference_source_cell_size_from_geometry(
-            y_spans,
-            component_size=component_size,
-            component_count=component_count,
-            component_mad=component_mad,
-        )
+    horizontal, horizontal_qualification = _native_directional_cell_record(
+        native, direction="ltr"
     )
-    component_sizes = _reference_fill_component_cell_sizes(glyph)
-    vertical_size, vertical_confidence, vertical_support, vertical_audit = (
-        _reference_qualify_source_cell_measurement(
-            glyph,
-            axis=0,
-            spans=x_spans,
-            legacy_size=legacy_vertical_size,
-            legacy_confidence=legacy_vertical_confidence,
-            fill_component_sizes=component_sizes,
-        )
+    vertical_supported = vertical.get("status") == "supported"
+    horizontal_supported = horizontal.get("status") == "supported"
+    vertical_confidence = (
+        float(vertical.get("confidence") or 0.0)
+        if vertical_supported
+        else 0.0
     )
-    horizontal_size, horizontal_confidence, horizontal_support, horizontal_audit = (
-        _reference_qualify_source_cell_measurement(
-            glyph,
-            axis=1,
-            spans=y_spans,
-            legacy_size=legacy_horizontal_size,
-            legacy_confidence=legacy_horizontal_confidence,
-            fill_component_sizes=component_sizes,
-        )
+    horizontal_confidence = (
+        float(horizontal.get("confidence") or 0.0)
+        if horizontal_supported
+        else 0.0
     )
-    (
-        vertical_size,
-        vertical_confidence,
-        vertical_support,
-        vertical_audit,
-    ) = _qualify_punctuation_heavy_body_tier(
-        glyph,
-        axis=0,
-        reference_size=vertical_size,
-        reference_confidence=vertical_confidence,
-        reference_support=vertical_support,
-        reference_audit=vertical_audit,
+    vertical_size = (
+        float(vertical.get("cell_median_px") or 0.0)
+        if vertical_supported
+        else 0.0
     )
-    (
-        horizontal_size,
-        horizontal_confidence,
-        horizontal_support,
-        horizontal_audit,
-    ) = _qualify_punctuation_heavy_body_tier(
-        glyph,
-        axis=1,
-        reference_size=horizontal_size,
-        reference_confidence=horizontal_confidence,
-        reference_support=horizontal_support,
-        reference_audit=horizontal_audit,
+    horizontal_size = (
+        float(horizontal.get("cell_median_px") or 0.0)
+        if horizontal_supported
+        else 0.0
     )
-    confidence = max(vertical_confidence, horizontal_confidence)
+    vertical_support = (
+        "supported_native_authorized_glyph_distribution"
+        if vertical_supported
+        else str(vertical.get("status") or "unavailable")
+    )
+    horizontal_support = (
+        "supported_native_authorized_glyph_distribution"
+        if horizontal_supported
+        else str(horizontal.get("status") or "unavailable")
+    )
     value = {
+        "schema_version": "native_source_cell_distribution_v1",
+        "directions": {"ttb": vertical, "ltr": horizontal},
+        # Transitional scalar aliases carry only the measured median. They
+        # remain non-authoritative until the Stage 2-3 contract cutover.
         "vertical_px": round(vertical_size, 6),
         "horizontal_px": round(horizontal_size, 6),
         "vertical_confidence": round(vertical_confidence, 8),
@@ -2624,79 +1625,729 @@ def _measure_independent_source_scale(
         "horizontal_support": horizontal_support,
     }
     support = {
+        **dict(native.support),
         "glyph_geometry_mask_sha256": _array_sha256(
-            np.ascontiguousarray(glyph, dtype=np.uint8)
+            np.ascontiguousarray(native.glyph_mask, dtype=np.uint8)
         ),
-        "glyph_pixel_count": int(np.count_nonzero(glyph)),
-        "x_projection_spans_px": [round(float(value), 6) for value in x_spans],
-        "y_projection_spans_px": [round(float(value), 6) for value in y_spans],
-        "component_size_p70_px": round(component_size, 6),
-        "component_count": int(component_count),
-        "component_mad_px": round(component_mad, 6),
-        "vertical_qualification": vertical_audit,
-        "horizontal_qualification": horizontal_audit,
+        "glyph_pixel_count": int(np.count_nonzero(native.glyph_mask)),
+        "vertical_qualification": vertical_qualification,
+        "horizontal_qualification": horizontal_qualification,
+        "shared_scale_weight_geometry": True,
     }
-    reasons = [
-        *geometry.reason_codes,
-        vertical_support,
-        horizontal_support,
-    ]
-    axis_evidence = (
-        SourceStyleAxisEvidence(
-            axis="scale",
-            status="supported",
-            value=value,
-            confidence=confidence,
-            provenance=(
-                "authorized_source_style_view:independent_glyph_geometry_scale"
-            ),
-            support_identity=support_identity,
-            reason_codes=tuple(reason for reason in reasons if reason),
-            support=support,
+    confidence = max(vertical_confidence, horizontal_confidence)
+    supported = bool(vertical_supported or horizontal_supported)
+    reasons = tuple(
+        _unique(
+            [
+                *native.reason_codes,
+                vertical_support,
+                horizontal_support,
+                "source_cell_distribution_measured_from_native_authorized_glyphs"
+                if supported
+                else "source_scale_axis_unavailable",
+            ]
         )
-        if confidence > 0.0 and (vertical_size > 0.0 or horizontal_size > 0.0)
-        else SourceStyleAxisEvidence.unavailable(
-            "scale",
-            provenance=(
-                "authorized_source_style_view:independent_glyph_geometry_scale"
-            ),
-            support_identity=support_identity,
-            reason_codes=tuple(
-                reason
-                for reason in (
-                    *reasons,
-                    "source_scale_axis_unavailable",
-                )
-                if reason
-            ),
-            support=support,
-        )
+    )
+    axis_evidence = SourceStyleAxisEvidence(
+        axis="scale",
+        status="supported" if supported else "unavailable",
+        value=value,
+        confidence=confidence,
+        provenance=(
+            "authorized_source_style_view:native_authorized_glyph_scale"
+        ),
+        support_identity=support_identity,
+        reason_codes=reasons,
+        support=support,
     )
     return _IndependentScaleMeasurement(
         axis_evidence=axis_evidence,
-        glyph_mask=_readonly_array(glyph, dtype=bool),
+        glyph_mask=_readonly_array(native.glyph_mask, dtype=bool),
         vertical_size_px=vertical_size,
         horizontal_size_px=horizontal_size,
         vertical_confidence=vertical_confidence,
         horizontal_confidence=horizontal_confidence,
         vertical_support=vertical_support,
         horizontal_support=horizontal_support,
-        vertical_qualification=MappingProxyType(vertical_audit),
-        horizontal_qualification=MappingProxyType(horizontal_audit),
+        vertical_qualification=MappingProxyType(vertical_qualification),
+        horizontal_qualification=MappingProxyType(horizontal_qualification),
+        native_geometry=native,
     )
 
 
-def _observe_source_scale_axis(
+
+
+@dataclass(frozen=True)
+class _GrayscalePaintGeometry:
+    """One core/support/exterior measurement shared by fill and outline."""
+
+    status: str
+    source: Any = field(repr=False, compare=False)
+    authorized_mask: Any = field(repr=False, compare=False)
+    core_mask: Any = field(repr=False, compare=False)
+    adjacent_support_mask: Any = field(repr=False, compare=False)
+    external_surface_mask: Any = field(repr=False, compare=False)
+    core_polarity: str = ""
+    core_color: str = ""
+    support_color: str = ""
+    source_cell_median_px: float = 0.0
+    core_luma: Mapping[str, Any] = field(default_factory=dict)
+    adjacent_support_luma: Mapping[str, Any] = field(default_factory=dict)
+    external_surface_luma: Mapping[str, Any] = field(default_factory=dict)
+    outline_width_px: Mapping[str, Any] = field(default_factory=dict)
+    outline_to_cell_ratio: Mapping[str, Any] = field(default_factory=dict)
+    facts: Mapping[str, Any] = field(default_factory=dict)
+    external_ring_facts: Mapping[str, Any] = field(default_factory=dict)
+    reason_codes: tuple[str, ...] = ()
+
+    @property
+    def available(self) -> bool:
+        return self.status == "supported" and bool(self.core_polarity)
+
+
+def _p20_median_p80(values: np.ndarray) -> dict[str, Any]:
+    clean = np.asarray(values, dtype=np.float32).reshape(-1)
+    clean = clean[np.isfinite(clean)]
+    if clean.size <= 0:
+        return {
+            "p20": 0.0,
+            "median": 0.0,
+            "p80": 0.0,
+            "pixel_count": 0,
+            "available": False,
+        }
+    p20, median, p80 = [
+        float(value) for value in np.percentile(clean, [20, 50, 80])
+    ]
+    return {
+        "p20": round(p20, 6),
+        "median": round(median, 6),
+        "p80": round(p80, 6),
+        "pixel_count": int(clean.size),
+        "available": True,
+    }
+
+
+def _normalize_distribution_to_cell(
+    distribution: Mapping[str, Any],
+    source_cell_median_px: float,
+) -> dict[str, Any]:
+    cell = max(0.0, float(source_cell_median_px))
+    available = bool(cell > 0.0 and distribution.get("available"))
+    normalized = {
+        key: (
+            round(float(distribution[key]) / cell, 8)
+            if available
+            else 0.0
+        )
+        for key in ("p20", "median", "p80")
+    }
+    normalized.update(
+        {
+            "pixel_count": int(distribution.get("pixel_count") or 0),
+            "available": available,
+            "source_cell_median_px": round(cell, 6),
+        }
+    )
+    return normalized
+
+
+def _distribution_distance(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+) -> float:
+    if not first.get("available") or not second.get("available"):
+        return 0.0
+    return float(
+        np.median(
+            [
+                abs(float(first[key]) - float(second[key]))
+                for key in ("p20", "median", "p80")
+            ]
+        )
+    )
+
+
+def _median_rgb(source: np.ndarray, mask: np.ndarray) -> tuple[float, ...]:
+    pixels = np.asarray(source, dtype=np.uint8)[np.asarray(mask, dtype=bool)]
+    if pixels.size <= 0:
+        return ()
+    return tuple(
+        round(float(value), 6)
+        for value in np.median(pixels.reshape(-1, 3), axis=0)
+    )
+
+
+def _rgb_median_distance(
+    first: Sequence[float],
+    second: Sequence[float],
+) -> float:
+    if len(first) != 3 or len(second) != 3:
+        return 0.0
+    return float(
+        np.linalg.norm(
+            np.asarray(first, dtype=np.float32)
+            - np.asarray(second, dtype=np.float32)
+        )
+    )
+
+
+def _source_cell_reference(
+    scale_measurement: _IndependentScaleMeasurement,
+) -> float:
+    supported = [
+        float(value)
+        for value, status in (
+            (
+                scale_measurement.vertical_size_px,
+                scale_measurement.vertical_support,
+            ),
+            (
+                scale_measurement.horizontal_size_px,
+                scale_measurement.horizontal_support,
+            ),
+        )
+        if value > 0.0 and str(status).startswith("supported")
+    ]
+    return max(supported, default=0.0)
+
+
+def _paint_core_candidate_topology(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    glyph_pixel_count = int(
+        np.count_nonzero(np.asarray(candidate.get("glyph_mask"), dtype=bool))
+    )
+    qualified_component_pixel_count = int(
+        sum(
+            int(fact.get("area_px") or 0)
+            for fact in candidate.get("component_facts") or ()
+        )
+    )
+    has_majority = bool(
+        glyph_pixel_count > 0
+        and qualified_component_pixel_count * 2 >= glyph_pixel_count
+    )
+    return {
+        "status": str(candidate.get("status") or "unavailable"),
+        "glyph_pixel_count": glyph_pixel_count,
+        "qualified_component_pixel_count": qualified_component_pixel_count,
+        "qualified_component_coverage": round(
+            qualified_component_pixel_count / max(1, glyph_pixel_count), 8
+        ),
+        "has_majority_qualified_component_coverage": has_majority,
+        "body_component_count": int(
+            candidate.get("body_component_count") or 0
+        ),
+        "punctuation_component_count": int(
+            candidate.get("punctuation_component_count") or 0
+        ),
+    }
+
+
+def _qualified_paint_core_geometry(
+    source_crop: np.ndarray,
+    mask_crop: np.ndarray,
+) -> tuple[_IndependentGlyphGeometry, Mapping[str, Any]]:
+    """Validate the paint core without changing other observer axes."""
+
+    initial = _independent_glyph_geometry(source_crop, mask_crop)
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    authorized = np.ascontiguousarray(mask_crop, dtype=bool)
+    luma = (
+        source[:, :, 0].astype(np.float32) * 0.2126
+        + source[:, :, 1].astype(np.float32) * 0.7152
+        + source[:, :, 2].astype(np.float32) * 0.0722
+    )
+    authorized_luma = luma[authorized]
+    if authorized_luma.size < 6:
+        return initial, MappingProxyType(
+            {
+                "paint_core_hypothesis_version": (
+                    _PAINT_CORE_HYPOTHESIS_VERSION
+                ),
+                "paint_core_initial_polarity": initial.fill_polarity,
+                "paint_core_selected_polarity": initial.fill_polarity,
+                "paint_core_candidate_topology": {},
+                "paint_core_selection_reason": (
+                    "paint_core_candidate_topology_unavailable"
+                ),
+            }
+        )
+
+    low_luma, high_luma = [
+        float(value) for value in np.percentile(authorized_luma, [10, 90])
+    ]
+    candidates = {
+        polarity: _native_authorized_candidate(
+            authorized,
+            luma,
+            polarity=polarity,
+            low_luma=low_luma,
+            high_luma=high_luma,
+        )
+        for polarity in ("dark", "light")
+    }
+    topology = {
+        polarity: _paint_core_candidate_topology(candidate)
+        for polarity, candidate in candidates.items()
+    }
+    initial_polarity = initial.fill_polarity
+    selected_polarity = initial_polarity
+    selection_reason = "paint_core_support_ring_hypothesis_retained"
+    if initial_polarity in candidates:
+        alternate_polarity = (
+            "light" if initial_polarity == "dark" else "dark"
+        )
+        initial_candidate = candidates[initial_polarity]
+        alternate_candidate = candidates[alternate_polarity]
+        initial_topology = topology[initial_polarity]
+        alternate_topology = topology[alternate_polarity]
+        if (
+            initial_candidate.get("status") == "supported"
+            and alternate_candidate.get("status") == "supported"
+            and not bool(
+                initial_topology[
+                    "has_majority_qualified_component_coverage"
+                ]
+            )
+            and bool(
+                alternate_topology[
+                    "has_majority_qualified_component_coverage"
+                ]
+            )
+        ):
+            selected_polarity = alternate_polarity
+            selection_reason = (
+                "paint_core_rejected_unqualified_support_shell"
+            )
+
+    selected = candidates.get(selected_polarity)
+    resolved = initial
+    if selected is not None and selected_polarity != initial_polarity:
+        glyph = np.ascontiguousarray(selected.get("glyph_mask"), dtype=bool)
+        support = authorized & ~glyph
+        fill_luma = luma[glyph]
+        support_luma = luma[support]
+        support_median = (
+            float(np.median(support_luma))
+            if support_luma.size
+            else initial.support_luma_median
+        )
+        support_iqr = (
+            float(
+                np.percentile(support_luma, 75)
+                - np.percentile(support_luma, 25)
+            )
+            if support_luma.size
+            else initial.support_luma_iqr
+        )
+        fill_median = (
+            float(np.median(fill_luma))
+            if fill_luma.size
+            else initial.fill_luma_median
+        )
+        resolved = replace(
+            initial,
+            glyph_mask=_readonly_array(glyph, dtype=bool),
+            support_mask=_readonly_array(support, dtype=bool),
+            fill_polarity=selected_polarity,
+            fill_color=_polarized_hex_color(
+                source[glyph], fill_luma, polarity=selected_polarity
+            ),
+            support_color=_polarized_hex_color(
+                source[support],
+                support_luma,
+                polarity=(
+                    "light" if selected_polarity == "dark" else "dark"
+                ),
+                fraction=10.0,
+            ),
+            fill_cluster_resolved=bool(np.any(glyph)),
+            support_luma_median=support_median,
+            support_luma_iqr=support_iqr,
+            fill_luma_median=fill_median,
+            contrast=abs(support_median - fill_median),
+            fill_count=int(np.count_nonzero(glyph)),
+            reason_codes=tuple(
+                _unique(
+                    [
+                        *initial.reason_codes,
+                        selection_reason,
+                    ]
+                )
+            ),
+        )
+
+    return resolved, MappingProxyType(
+        {
+            "paint_core_hypothesis_version": _PAINT_CORE_HYPOTHESIS_VERSION,
+            "paint_core_initial_polarity": initial_polarity,
+            "paint_core_selected_polarity": selected_polarity,
+            "paint_core_candidate_topology": MappingProxyType(
+                {
+                    polarity: MappingProxyType(dict(facts))
+                    for polarity, facts in topology.items()
+                }
+            ),
+            "paint_core_selection_reason": selection_reason,
+        }
+    )
+
+
+def _grayscale_paint_geometry(
     source_crop: np.ndarray,
     mask_crop: np.ndarray,
     *,
+    source_cell_median_px: float,
+) -> _GrayscalePaintGeometry:
+    """Measure paint geometry without feeding it back into source scale."""
+
+    resolved, paint_core_support = _qualified_paint_core_geometry(
+        source_crop, mask_crop
+    )
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    authorized = np.ascontiguousarray(mask_crop, dtype=bool)
+    core = np.ascontiguousarray(resolved.glyph_mask, dtype=bool)
+    empty = np.zeros(authorized.shape, dtype=bool)
+    reasons = [
+        "grayscale_core_support_exterior_single_transaction",
+        *resolved.reason_codes,
+    ]
+    if not resolved.fill_cluster_resolved or not np.any(core):
+        return _GrayscalePaintGeometry(
+            status="unavailable",
+            source=_readonly_array(source, dtype=np.uint8),
+            authorized_mask=_readonly_array(authorized, dtype=bool),
+            core_mask=_readonly_array(core, dtype=bool),
+            adjacent_support_mask=_readonly_array(empty, dtype=bool),
+            external_surface_mask=_readonly_array(empty, dtype=bool),
+            reason_codes=tuple(
+                [*reasons, "grayscale_core_hypothesis_unavailable"]
+            ),
+        )
+
+    luma = (
+        source[:, :, 0].astype(np.float32) * 0.2126
+        + source[:, :, 1].astype(np.float32) * 0.7152
+        + source[:, :, 2].astype(np.float32) * 0.0722
+    )
+    cell = max(0.0, float(source_cell_median_px))
+    width_values = np.asarray([], dtype=np.float32)
+    authorized_extent_values = np.asarray([], dtype=np.float32)
+    outline_width_support = np.zeros(authorized.shape, dtype=bool)
+    distance_to_core = np.zeros(authorized.shape, dtype=np.float32)
+    try:
+        import cv2
+
+        authorized_distance = cv2.distanceTransform(
+            authorized.astype(np.uint8), cv2.DIST_L2, 5
+        )
+        core_distance = cv2.distanceTransform(
+            core.astype(np.uint8), cv2.DIST_L2, 5
+        )
+        distance_to_core = cv2.distanceTransform(
+            (~core).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        extension = np.maximum(authorized_distance - core_distance, 0.0)
+        authorized_extent_values = extension[core & (extension > 0.05)]
+        support_search_limit = max(
+            1.5,
+            cell * _GRAYSCALE_OUTLINE_MAX_SUPPORT_RATIO,
+        )
+        support_candidates = (
+            authorized
+            & ~core
+            & (distance_to_core > 0.0)
+            & (distance_to_core <= support_search_limit)
+        )
+        support_luma_distance = np.abs(
+            luma - float(resolved.support_luma_median)
+        )
+        core_luma_distance = np.abs(
+            luma - float(resolved.fill_luma_median)
+        )
+        outline_width_support = (
+            support_candidates
+            & (support_luma_distance < core_luma_distance)
+        )
+        width_values = distance_to_core[outline_width_support]
+        reasons.append(
+            "grayscale_outline_width_from_radial_support_distance"
+        )
+    except Exception:
+        reasons.append("grayscale_support_distance_transform_unavailable")
+
+    width_distribution = _p20_median_p80(width_values)
+    ratio_distribution = _normalize_distribution_to_cell(
+        width_distribution,
+        cell,
+    )
+    authorized_extent_distribution = _p20_median_p80(
+        authorized_extent_values
+    )
+    authorized_extent_ratio = _normalize_distribution_to_cell(
+        authorized_extent_distribution,
+        cell,
+    )
+
+    support_limit = 1.5
+    if authorized_extent_distribution["available"]:
+        support_limit = max(
+            1.5,
+            float(authorized_extent_distribution["p80"]) * 1.25,
+        )
+    if cell > 0.0:
+        support_limit = min(
+            support_limit,
+            max(1.5, cell * _GRAYSCALE_OUTLINE_MAX_SUPPORT_RATIO),
+        )
+    adjacent_support = (
+        authorized
+        & ~core
+        & (distance_to_core > 0.0)
+        & (distance_to_core <= support_limit)
+    )
+    if not np.any(adjacent_support):
+        adjacent_support = authorized & ~core
+        reasons.append("grayscale_adjacent_support_full_remainder_fallback")
+
+    external_surface, external_ring_facts = _external_source_surface_ring(
+        authorized
+    )
+    core_luma = _p20_median_p80(luma[core])
+    support_luma = _p20_median_p80(luma[adjacent_support])
+    external_luma = _p20_median_p80(luma[external_surface])
+    core_rgb = _median_rgb(source, core)
+    support_rgb = _median_rgb(source, adjacent_support)
+    external_rgb = _median_rgb(source, external_surface)
+    core_support_luma_distance = _distribution_distance(
+        core_luma, support_luma
+    )
+    support_surface_luma_distance = _distribution_distance(
+        support_luma, external_luma
+    )
+    core_support_rgb_distance = _rgb_median_distance(core_rgb, support_rgb)
+    support_surface_rgb_distance = _rgb_median_distance(
+        support_rgb, external_rgb
+    )
+    support_values = luma[adjacent_support]
+    if resolved.fill_polarity == "dark":
+        opposite_fraction = (
+            float(np.mean(support_values >= 192.0))
+            if support_values.size
+            else 0.0
+        )
+    else:
+        opposite_fraction = (
+            float(np.mean(support_values <= 63.0))
+            if support_values.size
+            else 0.0
+        )
+    support_luma_iqr = (
+        float(support_luma["p80"]) - float(support_luma["p20"])
+        if support_luma["available"]
+        else 0.0
+    )
+    ratio_median = float(ratio_distribution["median"])
+    ratio_p80 = float(ratio_distribution["p80"])
+    extent_ratio_p80 = float(authorized_extent_ratio["p80"])
+    spatially_plausible = bool(
+        ratio_distribution["available"]
+        and 0.0 < ratio_median <= _GRAYSCALE_OUTLINE_MAX_SUPPORT_RATIO
+    )
+    visible_transition = bool(
+        core_support_luma_distance >= 64.0
+        and support_luma_iqr >= 48.0
+        and 0.08 <= opposite_fraction <= 0.90
+        and spatially_plausible
+    )
+    uniform_opposite_support = bool(
+        core_support_luma_distance
+        >= _GRAYSCALE_OUTLINE_MIN_CORE_SUPPORT_LUMA_DISTANCE
+        and support_luma_iqr <= 44.0
+        and opposite_fraction >= 0.88
+    )
+    external_available = bool(
+        support_luma["available"]
+        and external_luma["available"]
+        and int(external_ring_facts.get("pixel_count") or 0) >= 24
+    )
+    external_continuity = bool(
+        external_available
+        and support_surface_rgb_distance
+        <= _OUTLINE_SURFACE_CONTINUITY_MAX_RGB_DISTANCE
+        and support_surface_luma_distance
+        <= _OUTLINE_SURFACE_CONTINUITY_MAX_LUMA_QUANTILE_DELTA
+    )
+    external_discontinuity = bool(
+        external_available
+        and support_surface_rgb_distance >= _OUTLINE_BACKING_MIN_RGB_DISTANCE
+        and support_surface_luma_distance
+        >= _OUTLINE_BACKING_MIN_LUMA_QUANTILE_DELTA
+    )
+    moderate_narrow_separation = bool(
+        external_available
+        and spatially_plausible
+        and ratio_p80 <= _GRAYSCALE_OUTLINE_NARROW_SUPPORT_RATIO
+        and support_surface_rgb_distance
+        >= _GRAYSCALE_OUTLINE_MODERATE_SURFACE_RGB_DISTANCE
+        and support_surface_luma_distance
+        >= _GRAYSCALE_OUTLINE_MODERATE_SURFACE_LUMA_DISTANCE
+    )
+    decisive_absence = bool(
+        uniform_opposite_support
+        and external_continuity
+        and (
+            not authorized_extent_ratio["available"]
+            or extent_ratio_p80
+            > _GRAYSCALE_OUTLINE_DECISIVE_SURFACE_RATIO
+        )
+    )
+    facts = MappingProxyType(
+        {
+            "core_support_luma_distance": round(
+                core_support_luma_distance, 6
+            ),
+            "core_support_rgb_distance": round(
+                core_support_rgb_distance, 6
+            ),
+            "support_surface_luma_distance": round(
+                support_surface_luma_distance, 6
+            ),
+            "support_surface_rgb_distance": round(
+                support_surface_rgb_distance, 6
+            ),
+            "support_luma_iqr": round(support_luma_iqr, 6),
+            "support_opposite_fraction": round(opposite_fraction, 8),
+            "spatially_plausible_support": spatially_plausible,
+            "visible_support_transition": visible_transition,
+            "uniform_opposite_support": uniform_opposite_support,
+            "external_surface_available": external_available,
+            "external_surface_continuity": external_continuity,
+            "external_surface_discontinuity": external_discontinuity,
+            "moderate_narrow_surface_separation": (
+                moderate_narrow_separation
+            ),
+            "decisive_outline_absence": decisive_absence,
+            "core_rgb_median": core_rgb,
+            "adjacent_support_rgb_median": support_rgb,
+            "external_surface_rgb_median": external_rgb,
+            "adjacent_support_limit_px": round(support_limit, 6),
+            "outline_width_measurement_version": (
+                _OUTLINE_WIDTH_MEASUREMENT_VERSION
+            ),
+            "outline_width_support_mask_sha256": _array_sha256(
+                np.ascontiguousarray(outline_width_support, dtype=np.uint8)
+            ),
+            "outline_width_support_pixel_count": int(
+                np.count_nonzero(outline_width_support)
+            ),
+            "authorized_support_extent_px": dict(
+                authorized_extent_distribution
+            ),
+            "authorized_support_extent_to_cell_ratio": dict(
+                authorized_extent_ratio
+            ),
+            "outline_absence_extent_ratio_p80": round(
+                extent_ratio_p80,
+                8,
+            ),
+            **dict(paint_core_support),
+        }
+    )
+    return _GrayscalePaintGeometry(
+        status="supported",
+        source=_readonly_array(source, dtype=np.uint8),
+        authorized_mask=_readonly_array(authorized, dtype=bool),
+        core_mask=_readonly_array(core, dtype=bool),
+        adjacent_support_mask=_readonly_array(adjacent_support, dtype=bool),
+        external_surface_mask=_readonly_array(external_surface, dtype=bool),
+        core_polarity=resolved.fill_polarity,
+        core_color=_rgb_hex(core_rgb),
+        support_color=_rgb_hex(support_rgb),
+        source_cell_median_px=cell,
+        core_luma=MappingProxyType(core_luma),
+        adjacent_support_luma=MappingProxyType(support_luma),
+        external_surface_luma=MappingProxyType(external_luma),
+        outline_width_px=MappingProxyType(width_distribution),
+        outline_to_cell_ratio=MappingProxyType(ratio_distribution),
+        facts=facts,
+        external_ring_facts=MappingProxyType(dict(external_ring_facts)),
+        reason_codes=tuple(reasons),
+    )
+
+
+def _grayscale_axis_support(
+    geometry: _GrayscalePaintGeometry,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _GRAYSCALE_PAINT_GEOMETRY_SCHEMA,
+        "core_mask_sha256": _array_sha256(
+            np.ascontiguousarray(geometry.core_mask, dtype=np.uint8)
+        ),
+        "adjacent_support_mask_sha256": _array_sha256(
+            np.ascontiguousarray(
+                geometry.adjacent_support_mask, dtype=np.uint8
+            )
+        ),
+        "external_surface_mask_sha256": _array_sha256(
+            np.ascontiguousarray(
+                geometry.external_surface_mask, dtype=np.uint8
+            )
+        ),
+        "core_pixel_count": int(np.count_nonzero(geometry.core_mask)),
+        "adjacent_support_pixel_count": int(
+            np.count_nonzero(geometry.adjacent_support_mask)
+        ),
+        "external_surface_pixel_count": int(
+            np.count_nonzero(geometry.external_surface_mask)
+        ),
+        "source_cell_median_px": round(
+            geometry.source_cell_median_px, 6
+        ),
+        "outline_width_px": dict(geometry.outline_width_px),
+        "outline_to_cell_ratio": dict(geometry.outline_to_cell_ratio),
+        **dict(geometry.facts),
+    }
+
+
+def _grayscale_support_identity(
     support_identity: Mapping[str, Any],
-) -> SourceStyleAxisEvidence:
-    return _measure_independent_source_scale(
-        source_crop,
-        mask_crop,
-        support_identity=support_identity,
-    ).axis_evidence
+    geometry: _GrayscalePaintGeometry,
+) -> dict[str, Any]:
+    external = np.asarray(geometry.external_surface_mask, dtype=bool)
+    facts = dict(geometry.external_ring_facts)
+    identity = dict(support_identity)
+    identity.update(
+        {
+            "external_surface_ring_version": str(
+                facts.get("version") or EXTERNAL_SOURCE_SURFACE_RING_VERSION
+            ),
+            "external_surface_ring_inner_radius_px": float(
+                facts.get("inner_radius_px") or 0.0
+            ),
+            "external_surface_ring_outer_radius_px": float(
+                facts.get("outer_radius_px") or 0.0
+            ),
+            "external_surface_ring_pixel_count": int(
+                facts.get("pixel_count") or 0
+            ),
+            "external_surface_ring_fallback_used": bool(
+                facts.get("fallback_used")
+            ),
+            "external_surface_ring_mask_sha256": _array_sha256(
+                np.ascontiguousarray(external, dtype=np.uint8)
+            ),
+            "external_surface_ring_pixel_sha256": _array_sha256(
+                np.ascontiguousarray(
+                    np.asarray(geometry.source, dtype=np.uint8)[external],
+                    dtype=np.uint8,
+                )
+            ),
+        }
+    )
+    return identity
 
 
 def _observe_fill_axis(
@@ -2704,39 +2355,40 @@ def _observe_fill_axis(
     mask_crop: np.ndarray,
     *,
     support_identity: Mapping[str, Any],
+    geometry: _GrayscalePaintGeometry | None = None,
+    source_cell_median_px: float = 0.0,
 ) -> SourceStyleAxisEvidence:
-    geometry = _independent_glyph_geometry(source_crop, mask_crop)
+    measured = geometry or _grayscale_paint_geometry(
+        source_crop,
+        mask_crop,
+        source_cell_median_px=source_cell_median_px,
+    )
+    support = _grayscale_axis_support(measured)
+    identity = _grayscale_support_identity(support_identity, measured)
+    core_contrast = float(
+        measured.facts.get("core_support_luma_distance") or 0.0
+    )
+    core_count = int(np.count_nonzero(measured.core_mask))
     confidence = (
         min(
             0.98,
-            max(0.0, geometry.contrast / 128.0)
-            * min(1.0, geometry.fill_count / 64.0),
+            0.55
+            + min(0.28, core_contrast / 512.0)
+            + min(0.15, core_count / 512.0),
         )
-        if geometry.fill_cluster_resolved
+        if measured.available and core_contrast > 0.0
         else 0.0
     )
-    support = {
-        "glyph_geometry_mask_sha256": _array_sha256(
-            np.ascontiguousarray(geometry.glyph_mask, dtype=np.uint8)
-        ),
-        "glyph_pixel_count": geometry.fill_count,
-        "support_luma_median": round(geometry.support_luma_median, 6),
-        "support_luma_iqr": round(geometry.support_luma_iqr, 6),
-        "fill_luma_median": round(geometry.fill_luma_median, 6),
-        "fill_support_contrast": round(geometry.contrast, 6),
-    }
-    if not (
-        geometry.fill_cluster_resolved
-        and confidence > 0.0
-        and geometry.fill_color
-    ):
+    if not measured.available or confidence <= 0.0 or not measured.core_color:
         return SourceStyleAxisEvidence.unavailable(
             "fill",
-            provenance="authorized_source_style_view:independent_fill_axis",
-            support_identity=support_identity,
+            provenance=(
+                "authorized_source_style_view:grayscale_fill_axis_v1"
+            ),
+            support_identity=identity,
             reason_codes=(
-                *geometry.reason_codes,
-                "source_fill_axis_unavailable",
+                *measured.reason_codes,
+                "source_grayscale_fill_axis_unavailable",
             ),
             support=support,
         )
@@ -2744,138 +2396,24 @@ def _observe_fill_axis(
         axis="fill",
         status="supported",
         value={
-            "color": geometry.fill_color,
-            "support_color": geometry.support_color,
-            "polarity": geometry.fill_polarity,
+            "schema_version": _GRAYSCALE_FILL_SCHEMA,
+            "color": measured.core_color,
+            "support_color": measured.support_color,
+            "polarity": measured.core_polarity,
+            "core_polarity": measured.core_polarity,
+            "core_luma": dict(measured.core_luma),
+            "adjacent_support_luma": dict(measured.adjacent_support_luma),
+            "external_surface_luma": dict(measured.external_surface_luma),
         },
         confidence=confidence,
-        provenance="authorized_source_style_view:independent_fill_axis",
-        support_identity=support_identity,
+        provenance="authorized_source_style_view:grayscale_fill_axis_v1",
+        support_identity=identity,
         reason_codes=(
-            *geometry.reason_codes,
-            "source_fill_measured_from_independent_authorized_contrast",
+            *measured.reason_codes,
+            "source_fill_measured_as_perceptual_core_polarity",
         ),
         support=support,
     )
-
-
-def _outline_support_facts(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
-) -> dict[str, Any]:
-    geometry = _independent_glyph_geometry(source_crop, mask_crop)
-    source = np.asarray(geometry.source, dtype=np.uint8)
-    support_mask = np.asarray(geometry.support_mask, dtype=bool)
-    luma = (
-        source[:, :, 0].astype(np.float32) * 0.2126
-        + source[:, :, 1].astype(np.float32) * 0.7152
-        + source[:, :, 2].astype(np.float32) * 0.0722
-    )
-    support_luma = luma[support_mask]
-    if geometry.fill_polarity == "dark":
-        opposite_fraction = (
-            float(np.mean(support_luma >= 192.0)) if support_luma.size else 0.0
-        )
-    else:
-        opposite_fraction = (
-            float(np.mean(support_luma <= 63.0)) if support_luma.size else 0.0
-        )
-    visible_transition = bool(
-        geometry.contrast >= 64.0
-        and geometry.support_luma_iqr >= 48.0
-        and 0.08 <= opposite_fraction <= 0.90
-    )
-    uniform_backing = bool(
-        geometry.contrast >= 48.0
-        and geometry.support_luma_iqr <= 44.0
-        and opposite_fraction >= 0.88
-    )
-    external_ring, external_ring_facts = _external_source_surface_ring(
-        mask_crop
-    )
-    internal_support_pixels = source[support_mask]
-    external_surface_pixels = source[external_ring]
-    external_surface_available = bool(
-        internal_support_pixels.size > 0
-        and external_surface_pixels.size > 0
-        and int(external_ring_facts.get("pixel_count") or 0) >= 24
-    )
-    internal_rgb_median: list[float] = []
-    external_rgb_median: list[float] = []
-    internal_luma_quantiles: list[float] = []
-    external_luma_quantiles: list[float] = []
-    external_rgb_distance = 0.0
-    external_luma_quantile_delta = 0.0
-    if external_surface_available:
-        internal_rgb_median = [
-            round(float(value), 6)
-            for value in np.median(
-                internal_support_pixels.reshape(-1, 3), axis=0
-            )
-        ]
-        external_rgb_median = [
-            round(float(value), 6)
-            for value in np.median(
-                external_surface_pixels.reshape(-1, 3), axis=0
-            )
-        ]
-        external_rgb_distance = float(
-            np.linalg.norm(
-                np.asarray(internal_rgb_median, dtype=np.float32)
-                - np.asarray(external_rgb_median, dtype=np.float32)
-            )
-        )
-        internal_luma_quantiles = _luma_quantiles(
-            luma[support_mask]
-        )
-        external_luma_quantiles = _luma_quantiles(
-            luma[external_ring]
-        )
-        if internal_luma_quantiles and external_luma_quantiles:
-            external_luma_quantile_delta = float(
-                np.median(
-                    np.abs(
-                        np.asarray(
-                            internal_luma_quantiles, dtype=np.float32
-                        )
-                        - np.asarray(
-                            external_luma_quantiles, dtype=np.float32
-                        )
-                    )
-                )
-            )
-    external_surface_continuity = bool(
-        external_surface_available
-        and external_rgb_distance
-        <= _OUTLINE_SURFACE_CONTINUITY_MAX_RGB_DISTANCE
-        and external_luma_quantile_delta
-        <= _OUTLINE_SURFACE_CONTINUITY_MAX_LUMA_QUANTILE_DELTA
-    )
-    external_surface_discontinuity = bool(
-        external_surface_available
-        and external_rgb_distance >= _OUTLINE_BACKING_MIN_RGB_DISTANCE
-        and external_luma_quantile_delta
-        >= _OUTLINE_BACKING_MIN_LUMA_QUANTILE_DELTA
-    )
-    return {
-        "geometry": geometry,
-        "support_opposite_fraction": opposite_fraction,
-        "visible_support_transition": visible_transition,
-        "uniform_support_backing": uniform_backing,
-        "external_surface_ring": external_ring,
-        "external_surface_ring_facts": external_ring_facts,
-        "external_surface_available": external_surface_available,
-        "external_surface_continuity": external_surface_continuity,
-        "external_surface_discontinuity": external_surface_discontinuity,
-        "external_surface_rgb_distance": external_rgb_distance,
-        "external_surface_luma_quantile_delta": (
-            external_luma_quantile_delta
-        ),
-        "internal_support_rgb_median": internal_rgb_median,
-        "external_surface_rgb_median": external_rgb_median,
-        "internal_support_luma_quantiles": internal_luma_quantiles,
-        "external_surface_luma_quantiles": external_luma_quantiles,
-    }
 
 
 def _observe_outline_axis(
@@ -2883,205 +2421,153 @@ def _observe_outline_axis(
     mask_crop: np.ndarray,
     *,
     support_identity: Mapping[str, Any],
+    geometry: _GrayscalePaintGeometry | None = None,
+    source_cell_median_px: float = 0.0,
 ) -> SourceStyleAxisEvidence:
-    facts = _outline_support_facts(source_crop, mask_crop)
-    geometry: _IndependentGlyphGeometry = facts["geometry"]
-    external_ring = np.asarray(
-        facts["external_surface_ring"], dtype=bool
+    measured = geometry or _grayscale_paint_geometry(
+        source_crop,
+        mask_crop,
+        source_cell_median_px=source_cell_median_px,
     )
-    external_ring_facts = dict(facts["external_surface_ring_facts"])
-    outline_support_identity = dict(support_identity)
-    outline_support_identity.update(
-        {
-            "external_surface_ring_version": str(
-                external_ring_facts.get("version")
-                or EXTERNAL_SOURCE_SURFACE_RING_VERSION
+    support = _grayscale_axis_support(measured)
+    identity = _grayscale_support_identity(support_identity, measured)
+    provenance = "authorized_source_style_view:grayscale_outline_axis_v1"
+    if not measured.available:
+        return SourceStyleAxisEvidence.unavailable(
+            "outline",
+            provenance=provenance,
+            support_identity=identity,
+            reason_codes=(
+                *measured.reason_codes,
+                "source_grayscale_outline_axis_unavailable",
             ),
-            "external_surface_ring_inner_radius_px": float(
-                external_ring_facts.get("inner_radius_px") or 0.0
-            ),
-            "external_surface_ring_outer_radius_px": float(
-                external_ring_facts.get("outer_radius_px") or 0.0
-            ),
-            "external_surface_ring_pixel_count": int(
-                external_ring_facts.get("pixel_count") or 0
-            ),
-            "external_surface_ring_fallback_used": bool(
-                external_ring_facts.get("fallback_used")
-            ),
-            "external_surface_ring_mask_sha256": _array_sha256(
-                np.ascontiguousarray(external_ring, dtype=np.uint8)
-            ),
-            "external_surface_ring_pixel_sha256": _array_sha256(
-                np.ascontiguousarray(
-                    np.asarray(source_crop, dtype=np.uint8)[external_ring],
-                    dtype=np.uint8,
-                )
-            ),
-        }
-    )
-    scale = _measure_independent_source_scale(
-        source_crop, mask_crop, support_identity=support_identity
-    )
-    scale_for_stroke = max(
-        scale.vertical_size_px,
-        scale.horizontal_size_px,
-        1.0,
-    )
-    support = {
-        "support_luma_median": round(geometry.support_luma_median, 6),
-        "support_luma_iqr": round(geometry.support_luma_iqr, 6),
-        "fill_support_contrast": round(geometry.contrast, 6),
-        "support_opposite_fraction": round(
-            float(facts["support_opposite_fraction"]), 8
-        ),
-        "visible_support_transition": bool(
-            facts["visible_support_transition"]
-        ),
-        "uniform_support_backing": bool(facts["uniform_support_backing"]),
-        "external_surface_available": bool(
-            facts["external_surface_available"]
-        ),
-        "external_surface_continuity": bool(
-            facts["external_surface_continuity"]
-        ),
-        "external_surface_discontinuity": bool(
-            facts["external_surface_discontinuity"]
-        ),
-        "external_surface_rgb_distance": round(
-            float(facts["external_surface_rgb_distance"]), 6
-        ),
-        "external_surface_luma_quantile_delta": round(
-            float(facts["external_surface_luma_quantile_delta"]), 6
-        ),
-        "internal_support_rgb_median": list(
-            facts["internal_support_rgb_median"]
-        ),
-        "external_surface_rgb_median": list(
-            facts["external_surface_rgb_median"]
-        ),
-        "internal_support_luma_quantiles": list(
-            facts["internal_support_luma_quantiles"]
-        ),
-        "external_surface_luma_quantiles": list(
-            facts["external_surface_luma_quantiles"]
-        ),
-        "surface_continuity_max_rgb_distance": (
-            _OUTLINE_SURFACE_CONTINUITY_MAX_RGB_DISTANCE
-        ),
-        "surface_continuity_max_luma_quantile_delta": (
-            _OUTLINE_SURFACE_CONTINUITY_MAX_LUMA_QUANTILE_DELTA
-        ),
-        "backing_min_rgb_distance": _OUTLINE_BACKING_MIN_RGB_DISTANCE,
-        "backing_min_luma_quantile_delta": (
-            _OUTLINE_BACKING_MIN_LUMA_QUANTILE_DELTA
-        ),
-    }
-    if facts["visible_support_transition"]:
-        width = min(
-            max(1.0, float(round(scale_for_stroke * 0.055))),
-            max(1.0, scale_for_stroke * 0.15),
+            support=support,
         )
+
+    facts = measured.facts
+    width = dict(measured.outline_width_px)
+    ratio = dict(measured.outline_to_cell_ratio)
+    contrast = float(facts.get("core_support_luma_distance") or 0.0)
+    present = bool(
+        contrast >= _GRAYSCALE_OUTLINE_MIN_CORE_SUPPORT_LUMA_DISTANCE
+        and bool(facts.get("spatially_plausible_support"))
+        and (
+            bool(facts.get("visible_support_transition"))
+            or bool(facts.get("external_surface_discontinuity"))
+            or bool(facts.get("moderate_narrow_surface_separation"))
+        )
+    )
+    if present:
         confidence = min(
             0.95,
-            0.52
-            + min(0.25, geometry.contrast / 512.0)
-            + min(0.18, geometry.support_luma_iqr / 255.0),
-        )
-        return SourceStyleAxisEvidence(
-            axis="outline",
-            status="supported",
-            value={
-                "present": True,
-                "kind": "outline",
-                "color": geometry.support_color,
-                "width_px": round(width, 6),
-            },
-            confidence=confidence,
-            provenance="authorized_source_style_view:independent_outline_axis",
-            support_identity=outline_support_identity,
-            reason_codes=("source_visible_support_stroke_measured",),
-            support=support,
-        )
-    if (
-        facts["uniform_support_backing"]
-        and facts["external_surface_discontinuity"]
-    ):
-        width = min(
-            max(1.0, float(round(scale_for_stroke * 0.055))),
-            max(1.0, scale_for_stroke * 0.15),
-        )
-        confidence = min(
-            0.94,
             0.68
+            + min(0.12, contrast / 1024.0)
             + min(
-                0.14,
-                float(facts["external_surface_rgb_distance"]) / 768.0,
+                0.08,
+                float(facts.get("support_surface_luma_distance") or 0.0)
+                / 512.0,
             )
             + min(
-                0.12,
-                float(facts["external_surface_luma_quantile_delta"])
-                / 512.0,
+                0.07,
+                float(facts.get("support_surface_rgb_distance") or 0.0)
+                / 1024.0,
             ),
         )
         return SourceStyleAxisEvidence(
             axis="outline",
             status="supported",
             value={
+                "schema_version": _GRAYSCALE_OUTLINE_SCHEMA,
                 "present": True,
-                "kind": "backing",
-                "color": geometry.support_color,
-                "width_px": round(width, 6),
+                "kind": "outline",
+                "color": measured.support_color,
+                "width_px": round(float(width.get("median") or 0.0), 6),
+                "outline_width_px": width,
+                "outline_to_cell_ratio": ratio,
+                "core_polarity": measured.core_polarity,
             },
             confidence=confidence,
-            provenance="authorized_source_style_view:independent_outline_axis",
-            support_identity=outline_support_identity,
+            provenance=provenance,
+            support_identity=identity,
             reason_codes=(
-                "source_uniform_support_backing_measured_against_surface",
+                "source_outline_promoted_from_spatial_perceptual_support",
             ),
             support=support,
         )
-    if (
-        facts["uniform_support_backing"]
-        and facts["external_surface_continuity"]
-    ):
+
+    if bool(facts.get("decisive_outline_absence")):
+        zero_ratio = {
+            "p20": 0.0,
+            "median": 0.0,
+            "p80": 0.0,
+            "pixel_count": int(ratio.get("pixel_count") or 0),
+            "available": True,
+            "source_cell_median_px": round(
+                measured.source_cell_median_px, 6
+            ),
+        }
         confidence = min(
             0.92,
-            0.72
-            + min(0.15, geometry.contrast / 1024.0)
+            0.70
+            + min(0.12, contrast / 1024.0)
             + min(
-                0.05,
-                float(facts["support_opposite_fraction"]) / 20.0,
+                0.08,
+                max(
+                    0.0,
+                    _OUTLINE_SURFACE_CONTINUITY_MAX_LUMA_QUANTILE_DELTA
+                    - float(
+                        facts.get("support_surface_luma_distance") or 0.0
+                    ),
+                )
+                / 256.0,
             ),
         )
         return SourceStyleAxisEvidence(
             axis="outline",
             status="supported",
             value={
+                "schema_version": _GRAYSCALE_OUTLINE_SCHEMA,
                 "present": False,
                 "kind": "surface",
-                "color": geometry.support_color,
+                "color": measured.support_color,
                 "width_px": 0.0,
+                "outline_width_px": {
+                    "p20": 0.0,
+                    "median": 0.0,
+                    "p80": 0.0,
+                    "pixel_count": int(width.get("pixel_count") or 0),
+                    "available": True,
+                },
+                "outline_to_cell_ratio": zero_ratio,
+                "core_polarity": measured.core_polarity,
             },
             confidence=confidence,
-            provenance="authorized_source_style_view:independent_outline_axis",
-            support_identity=outline_support_identity,
+            provenance=provenance,
+            support_identity=identity,
             reason_codes=(
-                "source_visible_stroke_absent_continuous_surface",
+                "source_outline_absence_supported_by_broad_continuous_surface",
             ),
             support=support,
         )
-    return SourceStyleAxisEvidence.unavailable(
-        "outline",
-        provenance="authorized_source_style_view:independent_outline_axis",
-        support_identity=outline_support_identity,
+
+    return SourceStyleAxisEvidence(
+        axis="outline",
+        status="ambiguous",
+        value={
+            "schema_version": _GRAYSCALE_OUTLINE_SCHEMA,
+            "present": None,
+            "kind": "ambiguous",
+            "color": measured.support_color,
+            "width_px": round(float(width.get("median") or 0.0), 6),
+            "outline_width_px": width,
+            "outline_to_cell_ratio": ratio,
+            "core_polarity": measured.core_polarity,
+        },
+        confidence=min(0.49, max(0.10, contrast / 512.0)),
+        provenance=provenance,
+        support_identity=identity,
         reason_codes=(
-            "source_outline_axis_not_independently_supported",
-            *(
-                ("source_uniform_support_surface_context_ambiguous",)
-                if facts["uniform_support_backing"]
-                else ()
-            ),
+            "source_outline_core_support_surface_relation_ambiguous",
         ),
         support=support,
     )
@@ -3092,125 +2578,188 @@ def _observe_weight_axis(
     mask_crop: np.ndarray,
     *,
     support_identity: Mapping[str, Any],
+    geometry: _NativeAuthorizedGlyphGeometry | None = None,
+    scale_measurement: _IndependentScaleMeasurement | None = None,
 ) -> SourceStyleAxisEvidence:
-    facts = _outline_support_facts(source_crop, mask_crop)
-    geometry: _IndependentGlyphGeometry = facts["geometry"]
-    glyph = np.asarray(geometry.glyph_mask, dtype=bool)
-    try:
-        import cv2
+    native = geometry or _native_authorized_glyph_geometry(
+        source_crop, mask_crop
+    )
+    scale = scale_measurement or _measure_independent_source_scale(
+        source_crop,
+        mask_crop,
+        support_identity=support_identity,
+        geometry=native,
+    )
+    scale_directions = dict(scale.axis_evidence.value).get("directions", {})
+    direction_records: dict[str, dict[str, Any]] = {}
+    confidences: list[float] = []
+    for direction in ("ttb", "ltr"):
+        scale_record = dict(scale_directions.get(direction) or {})
+        cell_size = float(scale_record.get("cell_median_px") or 0.0)
+        qualification = (
+            scale.vertical_qualification
+            if direction == "ttb"
+            else scale.horizontal_qualification
+        )
+        qualified_indices = {
+            int(value)
+            for value in qualification.get("qualified_component_indices")
+            or ()
+        }
+        qualified = [
+            fact
+            for fact in native.component_facts
+            if int(fact.get("component_index") or 0) in qualified_indices
+        ]
+        record: dict[str, Any] = {
+            "status": str(scale_record.get("status") or native.status),
+            "cell_median_px": round(cell_size, 6),
+            "stem_to_cell_ratio": {},
+            "ink_occupancy_ratio": {},
+            "confidence": 0.0,
+            "uncertainty": dict(scale_record.get("uncertainty") or {}),
+        }
+        direction_records[direction] = record
+        if (
+            scale_record.get("status") != "supported"
+            or cell_size <= 0.0
+            or len(qualified) < 2
+        ):
+            continue
 
-        distance = cv2.distanceTransform(
-            np.asarray(glyph, dtype=np.uint8), cv2.DIST_L2, 5
-        )
-    except Exception:
-        distance = np.zeros_like(glyph, dtype=np.float32)
-    distance_values = distance[glyph]
-    distance_p75 = (
-        float(np.percentile(distance_values, 75))
-        if distance_values.size
-        else 0.0
-    )
-    ink_width = max(0.0, distance_p75 * 2.0)
-    generic_class = ""
-    generic_confidence = 0.0
-    if (
-        geometry.fill_cluster_resolved
-        and geometry.fill_count >= 24
-        and distance_p75 > 0.0
-    ):
-        if distance_p75 <= 1.5:
-            generic_class = "regular"
-            generic_confidence = min(
-                0.92, 0.72 + geometry.fill_count / 4096.0
+        stem_values: list[float] = []
+        occupancy_values: list[float] = []
+        total_weighted_area = 0.0
+        total_perimeter = 0.0
+        total_bbox_area = 0.0
+        for fact in qualified:
+            weighted_area = float(fact.get("weighted_ink_area_px") or 0.0)
+            perimeter = float(fact.get("contour_perimeter_px") or 0.0)
+            bbox_area = float(fact.get("bbox_area_px") or 0.0)
+            if weighted_area <= 0.0 or perimeter <= 0.0 or bbox_area <= 0.0:
+                continue
+            stem_values.append(
+                min(1.0, (2.0 * weighted_area / perimeter) / cell_size)
             )
-        elif distance_p75 >= 1.9:
-            generic_class = "bold"
-            generic_confidence = min(
-                0.94,
-                0.72
-                + min(0.16, (distance_p75 - 1.9) * 0.12)
-                + geometry.fill_count / 4096.0,
-            )
-    scale = _measure_independent_source_scale(
-        source_crop, mask_crop, support_identity=support_identity
-    )
-    directional = {
-        "status": "not_applicable_no_visible_support_transition",
-        "directions": {},
-    }
-    vertical_class = ""
-    vertical_confidence = 0.0
-    vertical_support = ""
-    horizontal_class = ""
-    horizontal_confidence = 0.0
-    horizontal_support = ""
-    if facts["visible_support_transition"]:
-        _, _, directional = _qualify_outlined_ink_weight(
-            glyph,
-            source_cell_size_vertical_px=scale.vertical_size_px,
-            source_cell_size_horizontal_px=scale.horizontal_size_px,
+            occupancy_values.append(min(1.0, weighted_area / bbox_area))
+            total_weighted_area += weighted_area
+            total_perimeter += perimeter
+            total_bbox_area += bbox_area
+        if (
+            len(stem_values) < 2
+            or len(occupancy_values) < 2
+            or total_perimeter <= 0.0
+            or total_bbox_area <= 0.0
+        ):
+            record["status"] = "unavailable_insufficient_weight_support"
+            continue
+
+        def distribution(
+            values: Sequence[float],
+            aggregate: float,
+        ) -> dict[str, float]:
+            p20, _, p80 = [
+                float(value)
+                for value in np.percentile(
+                    np.asarray(values, dtype=np.float32), [20, 50, 80]
+                )
+            ]
+            median = max(1e-8, min(1.0, float(aggregate)))
+            return {
+                "p20": round(max(1e-8, min(p20, median)), 8),
+                "median": round(median, 8),
+                "p80": round(min(1.0, max(p80, median)), 8),
+            }
+
+        aggregate_stem = (
+            2.0 * total_weighted_area / total_perimeter / cell_size
         )
-        directions = dict(directional.get("directions") or {})
-        vertical = dict(directions.get("vertical") or {})
-        horizontal = dict(directions.get("horizontal") or {})
-        vertical_support = str(vertical.get("status") or "")
-        horizontal_support = str(horizontal.get("status") or "")
-        if vertical_support.startswith("supported_"):
-            vertical_class = str(vertical.get("weight_class") or "")
-            vertical_confidence = float(vertical.get("confidence") or 0.0)
-        if horizontal_support.startswith("supported_"):
-            horizontal_class = str(horizontal.get("weight_class") or "")
-            horizontal_confidence = float(horizontal.get("confidence") or 0.0)
-        if vertical_class or horizontal_class:
-            generic_class = ""
-            generic_confidence = 0.0
-        elif generic_class:
-            generic_class = ""
-            generic_confidence = 0.0
-    confidence = max(
-        generic_confidence,
-        vertical_confidence,
-        horizontal_confidence,
-    )
-    support = {
-        "glyph_geometry_mask_sha256": _array_sha256(
-            np.ascontiguousarray(glyph, dtype=np.uint8)
-        ),
-        "glyph_pixel_count": geometry.fill_count,
-        "ink_distance_p75": round(distance_p75, 6),
-        "source_ink_stroke_width_px": round(ink_width, 6),
-        "outlined_weight_qualification": directional,
-    }
+        aggregate_occupancy = total_weighted_area / total_bbox_area
+        stem_distribution = distribution(stem_values, aggregate_stem)
+        occupancy_distribution = distribution(
+            occupancy_values, aggregate_occupancy
+        )
+        uncertainty = dict(record["uncertainty"])
+        uncertainty.update(
+            {
+                "weight_component_count": len(stem_values),
+                "stem_relative_spread": round(
+                    (
+                        stem_distribution["p80"]
+                        - stem_distribution["p20"]
+                    )
+                    / max(1e-8, stem_distribution["median"]),
+                    8,
+                ),
+                "ink_occupancy_relative_spread": round(
+                    (
+                        occupancy_distribution["p80"]
+                        - occupancy_distribution["p20"]
+                    )
+                    / max(1e-8, occupancy_distribution["median"]),
+                    8,
+                ),
+            }
+        )
+        confidence = max(
+            0.55,
+            min(
+                0.95,
+                float(scale_record.get("confidence") or 0.0)
+                - min(
+                    0.18,
+                    max(
+                        float(uncertainty["stem_relative_spread"]),
+                        float(
+                            uncertainty["ink_occupancy_relative_spread"]
+                        ),
+                    )
+                    * 0.08,
+                ),
+            ),
+        )
+        record.update(
+            {
+                "status": "supported",
+                "stem_to_cell_ratio": stem_distribution,
+                "ink_occupancy_ratio": occupancy_distribution,
+                "confidence": round(confidence, 8),
+                "uncertainty": uncertainty,
+            }
+        )
+        confidences.append(confidence)
+
+    supported = bool(confidences)
     value = {
-        "class": generic_class,
-        "confidence": round(generic_confidence, 8),
-        "vertical_class": vertical_class,
-        "vertical_confidence": round(vertical_confidence, 8),
-        "vertical_support": vertical_support,
-        "horizontal_class": horizontal_class,
-        "horizontal_confidence": round(horizontal_confidence, 8),
-        "horizontal_support": horizontal_support,
-        "source_ink_stroke_width_px": round(ink_width, 6),
+        "schema_version": "native_normalized_weight_evidence_v1",
+        "directions": direction_records,
     }
-    if confidence <= 0.0:
-        return SourceStyleAxisEvidence.unavailable(
-            "weight",
-            provenance="authorized_source_style_view:independent_weight_axis",
-            support_identity=support_identity,
-            reason_codes=("source_ink_weight_axis_unavailable",),
-            support=support,
-        )
+    support = {
+        **dict(native.support),
+        "glyph_geometry_mask_sha256": _array_sha256(
+            np.ascontiguousarray(native.glyph_mask, dtype=np.uint8)
+        ),
+        "glyph_pixel_count": int(np.count_nonzero(native.glyph_mask)),
+        "shared_scale_weight_geometry": True,
+    }
     return SourceStyleAxisEvidence(
         axis="weight",
-        status="supported",
+        status="supported" if supported else "unavailable",
         value=value,
-        confidence=confidence,
-        provenance="authorized_source_style_view:independent_weight_axis",
+        confidence=max(confidences, default=0.0),
+        provenance=(
+            "authorized_source_style_view:native_normalized_weight_axis"
+        ),
         support_identity=support_identity,
-        reason_codes=(
-            "source_ink_weight_directional_geometry_measured"
-            if vertical_class or horizontal_class
-            else "source_ink_weight_direct_geometry_measured",
+        reason_codes=tuple(
+            _unique(
+                [
+                    *native.reason_codes,
+                    "source_weight_continuous_native_geometry_measured"
+                    if supported
+                    else "source_ink_weight_axis_unavailable",
+                ]
+            )
         ),
         support=support,
     )
@@ -3296,8 +2845,6 @@ def _observe_rotation_axis(
 ) -> SourceStyleAxisEvidence:
     try:
         observed = _observe_additive_rotation(
-            source_crop,
-            mask_crop,
             spatial_facts=_axis_local_effect_facts(source_crop, mask_crop),
         )
     except Exception:
@@ -3318,8 +2865,6 @@ def _observe_shadow_axis(
 ) -> SourceStyleAxisEvidence:
     try:
         observed = _observe_additive_shadow(
-            source_crop,
-            mask_crop,
             spatial_facts=_axis_local_effect_facts(source_crop, mask_crop),
         )
     except Exception:
@@ -3351,11 +2896,11 @@ def build_authorized_style_observation_inputs(
 ) -> AuthorizedStyleObservationInputs:
     """Build one transaction of independent source-style observations.
 
-    Detector inputs and ink-derived axes use accepted foreground pixels. Only
-    the outline axis may compare its internal support with a bounded exterior
-    annulus, whose identity is attached to that axis alone. Raw exterior
-    pixels are never published or reused by scale, fill, weight, orientation,
-    rotation, shadow, or detector presentation.
+    Detector inputs and ink-derived axes use accepted foreground pixels. Fill
+    and outline share one grayscale core/support/exterior measurement; its
+    bounded exterior annulus is descriptive evidence only and cannot feed
+    detector, source-scale, weight, orientation, rotation, or shadow paths.
+    Raw exterior pixels are never published.
     """
 
     if image is None or not view.available or len(view.analysis_bbox) != 4:
@@ -3401,25 +2946,39 @@ def build_authorized_style_observation_inputs(
     )
     support_identity["detector_input_sha256"] = detector_input_sha256
 
+    native_geometry = _native_authorized_glyph_geometry(
+        source_crop, mask_crop
+    )
     scale_measurement = _measure_independent_source_scale(
         source_crop,
         mask_crop,
         support_identity=support_identity,
+        geometry=native_geometry,
+    )
+    source_cell_median_px = _source_cell_reference(scale_measurement)
+    grayscale_geometry = _grayscale_paint_geometry(
+        source_crop,
+        mask_crop,
+        source_cell_median_px=source_cell_median_px,
     )
     fill_axis = _observe_fill_axis(
         source_crop,
         mask_crop,
         support_identity=support_identity,
+        geometry=grayscale_geometry,
     )
     outline_axis = _observe_outline_axis(
         source_crop,
         mask_crop,
         support_identity=support_identity,
+        geometry=grayscale_geometry,
     )
     weight_axis = _observe_weight_axis(
         source_crop,
         mask_crop,
         support_identity=support_identity,
+        geometry=native_geometry,
+        scale_measurement=scale_measurement,
     )
     rotation_axis = _observe_rotation_axis(
         source_crop,
@@ -3784,232 +3343,19 @@ def _bind_source_text_footprint(
     )
 
 
-def _perceptual_fact_set_id(source_identity: Mapping[str, Any]) -> str:
-    try:
-        encoded = json.dumps(
-            dict(source_identity),
-            ensure_ascii=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    except (
-        TypeError,
-        ValueError,
-        UnicodeEncodeError,
-        RecursionError,
-        OverflowError,
-    ):
-        return ""
-    return (
-        f"{_PERCEPTUAL_STYLE_FACT_SET_PREFIX}"
-        f"{hashlib.sha256(encoded).hexdigest()}"
-    )
 
 
-def _perceptual_axis_record(
-    *,
-    axis: str,
-    fact_set_id: str,
-    support_status: str,
-    confidence: float,
-    reason_codes: Sequence[str],
-    support: Mapping[str, Any],
-    uncertainty: Mapping[str, Any] | None = None,
-    value: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    status = support_status if support_status in {"supported", "ambiguous"} else "unavailable"
-    record: dict[str, Any] = {
-        "support_status": status,
-        "confidence": round(max(0.0, min(1.0, float(confidence))), 8),
-        "provenance": _PERCEPTUAL_STYLE_PROVENANCE,
-        "fact_set_id": fact_set_id,
-        "reason_codes": _unique([str(item) for item in reason_codes if str(item)]),
-        "support": _json_safe_mapping(support),
-        "conflict": {
-            "status": (
-                "clear"
-                if status == "supported"
-                else "ambiguous"
-                if status == "ambiguous"
-                else "unavailable"
-            )
-        },
-        "uncertainty": _json_safe_mapping(uncertainty),
-    }
-    if status == "supported" and value:
-        record["value"] = _json_safe_mapping(value)
-    return record
 
 
-def _build_additive_perceptual_carrier(
-    *,
-    source_identity: Mapping[str, Any],
-    observed_by_axis: Mapping[str, Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Serialize axis observations already derived from one spatial fact set."""
-    if not any(
-        observed.get("support_status") == "supported"
-        for observed in observed_by_axis.values()
-    ):
-        return {}
-    fact_set_id = _perceptual_fact_set_id(source_identity)
-    if not fact_set_id:
-        return {}
-    records: dict[str, Any] = {}
-    for axis in _PERCEPTUAL_STYLE_AXES:
-        observed = observed_by_axis.get(axis)
-        if observed is None:
-            observed = {
-                "support_status": "unavailable",
-                "confidence": 0.0,
-                "reason_codes": (f"perceptual_{axis}_producer_not_enabled",),
-                "support": {},
-                "uncertainty": {},
-            }
-        records[axis] = _perceptual_axis_record(
-            axis=axis,
-            fact_set_id=fact_set_id,
-            support_status=str(observed.get("support_status") or "unavailable"),
-            confidence=float(observed.get("confidence") or 0.0),
-            reason_codes=tuple(observed.get("reason_codes") or ()),
-            support=(
-                observed.get("support")
-                if isinstance(observed.get("support"), Mapping)
-                else {}
-            ),
-            uncertainty=(
-                observed.get("uncertainty")
-                if isinstance(observed.get("uncertainty"), Mapping)
-                else {}
-            ),
-            value=(
-                observed.get("value")
-                if isinstance(observed.get("value"), Mapping)
-                else {}
-            ),
-        )
-    return {
-        "contract_version": _PERCEPTUAL_STYLE_AXES_VERSION,
-        "source_identity": _json_safe_mapping(source_identity),
-        "fact_set_id": fact_set_id,
-        **records,
-    }
 
 
-def _observe_additive_chromatic_fill(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
-    *,
-    spatial_facts: AuthorizedStyleSpatialFactSet | None = None,
-) -> dict[str, Any]:
-    """Observe chromatic fill only from the canonical character core."""
-
-    facts = spatial_facts or build_authorized_style_spatial_fact_set(
-        source_crop, mask_crop
-    )
-    source = np.asarray(facts.source_rgb, dtype=np.uint8)
-    mask = np.asarray(facts.authorized_mask, dtype=bool)
-    core = np.asarray(facts.character_core_mask, dtype=bool)
-    unavailable: dict[str, Any] = {
-        "support_status": "unavailable",
-        "confidence": 0.0,
-        "reason_codes": [],
-        "support": {
-            "authorized_pixel_count": int(np.count_nonzero(mask)),
-            "canonical_core_pixel_count": int(np.count_nonzero(core)),
-            "canonical_core_role_status": facts.core_role_status,
-            "canonical_core_role_reason": facts.core_role_reason,
-        },
-        "uncertainty": {},
-    }
-    if (
-        source.ndim != 3
-        or source.shape[2] != 3
-        or mask.shape != source.shape[:2]
-        or core.shape != mask.shape
-    ):
-        unavailable["reason_codes"].append("perceptual_fill_input_invalid")
-        return unavailable
-    core_count = int(np.count_nonzero(core))
-    if (
-        facts.core_role_status != "supported"
-        or core_count < _ADDITIVE_FILL_MIN_CLUSTER_PIXELS
-    ):
-        unavailable["reason_codes"].append(
-            "perceptual_fill_canonical_core_unavailable"
-        )
-        return unavailable
-
-    pixels = source[core].astype(np.float32)
-    chroma = pixels.max(axis=1) - pixels.min(axis=1)
-    chromatic_count = int(
-        np.count_nonzero(chroma >= _ADDITIVE_FILL_MIN_CHROMA)
-    )
-    chromatic_fraction = chromatic_count / max(1, core_count)
-    median_rgb = np.median(pixels, axis=0)
-    dispersion = float(
-        np.median(
-            np.linalg.norm(pixels - median_rgb[None, :], axis=1)
-        )
-    )
-    unavailable["support"].update(
-        {
-            "canonical_core_color": facts.core_color,
-            "chromatic_pixel_count": chromatic_count,
-            "chromatic_fraction": round(chromatic_fraction, 8),
-            "color_dispersion_rgb": round(dispersion, 8),
-        }
-    )
-    if (
-        chromatic_count < _ADDITIVE_FILL_MIN_CLUSTER_PIXELS
-        or chromatic_fraction
-        < _ADDITIVE_FILL_MIN_CORE_CHROMATIC_FRACTION
-    ):
-        unavailable["reason_codes"].append(
-            "perceptual_fill_canonical_core_not_chromatic"
-        )
-        return unavailable
-    if dispersion > _ADDITIVE_FILL_MAX_COLOR_DISPERSION:
-        unavailable["reason_codes"].append(
-            "perceptual_fill_canonical_core_paint_incoherent"
-        )
-        return unavailable
-
-    confidence = min(
-        0.98,
-        0.64
-        + 0.20 * min(1.0, chromatic_fraction)
-        + 0.10 * max(
-            0.0,
-            1.0
-            - dispersion
-            / max(_ADDITIVE_FILL_MAX_COLOR_DISPERSION, 1e-6),
-        ),
-    )
-    return {
-        "support_status": "supported",
-        "value": {"color": facts.core_color or _rgb_hex(median_rgb)},
-        "confidence": round(confidence, 8),
-        "reason_codes": [
-            "perceptual_fill_canonical_chromatic_character_core"
-        ],
-        "support": dict(unavailable["support"]),
-        "uncertainty": {
-            "color_dispersion_rgb": round(dispersion, 8)
-        },
-    }
 def _observe_additive_rotation(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
     *,
-    spatial_facts: AuthorizedStyleSpatialFactSet | None = None,
+    spatial_facts: _AxisLocalSpatialFacts,
 ) -> dict[str, Any]:
     """Return one pronounced rotation measured from the canonical core."""
 
-    facts = spatial_facts or build_authorized_style_spatial_fact_set(
-        source_crop, mask_crop
-    )
+    facts = spatial_facts
     source = np.asarray(facts.source_rgb, dtype=np.uint8)
     mask = np.asarray(facts.authorized_mask, dtype=bool)
     core = np.asarray(facts.character_core_mask, dtype=bool)
@@ -4211,76 +3557,11 @@ def _observe_additive_rotation(
             "pivot": "visual_center",
         },
     }
-def _observe_additive_outline(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
-    *,
-    canonical_carrier_observation: Mapping[str, Any] | None = None,
-    spatial_facts: AuthorizedStyleSpatialFactSet | None = None,
-) -> dict[str, Any]:
-    """Project the canonical carrier decision onto the additive outline axis."""
-
-    canonical = (
-        dict(canonical_carrier_observation)
-        if isinstance(canonical_carrier_observation, Mapping)
-        else {}
-    )
-    carrier_kind = str(canonical.get("carrier_kind") or "unavailable")
-    support_status = str(canonical.get("support_status") or "unavailable")
-    support = (
-        dict(canonical.get("support") or {})
-        if isinstance(canonical.get("support"), Mapping)
-        else {}
-    )
-    if support_status == "supported" and carrier_kind in {"outline", "backing"}:
-        value = (
-            dict(canonical.get("value") or {})
-            if isinstance(canonical.get("value"), Mapping)
-            else {}
-        )
-        return {
-            "support_status": "supported",
-            "confidence": float(canonical.get("confidence") or 0.0),
-            "reason_codes": [
-                f"perceptual_outline_canonical_source_{carrier_kind}"
-            ],
-            "support": support,
-            "uncertainty": {},
-            "value": {
-                "color": str(value.get("color") or ""),
-                "width_px": float(value.get("width_px") or 0.0),
-            },
-        }
-    if canonical:
-        return {
-            "support_status": "unavailable",
-            "confidence": 0.0,
-            "reason_codes": [
-                "perceptual_outline_external_surface_continuity"
-                if support_status == "supported" and carrier_kind == "surface"
-                else "perceptual_outline_canonical_source_carrier_absent"
-                if support_status == "supported" and carrier_kind == "none"
-                else "perceptual_outline_canonical_source_carrier_unavailable"
-            ],
-            "support": support,
-            "uncertainty": {},
-        }
-    return {
-        "support_status": "unavailable",
-        "confidence": 0.0,
-        "reason_codes": ["perceptual_outline_canonical_carrier_missing"],
-        "support": {
-            "authorized_pixel_count": int(np.count_nonzero(mask_crop))
-        },
-        "uncertainty": {},
-    }
 
 
 def _observe_additive_shadow(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
     *,
-    spatial_facts: AuthorizedStyleSpatialFactSet | None = None,
+    spatial_facts: _AxisLocalSpatialFacts,
 ) -> dict[str, Any]:
     """Return one complete displaced glyph-correlated shadow.
 
@@ -4292,9 +3573,7 @@ def _observe_additive_shadow(
     remains unavailable.
     """
 
-    facts = spatial_facts or build_authorized_style_spatial_fact_set(
-        source_crop, mask_crop
-    )
+    facts = spatial_facts
     source = np.asarray(facts.source_rgb, dtype=np.uint8)
     mask = np.asarray(facts.authorized_mask, dtype=bool)
     pixel_count = int(np.count_nonzero(mask))
@@ -4676,764 +3955,20 @@ def _external_source_surface_ring(
     return np.ascontiguousarray(ring, dtype=bool), facts
 
 
-def _luma_quantiles(values: np.ndarray) -> list[float]:
-    clean = np.asarray(values, dtype=np.float32).reshape(-1)
-    if clean.size <= 0:
-        return []
-    return [
-        round(float(np.percentile(clean, percentile)), 6)
-        for percentile in (10, 25, 50, 75, 90)
-    ]
 
 
-def _observe_source_carrier(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
-    *,
-    spatial_facts: AuthorizedStyleSpatialFactSet,
-    shadow_observation: Mapping[str, Any] | None,
-    source_cell_size_px: float,
-) -> dict[str, Any]:
-    """Classify only the canonical shell against the external page surface."""
-
-    _ = (source_crop, mask_crop, shadow_observation, source_cell_size_px)
-    source = np.asarray(spatial_facts.source_rgb, dtype=np.uint8)
-    mask = np.asarray(spatial_facts.authorized_mask, dtype=bool)
-    core = np.asarray(spatial_facts.character_core_mask, dtype=bool)
-    shell = np.asarray(spatial_facts.concentric_shell_mask, dtype=bool)
-    external_ring = np.asarray(
-        spatial_facts.external_surface_ring_mask, dtype=bool
-    )
-    source_identity = spatial_facts.source_identity
-    unavailable: dict[str, Any] = {
-        "support_status": "unavailable",
-        "carrier_kind": "unavailable",
-        "confidence": 0.0,
-        "reason_codes": [],
-        "support": {
-            "authorized_pixel_count": int(np.count_nonzero(mask)),
-            "core_pixel_count": int(np.count_nonzero(core)),
-            "canonical_shell_pixel_count": int(np.count_nonzero(shell)),
-            "canonical_outline_role_status": (
-                spatial_facts.outline_role_status
-            ),
-            "canonical_outline_role_reason": (
-                spatial_facts.outline_role_reason
-            ),
-            "external_surface_ring_version": EXTERNAL_SOURCE_SURFACE_RING_VERSION,
-            "external_surface_ring_inner_radius_px": float(
-                source_identity.get("external_surface_ring_inner_radius_px")
-                or 0.0
-            ),
-            "external_surface_ring_outer_radius_px": float(
-                source_identity.get("external_surface_ring_outer_radius_px")
-                or 0.0
-            ),
-            "external_surface_ring_pixel_count": int(
-                source_identity.get("external_surface_ring_pixel_count") or 0
-            ),
-        },
-        "uncertainty": {},
-    }
-    if (
-        source.ndim != 3
-        or source.shape[2] != 3
-        or mask.shape != source.shape[:2]
-        or core.shape != mask.shape
-        or shell.shape != mask.shape
-    ):
-        unavailable["reason_codes"].append("source_carrier_input_invalid")
-        return unavailable
-    if (
-        spatial_facts.core_role_status != "supported"
-        or int(np.count_nonzero(core))
-        < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS
-    ):
-        unavailable["reason_codes"].append(
-            "source_carrier_canonical_core_unavailable"
-        )
-        return unavailable
-    if _mask_border_margin(mask) < 1:
-        unavailable["reason_codes"].append(
-            "source_carrier_authorized_support_truncated"
-        )
-        return unavailable
-
-    role = spatial_facts.outline_role
-    if role is None:
-        if spatial_facts.outline_role_status == "ambiguous":
-            unavailable["reason_codes"].append(
-                "source_carrier_canonical_shell_ambiguous"
-            )
-            return unavailable
-        return {
-            **unavailable,
-            "support_status": "supported",
-            "carrier_kind": "none",
-            "confidence": 0.84,
-            "reason_codes": ["source_carrier_canonical_shell_absent"],
-            "value": {"color": "", "width_px": 0.0},
-        }
-
-    shell_count = int(np.count_nonzero(shell))
-    if shell_count < _CANONICAL_ROLE_MIN_CLUSTER_PIXELS:
-        unavailable["reason_codes"].append(
-            "source_carrier_canonical_shell_support_unavailable"
-        )
-        return unavailable
-    external_count = int(np.count_nonzero(external_ring))
-    if external_count < 24:
-        unavailable["reason_codes"].append(
-            "source_carrier_external_surface_ring_unavailable"
-        )
-        return unavailable
-
-    external_rgb = np.median(
-        source[external_ring].astype(np.float32), axis=0
-    )
-    shell_rgb = np.median(
-        source[shell].astype(np.float32), axis=0
-    )
-    color_distance = float(np.linalg.norm(shell_rgb - external_rgb))
-    luma = (
-        source[:, :, 0].astype(np.float32) * 0.2126
-        + source[:, :, 1].astype(np.float32) * 0.7152
-        + source[:, :, 2].astype(np.float32) * 0.0722
-    )
-    shell_luma = luma[shell]
-    external_luma = luma[external_ring]
-    shell_quantiles = _luma_quantiles(shell_luma)
-    external_quantiles = _luma_quantiles(external_luma)
-    quantile_delta = float(
-        np.median(
-            np.abs(
-                np.asarray(shell_quantiles, dtype=np.float32)
-                - np.asarray(external_quantiles, dtype=np.float32)
-            )
-        )
-    )
-    shell_iqr = float(
-        np.percentile(shell_luma, 75)
-        - np.percentile(shell_luma, 25)
-    )
-    external_iqr = float(
-        np.percentile(external_luma, 75)
-        - np.percentile(external_luma, 25)
-    )
-    continuity_votes = (
-        color_distance <= 40.0,
-        quantile_delta <= 24.0,
-        abs(shell_iqr - external_iqr) <= 24.0,
-    )
-    surface_continuity = all(continuity_votes)
-    support = dict(unavailable["support"])
-    support.update(
-        {
-            "core_color": spatial_facts.core_color,
-            "internal_support_color": _rgb_hex(shell_rgb),
-            "carrier_shell_pixel_count": shell_count,
-            "external_surface_color": _rgb_hex(external_rgb),
-            "internal_external_color_distance_rgb": round(
-                color_distance, 6
-            ),
-            "internal_external_luma_quantile_delta": round(
-                quantile_delta, 6
-            ),
-            "internal_luma_iqr": round(shell_iqr, 6),
-            "external_luma_iqr": round(external_iqr, 6),
-            "radial_distance_p90_px": round(role.width_px, 6),
-            "shell_ring_recall": round(role.shell_ring_recall, 8),
-            "ring_shell_precision": round(
-                role.ring_shell_precision, 8
-            ),
-            "spatial_outline_role": role.to_audit_dict(),
-        }
-    )
-    if surface_continuity:
-        return {
-            **unavailable,
-            "support_status": "supported",
-            "carrier_kind": "surface",
-            "confidence": round(role.confidence, 8),
-            "reason_codes": [
-                "source_carrier_external_surface_continuity"
-            ],
-            "support": support,
-            "value": {"color": _rgb_hex(shell_rgb), "width_px": 0.0},
-        }
-    if not continuity_votes[0] and not continuity_votes[1]:
-        return {
-            **unavailable,
-            "support_status": "supported",
-            "carrier_kind": "outline",
-            "confidence": round(role.confidence, 8),
-            "reason_codes": [
-                "source_outline_supported_canonical_spatial_role"
-            ],
-            "support": support,
-            "value": {
-                "color": _rgb_hex(shell_rgb),
-                "width_px": round(role.width_px, 6),
-            },
-        }
-    return {
-        **unavailable,
-        "reason_codes": [
-            "source_carrier_external_surface_evidence_conflicting"
-        ],
-        "support": support,
-    }
 
 
-def _measure_authorized_style_crop(
-    source_crop: np.ndarray,
-    mask_crop: np.ndarray,
-    *,
-    spatial_facts: AuthorizedStyleSpatialFactSet | None = None,
-    shadow_observation: Mapping[str, Any] | None = None,
-) -> _AuthorizedStyleCropMeasurement:
-    facts = spatial_facts or build_authorized_style_spatial_fact_set(
-        source_crop, mask_crop
-    )
-    source_crop = np.asarray(facts.source_rgb, dtype=np.uint8)
-    mask_crop = np.asarray(facts.authorized_mask, dtype=bool)
-    reasons: list[str] = ["detector_and_ink_axes_authorized_pixels_only"]
-    mask_binary = np.asarray(mask_crop, dtype=np.uint8)
-    luma_image = (
-        source_crop[:, :, 0].astype(np.float32) * 0.2126
-        + source_crop[:, :, 1].astype(np.float32) * 0.7152
-        + source_crop[:, :, 2].astype(np.float32) * 0.0722
-    )
-    try:
-        import cv2
-
-        distance = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 5)
-    except Exception:
-        distance = mask_binary.astype(np.float32)
-        reasons.append("distance_transform_unavailable")
-    fill = np.asarray(facts.character_core_mask, dtype=bool)
-    fill_cluster_resolved = facts.core_role_status == "supported"
-    support_mask = np.asarray(facts.concentric_shell_mask, dtype=bool)
-    if int(np.count_nonzero(support_mask)) < 8:
-        # Direct diagnostics may compare the core with itself when no
-        # canonical shell exists, but support color remains unavailable.
-        support_mask = fill.copy()
-        reasons.append("direct_paint_canonical_shell_unavailable")
-    edge = support_mask
-    edge_luma = luma_image[support_mask]
-    support_median = float(np.median(edge_luma)) if edge_luma.size else 127.0
-    support_iqr = (
-        float(np.percentile(edge_luma, 75) - np.percentile(edge_luma, 25))
-        if edge_luma.size
-        else 255.0
-    )
-    fill_polarity = facts.fill_polarity
-    fill_count = int(np.count_nonzero(fill))
-    if fill_count <= 0:
-        fill_cluster_resolved = False
-        reasons.append("canonical_character_core_unresolved")
-
-    fill_pixels = source_crop[fill]
-    support_pixels = source_crop[edge]
-    fill_luma = luma_image[fill]
-    fill_median = float(np.median(fill_luma)) if fill_luma.size else support_median
-    contrast = abs(support_median - fill_median)
-    fill_color = facts.core_color if fill_cluster_resolved else ""
-    support_color = facts.support_color
-
-    x_spans = _projection_spans(fill, axis=0)
-    y_spans = _projection_spans(fill, axis=1)
-    fill_component_facts = _fill_component_facts(fill)
-    (
-        vertical_size,
-        vertical_confidence,
-        vertical_support,
-        vertical_qualification,
-    ) = _qualify_source_cell_measurement(
-        fill,
-        axis=0,
-        spans=x_spans,
-        component_facts=fill_component_facts,
-    )
-    (
-        horizontal_size,
-        horizontal_confidence,
-        horizontal_support,
-        horizontal_qualification,
-    ) = _qualify_source_cell_measurement(
-        fill,
-        axis=1,
-        spans=y_spans,
-        component_facts=fill_component_facts,
-    )
-    if vertical_size > 0 or horizontal_size > 0:
-        reasons.append("source_cell_scale_measured_from_authorized_geometry")
-    else:
-        reasons.append("source_cell_scale_unavailable")
-    reasons.extend(
-        reason
-        for reason in (
-            vertical_support,
-            horizontal_support,
-        )
-        if reason
-    )
-    source_text_footprint = _summarize_source_text_footprint(
-        fill,
-        component_facts=fill_component_facts,
-        vertical_cell_size_px=vertical_size,
-        vertical_scale_confidence=vertical_confidence,
-        vertical_scale_support=vertical_support,
-        vertical_scale_qualification=vertical_qualification,
-        horizontal_cell_size_px=horizontal_size,
-        horizontal_scale_confidence=horizontal_confidence,
-        horizontal_scale_support=horizontal_support,
-        horizontal_scale_qualification=horizontal_qualification,
-    )
-
-    fill_distances = distance[fill]
-    fill_distance_p25 = (
-        float(np.percentile(fill_distances, 25)) if fill_distances.size else 0.0
-    )
-    try:
-        ink_distance = cv2.distanceTransform(
-            np.asarray(fill, dtype=np.uint8), cv2.DIST_L2, 5
-        )
-    except Exception:
-        ink_distance = np.zeros_like(distance, dtype=np.float32)
-        reasons.append("ink_distance_transform_unavailable")
-    ink_distance_values = ink_distance[fill]
-    ink_distance_p75 = (
-        float(np.percentile(ink_distance_values, 75))
-        if ink_distance_values.size
-        else 0.0
-    )
-    source_ink_stroke_width = max(0.0, ink_distance_p75 * 2.0)
-    ink_weight_class = ""
-    ink_weight_confidence = 0.0
-    if fill_cluster_resolved and fill_count >= 24 and ink_distance_p75 > 0.0:
-        if ink_distance_p75 <= 1.5:
-            ink_weight_class = "regular"
-            ink_weight_confidence = min(0.92, 0.72 + fill_count / 4096.0)
-            reasons.append("source_ink_weight_regular_measured")
-        elif ink_distance_p75 >= 1.9:
-            ink_weight_class = "bold"
-            ink_weight_confidence = min(
-                0.94,
-                0.72 + min(0.16, (ink_distance_p75 - 1.9) * 0.12) + fill_count / 4096.0,
-            )
-            reasons.append("source_ink_weight_bold_measured")
-        else:
-            reasons.append("source_ink_weight_transition_unresolved")
-    else:
-        reasons.append("source_ink_weight_unavailable")
-
-    scale_for_stroke = max(vertical_size, horizontal_size, 1.0)
-    stroke_width = 0.0
-    stroke_confidence = 0.0
-    source_carrier_observation = _observe_source_carrier(
-        source_crop,
-        mask_crop,
-        spatial_facts=facts,
-        shadow_observation=shadow_observation,
-        source_cell_size_px=scale_for_stroke,
-    )
-    carrier_status = str(
-        source_carrier_observation.get("support_status") or "unavailable"
-    )
-    carrier_kind = str(
-        source_carrier_observation.get("carrier_kind") or "unavailable"
-    )
-    carrier_value = (
-        dict(source_carrier_observation.get("value") or {})
-        if isinstance(source_carrier_observation.get("value"), Mapping)
-        else {}
-    )
-    outlined_weight_qualification: dict[str, Any] = {
-        "status": "not_applicable_source_carrier_unavailable",
-        "directions": {},
-    }
-    ink_weight_class_vertical = ""
-    ink_weight_confidence_vertical = 0.0
-    ink_weight_support_vertical = ""
-    ink_weight_class_horizontal = ""
-    ink_weight_confidence_horizontal = 0.0
-    ink_weight_support_horizontal = ""
-    if carrier_status == "supported" and carrier_kind in {"outline", "backing"}:
-        stroke_width = max(0.0, float(carrier_value.get("width_px") or 0.0))
-        stroke_confidence = max(
-            0.0, float(source_carrier_observation.get("confidence") or 0.0)
-        )
-        reasons.append(f"source_{carrier_kind}_supported_external_surface_ring")
-        _, _, outlined_weight_qualification = _qualify_outlined_ink_weight(
-            fill,
-            source_cell_size_vertical_px=vertical_size,
-            source_cell_size_horizontal_px=horizontal_size,
-        )
-        outlined_directions = dict(
-            outlined_weight_qualification.get("directions") or {}
-        )
-        vertical_weight = dict(outlined_directions.get("vertical") or {})
-        horizontal_weight = dict(outlined_directions.get("horizontal") or {})
-        ink_weight_support_vertical = str(
-            vertical_weight.get("status") or ""
-        )
-        ink_weight_support_horizontal = str(
-            horizontal_weight.get("status") or ""
-        )
-        if str(vertical_weight.get("status") or "").startswith("supported_"):
-            ink_weight_class_vertical = str(
-                vertical_weight.get("weight_class") or ""
-            )
-            ink_weight_confidence_vertical = float(
-                vertical_weight.get("confidence") or 0.0
-            )
-        if str(horizontal_weight.get("status") or "").startswith("supported_"):
-            ink_weight_class_horizontal = str(
-                horizontal_weight.get("weight_class") or ""
-            )
-            ink_weight_confidence_horizontal = float(
-                horizontal_weight.get("confidence") or 0.0
-            )
-        if ink_weight_class_vertical or ink_weight_class_horizontal:
-            reasons = [
-                reason
-                for reason in reasons
-                if not reason.startswith("source_ink_weight_")
-            ]
-            ink_weight_class = ""
-            ink_weight_confidence = 0.0
-            if ink_weight_class_vertical:
-                reasons.append(
-                    "source_ink_weight_"
-                    f"{ink_weight_class_vertical}_supported_outlined_vertical_cell_cohort"
-                )
-            if ink_weight_class_horizontal:
-                reasons.append(
-                    "source_ink_weight_"
-                    f"{ink_weight_class_horizontal}_supported_outlined_horizontal_cell_cohort"
-                )
-        elif ink_weight_class:
-            # ``fill`` is the contrast-resolved glyph interior, not the full
-            # authorized carrier. A supported external carrier therefore does
-            # not invalidate the independently measured core weight when a
-            # repeated outlined-cell cohort is unavailable.
-            reasons.append(
-                "source_ink_weight_retained_contrast_resolved_core"
-            )
-    elif carrier_status == "supported" and carrier_kind in {"surface", "none"}:
-        stroke_confidence = max(
-            0.0, float(source_carrier_observation.get("confidence") or 0.0)
-        )
-        outlined_weight_qualification["status"] = (
-            "not_applicable_source_surface_continuity"
-            if carrier_kind == "surface"
-            else "not_applicable_source_carrier_absent"
-        )
-        reasons.append(
-            "source_carrier_absent_external_surface_continuity"
-            if carrier_kind == "surface"
-            else "source_carrier_absent_no_internal_support"
-        )
-    else:
-        reasons.append("source_carrier_not_independently_supported")
-
-    fill_rgb = fill_pixels.astype(np.float32)
-    fill_rgb_median = (
-        np.median(fill_rgb, axis=0)
-        if fill_rgb.size
-        else np.asarray((127.0, 127.0, 127.0), dtype=np.float32)
-    )
-    fill_color_distances = (
-        np.linalg.norm(fill_rgb - fill_rgb_median[None, :], axis=1)
-        if fill_rgb.size
-        else np.asarray([], dtype=np.float32)
-    )
-    fill_color_dispersion_p75 = (
-        float(np.percentile(fill_color_distances, 75))
-        if fill_color_distances.size
-        else 255.0
-    )
-    fill_color_coherence = max(
-        0.0,
-        1.0 - min(1.0, fill_color_dispersion_p75 / 64.0),
-    )
-    paint_confidence = (
-        min(
-            0.98,
-            0.98
-            * min(1.0, fill_count / 64.0)
-            * fill_color_coherence,
-        )
-        if fill_cluster_resolved
-        else 0.0
-    )
-    if paint_confidence > 0:
-        reasons.append("source_fill_measured_from_authorized_core_paint")
-    scale_confidence = max(vertical_confidence, horizontal_confidence)
-    metrics = {
-        "fill_polarity": fill_polarity,
-        "fill_color": fill_color,
-        "support_color": support_color,
-        "source_cell_size_vertical_px": round(vertical_size, 6),
-        "source_cell_size_horizontal_px": round(horizontal_size, 6),
-        "source_cell_confidence_vertical": round(vertical_confidence, 8),
-        "source_cell_confidence_horizontal": round(horizontal_confidence, 8),
-        "source_cell_support_vertical": vertical_support,
-        "source_cell_support_horizontal": horizontal_support,
-        "source_stroke_width_px": round(stroke_width, 6),
-        "source_ink_stroke_width_px": round(source_ink_stroke_width, 6),
-        "ink_weight_class": ink_weight_class,
-        "ink_weight_confidence": round(ink_weight_confidence, 8),
-        "ink_weight_class_vertical": ink_weight_class_vertical,
-        "ink_weight_confidence_vertical": round(
-            ink_weight_confidence_vertical, 8
-        ),
-        "ink_weight_support_vertical": ink_weight_support_vertical,
-        "ink_weight_class_horizontal": ink_weight_class_horizontal,
-        "ink_weight_confidence_horizontal": round(
-            ink_weight_confidence_horizontal, 8
-        ),
-        "ink_weight_support_horizontal": ink_weight_support_horizontal,
-        "scale_confidence": round(scale_confidence, 8),
-        "paint_confidence": round(paint_confidence, 8),
-        "stroke_confidence": round(stroke_confidence, 8),
-        "reason_codes": _unique(reasons),
-        "support_luma_median": round(support_median, 6),
-        "support_luma_iqr": round(support_iqr, 6),
-        "fill_luma_median": round(fill_median, 6),
-        "fill_support_contrast": round(contrast, 6),
-        "fill_color_dispersion_rgb_p75": round(
-            fill_color_dispersion_p75, 6
-        ),
-        "fill_color_coherence": round(fill_color_coherence, 8),
-        "authorized_pixel_count": int(np.count_nonzero(mask_crop)),
-        "fill_pixel_count": fill_count,
-        "fill_distance_p25": round(fill_distance_p25, 6),
-        "ink_distance_p75": round(ink_distance_p75, 6),
-        "source_carrier_kind": carrier_kind,
-        "source_carrier_observation": source_carrier_observation,
-        "outlined_weight_qualification": outlined_weight_qualification,
-        "fill_x_spans": [round(float(value), 6) for value in x_spans],
-        "fill_y_spans": [round(float(value), 6) for value in y_spans],
-        "fill_component_facts": [
-            _json_safe_mapping(fact) for fact in fill_component_facts
-        ],
-        "density_decomposition_vertical_spans": list(
-            vertical_qualification.get("density_spans") or []
-        ),
-        "density_decomposition_horizontal_spans": list(
-            horizontal_qualification.get("density_spans") or []
-        ),
-        "source_cell_qualification_vertical": vertical_qualification,
-        "source_cell_qualification_horizontal": horizontal_qualification,
-        "authorized_style_spatial_facts": facts.audit_summary(),
-    }
-    return _AuthorizedStyleCropMeasurement(
-        metrics=metrics,
-        source_text_footprint=source_text_footprint,
-    )
 
 
-def _projection_spans(binary: np.ndarray, *, axis: int) -> list[float]:
-    projected = np.any(np.asarray(binary, dtype=bool), axis=axis).astype(np.uint8)
-    if projected.size <= 0:
-        return []
-    try:
-        import cv2
-
-        projected = cv2.morphologyEx(
-            projected.reshape(1, -1),
-            cv2.MORPH_CLOSE,
-            np.ones((1, 3), dtype=np.uint8),
-        ).reshape(-1)
-    except Exception:
-        pass
-    padded = np.pad(projected, (1, 1), constant_values=0)
-    changes = np.diff(padded.astype(np.int8))
-    starts = np.where(changes == 1)[0]
-    ends = np.where(changes == -1)[0]
-    return [float(end - start) for start, end in zip(starts, ends) if end - start >= 2]
 
 
-def _projection_spans_at_min_occupancy(
-    binary: np.ndarray,
-    *,
-    axis: int,
-    minimum_occupancy: int,
-) -> list[float]:
-    """Return occupied-axis runs without reconnecting adjacent text columns."""
-
-    return [
-        float(end - start)
-        for start, end in _projection_runs_at_min_occupancy(
-            binary,
-            axis=axis,
-            minimum_occupancy=minimum_occupancy,
-        )
-    ]
 
 
-def _projection_runs_at_min_occupancy(
-    binary: np.ndarray,
-    *,
-    axis: int,
-    minimum_occupancy: int,
-) -> list[tuple[int, int]]:
-    counts = np.count_nonzero(np.asarray(binary, dtype=bool), axis=axis)
-    projected = (counts >= max(1, int(minimum_occupancy))).astype(np.uint8)
-    if projected.size <= 0:
-        return []
-    padded = np.pad(projected, (1, 1), constant_values=0)
-    changes = np.diff(padded.astype(np.int8))
-    starts = np.where(changes == 1)[0]
-    ends = np.where(changes == -1)[0]
-    return [
-        (int(start), int(end))
-        for start, end in zip(starts, ends)
-        if end - start >= 2
-    ]
 
 
-def _qualify_outlined_ink_weight(
-    fill: np.ndarray,
-    *,
-    source_cell_size_vertical_px: float,
-    source_cell_size_horizontal_px: float,
-) -> tuple[str, float, dict[str, Any]]:
-    """Qualify weight only when an outline covers repeated source-cell bands.
-
-    A parent-wide distance statistic is unsafe when only punctuation or one
-    fragment carries visible support. Repeated full-cell bands make the ink
-    tier a text-wide observation while leaving mixed/local support unresolved.
-    """
-
-    binary = np.asarray(fill, dtype=bool)
-    directions: dict[str, dict[str, Any]] = {}
-    supported: list[tuple[str, str, float, int, float]] = []
-    for direction, axis, cell_size in (
-        ("vertical", 0, float(source_cell_size_vertical_px)),
-        ("horizontal", 1, float(source_cell_size_horizontal_px)),
-    ):
-        record: dict[str, Any] = {
-            "cell_size_px": round(max(0.0, cell_size), 6),
-            "status": "unavailable_source_cell_scale",
-            "band_spans_px": [],
-            "band_ink_widths_px": [],
-        }
-        directions[direction] = record
-        if cell_size <= 0.0:
-            continue
-        orthogonal_extent = int(binary.shape[0] if axis == 0 else binary.shape[1])
-        runs = _projection_runs_at_min_occupancy(
-            binary,
-            axis=axis,
-            minimum_occupancy=max(2, int(round(orthogonal_extent * 0.10))),
-        )
-        full_cell_runs = [
-            (start, end)
-            for start, end in runs
-            if cell_size * 0.60 <= float(end - start) <= cell_size * 1.45
-        ]
-        record["band_spans_px"] = [
-            float(end - start) for start, end in full_cell_runs
-        ]
-        if len(full_cell_runs) < 3:
-            record["status"] = "unavailable_insufficient_full_cell_bands"
-            continue
-        ink_widths: list[float] = []
-        try:
-            import cv2
-
-            for start, end in full_cell_runs:
-                band = (
-                    binary[:, start:end]
-                    if axis == 0
-                    else binary[start:end, :]
-                )
-                distance = cv2.distanceTransform(
-                    np.asarray(band, dtype=np.uint8), cv2.DIST_L2, 5
-                )
-                values = distance[band]
-                if values.size:
-                    ink_widths.append(float(np.percentile(values, 75)) * 2.0)
-        except Exception:
-            record["status"] = "unavailable_distance_transform"
-            continue
-        record["band_ink_widths_px"] = [
-            round(float(value), 6) for value in ink_widths
-        ]
-        if len(ink_widths) < 3:
-            record["status"] = "unavailable_insufficient_ink_bands"
-            continue
-        median_width = float(np.median(np.asarray(ink_widths, dtype=np.float32)))
-        relative_mad = float(
-            np.median(np.abs(np.asarray(ink_widths) - median_width))
-            / max(1.0, median_width)
-        )
-        record["median_ink_width_px"] = round(median_width, 6)
-        record["relative_mad"] = round(relative_mad, 8)
-        if relative_mad > 0.20:
-            record["status"] = "unavailable_mixed_ink_tiers"
-            continue
-        if median_width <= 3.0:
-            weight_class = "regular"
-        elif median_width >= 3.8:
-            weight_class = "bold"
-        else:
-            record["status"] = "unavailable_transition_ink_tier"
-            continue
-        confidence = min(
-            0.94,
-            0.76
-            + min(0.10, (len(ink_widths) - 3) * 0.04)
-            + min(0.08, max(0.0, 0.20 - relative_mad) * 0.40),
-        )
-        record["status"] = "supported_outlined_cell_cohort"
-        record["weight_class"] = weight_class
-        record["confidence"] = round(confidence, 8)
-        supported.append(
-            (direction, weight_class, confidence, len(ink_widths), relative_mad)
-        )
-
-    if not supported:
-        return "", 0.0, {"status": "unavailable", "directions": directions}
-    classes = {item[1] for item in supported}
-    if len(classes) != 1:
-        return "", 0.0, {
-            "status": "unavailable_directional_weight_disagreement",
-            "directions": directions,
-        }
-    selected = max(supported, key=lambda item: (item[3], item[2], -item[4]))
-    return selected[1], float(selected[2]), {
-        "status": "supported_outlined_cell_cohort",
-        "selected_direction": selected[0],
-        "directions": directions,
-    }
 
 
-def _stable_numeric_tier(
-    values: Sequence[float],
-    *,
-    minimum_count: int,
-) -> tuple[float, int, float]:
-    clean = np.asarray(
-        [float(value) for value in values if float(value) >= 3.0],
-        dtype=np.float32,
-    )
-    if clean.size < minimum_count:
-        return 0.0, int(clean.size), 0.0
-    upper_reference = float(np.max(clean))
-    cohort = clean[clean >= max(3.0, upper_reference * 0.78)]
-    if cohort.size < minimum_count:
-        return 0.0, int(cohort.size), 0.0
-    median = float(np.median(cohort))
-    relative_mad = float(
-        np.median(np.abs(cohort - median)) / max(1.0, median)
-    )
-    if relative_mad > 0.20:
-        return 0.0, int(cohort.size), relative_mad
-    return median, int(cohort.size), relative_mad
 
 
 def _fill_component_facts(fill: np.ndarray) -> list[dict[str, Any]]:
@@ -5537,593 +4072,14 @@ def _fill_component_facts(fill: np.ndarray) -> list[dict[str, Any]]:
     return facts
 
 
-def _densest_center_pitch_tier(
-    values: Sequence[float],
-) -> tuple[float, int, float, bool]:
-    """Return one non-harmonic repeated pitch tier or fail ambiguous."""
-
-    clean = sorted(float(value) for value in values if float(value) >= 3.0)
-    if len(clean) < 2:
-        return 0.0, len(clean), 0.0, False
-    candidates: list[tuple[int, float, float, list[float]]] = []
-    for seed in clean:
-        tolerance = max(1.5, seed * 0.12)
-        cohort = [value for value in clean if abs(value - seed) <= tolerance]
-        median = float(np.median(cohort))
-        relative_mad = float(
-            np.median(np.abs(np.asarray(cohort) - median))
-            / max(1.0, median)
-        )
-        candidates.append(
-            (len(cohort), relative_mad, median, cohort)
-        )
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-    best = candidates[0]
-    if best[1] > 0.12:
-        return 0.0, int(best[0]), float(best[1]), False
-    competing = [
-        item
-        for item in candidates[1:]
-        if item[0] == best[0]
-        and abs(item[2] - best[2]) / max(1.0, best[2]) > 0.18
-    ]
-    if competing:
-        return 0.0, int(best[0]), float(best[1]), True
-    return float(best[2]), int(best[0]), float(best[1]), False
 
 
-def _component_center_pitch_candidates(
-    component_facts: Sequence[Mapping[str, Any]],
-    *,
-    axis: int,
-    reference_px: float,
-) -> tuple[list[float], list[dict[str, Any]]]:
-    """Collect adjacent glyph-center deltas without bridging punctuation."""
-
-    if reference_px <= 0.0:
-        return [], []
-    cross_index = 0 if axis == 0 else 1
-    inline_index = 1 if axis == 0 else 0
-    records: list[dict[str, Any]] = []
-    for fact in component_facts:
-        center = list(fact.get("center_xy") or ())
-        if len(center) != 2:
-            continue
-        records.append(
-            {
-                "cross": float(center[cross_index]),
-                "inline": float(center[inline_index]),
-                "punctuation": bool(
-                    fact.get("punctuation_fragment")
-                ),
-                "area": max(1.0, float(fact.get("area_px") or 1.0)),
-            }
-        )
-    if len(records) < 3:
-        return [], []
-    track_tolerance = max(3.0, reference_px * 0.65)
-    tracks: list[list[dict[str, Any]]] = []
-    for record in sorted(records, key=lambda item: item["cross"]):
-        candidates = [
-            (
-                abs(
-                    record["cross"]
-                    - float(
-                        np.average(
-                            [item["cross"] for item in track],
-                            weights=[item["area"] for item in track],
-                        )
-                    )
-                ),
-                index,
-            )
-            for index, track in enumerate(tracks)
-        ]
-        candidates = [
-            item for item in candidates if item[0] <= track_tolerance
-        ]
-        if candidates:
-            tracks[min(candidates)[1]].append(record)
-        else:
-            tracks.append([record])
-
-    inline_tolerance = max(
-        2.0, min(14.0, reference_px * 0.65)
-    )
-    deltas: list[float] = []
-    track_audit: list[dict[str, Any]] = []
-    for track_index, track in enumerate(tracks):
-        glyph_groups: list[list[dict[str, Any]]] = []
-        for record in sorted(track, key=lambda item: item["inline"]):
-            if (
-                glyph_groups
-                and abs(
-                    record["inline"]
-                    - float(
-                        np.average(
-                            [item["inline"] for item in glyph_groups[-1]],
-                            weights=[item["area"] for item in glyph_groups[-1]],
-                        )
-                    )
-                )
-                <= inline_tolerance
-            ):
-                glyph_groups[-1].append(record)
-            else:
-                glyph_groups.append([record])
-        glyph_records: list[dict[str, Any]] = []
-        for group in glyph_groups:
-            center = float(
-                np.average(
-                    [item["inline"] for item in group],
-                    weights=[item["area"] for item in group],
-                )
-            )
-            glyph_records.append(
-                {
-                    "center_px": center,
-                    "body": any(
-                        not bool(item["punctuation"]) for item in group
-                    ),
-                    "punctuation": all(
-                        bool(item["punctuation"]) for item in group
-                    ),
-                }
-            )
-        track_deltas: list[float] = []
-        for first, second in zip(glyph_records, glyph_records[1:]):
-            delta = float(second["center_px"] - first["center_px"])
-            if (
-                first["body"]
-                and second["body"]
-                and reference_px * 0.70
-                <= delta
-                <= reference_px * 2.40
-            ):
-                track_deltas.append(delta)
-        track_tier = _densest_center_pitch_tier(track_deltas)
-        track_qualified = bool(
-            track_tier[0] > 0.0
-            and track_tier[1] >= 3
-            and not track_tier[3]
-        )
-        if track_qualified:
-            tolerance = max(1.5, track_tier[0] * 0.12)
-            deltas.extend(
-                value
-                for value in track_deltas
-                if abs(value - track_tier[0]) <= tolerance
-            )
-        track_audit.append(
-            {
-                "track_index": track_index,
-                "cross_center_px": round(
-                    float(
-                        np.average(
-                            [item["cross"] for item in track],
-                            weights=[item["area"] for item in track],
-                        )
-                    ),
-                    6,
-                ),
-                "glyph_centers_px": [
-                    round(float(item["center_px"]), 6)
-                    for item in glyph_records
-                ],
-                "glyph_body_flags": [
-                    bool(item["body"]) for item in glyph_records
-                ],
-                "pitch_candidates_px": [
-                    round(value, 6) for value in track_deltas
-                ],
-                "pitch_tier_px": round(track_tier[0], 6),
-                "pitch_tier_count": int(track_tier[1]),
-                "pitch_relative_mad": round(track_tier[2], 8),
-                "pitch_ambiguous": bool(track_tier[3]),
-                "pitch_track_qualified": track_qualified,
-                "qualified_pitch_delta_count": (
-                    int(track_tier[1]) if track_qualified else 0
-                ),
-            }
-        )
-    return deltas, track_audit
 
 
-def _band_center_pitch_candidates(
-    fill: np.ndarray,
-    *,
-    axis: int,
-    reference_px: float,
-) -> tuple[list[float], list[dict[str, Any]]]:
-    """Collect adjacent occupied-band deltas without skipping small bands."""
-
-    if reference_px <= 0.0:
-        return [], []
-    records = _occupied_band_records(fill, axis=1 - axis)
-    body_flags = [
-        max(3.0, reference_px * 0.35)
-        <= float(record.get("span_px") or 0.0)
-        <= reference_px * 2.20
-        for record in records
-    ]
-    deltas: list[float] = []
-    for index, (first, second) in enumerate(zip(records, records[1:])):
-        delta = float(second["center_px"]) - float(first["center_px"])
-        if (
-            body_flags[index]
-            and body_flags[index + 1]
-            and reference_px * 0.70
-            <= delta
-            <= reference_px * 2.40
-        ):
-            deltas.append(delta)
-    audit = [
-        {
-            **dict(record),
-            "body_like_for_pitch": bool(body_flags[index]),
-        }
-        for index, record in enumerate(records)
-    ]
-    return deltas, audit
 
 
-def _repeated_center_pitch(
-    fill: np.ndarray,
-    *,
-    axis: int,
-    raw_candidate: float,
-    body_candidate: float,
-    component_facts: Sequence[Mapping[str, Any]],
-) -> tuple[float, int, float, dict[str, Any]]:
-    """Resolve cell pitch from repeated centers before body dimensions."""
-
-    reference = body_candidate if body_candidate > 0.0 else raw_candidate
-    component_values, component_tracks = (
-        _component_center_pitch_candidates(
-            component_facts,
-            axis=axis,
-            reference_px=reference,
-        )
-    )
-    band_values, band_records = _band_center_pitch_candidates(
-        fill,
-        axis=axis,
-        reference_px=reference,
-    )
-    component_tier = _densest_center_pitch_tier(component_values)
-    band_tier = _densest_center_pitch_tier(band_values)
-    audit: dict[str, Any] = {
-        "center_pitch_reference_px": round(reference, 6),
-        "component_center_pitch_candidates_px": [
-            round(value, 6) for value in component_values
-        ],
-        "component_center_pitch_tier_px": round(component_tier[0], 6),
-        "component_center_pitch_tier_count": int(component_tier[1]),
-        "component_center_pitch_relative_mad": round(
-            component_tier[2], 8
-        ),
-        "component_center_pitch_ambiguous": bool(component_tier[3]),
-        "component_pitch_tracks": component_tracks,
-        "band_center_pitch_candidates_px": [
-            round(value, 6) for value in band_values
-        ],
-        "band_center_pitch_tier_px": round(band_tier[0], 6),
-        "band_center_pitch_tier_count": int(band_tier[1]),
-        "band_center_pitch_relative_mad": round(band_tier[2], 8),
-        "band_center_pitch_ambiguous": bool(band_tier[3]),
-        "band_pitch_records": band_records,
-        "center_pitch_independent_sources": False,
-        "center_pitch_status": "unavailable",
-    }
-    if component_tier[3] or band_tier[3]:
-        audit["center_pitch_status"] = "ambiguous_competing_pitch_tiers"
-        return 0.0, 0, 0.0, audit
-    component_ready = component_tier[0] > 0.0 and component_tier[1] >= 2
-    band_ready = band_tier[0] > 0.0 and band_tier[1] >= 2
-    if component_ready and band_ready:
-        disagreement = abs(component_tier[0] - band_tier[0]) / max(
-            1.0, min(component_tier[0], band_tier[0])
-        )
-        audit["center_pitch_source_disagreement"] = round(
-            disagreement, 8
-        )
-        if disagreement > 0.10:
-            lower = min(component_tier[0], band_tier[0])
-            upper = max(component_tier[0], band_tier[0])
-            harmonic_ratio = upper / max(1.0, lower)
-            upper_tier = (
-                component_tier
-                if component_tier[0] >= band_tier[0]
-                else band_tier
-            )
-            if 1.80 <= harmonic_ratio <= 2.20 and upper_tier[1] >= 3:
-                audit["center_pitch_harmonic_rejected_px"] = round(
-                    lower, 6
-                )
-                audit["center_pitch_status"] = (
-                    "supported_higher_nonfragment_harmonic"
-                )
-                return (
-                    float(upper_tier[0]),
-                    int(upper_tier[1]),
-                    float(upper_tier[2]),
-                    audit,
-                )
-            audit["center_pitch_status"] = (
-                "ambiguous_pitch_sources_disagree"
-            )
-            return 0.0, 0, 0.0, audit
-        candidate = float(
-            np.median([component_tier[0], band_tier[0]])
-        )
-        count = int(component_tier[1] + band_tier[1])
-        relative_mad = max(component_tier[2], band_tier[2])
-        audit["center_pitch_independent_sources"] = True
-        audit["center_pitch_status"] = "supported"
-        return candidate, count, relative_mad, audit
-    selected = component_tier if component_ready else band_tier
-    if selected[0] > 0.0 and selected[1] >= 3:
-        audit["center_pitch_status"] = "supported"
-        return float(selected[0]), int(selected[1]), float(selected[2]), audit
-    return 0.0, 0, 0.0, audit
 
 
-def _qualify_source_cell_measurement(
-    fill: np.ndarray,
-    *,
-    axis: int,
-    spans: Sequence[float],
-    component_facts: Sequence[Mapping[str, Any]],
-) -> tuple[float, float, str, dict[str, Any]]:
-    """Resolve source cell scale from repeated pitch, then corroboration."""
-
-    binary = np.asarray(fill, dtype=bool)
-    raw_candidate, raw_count, raw_relative_mad = _stable_numeric_tier(
-        spans,
-        minimum_count=1,
-    )
-    axis_key = "width_px" if axis == 0 else "height_px"
-    punctuation_count = sum(
-        1
-        for fact in component_facts
-        if bool(fact.get("punctuation_fragment"))
-    )
-    body_values = [
-        float(fact.get(axis_key) or 0.0)
-        for fact in component_facts
-        if not bool(fact.get("punctuation_fragment"))
-        and float(fact.get(axis_key) or 0.0) >= 3.0
-    ]
-    body_candidate, body_count, body_relative_mad = (
-        _stable_numeric_tier(body_values, minimum_count=1)
-    )
-    (
-        pitch_candidate,
-        pitch_count,
-        pitch_relative_mad,
-        pitch_audit,
-    ) = _repeated_center_pitch(
-        binary,
-        axis=axis,
-        raw_candidate=raw_candidate,
-        body_candidate=body_candidate,
-        component_facts=component_facts,
-    )
-
-    axis_extent = int(binary.shape[1] if axis == 0 else binary.shape[0])
-    orthogonal_extent = int(
-        binary.shape[0] if axis == 0 else binary.shape[1]
-    )
-    coordinates = np.where(binary)
-    orthogonal_coordinates = (
-        coordinates[0] if axis == 0 else coordinates[1]
-    )
-    filled_orthogonal_extent = (
-        int(np.ptp(orthogonal_coordinates)) + 1
-        if orthogonal_coordinates.size
-        else 0
-    )
-    raw_max = max((float(value) for value in spans), default=0.0)
-    parent_sized_island = bool(
-        axis_extent > 0
-        and orthogonal_extent > 0
-        and raw_max >= axis_extent * 0.78
-        and filled_orthogonal_extent >= orthogonal_extent * 0.78
-    )
-    density_spans: list[float] = []
-    density_candidate = 0.0
-    density_count = 0
-    density_relative_mad = 0.0
-    if parent_sized_island:
-        density_spans = _projection_spans_at_min_occupancy(
-            binary,
-            axis=axis,
-            minimum_occupancy=max(
-                2, int(round(orthogonal_extent * 0.10))
-            ),
-        )
-        (
-            density_candidate,
-            density_count,
-            density_relative_mad,
-        ) = _stable_numeric_tier(
-            density_spans,
-            minimum_count=3,
-        )
-
-    projection_matches = sorted(
-        float(value)
-        for value in [*spans, *density_spans]
-        if body_candidate > 0.0
-        and float(value) >= 3.0
-        and 0.70 <= float(value) / body_candidate <= 1.35
-    )
-    body_pitch_ratio = (
-        body_candidate / pitch_candidate
-        if pitch_candidate > 0.0
-        else 0.0
-    )
-    projection_pitch_ratio = (
-        raw_candidate / pitch_candidate
-        if pitch_candidate > 0.0 and raw_candidate > 0.0
-        else 0.0
-    )
-    audit = {
-        "raw_projection_candidate": round(raw_candidate, 6),
-        "raw_projection_candidate_count": int(raw_count),
-        "raw_projection_relative_mad": round(raw_relative_mad, 8),
-        "selected_body_tier_px": round(body_candidate, 6),
-        "selected_body_tier_count": int(body_count),
-        "selected_body_tier_relative_mad": round(
-            body_relative_mad, 8
-        ),
-        "body_component_count": len(body_values),
-        "punctuation_component_count": int(punctuation_count),
-        "axis_extent": axis_extent,
-        "orthogonal_extent": orthogonal_extent,
-        "filled_orthogonal_extent": filled_orthogonal_extent,
-        "parent_sized_island": parent_sized_island,
-        "density_minimum_occupancy": (
-            max(2, int(round(orthogonal_extent * 0.10)))
-            if parent_sized_island
-            else 0
-        ),
-        "density_spans": [
-            round(float(value), 6) for value in density_spans
-        ],
-        "density_candidate": round(density_candidate, 6),
-        "density_candidate_count": int(density_count),
-        "density_relative_mad": round(
-            density_relative_mad, 8
-        ),
-        "body_projection_matches_px": [
-            round(value, 6) for value in projection_matches
-        ],
-        "center_pitch_candidate_px": round(pitch_candidate, 6),
-        "center_pitch_candidate_count": int(pitch_count),
-        "center_pitch_relative_mad": round(
-            pitch_relative_mad, 8
-        ),
-        "body_to_center_pitch_ratio": round(body_pitch_ratio, 8),
-        "projection_to_center_pitch_ratio": round(
-            projection_pitch_ratio, 8
-        ),
-        **pitch_audit,
-    }
-
-    if pitch_candidate > 0.0:
-        body_corroborated = (
-            body_candidate > 0.0
-            and 0.45 <= body_pitch_ratio <= 1.15
-        )
-        projection_corroborated = (
-            raw_candidate > 0.0
-            and 0.65 <= projection_pitch_ratio <= 1.35
-        )
-        independent_sources = bool(
-            pitch_audit.get("center_pitch_independent_sources")
-        )
-        audit.update(
-            {
-                "center_pitch_body_corroborated": body_corroborated,
-                "center_pitch_projection_corroborated": (
-                    projection_corroborated
-                ),
-            }
-        )
-        if body_corroborated and pitch_count >= 3:
-            confidence = max(
-                0.76,
-                min(
-                    0.94,
-                    0.86
-                    - pitch_relative_mad * 0.50
-                    + (0.04 if independent_sources else 0.0),
-                ),
-            )
-            return (
-                pitch_candidate,
-                confidence,
-                "supported_repeated_center_pitch",
-                audit,
-            )
-        return (
-            0.0,
-            0.0,
-            "unavailable_center_pitch_not_corroborated",
-            audit,
-        )
-
-    if str(pitch_audit.get("center_pitch_status") or "").startswith(
-        "ambiguous_"
-    ):
-        return (
-            0.0,
-            0.0,
-            "unavailable_competing_center_pitch",
-            audit,
-        )
-
-    if parent_sized_island:
-        if (
-            density_candidate > 0.0
-            and raw_max >= density_candidate * 2.2
-        ):
-            confidence = max(
-                0.72,
-                min(0.90, 0.86 - density_relative_mad * 0.40),
-            )
-            return (
-                density_candidate,
-                confidence,
-                "supported_density_decomposition",
-                audit,
-            )
-        return 0.0, 0.0, "unavailable_parent_sized_island", audit
-
-    if (
-        body_candidate > 0.0
-        and body_count >= 2
-        and projection_matches
-    ):
-        projection_candidate = min(
-            projection_matches,
-            key=lambda value: abs(value - body_candidate),
-        )
-        confidence = max(
-            0.72,
-            min(
-                0.88,
-                0.82
-                - body_relative_mad * 0.30
-                - abs(projection_candidate - body_candidate)
-                / max(1.0, body_candidate)
-                * 0.18,
-            ),
-        )
-        audit["selected_projection_match_px"] = round(
-            projection_candidate, 6
-        )
-        return (
-            projection_candidate,
-            confidence,
-            "supported_projection_span_body_corroborated",
-            audit,
-        )
-
-    if not body_values and punctuation_count > 0:
-        return (
-            0.0,
-            0.0,
-            "unavailable_punctuation_only_geometry",
-            audit,
-        )
-    return (
-        0.0,
-        0.0,
-        "unavailable_unqualified_body_geometry",
-        audit,
-    )
 
 
 def _occupied_band_records(binary: np.ndarray, *, axis: int) -> list[dict[str, Any]]:

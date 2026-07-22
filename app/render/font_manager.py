@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import statistics
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +27,9 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 
 FONT_MANAGER_VERSION = "font_manager_v1"
+TARGET_OPTICAL_PROFILE_VERSION = "target_optical_profile_v1"
+TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX = 64
+TARGET_OPTICAL_PROFILE_CJK_PROBE = ("永", "国", "語", "文")
 DEFAULT_FALLBACK_CHAIN = "cjk-sc"
 TARGET_FONT_REQUEST_VERSION = "target_font_request_v1"
 TARGET_FONT_REQUEST_PROVENANCE = "parent_style_arbitrator_source_label_taxonomy_v1"
@@ -304,6 +309,96 @@ class OpenTypeMetrics:
 
 
 @dataclass(frozen=True)
+class TargetOpticalGlyphSelection:
+    """Per-request glyph evidence kept outside the cached face profile."""
+
+    glyph_set: tuple[str, ...]
+    glyph_set_sha256: str
+    evidence_source: str
+    fallback_probe_used: bool
+
+    @property
+    def glyph_count(self) -> int:
+        return len(self.glyph_set)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "glyph_set": list(self.glyph_set),
+            "glyph_set_sha256": self.glyph_set_sha256,
+            "glyph_count": self.glyph_count,
+            "evidence_source": self.evidence_source,
+            "fallback_probe_used": bool(self.fallback_probe_used),
+        }
+
+
+@dataclass(frozen=True)
+class TargetFontOpticalProfile:
+    """Cached realized target-face metrics without request or style policy."""
+
+    profile_id: str
+    face_id: str
+    font_path: str
+    reference_em_px: int
+    writing_mode: str
+    glyph_set: tuple[str, ...]
+    glyph_set_sha256: str
+    visible_ink_height_px: float
+    visible_ink_height_ratio: float
+    advance_px: float
+    advance_to_cell_ratio: float
+    stem_width_px: float
+    stem_to_ink_ratio: float
+    ink_coverage_ratio: float
+    measurement_source: str = "pillow_raster_opencv_distance_transform"
+
+    @property
+    def glyph_count(self) -> int:
+        return len(self.glyph_set)
+
+    @property
+    def cache_key(self) -> tuple[str, str, str]:
+        return (self.face_id, self.glyph_set_sha256, self.writing_mode)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "font_manager_version": FONT_MANAGER_VERSION,
+            "target_optical_profile_version": TARGET_OPTICAL_PROFILE_VERSION,
+            "profile_id": self.profile_id,
+            "face_id": self.face_id,
+            "font_path": self.font_path,
+            "reference_em_px": int(self.reference_em_px),
+            "writing_mode": self.writing_mode,
+            "glyph_set": list(self.glyph_set),
+            "glyph_set_sha256": self.glyph_set_sha256,
+            "glyph_count": self.glyph_count,
+            "visible_ink_height_px": float(self.visible_ink_height_px),
+            "visible_ink_height_ratio": float(self.visible_ink_height_ratio),
+            "advance_px": float(self.advance_px),
+            "advance_to_cell_ratio": float(self.advance_to_cell_ratio),
+            "stem_width_px": float(self.stem_width_px),
+            "stem_to_ink_ratio": float(self.stem_to_ink_ratio),
+            "ink_coverage_ratio": float(self.ink_coverage_ratio),
+            "measurement_source": self.measurement_source,
+            "cache_key": list(self.cache_key),
+        }
+
+
+@dataclass(frozen=True)
+class TargetFontOpticalProfileResolution:
+    """One request's evidence provenance plus its shared cached metrics."""
+
+    selection: TargetOpticalGlyphSelection
+    profile: TargetFontOpticalProfile
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "target_optical_profile_version": TARGET_OPTICAL_PROFILE_VERSION,
+            "selection": self.selection.to_audit_dict(),
+            "profile": self.profile.to_audit_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class FontRoleStatus:
     role_id: str
     preferred_filename: str
@@ -422,6 +517,9 @@ class FontManager:
         self._glyph_metrics_cache: dict[tuple[str, int, str], GlyphMetrics] = {}
         self._text_metrics_cache: dict[tuple[str, int, str, str], TextMetrics] = {}
         self._open_type_metrics_cache: dict[tuple[str, int], OpenTypeMetrics] = {}
+        self._target_optical_profile_cache: dict[
+            tuple[str, str, str], TargetFontOpticalProfile
+        ] = {}
         catalog = (
             list(optional_font_catalog)
             if optional_font_catalog is not None
@@ -445,6 +543,7 @@ class FontManager:
             "glyph_metrics": 0,
             "text_metrics": 0,
             "open_type_metrics": 0,
+            "target_optical_profile": 0,
             "cmap": 0,
         }
         self._cache_misses = {
@@ -452,6 +551,7 @@ class FontManager:
             "glyph_metrics": 0,
             "text_metrics": 0,
             "open_type_metrics": 0,
+            "target_optical_profile": 0,
             "cmap": 0,
         }
         self._register_noto_cjk_sc_core()
@@ -476,20 +576,38 @@ class FontManager:
         text: str = "",
     ) -> FontResolution:
         style = resolved_style if isinstance(resolved_style, Mapping) else {}
-        requested_family = str(
-            style.get("font_family")
-            or style.get("font")
-            or style.get("family")
-            or ""
+        primary_font_role = str(style.get("primary_font_role") or "").strip()
+        role_inventory = {
+            item.role_id: item for item in self.required_role_inventory()
+        }
+        role_status = role_inventory.get(primary_font_role)
+        selected = (
+            self.face(role_status.selected_face_id)
+            if role_status is not None and role_status.selected_face_id
+            else None
         )
-        requested_weight = _normalize_weight(style.get("font_weight") or style.get("weight") or "")
-        style_class = str(style.get("style_class") or style.get("font_style") or "").strip().lower()
+        requested_family = selected.family if selected is not None else primary_font_role
+        requested_weight = selected.weight if selected is not None else ""
+        style_class = selected.style_class if selected is not None else ""
+        if selected is None:
+            return FontResolution(
+                requested_family=requested_family,
+                requested_weight=requested_weight,
+                style_class=style_class,
+                fallback_chain_key=fallback_chain_key,
+                writing_mode=writing_mode,
+                primary_face=None,
+                fallback_faces=[],
+                missing_glyphs=list(_unique_chars(text)),
+                issues=["registered_primary_font_role_unavailable"],
+            )
         chain = self._fallback_chain(
             requested_family=requested_family,
             requested_weight=requested_weight,
             style_class=style_class,
             fallback_chain_key=fallback_chain_key,
         )
+        chain = [selected, *[face for face in chain if face.face_id != selected.face_id]]
         issues: list[str] = []
         style_faces = [face for face in chain if face.source != "windows_system_font"]
         if not style_faces:
@@ -504,7 +622,6 @@ class FontManager:
                 missing_glyphs=list(_unique_chars(text)),
                 issues=["missing_font_pack"],
             )
-        selected = style_faces[0]
         missing_glyphs: list[str] = []
         if text:
             for char in _unique_chars(text):
@@ -525,28 +642,7 @@ class FontManager:
             missing_glyphs=missing_glyphs,
             issues=issues,
         )
-        optional_face, optional_audit = self._resolve_optional_target_face(
-            style=style,
-            text=str(text or ""),
-            requested_weight=requested_weight,
-        )
-        if optional_face is None:
-            core_resolution.optional_target_face_resolution = optional_audit
-            return core_resolution
-        return FontResolution(
-            requested_family=requested_family,
-            requested_weight=requested_weight,
-            style_class=style_class,
-            fallback_chain_key=fallback_chain_key,
-            writing_mode=writing_mode,
-            primary_face=optional_face,
-            fallback_faces=[
-                face for face in chain if face.face_id != optional_face.face_id
-            ],
-            missing_glyphs=[],
-            issues=[],
-            optional_target_face_resolution=optional_audit,
-        )
+        return core_resolution
 
     def _resolve_optional_target_face(
         self,
@@ -1178,6 +1274,111 @@ class FontManager:
         self._open_type_metrics_cache[key] = metrics
         return metrics
 
+    def target_optical_profile(
+        self,
+        face: FontFace,
+        translated_text: str,
+        writing_mode: str,
+    ) -> TargetFontOpticalProfileResolution:
+        """Measure one registered target face at the fixed reference em.
+
+        The returned value contains continuous realized metrics only. Source
+        style tiers, target em selection, readability, fitting, and layout are
+        deliberately outside this owner.
+        """
+
+        registered = self.face(face.face_id) if face is not None else None
+        if (
+            registered is None
+            or registered.path != face.path
+            or registered.source != "noto_cjk_sc_core"
+        ):
+            raise FontManagerError("target optical profile requires a registered Noto CJK SC face")
+        mode = _normalize_optical_writing_mode(writing_mode)
+        glyph_set = _usable_optical_cjk_graphemes(self, registered, translated_text)
+        fallback_probe_used = not glyph_set
+        if fallback_probe_used:
+            glyph_set = _usable_optical_cjk_graphemes(
+                self,
+                registered,
+                "".join(TARGET_OPTICAL_PROFILE_CJK_PROBE),
+            )
+        if not glyph_set:
+            raise FontManagerError("registered target face has no usable CJK optical probe glyph")
+
+        glyph_set_sha256 = _optical_glyph_set_sha256(glyph_set)
+        selection = TargetOpticalGlyphSelection(
+            glyph_set=glyph_set,
+            glyph_set_sha256=glyph_set_sha256,
+            evidence_source=(
+                "fixed_cjk_probe_fallback"
+                if fallback_probe_used
+                else "translated_cjk_glyph_set"
+            ),
+            fallback_probe_used=fallback_probe_used,
+        )
+        key = (registered.face_id, glyph_set_sha256, mode)
+        cached = self._target_optical_profile_cache.get(key)
+        if cached is not None:
+            self._cache_hits["target_optical_profile"] += 1
+            return TargetFontOpticalProfileResolution(
+                selection=selection,
+                profile=cached,
+            )
+        self._cache_misses["target_optical_profile"] += 1
+
+        font = self.load_font(registered, TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX)
+        measurements = tuple(
+            _measure_optical_glyph(font, glyph, writing_mode=mode)
+            for glyph in glyph_set
+        )
+        visible_ink_height_px = statistics.median(
+            item["visible_ink_height_px"] for item in measurements
+        )
+        advance_px = statistics.median(item["advance_px"] for item in measurements)
+        stem_width_px = statistics.median(
+            item["stem_width_px"] for item in measurements
+        )
+        ink_coverage_ratio = statistics.median(
+            item["ink_coverage_ratio"] for item in measurements
+        )
+        reference_em = float(TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX)
+        profile_digest = hashlib.sha256(
+            "\x00".join(
+                (
+                    TARGET_OPTICAL_PROFILE_VERSION,
+                    registered.face_id,
+                    glyph_set_sha256,
+                    mode,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        profile = TargetFontOpticalProfile(
+            profile_id=f"{TARGET_OPTICAL_PROFILE_VERSION}:{profile_digest}",
+            face_id=registered.face_id,
+            font_path=registered.path,
+            reference_em_px=TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX,
+            writing_mode=mode,
+            glyph_set=glyph_set,
+            glyph_set_sha256=glyph_set_sha256,
+            visible_ink_height_px=round(float(visible_ink_height_px), 6),
+            visible_ink_height_ratio=round(
+                float(visible_ink_height_px) / reference_em, 8
+            ),
+            advance_px=round(float(advance_px), 6),
+            advance_to_cell_ratio=round(float(advance_px) / reference_em, 8),
+            stem_width_px=round(float(stem_width_px), 6),
+            stem_to_ink_ratio=round(
+                float(stem_width_px) / float(visible_ink_height_px), 8
+            ),
+            ink_coverage_ratio=round(float(ink_coverage_ratio), 8),
+        )
+        self._target_optical_profile_cache[key] = profile
+        return TargetFontOpticalProfileResolution(
+            selection=selection,
+            profile=profile,
+        )
+
     def required_role_inventory(self) -> list[FontRoleStatus]:
         statuses: list[FontRoleStatus] = []
         for role_id, filename, native_face_id, substitute_face_id in REQUIRED_FONT_ROLES:
@@ -1531,6 +1732,108 @@ def _unique_chars(text: str) -> list[str]:
         seen.add(char)
         chars.append(char)
     return chars
+
+
+def _normalize_optical_writing_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode.startswith("vert"):
+        return "vertical"
+    if mode.startswith("horiz"):
+        return "horizontal"
+    raise FontManagerError(f"unsupported optical-profile writing mode: {value!r}")
+
+
+def _usable_optical_cjk_graphemes(
+    manager: FontManager,
+    face: FontFace,
+    text: str,
+) -> tuple[str, ...]:
+    candidates: set[str] = set()
+    for cluster in strict_grapheme_clusters(str(text or "")):
+        if not cluster or not any(_is_cjk_codepoint(char) for char in cluster):
+            continue
+        visible_categories = {
+            unicodedata.category(char)
+            for char in cluster
+            if unicodedata.category(char) not in {"Cf", "Mn", "Me"}
+        }
+        if not visible_categories or all(category.startswith("P") for category in visible_categories):
+            continue
+        if manager.coverage_for_text(face, cluster).supports_text:
+            candidates.add(cluster)
+    return tuple(sorted(candidates))
+
+
+def _is_cjk_codepoint(char: str) -> bool:
+    codepoint = ord(char)
+    return any(
+        start <= codepoint <= end
+        for start, end in (
+            (0x2E80, 0x2FFF),
+            (0x3040, 0x30FF),
+            (0x3100, 0x312F),
+            (0x3130, 0x318F),
+            (0x31A0, 0x31BF),
+            (0x31F0, 0x31FF),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xA960, 0xA97F),
+            (0xAC00, 0xD7AF),
+            (0xF900, 0xFAFF),
+            (0x20000, 0x2FA1F),
+        )
+    )
+
+
+def _optical_glyph_set_sha256(glyph_set: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    for glyph in glyph_set:
+        encoded = str(glyph).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, byteorder="big", signed=False))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _measure_optical_glyph(
+    font: Any,
+    glyph: str,
+    *,
+    writing_mode: str,
+) -> dict[str, float]:
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - required local dependencies
+        raise FontManagerError("target optical metrics require numpy and OpenCV") from exc
+
+    direction = "ttb" if writing_mode == "vertical" else None
+    try:
+        mask = font.getmask(glyph, mode="L", direction=direction)
+        width, height = mask.size
+        raster = np.asarray(mask, dtype=np.uint8).reshape((height, width))
+        advance = float(font.getlength(glyph, direction=direction))
+    except Exception as exc:
+        raise FontManagerError(f"target optical glyph raster failed: {glyph!r}") from exc
+    binary = raster >= 128
+    ys, xs = np.nonzero(binary)
+    if xs.size <= 0 or ys.size <= 0:
+        raise FontManagerError(f"target optical glyph has no visible ink: {glyph!r}")
+    ink = np.ascontiguousarray(
+        binary[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1],
+        dtype=np.uint8,
+    )
+    visible_ink_height_px = float(ink.shape[0])
+    distance = cv2.distanceTransform(ink, cv2.DIST_L2, 5)
+    positive = distance[distance > 0.0]
+    if positive.size <= 0:
+        raise FontManagerError(f"target optical glyph has no measurable stem: {glyph!r}")
+    stem_width_px = float(np.percentile(positive * 2.0, 75))
+    return {
+        "visible_ink_height_px": visible_ink_height_px,
+        "advance_px": advance,
+        "stem_width_px": stem_width_px,
+        "ink_coverage_ratio": float(ink.mean()),
+    }
 
 
 def _font_resolution_chain(resolution: FontResolution) -> list[FontFace]:

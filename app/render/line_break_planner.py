@@ -14,15 +14,18 @@ from typing import Any, Mapping, Sequence
 from app.render.typesetting_text import BreakOpportunity, classify_grapheme
 
 
-LINE_BREAK_PLANNER_VERSION = "line_break_planner_v1"
+LINE_BREAK_PLANNER_VERSION = "line_break_planner_v2_target_lexical"
 LEXICOGRAPHIC_VERTICAL_ORDER = [
     "hard_legality",
     "fit",
-    "reliable_source_layout",
-    "phrase_quality",
-    "visual_balance",
+    "source_relative_preferred_size",
+    "lexical_span_integrity",
+    "punctuation_attachment",
+    "optical_balance",
+    "advisory_source_footprint_distribution",
     "rtl_frontload_fallback",
 ]
+LEXICOGRAPHIC_HORIZONTAL_ORDER = LEXICOGRAPHIC_VERTICAL_ORDER[:-1]
 
 _OPEN_PUNCTUATION = {"(", "（", "[", "［", "{", "｛", "「", "『", "【", "〈", "《", "“", "‘"}
 _CONTINUATION_PUNCTUATION = {
@@ -38,9 +41,6 @@ _STRONG_PHRASE_END = {
     "︙", "︱", "︴", "。", "，", "、", "︐", "︑", "︒", "！", "？", "︕",
     "︖", "‼", "⁇", "⁉", "⁈", "!", "?", "～", "〜", "~", "〰",
 }
-_WEAK_COLUMN_START = {"个", "的", "了", "吗", "呢", "吧", "啊", "呀", "嘛", "啦", "，", "、"}
-
-
 @dataclass
 class BreakPlanResult:
     groups: list[list[Any]]
@@ -68,9 +68,10 @@ class _VerticalPath:
     previous_units: float
     fit_overflow_count: int
     fit_overflow_units: float
-    source_layout_error: float
-    phrase_penalty: float
+    lexical_penalty: float
+    punctuation_penalty: float
     balance_penalty: float
+    source_layout_error: float
     frontload_penalty: float
 
 
@@ -79,8 +80,8 @@ class _HorizontalPath:
     breaks: tuple[int, ...]
     width_overflow_count: int
     width_overflow_amount: float
-    whitespace_penalty: float
-    strength_penalty: float
+    lexical_penalty: float
+    punctuation_penalty: float
     raggedness: float
 
 
@@ -201,7 +202,7 @@ class LineBreakPlanner:
         ]
         fit_overflow = selected_path.fit_overflow_count > 0
         extra_columns = max(0, len(groups) - desired)
-        phrase_adjustments = _partition_quality_adjustments(groups)
+        punctuation_adjustments = _partition_quality_adjustments(groups)
         metadata = {
             "line_break_planner_version": self.version,
             "selection_authority": "explicit_break_opportunities",
@@ -217,13 +218,20 @@ class LineBreakPlanner:
             "column_row_units": [round(_items_row_units(group), 3) for group in groups],
             "right_to_left_frontload_penalty": round(selected_path.frontload_penalty, 3),
             "vertical_break_quality_rules": ["terminal_cjk_widow_before_punctuation_tail"],
-            "segment_quality_adjustments": phrase_adjustments,
+            "segment_quality_adjustments": punctuation_adjustments,
             "break_penalties": [
                 {
                     "split_after": split,
                     "previous": str(values[split - 1].get("text") or ""),
                     "next": str(values[split].get("text") or ""),
-                    "penalty": round(_boundary_phrase_penalty(values, split), 3),
+                    "lexical_integrity_penalty": round(
+                        _boundary_lexical_penalty(boundary_by_split.get(split)),
+                        3,
+                    ),
+                    "punctuation_attachment_penalty": round(
+                        _boundary_punctuation_penalty(values, split),
+                        3,
+                    ),
                 }
                 for split in selected_path.breaks[:-1]
             ],
@@ -277,6 +285,9 @@ class LineBreakPlanner:
                     "line_break_planner_version": self.version,
                     "selection_authority": "explicit_break_opportunities",
                     "strategy": "empty",
+                    "lexicographic_decision_order": list(
+                        LEXICOGRAPHIC_HORIZONTAL_ORDER
+                    ),
                 },
             )
 
@@ -307,10 +318,12 @@ class LineBreakPlanner:
                 path.width_overflow_count,
                 round(path.width_overflow_amount, 6),
                 height_overflow,
-                round(path.whitespace_penalty, 6),
-                line_count,
-                round(path.strength_penalty, 6),
+                0,
+                round(path.lexical_penalty, 6),
+                round(path.punctuation_penalty, 6),
                 round(path.raggedness, 6),
+                line_count,
+                0,
                 path.breaks,
             )
             record = {
@@ -322,8 +335,11 @@ class LineBreakPlanner:
                 "lexicographic_key": {
                     "hard_legality": 0,
                     "fit": [path.width_overflow_count, round(path.width_overflow_amount, 3), height_overflow],
-                    "preferred_break_strength": round(path.strength_penalty, 3),
-                    "visual_balance": round(path.raggedness, 3),
+                    "source_relative_preferred_size": 0,
+                    "lexical_span_integrity": round(path.lexical_penalty, 3),
+                    "punctuation_attachment": round(path.punctuation_penalty, 3),
+                    "optical_balance": [round(path.raggedness, 3), line_count],
+                    "advisory_source_footprint_distribution": 0,
                 },
             }
             candidate_records.append(record)
@@ -342,6 +358,9 @@ class LineBreakPlanner:
                     "strategy": "unpartitioned_explicit_failure",
                     "max_width": round(width_limit, 3),
                     "max_lines": line_limit,
+                    "lexicographic_decision_order": list(
+                        LEXICOGRAPHIC_HORIZONTAL_ORDER
+                    ),
                 },
             )
 
@@ -368,12 +387,9 @@ class LineBreakPlanner:
             "line_break_planner_version": self.version,
             "selection_authority": "explicit_break_opportunities",
             "strategy": "authoritative_break_opportunity_partition",
-            "lexicographic_decision_order": [
-                "hard_legality",
-                "fit",
-                "preferred_break_strength",
-                "visual_balance",
-            ],
+            "lexicographic_decision_order": list(
+                LEXICOGRAPHIC_HORIZONTAL_ORDER
+            ),
             "max_width": round(width_limit, 3),
             "max_lines": line_limit,
             "selected_lines": selected_lines,
@@ -461,9 +477,10 @@ def _best_vertical_path(
                 previous_units=0.0,
                 fit_overflow_count=0,
                 fit_overflow_units=0.0,
-                source_layout_error=0.0,
-                phrase_penalty=0.0,
+                lexical_penalty=0.0,
+                punctuation_penalty=0.0,
                 balance_penalty=0.0,
+                source_layout_error=0.0,
                 frontload_penalty=0.0,
             )
         ]
@@ -486,9 +503,16 @@ def _best_vertical_path(
                 source_error = 0.0
                 if source_distribution:
                     source_error = abs(units - float(source_distribution[column]))
-                phrase = _segment_phrase_penalty(items, start, end)
-                balance = abs(units - ideal)
-                boundary_penalty = _boundary_phrase_penalty(items, end) if end < count else 0.0
+                boundary = boundary_by_split.get(end) if end < count else None
+                lexical = _boundary_lexical_penalty(boundary)
+                punctuation = _segment_punctuation_penalty(items, start, end)
+                if end < count:
+                    punctuation += _boundary_punctuation_penalty(items, end)
+                balance = abs(units - ideal) + _segment_optical_penalty(
+                    items,
+                    start,
+                    end,
+                )
                 for path in paths:
                     frontload = path.frontload_penalty
                     if path.breaks:
@@ -498,9 +522,10 @@ def _best_vertical_path(
                         previous_units=units,
                         fit_overflow_count=path.fit_overflow_count + int(overflow > 1e-9),
                         fit_overflow_units=path.fit_overflow_units + overflow,
-                        source_layout_error=path.source_layout_error + source_error,
-                        phrase_penalty=path.phrase_penalty + phrase + boundary_penalty,
+                        lexical_penalty=path.lexical_penalty + lexical,
+                        punctuation_penalty=path.punctuation_penalty + punctuation,
                         balance_penalty=path.balance_penalty + balance,
+                        source_layout_error=path.source_layout_error + source_error,
                         frontload_penalty=frontload,
                     )
                     key = (column + 1, end)
@@ -533,9 +558,10 @@ def _vertical_path_prefix_key(path: _VerticalPath) -> tuple[Any, ...]:
     return (
         path.fit_overflow_count,
         round(path.fit_overflow_units, 6),
-        round(path.source_layout_error, 6),
-        round(path.phrase_penalty, 6),
+        round(path.lexical_penalty, 6),
+        round(path.punctuation_penalty, 6),
         round(path.balance_penalty, 6),
+        round(path.source_layout_error, 6),
     )
 
 
@@ -553,10 +579,12 @@ def _vertical_candidate_key(
         0,
         path.fit_overflow_count,
         round(path.fit_overflow_units, 6),
-        round(path.source_layout_error + structural_penalty, 6),
-        round(path.phrase_penalty, 6),
+        0,
+        round(path.lexical_penalty, 6),
+        round(path.punctuation_penalty, 6),
         round(path.balance_penalty, 6),
         max(0, columns - desired_columns),
+        round(path.source_layout_error + structural_penalty, 6),
         round(path.frontload_penalty, 6),
         path.breaks,
     )
@@ -584,9 +612,14 @@ def _vertical_candidate_audit(
         "lexicographic_key": {
             "hard_legality": 0,
             "fit": [path.fit_overflow_count, round(path.fit_overflow_units, 3)],
-            "reliable_source_layout": round(path.source_layout_error + structural_penalty, 3),
-            "phrase_quality": round(path.phrase_penalty, 3),
-            "visual_balance": [round(path.balance_penalty, 3), max(0, columns - desired_columns)],
+            "source_relative_preferred_size": 0,
+            "lexical_span_integrity": round(path.lexical_penalty, 3),
+            "punctuation_attachment": round(path.punctuation_penalty, 3),
+            "optical_balance": [round(path.balance_penalty, 3), max(0, columns - desired_columns)],
+            "advisory_source_footprint_distribution": round(
+                path.source_layout_error + structural_penalty,
+                3,
+            ),
             "rtl_frontload_fallback": round(path.frontload_penalty, 3),
         },
         "sort_key": [item if not isinstance(item, tuple) else list(item) for item in key[:-1]],
@@ -625,15 +658,17 @@ def _best_horizontal_path(
                 width = max(0.0, prefix[end] - prefix[start])
                 overflow = max(0.0, width - max_width)
                 segment = items[start:end]
-                whitespace = _horizontal_whitespace_penalty(segment)
-                strength = _break_strength_penalty(boundary) if end < count else 0.0
+                lexical = _boundary_lexical_penalty(boundary)
+                punctuation = _horizontal_whitespace_penalty(segment)
+                if end < count:
+                    punctuation += _break_strength_penalty(boundary)
                 raggedness = max(0.0, max_width - min(max_width, width))
                 candidate = _HorizontalPath(
                     breaks=(*path.breaks, end),
                     width_overflow_count=path.width_overflow_count + int(overflow > 1e-9),
                     width_overflow_amount=path.width_overflow_amount + overflow,
-                    whitespace_penalty=path.whitespace_penalty + whitespace,
-                    strength_penalty=path.strength_penalty + strength,
+                    lexical_penalty=path.lexical_penalty + lexical,
+                    punctuation_penalty=path.punctuation_penalty + punctuation,
                     raggedness=path.raggedness + raggedness,
                 )
                 key = (line + 1, end)
@@ -650,8 +685,8 @@ def _horizontal_path_key(path: _HorizontalPath) -> tuple[Any, ...]:
     return (
         path.width_overflow_count,
         round(path.width_overflow_amount, 6),
-        round(path.whitespace_penalty, 6),
-        round(path.strength_penalty, 6),
+        round(path.lexical_penalty, 6),
+        round(path.punctuation_penalty, 6),
         round(path.raggedness, 6),
         path.breaks,
     )
@@ -675,30 +710,49 @@ def _groups_from_breaks(items: Sequence[Any], breaks: Sequence[int]) -> list[lis
     return groups
 
 
-def _segment_phrase_penalty(items: Sequence[Mapping[str, Any]], start: int, end: int) -> float:
+def _segment_punctuation_penalty(
+    items: Sequence[Mapping[str, Any]],
+    start: int,
+    end: int,
+) -> float:
     segment = list(items[start:end])
     if not segment:
         return 1000.0
     penalty = sum(float(item.get("penalty") or 0.0) for item in _segment_quality_adjustments(segment))
-    first = str(segment[0].get("text") or "")
-    if start > 0 and first[:1] in _WEAK_COLUMN_START:
-        penalty += 10.0
-    if len(segment) == 1 and len(items) > 3:
-        penalty += 9.0
     if _segment_is_punctuation_only(segment) and not _segment_is_punctuation_only(items):
         penalty += 45.0
     return penalty
 
 
-def _boundary_phrase_penalty(items: Sequence[Mapping[str, Any]], split: int) -> float:
+def _segment_optical_penalty(
+    items: Sequence[Mapping[str, Any]],
+    start: int,
+    end: int,
+) -> float:
+    segment = list(items[start:end])
+    if len(segment) == 1 and len(items) > 3:
+        return 9.0
+    return 0.0
+
+
+def _boundary_lexical_penalty(boundary: Mapping[str, Any] | None) -> float:
+    metadata = dict((boundary or {}).get("opportunity_metadata") or {})
+    try:
+        return max(0.0, float(metadata.get("lexical_integrity_penalty") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _boundary_punctuation_penalty(
+    items: Sequence[Mapping[str, Any]],
+    split: int,
+) -> float:
     if split <= 0 or split >= len(items):
         return 0.0
     previous = str(items[split - 1].get("text") or "")
     following = str(items[split].get("text") or "")
     if _is_strong_phrase_end(previous) and not _is_continuation_punctuation(following):
         return -8.0
-    if _is_cjk(previous) and _is_cjk(following):
-        return 4.5
     return 0.0
 
 
@@ -759,7 +813,10 @@ def _vertical_structure_penalty(
 ) -> float:
     if not _profile_needs_speech_column_conservation(profile) or columns <= desired:
         return 0.0
-    return sum(max(0.0, _boundary_phrase_penalty(items, int(split))) for split in split_points)
+    return sum(
+        max(0.0, _boundary_punctuation_penalty(items, int(split)))
+        for split in split_points
+    )
 
 
 def _profile_needs_speech_column_conservation(profile: Mapping[str, Any]) -> bool:
@@ -784,6 +841,9 @@ def _reliable_source_distribution(profile: Mapping[str, Any], columns: int) -> l
 
 
 def _break_strength_penalty(boundary: Mapping[str, Any] | None) -> float:
+    metadata = dict((boundary or {}).get("opportunity_metadata") or {})
+    if metadata.get("target_lexical_boundary") in {"intra_span", "between_spans"}:
+        return 0.0
     strength = str((boundary or {}).get("strength") or "normal")
     return {"preferred": 0.0, "normal": 1.0, "weak": 2.0}.get(strength, 3.0)
 

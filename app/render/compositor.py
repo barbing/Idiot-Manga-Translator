@@ -443,11 +443,7 @@ def _draw_glyph(
         return _failed_raster_audit(base_audit, "raster_invalid_placement_bbox")
     font_size = int(round(float(glyph.get("font_size") or layout.selected_font_size or 1)))
     style = plan.resolved_render_style if isinstance(plan.resolved_render_style, Mapping) else {}
-    fill = _parse_color(style.get("fill_color") or style.get("color") or "#000000", default=(0, 0, 0, 255))
-    stroke_fill = _parse_color(style.get("stroke_color") or style.get("stroke") or "#FFFFFF", default=(255, 255, 255, 255))
-    stroke_width = _safe_int(style.get("stroke_width"), default=0)
-    if stroke_width < 0:
-        stroke_width = 0
+    fill, stroke_fill, stroke_width = _resolved_v3_paint(style)
 
     width = max(1, x1 - x0)
     height = max(1, y1 - y0)
@@ -978,11 +974,15 @@ def _base_layout_preflight_issue(
     """Return the first hard base-text failure, independent of optional effects."""
 
     if (
-        str(report.fit_status or "") != "fits"
-        or not bool(report.full_text_placed)
-        or str(layout.fit_status or "") != "fits"
+        not bool(report.text_placement_complete)
+        or not bool(layout.text_placement_complete)
     ):
         return "parent_layer_base_layout_not_renderable"
+    if (
+        not bool(report.hard_bounds_contained)
+        or not bool(layout.hard_bounds_contained)
+    ):
+        return "parent_layer_base_layout_not_contained"
     if str(layout.original_text or "") != str(plan.translated_text or ""):
         return "parent_layer_layout_source_text_mismatch"
     glyph_text = "".join(str(item.get("text") or "") for item in glyphs)
@@ -1501,7 +1501,10 @@ def _layer_audit(
         "parent_layer_composition": copy_jsonish(composition),
         "raster_placements": copy_jsonish(raster_items),
         "glyph_text_matches_layout": glyph_text == normalized,
-        "full_text_placed": bool(report.full_text_placed),
+        "full_text_placed": bool(report.text_placement_complete),
+        "text_placement_complete": bool(report.text_placement_complete),
+        "hard_bounds_contained": bool(report.hard_bounds_contained),
+        "fit_quality": str(report.fit_quality or ""),
         "fit_status": report.fit_status,
         "overflow_risk": bool(report.overflow_risk),
         "clipping_risk": bool(report.clipping_risk),
@@ -1521,9 +1524,21 @@ def _layer_audit(
             if isinstance(plan.metadata, Mapping)
             else {}
         ),
-        "fill_color": style.get("fill_color") or style.get("color"),
-        "stroke_color": style.get("stroke_color") or style.get("stroke"),
-        "stroke_width": style.get("stroke_width"),
+        "fill_color": (
+            style.get("fill", {}).get("color")
+            if isinstance(style.get("fill"), Mapping)
+            else None
+        ),
+        "stroke_color": (
+            style.get("outline", {}).get("color")
+            if isinstance(style.get("outline"), Mapping)
+            else None
+        ),
+        "stroke_width": (
+            style.get("outline", {}).get("target_width_px")
+            if isinstance(style.get("outline"), Mapping)
+            else None
+        ),
         "issues": _unique_strings(issues or []),
     }
 
@@ -1869,6 +1884,37 @@ def _glyph_bounds(value: Any) -> list[int]:
     if w <= 0 or h <= 0:
         return []
     return [x, y, x + w, y + h]
+
+
+def _resolved_v3_paint(
+    style: Mapping[str, Any] | None,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int], int]:
+    """Resolve the frozen nested v3 fill/outline contract for raster only."""
+
+    values = dict(style or {})
+    fill_record = values.get("fill")
+    outline_record = values.get("outline")
+    fill_value = (
+        fill_record.get("color")
+        if isinstance(fill_record, Mapping)
+        else "#000000"
+    )
+    outline_value = (
+        outline_record.get("color")
+        if isinstance(outline_record, Mapping)
+        else "#FFFFFF"
+    )
+    outline_width = 0
+    if isinstance(outline_record, Mapping) and outline_record.get("present") is True:
+        outline_width = max(
+            0,
+            _safe_int(outline_record.get("target_width_px"), default=0),
+        )
+    return (
+        _parse_color(fill_value, default=(0, 0, 0, 255)),
+        _parse_color(outline_value, default=(255, 255, 255, 255)),
+        outline_width,
+    )
 
 
 def _parse_color(value: Any, *, default: tuple[int, int, int, int]) -> tuple[int, int, int, int]:

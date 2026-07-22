@@ -517,11 +517,9 @@ def _typeset_with_optional_effect_fallback(
 
 
 def _effect_envelope_blocked_base_layout(report: FitReport) -> bool:
-    return bool(
-        (str(report.fit_status or "") != "fits" or not bool(report.full_text_placed))
-        and "parent_layer_effect_envelope_exceeds_hard_bounds"
-        in {str(issue) for issue in list(report.issues or [])}
-    )
+    return "parent_layer_effect_envelope_exceeds_hard_bounds" in {
+        str(issue) for issue in list(report.issues or [])
+    }
 
 
 def _plan_without_optional_effects(plan: RenderLayerPlan) -> RenderLayerPlan:
@@ -580,10 +578,16 @@ def _required_layer_transaction_failures(
     failures: list[str] = []
     if not str(plan.translated_text or "").strip():
         failures.append("required_parent_translated_text_empty")
-    if str(report.fit_status or "") != "fits" or not bool(report.full_text_placed):
+    if (
+        not bool(report.text_placement_complete)
+        or not bool(layout.text_placement_complete)
+    ):
         failures.append("required_parent_layout_not_composable")
-    if str(layout.fit_status or "") != "fits":
-        failures.append("required_parent_layout_fit_status_failed")
+    if (
+        not bool(report.hard_bounds_contained)
+        or not bool(layout.hard_bounds_contained)
+    ):
+        failures.append("required_parent_layout_hard_bounds_failed")
     if not bool(audit.get("drawn")):
         failures.append("required_parent_base_text_not_drawn")
     if not bool(audit.get("glyph_text_matches_layout")):

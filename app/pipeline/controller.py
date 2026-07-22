@@ -10,7 +10,8 @@ import shutil
 import time
 from datetime import datetime, timezone
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
@@ -95,6 +96,401 @@ class PageProcessingResult:
     parent_execution_bundles: list[ParentExecutionBundle]
     page_class: str
     text_area_plan: Any | None = None
+
+
+def _freeze_compact_style_run_json(
+    value: Any,
+    *,
+    path: str,
+    depth: int = 0,
+) -> Any:
+    """Deep-freeze JSON metadata and reject image-bearing pending payloads."""
+
+    if depth > 80:
+        raise TypeError(f"{path} is not compact JSON: nesting limit exceeded")
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError(f"{path} is not compact JSON: non-finite float")
+        return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, Mapping):
+        frozen = {
+            str(key): _freeze_compact_style_run_json(
+                item,
+                path=f"{path}.{key}",
+                depth=depth + 1,
+            )
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _freeze_compact_style_run_json(
+                item,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+            )
+            for index, item in enumerate(value)
+        )
+    raise TypeError(
+        f"{path} is not compact JSON: {type(value).__name__} is not permitted"
+    )
+
+
+def _thaw_compact_style_run_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _thaw_compact_style_run_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_thaw_compact_style_run_json(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class ParentStylePendingPage:
+    """Compact page inputs awaiting one complete-run style transaction."""
+
+    page_id: str
+    parent_execution_bundles: tuple[ParentExecutionBundle, ...]
+    evidence: tuple[Any, ...]
+    cleaned_page_base: Mapping[str, Any] = field(default_factory=dict)
+    render_eligibility: Mapping[str, Any] = field(default_factory=dict)
+    observation_audit: Mapping[str, Any] = field(default_factory=dict)
+    page_payload: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        page_id = str(self.page_id or "")
+        if not page_id:
+            raise ValueError("parent style pending page identity is empty")
+        object.__setattr__(self, "page_id", page_id)
+        object.__setattr__(
+            self,
+            "parent_execution_bundles",
+            tuple(self.parent_execution_bundles or ()),
+        )
+        object.__setattr__(self, "evidence", tuple(self.evidence or ()))
+        for index, bundle in enumerate(self.parent_execution_bundles):
+            to_audit = getattr(bundle, "to_audit_dict", None)
+            if not callable(to_audit):
+                raise TypeError(
+                    f"parent_execution_bundles[{index}] is not auditable"
+                )
+            _freeze_compact_style_run_json(
+                to_audit(),
+                path=f"parent_execution_bundles[{index}]",
+            )
+        for index, item in enumerate(self.evidence):
+            to_audit = getattr(item, "to_audit_dict", None)
+            if not callable(to_audit):
+                raise TypeError(f"evidence[{index}] is not auditable")
+            _freeze_compact_style_run_json(
+                to_audit(),
+                path=f"evidence[{index}]",
+            )
+        for field_name in (
+            "cleaned_page_base",
+            "render_eligibility",
+            "observation_audit",
+            "page_payload",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _freeze_compact_style_run_json(
+                    getattr(self, field_name),
+                    path=field_name,
+                ),
+            )
+
+
+@dataclass(frozen=True)
+class ParentStyleRunSnapshotEntry:
+    page_id: str
+    bundle_id: str
+    parent_id: str
+    root_id: str
+    semantic_role: str
+    evidence: Any = field(repr=False)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "page_id": self.page_id,
+            "bundle_id": self.bundle_id,
+            "parent_id": self.parent_id,
+            "root_id": self.root_id,
+            "semantic_role": self.semantic_role,
+            "evidence": self.evidence.to_audit_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ParentStyleRunSnapshot:
+    snapshot_id: str
+    page_ids: tuple[str, ...]
+    bundle_ids: tuple[str, ...]
+    entries: tuple[ParentStyleRunSnapshotEntry, ...]
+    cleaned_page_bases: tuple[tuple[str, Mapping[str, Any]], ...]
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": "parent_style_run_snapshot_v1",
+            "snapshot_id": self.snapshot_id,
+            "page_ids": list(self.page_ids),
+            "bundle_ids": list(self.bundle_ids),
+            "page_count": len(self.page_ids),
+            "bundle_count": len(self.bundle_ids),
+            "pages": [
+                {
+                    "page_id": page_id,
+                    "cleaned_page_base": _thaw_compact_style_run_json(cleaned),
+                }
+                for page_id, cleaned in self.cleaned_page_bases
+            ],
+            "evidence_entries": [entry.to_audit_dict() for entry in self.entries],
+        }
+
+
+@dataclass(frozen=True)
+class ParentStyleRunFinalizationResult:
+    snapshot: ParentStyleRunSnapshot
+    arbitration: Any
+    page_results: tuple[tuple[str, Any], ...]
+    rendered_page_ids: tuple[str, ...]
+
+
+def _cleaned_page_base_snapshot_identity(
+    page_id: str,
+    cleaned_page_base: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "page_id": page_id,
+        "cleaned_page_base_version": str(
+            cleaned_page_base.get("cleaned_page_base_version") or ""
+        ),
+        "state": str(cleaned_page_base.get("state") or ""),
+        "valid": bool(cleaned_page_base.get("valid")),
+        "cleaned_page_base_sha256": str(
+            cleaned_page_base.get("cleaned_page_base_sha256") or ""
+        ),
+        "source_sha256": str(cleaned_page_base.get("source_sha256") or ""),
+        "parent_execution_signature": str(
+            cleaned_page_base.get("parent_execution_signature") or ""
+        ),
+        "cleanup_identity_signature": str(
+            cleaned_page_base.get("cleanup_identity_signature") or ""
+        ),
+    }
+
+
+def build_parent_style_run_snapshot(
+    pages: Iterable[ParentStylePendingPage],
+) -> ParentStyleRunSnapshot:
+    """Freeze one order-independent evidence scope without style decisions."""
+
+    pending = tuple(pages or ())
+    if any(not isinstance(page, ParentStylePendingPage) for page in pending):
+        raise TypeError("parent style run pages must use ParentStylePendingPage")
+    page_ids = [page.page_id for page in pending]
+    if len(set(page_ids)) != len(page_ids):
+        raise ValueError("duplicate parent style pending page identity")
+
+    entries: list[ParentStyleRunSnapshotEntry] = []
+    seen_bundle_ids: set[str] = set()
+    cleaned_page_bases: list[tuple[str, Mapping[str, Any]]] = []
+    digest_pages: list[dict[str, Any]] = []
+    for page in sorted(pending, key=lambda item: item.page_id):
+        clean_page_id = str(page.cleaned_page_base.get("page_id") or "")
+        if clean_page_id and clean_page_id != page.page_id:
+            raise ValueError(
+                f"CleanedPageBase identity mismatch for pending page {page.page_id}"
+            )
+        cleaned_page_bases.append((page.page_id, page.cleaned_page_base))
+        digest_pages.append(
+            _cleaned_page_base_snapshot_identity(
+                page.page_id,
+                page.cleaned_page_base,
+            )
+        )
+
+        render_bundles = [
+            bundle
+            for bundle in page.parent_execution_bundles
+            if bool(getattr(bundle, "render_required", False))
+        ]
+        evidence_by_bundle: dict[str, Any] = {}
+        for item in page.evidence:
+            bundle_id = str(getattr(item, "bundle_id", "") or "")
+            if not bundle_id:
+                raise ValueError(f"style evidence identity is empty on {page.page_id}")
+            if bundle_id in evidence_by_bundle:
+                raise ValueError(f"duplicate style evidence for {bundle_id}")
+            evidence_by_bundle[bundle_id] = item
+
+        expected_ids = {
+            str(getattr(bundle, "bundle_id", "") or "") for bundle in render_bundles
+        }
+        if "" in expected_ids:
+            raise ValueError(f"render-required bundle identity is empty on {page.page_id}")
+        if set(evidence_by_bundle) != expected_ids:
+            missing = sorted(expected_ids - set(evidence_by_bundle))
+            extra = sorted(set(evidence_by_bundle) - expected_ids)
+            raise ValueError(
+                "style evidence does not conserve render-required parents: "
+                f"page={page.page_id} missing={missing} extra={extra}"
+            )
+
+        for bundle in sorted(
+            render_bundles,
+            key=lambda item: str(getattr(item, "bundle_id", "") or ""),
+        ):
+            bundle_id = str(getattr(bundle, "bundle_id", "") or "")
+            if bundle_id in seen_bundle_ids:
+                raise ValueError(f"duplicate run bundle identity {bundle_id}")
+            seen_bundle_ids.add(bundle_id)
+            bundle_page_id = str(getattr(bundle, "page_id", "") or "")
+            item = evidence_by_bundle[bundle_id]
+            identity = (
+                bundle_page_id,
+                str(getattr(bundle, "parent_id", "") or ""),
+                str(getattr(bundle, "root_id", "") or ""),
+            )
+            evidence_identity = (
+                str(getattr(item, "page_id", "") or ""),
+                str(getattr(item, "parent_id", "") or ""),
+                str(getattr(item, "root_id", "") or ""),
+            )
+            if bundle_page_id != page.page_id or identity != evidence_identity:
+                raise ValueError(
+                    f"style evidence identity mismatch for run bundle {bundle_id}"
+                )
+            if not callable(getattr(item, "to_audit_dict", None)):
+                raise TypeError(f"style evidence is not auditable for {bundle_id}")
+            entries.append(
+                ParentStyleRunSnapshotEntry(
+                    page_id=page.page_id,
+                    bundle_id=bundle_id,
+                    parent_id=identity[1],
+                    root_id=identity[2],
+                    semantic_role=str(getattr(bundle, "role", "") or "speech")
+                    .strip()
+                    .lower(),
+                    evidence=item,
+                )
+            )
+
+    entries_tuple = tuple(sorted(entries, key=lambda item: item.bundle_id))
+    digest_payload = {
+        "contract_version": "parent_style_run_snapshot_v1",
+        "pages": digest_pages,
+        "evidence_entries": [entry.to_audit_dict() for entry in entries_tuple],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return ParentStyleRunSnapshot(
+        snapshot_id=f"parent-style-run-snapshot:{digest[:24]}",
+        page_ids=tuple(sorted(page_ids)),
+        bundle_ids=tuple(entry.bundle_id for entry in entries_tuple),
+        entries=entries_tuple,
+        cleaned_page_bases=tuple(cleaned_page_bases),
+    )
+
+
+def _page_parent_style_arbitration_projection(
+    arbitration: Any,
+    page: ParentStylePendingPage,
+) -> Any:
+    from app.pipeline.parent_font_detection import ParentStyleArbitrationResult
+
+    bundle_ids = {
+        str(getattr(bundle, "bundle_id", "") or "")
+        for bundle in page.parent_execution_bundles
+        if bool(getattr(bundle, "render_required", False))
+    }
+    resolved = {
+        bundle_id: dict(arbitration.resolved_styles[bundle_id])
+        for bundle_id in sorted(bundle_ids)
+        if bundle_id in arbitration.resolved_styles
+    }
+    if set(resolved) != bundle_ids:
+        raise ValueError(
+            "complete-run arbitration did not resolve every render-required "
+            f"bundle on {page.page_id}"
+        )
+    records = tuple(
+        dict(record)
+        for record in arbitration.records
+        if str(record.get("bundle_id") or "") in bundle_ids
+    )
+    return ParentStyleArbitrationResult(
+        resolved_styles=resolved,
+        records=records,
+    )
+
+
+def finalize_parent_style_run(
+    *,
+    pages: Iterable[ParentStylePendingPage],
+    default_font_name: str,
+    models_dir: str,
+    render_page: Any,
+) -> ParentStyleRunFinalizationResult:
+    """Realize one frozen v3 run scope, then render each page exactly once."""
+
+    from app.pipeline import parent_font_detection as font_detection
+    from app.render.font_manager import FontManager
+
+    pending = tuple(pages or ())
+    snapshot = build_parent_style_run_snapshot(pending)
+    bundle_by_id = {
+        str(getattr(bundle, "bundle_id", "") or ""): bundle
+        for page in pending
+        for bundle in page.parent_execution_bundles
+        if bool(getattr(bundle, "render_required", False))
+    }
+    all_bundles = tuple(
+        bundle_by_id[bundle_id] for bundle_id in snapshot.bundle_ids
+    )
+    all_evidence = tuple(entry.evidence for entry in snapshot.entries)
+    decision_ledger = font_detection.resolve_parent_style_decision_ledger_v3(
+        parent_execution_bundles=all_bundles,
+        evidence=all_evidence,
+    )
+    style_ledger = font_detection.realize_parent_render_styles_v3(
+        parent_execution_bundles=all_bundles,
+        decision_ledger=decision_ledger,
+        font_manager=FontManager(base_dir=models_dir),
+    )
+    arbitration = font_detection.activate_parent_render_style_ledger_v3(
+        parent_execution_bundles=all_bundles,
+        evidence=all_evidence,
+        style_ledger=style_ledger,
+    )
+
+    page_results: list[tuple[str, Any]] = []
+    rendered_page_ids: list[str] = []
+    for page in pending:
+        page_arbitration = _page_parent_style_arbitration_projection(
+            arbitration,
+            page,
+        )
+        render_page(page, page_arbitration)
+        page_results.append((page.page_id, page_arbitration))
+        rendered_page_ids.append(page.page_id)
+    return ParentStyleRunFinalizationResult(
+        snapshot=snapshot,
+        arbitration=arbitration,
+        page_results=tuple(page_results),
+        rendered_page_ids=tuple(rendered_page_ids),
+    )
 
 
 def _page014_timeout_diag_enabled() -> bool:
@@ -726,6 +1122,7 @@ class PipelineWorker(QtCore.QThread):
         ollama = None
         auto_glossary_state = None
         pages = []
+        pending_style_pages: list[ParentStylePendingPage] = []
         debug_artifacts_enabled = debug_enabled(self._settings)
         perf_telemetry_is_enabled = perf_telemetry_enabled(self._settings)
         debug_page_filter = debug_pages(self._settings) if debug_artifacts_enabled else set()
@@ -1659,6 +2056,9 @@ class PipelineWorker(QtCore.QThread):
                         continue
                 else:
                     parent_font_mode = str(self._settings.font_detection or "off").strip()
+                    parent_style_observation = None
+                    style_view_result = None
+                    source_punctuation_geometry_observation = None
                     if parent_execution_bundles:
                         parent_font_start = time.time()
                         try:
@@ -1669,42 +2069,43 @@ class PipelineWorker(QtCore.QThread):
                                 mode=parent_font_mode,
                                 parent_execution_bundle_count=len(parent_execution_bundles),
                             )
-                            style_view_result, parent_font_detection_result = (
-                                _apply_parent_style_after_cleanup(
+                            style_view_result, parent_style_observation = (
+                                _observe_parent_style_after_cleanup(
                                     page_id=page_id,
                                     image_path=source_path,
                                     parent_execution_bundles=parent_execution_bundles,
                                     cleanup_masks=cleanup_mask_contract_result,
                                     image_size=source_image_size,
                                     mode=parent_font_mode,
-                                    default_font_name=self._settings.font_name,
                                     use_gpu=self._settings.use_gpu,
                                     models_dir=os.path.join(os.getcwd(), "models"),
                                 )
                             )
-                            execution_regions = parent_execution_region_records(parent_execution_bundles)
                             _page014_timeout_checkpoint(
                                 "parent_style_after_cleanup",
-                                "end",
+                                "observed_pending_run_snapshot",
                                 page_id=page_id,
-                                applied_count=parent_font_detection_result.applied_count,
-                                fallback_count=parent_font_detection_result.fallback_count,
-                                skipped_count=parent_font_detection_result.skipped_count,
+                                evidence_count=len(parent_style_observation.evidence),
+                                observed_count=sum(
+                                    1
+                                    for item in parent_style_observation.evidence
+                                    if item.status == "observed" and item.vote_eligible
+                                ),
                                 requested_execution_provider=(
-                                    parent_font_detection_result.requested_execution_provider
+                                    parent_style_observation.requested_execution_provider
                                 ),
                                 primary_execution_provider=(
-                                    parent_font_detection_result.primary_execution_provider
+                                    parent_style_observation.primary_execution_provider
                                 ),
                                 provider_fallback_reason=(
-                                    parent_font_detection_result.provider_fallback_reason
+                                    parent_style_observation.provider_fallback_reason
                                 ),
                                 elapsed_ms=round((time.time() - parent_font_start) * 1000.0, 3),
                             )
-                            if parent_font_detection_result.provider_fallback_reason:
+                            if parent_style_observation.provider_fallback_reason:
                                 self.message.emit(
                                     "Font detection GPU fallback: "
-                                    f"{parent_font_detection_result.provider_fallback_reason}; "
+                                    f"{parent_style_observation.provider_fallback_reason}; "
                                     "continuing with CPUExecutionProvider."
                                 )
                             if debug_context is not None:
@@ -1723,8 +2124,8 @@ class PipelineWorker(QtCore.QThread):
                                             result=style_view_result,
                                         )
                                     )
-                                    debug_context["parent_font_detection"] = (
-                                        parent_font_detection_result.to_audit_dict()
+                                    debug_context["parent_style_evidence"] = (
+                                        parent_style_observation.to_audit_dict()
                                     )
                                 set_timing(
                                     debug_context,
@@ -1738,22 +2139,14 @@ class PipelineWorker(QtCore.QThread):
                                 )
                                 set_count(
                                     debug_context,
-                                    "parent_font_detection_applied",
-                                    parent_font_detection_result.applied_count,
+                                    "parent_style_evidence_observed",
+                                    sum(
+                                        1
+                                        for item in parent_style_observation.evidence
+                                        if item.status == "observed"
+                                        and item.vote_eligible
+                                    ),
                                 )
-                                set_count(
-                                    debug_context,
-                                    "parent_font_detection_fallback",
-                                    parent_font_detection_result.fallback_count,
-                                )
-                                for record in parent_font_detection_result.records:
-                                    rid = str(record.get("bundle_id") or "")
-                                    if rid:
-                                        mark_render_region(
-                                            debug_context,
-                                            rid,
-                                            parent_font_detection=record,
-                                        )
                         except Exception as exc:
                             _page014_timeout_checkpoint(
                                 "parent_style_after_cleanup",
@@ -1763,29 +2156,41 @@ class PipelineWorker(QtCore.QThread):
                             )
                             try:
                                 from app.pipeline.parent_font_detection import (
-                                    resolve_unavailable_parent_styles,
+                                    ParentStyleEvidenceRunResult,
+                                    StyleEvidence,
                                 )
 
-                                parent_font_detection_result = resolve_unavailable_parent_styles(
+                                parent_style_observation = ParentStyleEvidenceRunResult(
                                     page_id=page_id,
-                                    parent_execution_bundles=parent_execution_bundles,
-                                    reason_codes=(
-                                        "authorized_style_stage_failed",
-                                        f"authorized_style_stage_failed_{type(exc).__name__}",
-                                    ),
                                     mode=parent_font_mode,
-                                    default_font_name=self._settings.font_name,
-                                    models_dir=os.path.join(os.getcwd(), "models"),
+                                    evidence=[
+                                        StyleEvidence.unavailable(
+                                            page_id=page_id,
+                                            bundle_id=str(
+                                                getattr(bundle, "bundle_id", "") or ""
+                                            ),
+                                            parent_id=str(
+                                                getattr(bundle, "parent_id", "") or ""
+                                            ),
+                                            root_id=str(
+                                                getattr(bundle, "root_id", "") or ""
+                                            ),
+                                            reason_codes=(
+                                                "authorized_style_stage_failed",
+                                                "authorized_style_stage_failed_"
+                                                f"{type(exc).__name__}",
+                                            ),
+                                        )
+                                        for bundle in parent_execution_bundles
+                                        if bool(getattr(bundle, "render_required", False))
+                                    ],
                                     errors=(
                                         f"authorized_style_stage_failed:{type(exc).__name__}:{exc}",
                                     ),
                                 )
                                 self.message.emit(
                                     f"Parent style evidence failed for {name}; "
-                                    "rendering with an explicit unresolved default."
-                                )
-                                execution_regions = parent_execution_region_records(
-                                    parent_execution_bundles
+                                    "the run snapshot will use explicit unavailable evidence."
                                 )
                             except Exception as fallback_exc:
                                 page_elapsed = time.time() - page_start
@@ -1794,7 +2199,8 @@ class PipelineWorker(QtCore.QThread):
                                     f"error ({_format_seconds(page_elapsed)}): {fallback_exc}",
                                 )
                                 self.message.emit(
-                                    f"Failed to resolve parent styles for {name}: {fallback_exc}"
+                                    f"Failed to record unavailable parent style evidence for "
+                                    f"{name}: {fallback_exc}"
                                 )
                                 continue
                             if debug_context is not None and not debug_context.get(
@@ -1808,64 +2214,141 @@ class PipelineWorker(QtCore.QThread):
                                     "views": [],
                                     "errors": [f"{type(exc).__name__}: {exc}"],
                                 }
-                                debug_context["parent_font_detection"] = (
-                                    parent_font_detection_result.to_audit_dict()
+                                debug_context["parent_style_evidence"] = (
+                                    parent_style_observation.to_audit_dict()
                                 )
-                    elif debug_context is not None and not debug_context.get("perf_telemetry_only"):
-                        debug_context["parent_font_detection"] = {
-                            "parent_font_detection_version": "parent_font_detection_v2",
-                            "page_id": page_id,
-                            "mode": parent_font_mode,
-                            "enabled": False,
-                            "reason": "no_parent_execution_bundles",
-                        }
-                    try:
-                        render_start = time.time()
-                        _page014_timeout_checkpoint("renderer_entry", "start", page_id=page_id, render_input_path=render_input_path)
-                        if parent_execution_bundles:
-                            render_parent_execution_bundles(
-                                render_input_path,
-                                output_path,
-                                parent_execution_bundles,
-                                self._settings.font_name,
-                                inpaint_mode=self._settings.inpaint_mode,
-                                use_gpu=self._settings.use_gpu,
-                                model_id=self._settings.inpaint_model_id,
-                                debug_context=debug_context if debug_artifacts_enabled else None,
-                                source_glyph_masks=source_glyph_mask_result,
-                                render_eligibility=render_eligibility_contract_result,
-                                perf_telemetry_context=debug_context if perf_telemetry_is_enabled else None,
-                                cleaned_page_base=cleaned_page_base_record,
+                        source_punctuation_geometry_observation = (
+                            _observe_parent_punctuation_geometry_after_cleanup(
+                                page_id=page_id,
+                                image_path=source_path,
+                                parent_execution_bundles=parent_execution_bundles,
+                                cleanup_masks=cleanup_mask_contract_result,
+                                image_size=source_image_size,
+                                style_views=style_view_result,
+                                style_evidence=parent_style_observation,
                             )
-                        else:
-                            _write_no_layer_render_output(
-                                render_input_path,
-                                output_path,
-                                debug_context=debug_context,
-                            )
-                        if parent_execution_bundles:
-                            execution_regions = parent_execution_region_records(parent_execution_bundles)
+                        )
                         if debug_context is not None:
-                            set_timing(debug_context, "rendering_time", time.time() - render_start)
-                            if render_input_path != source_path:
-                                debug_context["cleanup_upstream_renderer_input_path"] = render_input_path
-                        _page014_timeout_checkpoint(
-                            "renderer_entry",
-                            "end",
-                            page_id=page_id,
-                            elapsed_ms=round((time.time() - render_start) * 1000.0, 3),
+                            if not debug_context.get("perf_telemetry_only"):
+                                debug_context["source_punctuation_geometry"] = (
+                                    source_punctuation_geometry_observation.to_audit_dict()
+                                )
+                            set_count(
+                                debug_context,
+                                "source_punctuation_geometry_occurrences",
+                                sum(
+                                    len(item.occurrences)
+                                    for item in source_punctuation_geometry_observation.evidence
+                                ),
+                            )
+                    else:
+                        from app.pipeline.parent_font_detection import (
+                            ParentStyleEvidenceRunResult,
                         )
-                    except Exception as exc:
-                        _page014_timeout_checkpoint(
-                            "renderer_entry",
-                            "error",
-                            page_id=page_id,
-                            error=f"{type(exc).__name__}: {exc}",
+                        from app.render.source_punctuation_hints import (
+                            SourcePunctuationGeometryRunResult,
                         )
+
+                        parent_style_observation = ParentStyleEvidenceRunResult(
+                            page_id=page_id,
+                            mode=parent_font_mode,
+                        )
+                        source_punctuation_geometry_observation = (
+                            SourcePunctuationGeometryRunResult(page_id=page_id)
+                        )
+                        if debug_context is not None and not debug_context.get(
+                            "perf_telemetry_only"
+                        ):
+                            debug_context["parent_style_evidence"] = {
+                                **parent_style_observation.to_audit_dict(),
+                                "reason": "no_parent_execution_bundles",
+                            }
+                            debug_context["source_punctuation_geometry"] = {
+                                **source_punctuation_geometry_observation.to_audit_dict(),
+                                "reason": "no_parent_execution_bundles",
+                            }
+
+                    render_eligibility_audit = (
+                        render_eligibility_contract_result.to_audit_dict()
+                        if hasattr(render_eligibility_contract_result, "to_audit_dict")
+                        else dict(render_eligibility_contract_result or {})
+                    )
+                    try:
+                        pending_style_page = ParentStylePendingPage(
+                            page_id=page_id,
+                            parent_execution_bundles=tuple(parent_execution_bundles),
+                            evidence=tuple(parent_style_observation.evidence),
+                            cleaned_page_base=cleaned_page_base_record,
+                            render_eligibility=render_eligibility_audit,
+                            observation_audit=parent_style_observation.to_audit_dict(),
+                            page_payload={
+                                "index": index,
+                                "name": name,
+                                "page_start": page_start,
+                                "page_process_cpu_start": page_process_cpu_start,
+                                "source_path": source_path,
+                                "output_path": output_path,
+                                "render_input_path": render_input_path,
+                                "debug_context": debug_context,
+                                "regions": regions,
+                                "execution_regions": execution_regions,
+                                "page_class": page_class,
+                                "cleanup_upstream_temp_path": cleanup_upstream_temp_path,
+                            },
+                        )
+                    except (TypeError, ValueError) as exc:
+                        if (
+                            cleanup_upstream_temp_path
+                            and os.path.isfile(cleanup_upstream_temp_path)
+                        ):
+                            try:
+                                os.unlink(cleanup_upstream_temp_path)
+                            except OSError:
+                                pass
                         page_elapsed = time.time() - page_start
-                        self.queue_item.emit(index - 1, f"error ({_format_seconds(page_elapsed)}): {exc}")
-                        self.message.emit(f"Failed to render {name}: {exc}")
-                        continue
+                        self.queue_item.emit(
+                            index - 1,
+                            f"error ({_format_seconds(page_elapsed)}): {exc}",
+                        )
+                        self.message.emit(
+                            "Failed to freeze compact parent style inputs for "
+                            f"{name}: {type(exc).__name__}: {exc}"
+                        )
+                        return
+                    pending_style_pages.append(pending_style_page)
+                    if auto_glossary_state is not None:
+                        with _glossary_lock:
+                            current_glossary_size = len(
+                                auto_glossary_state.get("map", {})
+                            )
+                            snapshots = auto_glossary_state.setdefault(
+                                "page_snapshots", {}
+                            )
+                            snapshots[index - 1] = current_glossary_size
+                    self.queue_item.emit(index - 1, "awaiting run style snapshot")
+                    source_glyph_mask_result = None
+                    cleanup_job_contract_result = None
+                    cleanup_mask_contract_result = None
+                    cleanup_plan_contract_result = None
+                    cleanup_runtime_contract_result = None
+                    cleanup_upstream_commit_result = None
+                    render_eligibility_contract_result = None
+                    text_foreground_segmentation_mask = None
+                    component_authorization_map = None
+                    cleanup_plan_mask_contracts = None
+                    style_view_result = None
+                    parent_style_observation = None
+                    source_punctuation_geometry_observation = None
+                    page_result = None
+                    text_area_plan = None
+                    regions = None
+                    execution_regions = None
+                    parent_execution_bundles = None
+                    debug_context = None
+                    import gc
+
+                    gc.collect()
+                    continue
                 if cleanup_upstream_temp_path:
                     try:
                         os.unlink(cleanup_upstream_temp_path)
@@ -1995,6 +2478,317 @@ class PipelineWorker(QtCore.QThread):
                     except Exception as exc:
                         self.message.emit(f"Failed to write performance telemetry for {name}: {exc}")
 
+            style_run_result = None
+            if pending_style_pages:
+                def _render_snapshot_finalized_page(
+                    pending_page: ParentStylePendingPage,
+                    page_arbitration: Any,
+                ) -> None:
+                    payload = _thaw_compact_style_run_json(
+                        pending_page.page_payload
+                    )
+                    cleaned_page_base_record = _thaw_compact_style_run_json(
+                        pending_page.cleaned_page_base
+                    )
+                    render_eligibility_audit = _thaw_compact_style_run_json(
+                        pending_page.render_eligibility
+                    )
+                    observation_audit = _thaw_compact_style_run_json(
+                        pending_page.observation_audit
+                    )
+                    page_id = pending_page.page_id
+                    bundles = list(pending_page.parent_execution_bundles)
+                    index = int(payload.get("index") or 0)
+                    name = str(payload.get("name") or page_id)
+                    source_path = str(payload.get("source_path") or "")
+                    output_path = str(payload.get("output_path") or "")
+                    render_input_path = str(
+                        payload.get("render_input_path") or source_path
+                    )
+                    debug_context = payload.get("debug_context")
+                    regions = list(payload.get("regions") or [])
+                    execution_regions = list(
+                        payload.get("execution_regions") or []
+                    )
+
+                    records = [dict(record) for record in page_arbitration.records]
+                    applied_count = sum(
+                        1 for record in records
+                        if str(record.get("status") or "") == "applied"
+                    )
+                    skipped_count = sum(
+                        1 for record in records
+                        if str(record.get("status") or "") == "skipped"
+                    )
+                    fallback_count = len(records) - applied_count - skipped_count
+                    parent_font_audit = {
+                        "parent_font_detection_version": "parent_font_detection_v2",
+                        "page_id": page_id,
+                        "mode": str(observation_audit.get("mode") or "off"),
+                        "enabled": bool(observation_audit.get("enabled")),
+                        "applied_count": applied_count,
+                        "fallback_count": fallback_count,
+                        "skipped_count": skipped_count,
+                        "model_path": str(observation_audit.get("model_path") or ""),
+                        "labels_path": str(observation_audit.get("labels_path") or ""),
+                        "gpu_requested": bool(
+                            observation_audit.get("gpu_requested")
+                        ),
+                        "requested_execution_provider": str(
+                            observation_audit.get("requested_execution_provider")
+                            or ""
+                        ),
+                        "available_execution_providers": list(
+                            observation_audit.get("available_execution_providers")
+                            or []
+                        ),
+                        "active_execution_providers": list(
+                            observation_audit.get("active_execution_providers")
+                            or []
+                        ),
+                        "primary_execution_provider": str(
+                            observation_audit.get("primary_execution_provider")
+                            or ""
+                        ),
+                        "provider_fallback_reason": str(
+                            observation_audit.get("provider_fallback_reason") or ""
+                        ),
+                        "provider_preload_error": str(
+                            observation_audit.get("provider_preload_error") or ""
+                        ),
+                        "errors": list(observation_audit.get("errors") or []),
+                        "records": records,
+                    }
+                    if isinstance(debug_context, dict):
+                        if not debug_context.get("perf_telemetry_only"):
+                            debug_context["parent_font_detection"] = parent_font_audit
+                        debug_context["parent_style_run_snapshot"] = {
+                            "contract_version": "parent_style_run_snapshot_v1",
+                            "page_finalized_after_complete_run_observation": True,
+                        }
+                        set_count(
+                            debug_context,
+                            "parent_font_detection_applied",
+                            applied_count,
+                        )
+                        set_count(
+                            debug_context,
+                            "parent_font_detection_fallback",
+                            fallback_count,
+                        )
+                        for record in records:
+                            bundle_id = str(record.get("bundle_id") or "")
+                            if bundle_id:
+                                mark_render_region(
+                                    debug_context,
+                                    bundle_id,
+                                    parent_font_detection=record,
+                                )
+
+                    render_start = time.time()
+                    _page014_timeout_checkpoint(
+                        "renderer_entry",
+                        "start_after_run_style_snapshot",
+                        page_id=page_id,
+                        render_input_path=render_input_path,
+                    )
+                    try:
+                        if bundles:
+                            render_parent_execution_bundles(
+                                render_input_path,
+                                output_path,
+                                bundles,
+                                self._settings.font_name,
+                                inpaint_mode=self._settings.inpaint_mode,
+                                use_gpu=self._settings.use_gpu,
+                                model_id=self._settings.inpaint_model_id,
+                                debug_context=(
+                                    debug_context
+                                    if debug_artifacts_enabled
+                                    else None
+                                ),
+                                render_eligibility=render_eligibility_audit,
+                                perf_telemetry_context=(
+                                    debug_context
+                                    if perf_telemetry_is_enabled
+                                    else None
+                                ),
+                                cleaned_page_base=cleaned_page_base_record,
+                            )
+                            execution_regions = parent_execution_region_records(
+                                bundles
+                            )
+                        else:
+                            _write_no_layer_render_output(
+                                render_input_path,
+                                output_path,
+                                debug_context=debug_context,
+                            )
+                        if isinstance(debug_context, dict):
+                            set_timing(
+                                debug_context,
+                                "rendering_time",
+                                time.time() - render_start,
+                            )
+                            if render_input_path != source_path:
+                                debug_context[
+                                    "cleanup_upstream_renderer_input_path"
+                                ] = render_input_path
+                        _page014_timeout_checkpoint(
+                            "renderer_entry",
+                            "end_after_run_style_snapshot",
+                            page_id=page_id,
+                            elapsed_ms=round(
+                                (time.time() - render_start) * 1000.0,
+                                3,
+                            ),
+                        )
+                    except Exception as exc:
+                        _page014_timeout_checkpoint(
+                            "renderer_entry",
+                            "error_after_run_style_snapshot",
+                            page_id=page_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                        self.queue_item.emit(index - 1, f"error: {exc}")
+                        self.message.emit(f"Failed to render {name}: {exc}")
+                        raise
+
+                    page_record = build_page_record(
+                        source_path,
+                        page_id,
+                        execution_regions,
+                        output_path,
+                        page_class=str(payload.get("page_class") or ""),
+                    )
+                    if cleaned_page_base_record:
+                        page_record["cleaned_page_base"] = cleaned_page_base_record
+                    if bundles:
+                        page_record["source_regions"] = regions
+                        page_record["parent_execution_bundles"] = [
+                            bundle.to_audit_dict() for bundle in bundles
+                        ]
+                    pages.append(page_record)
+                    self.page_ready.emit(index - 1, page_record)
+
+                    page_elapsed = time.time() - float(
+                        payload.get("page_start") or time.time()
+                    )
+                    if isinstance(debug_context, dict):
+                        set_timing(debug_context, "total_page_time", page_elapsed)
+                        set_timing(
+                            debug_context,
+                            "page_functional_time",
+                            page_elapsed,
+                        )
+                    if debug_artifacts_enabled and isinstance(debug_context, dict):
+                        try:
+                            artifact_start = time.time()
+                            _page014_timeout_checkpoint(
+                                "debug_artifact_write",
+                                "start",
+                                page_id=page_id,
+                            )
+                            write_page_artifacts(
+                                debug_context,
+                                execution_regions if bundles else regions,
+                            )
+                            _page014_timeout_checkpoint(
+                                "debug_artifact_write",
+                                "end",
+                                page_id=page_id,
+                                elapsed_ms=round(
+                                    (time.time() - artifact_start) * 1000.0,
+                                    3,
+                                ),
+                            )
+                            self.message.emit(
+                                f"Debug artifacts written for {name}"
+                            )
+                        except Exception as exc:
+                            self.message.emit(
+                                f"Failed to write debug artifacts for {name}: {exc}"
+                            )
+                    self.page_time_changed.emit(
+                        f"Page: {_format_seconds(page_elapsed)}"
+                    )
+                    self.queue_item.emit(
+                        index - 1,
+                        f"done ({_format_seconds(page_elapsed)})",
+                    )
+                    self.progress_changed.emit(int(index / total * 100))
+                    elapsed = time.time() - start_time
+                    self.total_time_changed.emit(
+                        f"Total: {_format_seconds(elapsed)}"
+                    )
+                    remaining_pages = max(0, total - index)
+                    self.eta_changed.emit(
+                        _format_eta(
+                            (elapsed / max(1, index)) * remaining_pages
+                        )
+                    )
+
+                    if perf_telemetry_is_enabled and isinstance(
+                        debug_context,
+                        dict,
+                    ):
+                        set_timing(
+                            debug_context,
+                            "page_process_cpu_time",
+                            max(
+                                0.0,
+                                time.process_time()
+                                - float(
+                                    payload.get("page_process_cpu_start") or 0.0
+                                ),
+                            ),
+                        )
+                        try:
+                            telemetry_write_start = time.perf_counter()
+                            write_perf_timing_artifact(
+                                debug_context,
+                                execution_regions if bundles else regions,
+                            )
+                            append_perf_timing_overhead_artifact(
+                                debug_context,
+                                telemetry_artifact_write_time=(
+                                    time.perf_counter() - telemetry_write_start
+                                ),
+                                observed_page_cycle_with_telemetry=(
+                                    time.time()
+                                    - float(
+                                        payload.get("page_start")
+                                        or time.time()
+                                    )
+                                ),
+                            )
+                        except Exception as exc:
+                            self.message.emit(
+                                f"Failed to write performance telemetry for "
+                                f"{name}: {exc}"
+                            )
+
+                try:
+                    style_run_result = finalize_parent_style_run(
+                        pages=pending_style_pages,
+                        default_font_name=self._settings.font_name,
+                        models_dir=os.path.join(os.getcwd(), "models"),
+                        render_page=_render_snapshot_finalized_page,
+                    )
+                except Exception as exc:
+                    self.message.emit(
+                        "Failed to finalize the immutable parent style run: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    return
+                project["parent_style_run_snapshot"] = (
+                    style_run_result.snapshot.to_audit_dict()
+                )
+                self.message.emit(
+                    "Parent styles finalized from one immutable run snapshot "
+                    f"({style_run_result.snapshot.snapshot_id})."
+                )
+
             project["pages"] = pages
             json_path = self._settings.json_path or os.path.join(self._settings.export_dir, "project.json")
             try:
@@ -2021,6 +2815,18 @@ class PipelineWorker(QtCore.QThread):
             self.total_time_changed.emit(f"Total: {_format_seconds(total_elapsed)}")
             self.message.emit("Completed")
         finally:
+            for pending_page in pending_style_pages:
+                try:
+                    pending_payload = _thaw_compact_style_run_json(
+                        pending_page.page_payload
+                    )
+                    cleanup_temp_path = str(
+                        pending_payload.get("cleanup_upstream_temp_path") or ""
+                    )
+                    if cleanup_temp_path and os.path.isfile(cleanup_temp_path):
+                        os.unlink(cleanup_temp_path)
+                except (OSError, TypeError, ValueError):
+                    pass
             should_finalize_auto_glossary = (
                 auto_glossary_state
                 and self._settings.style_guide_path
@@ -10734,7 +11540,7 @@ def _sync_parent_execution_downstream_contracts(
     sync_bundles_from_region_records(bundles, execution_regions)
 
 
-def _apply_parent_style_after_cleanup(
+def _observe_parent_style_after_cleanup(
     *,
     page_id: str,
     image_path: str,
@@ -10742,14 +11548,13 @@ def _apply_parent_style_after_cleanup(
     cleanup_masks: Any,
     image_size: tuple[int, int] | None,
     mode: str,
-    default_font_name: str,
     use_gpu: bool,
     models_dir: str,
     detector: Any = None,
 ) -> tuple[Any, Any]:
-    """Observe and resolve style only after parent cleanup authority exists."""
+    """Observe typed style evidence after parent cleanup authority exists."""
 
-    from app.pipeline.parent_font_detection import apply_parent_font_detection
+    from app.pipeline.parent_font_detection import observe_parent_style_evidence
     from app.pipeline.parent_style_evidence import build_authorized_source_style_views
 
     style_views = build_authorized_source_style_views(
@@ -10758,18 +11563,118 @@ def _apply_parent_style_after_cleanup(
         cleanup_masks=cleanup_masks,
         image_size=image_size,
     )
-    font_result = apply_parent_font_detection(
+    observed = observe_parent_style_evidence(
         page_id=page_id,
         image_path=image_path,
         parent_execution_bundles=parent_execution_bundles,
         authorized_style_views=style_views.views_by_bundle_id,
         mode=mode,
-        default_font_name=default_font_name,
         use_gpu=use_gpu,
         models_dir=models_dir,
         detector=detector,
     )
-    return style_views, font_result
+    return style_views, observed
+
+
+def _observe_parent_punctuation_geometry_after_cleanup(
+    *,
+    page_id: str,
+    image_path: str,
+    parent_execution_bundles: list[ParentExecutionBundle],
+    cleanup_masks: Any,
+    image_size: tuple[int, int] | None,
+    style_views: Any = None,
+    style_evidence: Any = None,
+) -> Any:
+    """Attach degradable source-pixel punctuation facts to parent bundles.
+
+    The accepted source-style view is reused only as a parent-bound pixel
+    aperture.  Observation failure records unavailable evidence and never
+    changes render admission or the translated text carried by the bundle.
+    """
+
+    from app.pipeline.parent_style_evidence import (
+        build_authorized_source_style_views,
+    )
+    from app.render.source_punctuation_hints import (
+        SourcePunctuationGeometryEvidence,
+        SourcePunctuationGeometryRunResult,
+        observe_source_punctuation_geometry,
+    )
+
+    render_bundles = [
+        bundle
+        for bundle in list(parent_execution_bundles or [])
+        if bool(getattr(bundle, "render_required", False))
+    ]
+    errors: list[str] = []
+    try:
+        if hasattr(style_views, "views_by_bundle_id"):
+            views_by_bundle_id = dict(style_views.views_by_bundle_id)
+        elif isinstance(style_views, Mapping):
+            views_by_bundle_id = dict(style_views)
+        else:
+            rebuilt = build_authorized_source_style_views(
+                page_id=page_id,
+                parent_execution_bundles=parent_execution_bundles,
+                cleanup_masks=cleanup_masks,
+                image_size=image_size,
+            )
+            views_by_bundle_id = dict(rebuilt.views_by_bundle_id)
+        if hasattr(style_evidence, "evidence"):
+            style_evidence_items = list(style_evidence.evidence or ())
+        elif isinstance(style_evidence, Mapping):
+            style_evidence_items = list(style_evidence.values())
+        else:
+            style_evidence_items = list(style_evidence or ())
+        style_evidence_by_bundle_id = {
+            str(getattr(item, "bundle_id", "") or ""): item
+            for item in style_evidence_items
+            if str(getattr(item, "bundle_id", "") or "")
+        }
+        observed = observe_source_punctuation_geometry(
+            page_id=page_id,
+            source_image_path=image_path,
+            parent_execution_bundles=parent_execution_bundles,
+            authorized_style_views=views_by_bundle_id,
+            source_style_evidence_by_bundle_id=style_evidence_by_bundle_id,
+        )
+        observed_by_bundle_id = observed.evidence_by_bundle_id
+        errors.extend(observed.errors)
+    except Exception as exc:
+        views_by_bundle_id = {}
+        observed_by_bundle_id = {}
+        errors.append(
+            "source_punctuation_geometry_stage_failed:"
+            f"{type(exc).__name__}:{exc}"
+        )
+
+    evidence: list[SourcePunctuationGeometryEvidence] = []
+    for bundle in render_bundles:
+        bundle_id = str(getattr(bundle, "bundle_id", "") or "")
+        item = observed_by_bundle_id.get(bundle_id)
+        if item is None:
+            view = views_by_bundle_id.get(bundle_id)
+            item = SourcePunctuationGeometryEvidence.unavailable(
+                page_id=str(page_id or ""),
+                bundle_id=bundle_id,
+                parent_id=str(getattr(bundle, "parent_id", "") or ""),
+                root_id=str(getattr(bundle, "root_id", "") or ""),
+                view_id=str(getattr(view, "view_id", "") or ""),
+                reason="source_punctuation_geometry_stage_unavailable",
+                reason_codes=(
+                    "source_punctuation_geometry_stage_unavailable",
+                ),
+            )
+        bundle.source_punctuation_geometry = item.to_audit_dict()
+        bundle.to_region_record()
+        evidence.append(item)
+
+    return SourcePunctuationGeometryRunResult(
+        page_id=str(page_id or ""),
+        evidence=tuple(evidence),
+        errors=tuple(_unique_strings(errors)),
+    )
 
 
 def _safe_region_audit_fields(source_glyph_masks: Any) -> dict[str, dict[str, Any]]:

@@ -241,6 +241,9 @@ class TypesetLayout:
     selected_font_face: str
     selected_font_size: float
     writing_mode: str
+    text_placement_complete: bool = False
+    hard_bounds_contained: bool = False
+    fit_quality: str = "not_typeset"
     lines: list[JsonDict] = field(default_factory=list)
     columns: list[JsonDict] = field(default_factory=list)
     glyphs: list[GlyphPlacement | JsonDict] = field(default_factory=list)
@@ -266,6 +269,9 @@ class TypesetLayout:
             "selected_font_face": self.selected_font_face,
             "selected_font_size": float(self.selected_font_size),
             "writing_mode": self.writing_mode,
+            "text_placement_complete": bool(self.text_placement_complete),
+            "hard_bounds_contained": bool(self.hard_bounds_contained),
+            "fit_quality": self.fit_quality,
             "lines": copy_jsonish(self.lines),
             "columns": copy_jsonish(self.columns),
             "glyphs": [_glyph_to_dict(item) for item in self.glyphs],
@@ -296,6 +302,15 @@ class FitReport:
     bundle_id: str
     parent_id: str
     root_id: str
+    text_placement_complete: bool = False
+    hard_bounds_contained: bool = False
+    fit_quality: str = "not_typeset"
+    preferred_font_size: float = 0.0
+    selected_pre_scale_font_size: float = 0.0
+    final_effective_font_size: float = 0.0
+    final_scale: float = 1.0
+    fit_trigger: str = ""
+    candidate_rank: int = -1
     natural_fit_success: bool = False
     fallback_used: bool = False
     fallback_reason: str = ""
@@ -320,6 +335,17 @@ class FitReport:
             "bundle_id": self.bundle_id,
             "parent_id": self.parent_id,
             "root_id": self.root_id,
+            "text_placement_complete": bool(self.text_placement_complete),
+            "hard_bounds_contained": bool(self.hard_bounds_contained),
+            "fit_quality": self.fit_quality,
+            "preferred_font_size": float(self.preferred_font_size),
+            "selected_pre_scale_font_size": float(
+                self.selected_pre_scale_font_size
+            ),
+            "final_effective_font_size": float(self.final_effective_font_size),
+            "final_scale": float(self.final_scale),
+            "fit_trigger": self.fit_trigger,
+            "candidate_rank": int(self.candidate_rank),
             "natural_fit_success": bool(self.natural_fit_success),
             "fallback_used": bool(self.fallback_used),
             "fallback_reason": self.fallback_reason,
@@ -397,6 +423,54 @@ def validated_source_text_footprint_ref(
     ):
         return {}
     return copy_jsonish(footprint)
+
+
+def validated_source_punctuation_geometry_ref(
+    plan: RenderLayerPlan,
+) -> JsonDict:
+    """Return adapter-validated punctuation geometry for this exact plan.
+
+    Schema, support, fact-set, and geometry validation remain adapter-owned.
+    This consumer check only prevents a post-adapter identity or validation
+    mismatch from becoming executable presentation evidence.
+    """
+
+    provenance = (
+        plan.source_provenance_ref
+        if isinstance(plan.source_provenance_ref, Mapping)
+        else {}
+    )
+    validation = provenance.get("source_punctuation_geometry_validation")
+    evidence = provenance.get("source_punctuation_geometry")
+    if not isinstance(validation, Mapping) or not isinstance(evidence, Mapping):
+        return {}
+    if str(validation.get("status") or "") != "accepted":
+        return {}
+    contract_version = str(evidence.get("contract_version") or "")
+    fact_set_id = str(evidence.get("fact_set_id") or "")
+    if (
+        not contract_version
+        or contract_version != str(validation.get("contract_version") or "")
+        or not fact_set_id
+        or fact_set_id != str(validation.get("fact_set_id") or "")
+        or not fact_set_id.startswith(f"{contract_version}:")
+    ):
+        return {}
+    identity = evidence.get("source_identity")
+    if not isinstance(identity, Mapping):
+        return {}
+    expected_identity = {
+        "page_id": plan.page_id,
+        "bundle_id": plan.bundle_id,
+        "parent_id": plan.parent_id,
+        "root_id": plan.root_id,
+    }
+    if any(
+        str(identity.get(key) or "") != str(expected or "")
+        for key, expected in expected_identity.items()
+    ):
+        return {}
+    return copy_jsonish(evidence)
 
 
 def bbox_from_value(value: Any) -> list[int]:

@@ -309,9 +309,13 @@ def _stamp_parent_bundle_render_layout_summaries(
         ]
         translated_matches_original = translated_text == original_text
         normalized_matches_glyphs = normalized_text == glyph_text
-        full_text_placed = bool(layer.get("full_text_placed")) and bool(
-            report.get("full_text_placed")
-        )
+        text_placement_complete = bool(
+            layer.get("text_placement_complete")
+        ) and bool(report.get("text_placement_complete"))
+        hard_bounds_contained = bool(
+            layer.get("hard_bounds_contained")
+        ) and bool(report.get("hard_bounds_contained"))
+        full_text_placed = text_placement_complete
         glyph_text_matches_layout = bool(layer.get("glyph_text_matches_layout"))
         layer_drawn = bool(layer.get("drawn"))
         failed_raster_placement_count = int(
@@ -400,6 +404,7 @@ def _stamp_parent_bundle_render_layout_summaries(
             translated_matches_original
             and normalized_matches_glyphs
             and full_text_placed
+            and hard_bounds_contained
             and glyph_text_matches_layout
             and render_commit_complete
         )
@@ -430,6 +435,9 @@ def _stamp_parent_bundle_render_layout_summaries(
             "translated_text_matches_layout_original": translated_matches_original,
             "normalized_text_matches_layout_glyphs": normalized_matches_glyphs,
             "full_text_placed": full_text_placed,
+            "text_placement_complete": text_placement_complete,
+            "hard_bounds_contained": hard_bounds_contained,
+            "fit_quality": str(report.get("fit_quality") or ""),
             "glyph_text_matches_layout": glyph_text_matches_layout,
             "layer_drawn": layer_drawn,
             "failed_raster_placement_count": failed_raster_placement_count,
