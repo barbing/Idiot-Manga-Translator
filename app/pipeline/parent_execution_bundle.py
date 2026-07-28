@@ -12,7 +12,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-
 PARENT_EXECUTION_BUNDLE_VERSION = "parent_execution_bundle_v1"
 PARENT_RENDER_STYLE_VERSION = "parent_render_style_v3"
 PARENT_STYLE_ARBITRATOR_SOURCE = "parent_authorized_style_evidence"
@@ -48,7 +47,12 @@ _PARENT_STYLE_ROLE_STATUSES = {
     "degraded_registered_role",
     "fallback_registered_role",
 }
-_PARENT_STYLE_SOURCE_CELL_STATUSES = {"direct", "peer", "unavailable"}
+_PARENT_STYLE_SOURCE_CELL_STATUSES = {
+    "direct",
+    "peer",
+    "fallback",
+    "unavailable",
+}
 _PARENT_STYLE_AXIS_NAMES = (
     "family",
     "weight",
@@ -1320,7 +1324,7 @@ def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
         _finite_number(source_cell.get(name))
         for name in ("p20_px", "median_px", "p80_px")
     )
-    if source_status in {"direct", "peer"}:
+    if source_status in {"direct", "peer", "fallback"}:
         if any(value is None or value <= 0.0 for value in cell_interval):
             reasons.append("source_visual_cell_measurement_missing")
         elif not cell_interval[0] <= cell_interval[1] <= cell_interval[2]:

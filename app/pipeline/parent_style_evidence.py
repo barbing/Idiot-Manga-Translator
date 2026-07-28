@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import math
 import os
 from types import MappingProxyType
 from typing import Any
@@ -43,20 +44,27 @@ _ADDITIVE_ROTATION_MAX_BBOX_OCCUPANCY = 0.78
 _ADDITIVE_ROTATION_MIN_ABS_DEGREES = 12.0
 _ADDITIVE_ROTATION_MAX_ABS_DEGREES = 40.0
 _ADDITIVE_ROTATION_MAX_EROSION_DELTA_DEGREES = 3.0
-_ADDITIVE_SHADOW_MIN_EFFECT_PIXELS = 24
+_SHADOW_FACT_CONTRACT_VERSION = "shadow_axis_facts_v1"
+_SHADOW_GEOMETRY_SCHEMA_VERSION = "source_shadow_geometry_v1"
+_SHADOW_CORE_COLOR_BIN_WIDTH = 16
+_SHADOW_CORE_COLOR_RADIUS = 24.0
+_SHADOW_CORE_MIN_MASK_FRACTION = 0.08
+_SHADOW_CORE_MIN_COMPONENT_AREA_FRACTION = 0.01
+_SHADOW_CONCENTRIC_SHELL_TO_CELL_RATIO = 0.04
+_ADDITIVE_SHADOW_MIN_EFFECT_TO_CORE_RATIO = 0.02
 _ADDITIVE_SHADOW_MIN_EFFECT_MASK_FRACTION = 0.05
-_ADDITIVE_SHADOW_MIN_EFFECT_BORDER_MARGIN_PX = 1
 _ADDITIVE_SHADOW_UNIFORM_LUMA_IQR = 8.0
 _ADDITIVE_SHADOW_CENTRAL_LUMA_PERCENTILE = 35.0
 _ADDITIVE_SHADOW_MIN_CORE_EFFECT_LUMA_DELTA = 16.0
-_ADDITIVE_SHADOW_MIN_OFFSET_PX = 5.0
-_ADDITIVE_SHADOW_MAX_OFFSET_PX = 32.0
+_ADDITIVE_SHADOW_MIN_OFFSET_TO_CELL_RATIO = 0.08
+_ADDITIVE_SHADOW_MAX_OFFSET_TO_CELL_RATIO = 0.80
 _ADDITIVE_SHADOW_MIN_CENTRAL_EXPLAINED_FRACTION = 0.88
-_ADDITIVE_SHADOW_COMPETING_PEAK_DISTANCE_PX = 8.0
+_ADDITIVE_SHADOW_COMPETING_PEAK_DISTANCE_TO_CELL_RATIO = 0.20
 _ADDITIVE_SHADOW_COMPETING_PEAK_RATIO = 0.90
 _ADDITIVE_SHADOW_MIN_SPATIAL_RECALL = 0.90
 _ADDITIVE_SHADOW_MIN_SPATIAL_PRECISION = 0.85
-_ADDITIVE_SHADOW_MAX_SPREAD_RADIUS_PX = 16
+_ADDITIVE_SHADOW_MAX_SPREAD_TO_CELL_RATIO = 0.35
+_ADDITIVE_SHADOW_MIN_BLUR_TO_CELL_RATIO = 0.012
 _ADDITIVE_SHADOW_BLUR_SPREAD_DIVISOR = 1.4
 EXTERNAL_SOURCE_SURFACE_RING_VERSION = (
     "authorized_external_source_surface_ring_v1"
@@ -76,6 +84,11 @@ _OUTLINE_WIDTH_MEASUREMENT_VERSION = "radial_support_distance_to_core_v1"
 _GRAYSCALE_FILL_SCHEMA = "grayscale_core_polarity_v1"
 _GRAYSCALE_OUTLINE_SCHEMA = "grayscale_outline_geometry_v1"
 _PAINT_CORE_HYPOTHESIS_VERSION = "paint_core_component_topology_v1"
+_NORMALIZED_STROKE_PROFILE_SCHEMA = "normalized_stroke_profile_v2"
+_WEIGHT_PROFILE_COMPONENT_MIN_AREA_PX = 6
+_WEIGHT_PROFILE_COMPONENT_MAX_ASPECT = 2.2
+_WEIGHT_PROFILE_ELIGIBLE_SPAN_MIN_RATIO = 0.5
+_WEIGHT_PROFILE_ELIGIBLE_SPAN_MAX_RATIO = 1.55
 SOURCE_TEXT_FOOTPRINT_VERSION = "authorized_source_text_footprint_v2"
 SOURCE_TEXT_FOOTPRINT_PROFILE_SELECTION_AUTHORITY = (
     "parent_style_arbitrator_resolved_writing_direction"
@@ -924,7 +937,9 @@ class _IndependentScaleMeasurement:
 
 
 @dataclass(frozen=True)
-class _AxisLocalSpatialFacts:
+class _ShadowAxisFacts:
+    """Shadow-local source geometry with no downstream style decision."""
+
     source_rgb: Any = field(repr=False, compare=False)
     authorized_mask: Any = field(repr=False, compare=False)
     character_core_mask: Any = field(repr=False, compare=False)
@@ -932,7 +947,20 @@ class _AxisLocalSpatialFacts:
     displaced_effect_mask: Any = field(repr=False, compare=False)
     core_color: str
     core_role_status: str
+    core_role_reason: str
     core_resolution: str
+    source_cell_reference_px: float
+    support: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _RotationAxisFacts:
+    """Authorized foreground geometry used only by the rotation observer."""
+
+    authorized_mask: Any = field(repr=False, compare=False)
+    rotation_mask: Any = field(repr=False, compare=False)
+    geometry_status: str
+    geometry_reason: str
 
 
 def _axis_support_identity(
@@ -1405,6 +1433,305 @@ def _native_authorized_glyph_geometry(
 
 
 
+def _native_repeated_cross_axis_cell_population(
+    geometry: _NativeAuthorizedGlyphGeometry,
+    *,
+    direction: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Prove repeated regular cells without estimating their scale."""
+
+    cross_axis = 0 if direction == "ttb" else 1
+    bands = _occupied_band_records(geometry.glyph_mask, axis=cross_axis)
+    spans = np.asarray(
+        [float(record.get("span_px") or 0.0) for record in bands],
+        dtype=np.float32,
+    )
+    support = {
+        "cross_axis_band_count": int(spans.size),
+        "cross_axis_band_spans_px": [float(value) for value in spans],
+        "cross_axis_max_relative_deviation": 0.0,
+    }
+    if spans.size < 3:
+        return False, support
+    median = float(np.median(spans))
+    deviation = float(np.max(np.abs(spans - median))) / max(1.0, median)
+    support.update(
+        {
+            "cross_axis_band_median_px": round(median, 6),
+            "cross_axis_max_relative_deviation": round(deviation, 8),
+        }
+    )
+    return deviation <= 0.15, support
+
+
+def _terminal_line_residual_component_facts(
+    binary: np.ndarray,
+) -> list[dict[str, float]]:
+    """Return glyph-sized residual components after terminal-line removal."""
+
+    try:
+        import cv2
+    except Exception:
+        return []
+    count, _, stats, _ = cv2.connectedComponentsWithStats(
+        np.asarray(binary, dtype=np.uint8), connectivity=8
+    )
+    facts: list[dict[str, float]] = []
+    for index in range(1, count):
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        short = min(width, height)
+        long = max(width, height)
+        if area < 6 or short < 2 or long / max(1, short) > 2.2:
+            continue
+        facts.append(
+            {
+                "component_index": float(index),
+                "width_px": float(width),
+                "height_px": float(height),
+                "long_span_px": float(long),
+                "area_px": float(area),
+            }
+        )
+    return facts
+
+
+def _separate_joined_terminal_line(
+    binary: np.ndarray,
+    *,
+    direction: str,
+) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Remove one proven terminal narrow run joined to a residual component."""
+
+    try:
+        import cv2
+    except Exception:
+        return None
+    yy, xx = np.where(binary)
+    if not xx.size or not yy.size:
+        return None
+    x0, x1 = int(xx.min()), int(xx.max()) + 1
+    y0, y1 = int(yy.min()), int(yy.max()) + 1
+    inline_start, inline_end = (y0, y1) if direction == "ttb" else (x0, x1)
+    cross_spans: list[int] = []
+    for coordinate in range(inline_start, inline_end):
+        values = (
+            np.where(binary[coordinate, x0:x1])[0]
+            if direction == "ttb"
+            else np.where(binary[y0:y1, coordinate])[0]
+        )
+        cross_spans.append(
+            int(values.max() - values.min() + 1) if values.size else 0
+        )
+    positive = [value for value in cross_spans if value > 0]
+    if not positive:
+        return None
+    maximum_cross_span = max(positive)
+    narrow_limit = max(1, int(math.floor(maximum_cross_span * 0.25)))
+
+    prefix = 0
+    for value in cross_spans:
+        if 0 < value <= narrow_limit:
+            prefix += 1
+        else:
+            break
+    suffix = 0
+    for value in reversed(cross_spans):
+        if 0 < value <= narrow_limit:
+            suffix += 1
+        else:
+            break
+    minimum_run = max(6, int(math.ceil(maximum_cross_span * 1.5)))
+    qualifying = [
+        ("leading", prefix) if prefix >= minimum_run else None,
+        ("terminal", suffix) if suffix >= minimum_run else None,
+    ]
+    qualifying = [item for item in qualifying if item is not None]
+    if len(qualifying) != 1:
+        return None
+    edge, run_length = qualifying[0]
+    component_count, component_labels = cv2.connectedComponents(
+        np.asarray(binary, dtype=np.uint8), connectivity=8
+    )
+    if component_count <= 1:
+        return None
+
+    residual = np.array(binary, dtype=bool, copy=True)
+    run_mask = np.zeros_like(binary, dtype=bool)
+    if direction == "ttb":
+        if edge == "leading":
+            run_mask[y0 : y0 + run_length, :] = binary[
+                y0 : y0 + run_length, :
+            ]
+            residual[y0 : y0 + run_length, :] = False
+            run_cross_spans = cross_spans[:run_length]
+        else:
+            run_mask[y1 - run_length : y1, :] = binary[
+                y1 - run_length : y1, :
+            ]
+            residual[y1 - run_length : y1, :] = False
+            run_cross_spans = cross_spans[-run_length:]
+    else:
+        if edge == "leading":
+            run_mask[:, x0 : x0 + run_length] = binary[
+                :, x0 : x0 + run_length
+            ]
+            residual[:, x0 : x0 + run_length] = False
+            run_cross_spans = cross_spans[:run_length]
+        else:
+            run_mask[:, x1 - run_length : x1] = binary[
+                :, x1 - run_length : x1
+            ]
+            residual[:, x1 - run_length : x1] = False
+            run_cross_spans = cross_spans[-run_length:]
+
+    run_labels = {
+        int(value)
+        for value in np.unique(component_labels[run_mask])
+        if int(value) > 0
+    }
+    if len(run_labels) != 1:
+        return None
+    joined_component_label = next(iter(run_labels))
+    if not np.any(residual & (component_labels == joined_component_label)):
+        return None
+    positive_run_spans = np.asarray(
+        [value for value in run_cross_spans if value > 0], dtype=np.float32
+    )
+    return residual, {
+        "edge": edge,
+        "run_length_px": run_length,
+        "run_cross_span_median_px": round(
+            float(np.median(positive_run_spans)), 6
+        ),
+        "run_cross_span_p80_px": round(
+            float(np.percentile(positive_run_spans, 80)), 6
+        ),
+        "run_cross_span_max_px": int(np.max(positive_run_spans)),
+        "joined_component_label": joined_component_label,
+        "joined_component_survives_in_residual": True,
+        "maximum_cross_span_px": maximum_cross_span,
+        "narrow_cross_span_limit_px": narrow_limit,
+        "minimum_run_px": minimum_run,
+    }
+
+
+def _terminal_line_joined_directional_cell_record(
+    geometry: _NativeAuthorizedGlyphGeometry,
+    *,
+    direction: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Recover source scale only from a terminal line plus coherent cells."""
+
+    if str(geometry.status) not in {
+        "unavailable_fragmented_geometry",
+        "unavailable_merged_island_geometry",
+    }:
+        return None
+    separated = _separate_joined_terminal_line(
+        np.asarray(geometry.glyph_mask, dtype=bool),
+        direction=direction,
+    )
+    if separated is None:
+        return None
+    residual, line = separated
+    facts = _terminal_line_residual_component_facts(residual)
+    if len(facts) < 2:
+        return None
+
+    long_spans = np.asarray(
+        [fact["long_span_px"] for fact in facts], dtype=np.float32
+    )
+    reference = float(np.percentile(long_spans, 75))
+    lower = max(2.0, reference * 0.50)
+    upper = reference * 1.55
+    qualified = [
+        fact for fact in facts if lower <= fact["long_span_px"] <= upper
+    ]
+    if len(qualified) < 2:
+        return None
+    qualified_long = np.asarray(
+        [fact["long_span_px"] for fact in qualified], dtype=np.float32
+    )
+    long_p20, long_median, long_p80 = [
+        float(value) for value in np.percentile(qualified_long, [20, 50, 80])
+    ]
+    long_spread = (long_p80 - long_p20) / max(1.0, long_median)
+    if long_spread > 0.45:
+        return None
+
+    dimension_key = "height_px" if direction == "ttb" else "width_px"
+    cross_key = "width_px" if direction == "ttb" else "height_px"
+    values = np.asarray(
+        [fact[dimension_key] for fact in qualified], dtype=np.float32
+    )
+    cross_values = np.asarray(
+        [fact[cross_key] for fact in qualified], dtype=np.float32
+    )
+    p20, median, p80 = [
+        float(value) for value in np.percentile(values, [20, 50, 80])
+    ]
+    cross_median = float(np.median(cross_values))
+    if line["run_length_px"] < median * 1.5:
+        return None
+    if line["run_cross_span_p80_px"] > max(2.0, cross_median * 0.25):
+        return None
+    if line["run_cross_span_max_px"] > max(3.0, cross_median * 0.35):
+        return None
+
+    relative_spread = (p80 - p20) / max(1.0, median)
+    sample_uncertainty = 1.0 / float(np.sqrt(len(qualified)))
+    confidence = min(
+        max(0.0, 1.0 - sample_uncertainty),
+        max(0.0, 1.0 - relative_spread),
+    )
+    qualification = {
+        "direction": direction,
+        "dimension_key": dimension_key,
+        "density_spans": [],
+        "qualified_component_indices": [
+            int(fact["component_index"]) for fact in qualified
+        ],
+        "qualified_component_spans_px": [
+            round(float(fact[dimension_key]), 6) for fact in qualified
+        ],
+        "body_component_count": len(facts),
+        "punctuation_component_count": 1,
+        "rejected_fragment_count": int(
+            geometry.support.get("rejected_fragment_count") or 0
+        ),
+        "reference_long_span_p75_px": round(reference, 6),
+        "qualification_band_px": [round(lower, 6), round(upper, 6)],
+        "qualification_relative_long_span_spread": round(long_spread, 8),
+        "relative_cell_spread": round(relative_spread, 8),
+        "source_scale_axis_only": True,
+        "non_scale_normalization_status": str(geometry.status),
+        "qualification_override_reason": (
+            "terminal_line_separated_from_coherent_residual_glyph_cells"
+        ),
+        "terminal_line_joined_cell_population": {
+            **line,
+            "residual_component_count": len(facts),
+            "qualified_component_count": len(qualified),
+            "residual_cross_span_median_px": round(cross_median, 6),
+        },
+    }
+    record = {
+        "status": "supported",
+        "cell_p20_px": round(p20, 6),
+        "cell_median_px": round(median, 6),
+        "cell_p80_px": round(p80, 6),
+        "confidence": round(confidence, 8),
+        "uncertainty": {
+            "relative_cell_spread": round(relative_spread, 8),
+            "qualified_component_count": len(qualified),
+            "sample_uncertainty": round(sample_uncertainty, 8),
+        },
+    }
+    return record, qualification
+
+
 def _native_directional_cell_record(
     geometry: _NativeAuthorizedGlyphGeometry,
     *,
@@ -1439,6 +1766,12 @@ def _native_directional_cell_record(
         ),
     }
     if not geometry.available:
+        terminal_line_record = _terminal_line_joined_directional_cell_record(
+            geometry,
+            direction=direction,
+        )
+        if terminal_line_record is not None:
+            return terminal_line_record
         return base_record, qualification
 
     body_facts = [
@@ -1522,8 +1855,25 @@ def _native_directional_cell_record(
         qualification_relative_spread, 8
     )
     if qualification_relative_spread > 0.45:
-        base_record["status"] = "unavailable_competing_glyph_tiers"
-        return base_record, qualification
+        repeated, repeated_support = (
+            _native_repeated_cross_axis_cell_population(
+                geometry,
+                direction=direction,
+            )
+        )
+        qualification["repeated_cross_axis_cell_population"] = (
+            repeated_support
+        )
+        if not repeated:
+            base_record["status"] = "unavailable_competing_glyph_tiers"
+            return base_record, qualification
+        qualification["qualification_override_reason"] = (
+            "repeated_cross_axis_bands_prove_fragmented_regular_cell_population"
+        )
+        qualification["source_scale_axis_only"] = True
+        qualification["non_scale_normalization_status"] = (
+            "unavailable_competing_glyph_tiers"
+        )
 
     values = np.asarray(
         [float(fact.get(dimension_key) or 0.0) for fact in qualified],
@@ -1534,15 +1884,10 @@ def _native_directional_cell_record(
     ]
     relative_spread = (p80 - p20) / max(1.0, median)
     qualification["relative_cell_spread"] = round(relative_spread, 8)
-    confidence = max(
-        0.58,
-        min(
-            0.96,
-            0.70
-            + min(0.16, (len(qualified) - 2) * 0.02)
-            + min(0.10, max(0.0, 0.45 - relative_spread) * 0.22),
-        ),
-    )
+    sample_uncertainty = 1.0 / float(np.sqrt(len(qualified)))
+    sample_reliability = max(0.0, 1.0 - sample_uncertainty)
+    dispersion_reliability = max(0.0, 1.0 - relative_spread)
+    confidence = min(sample_reliability, dispersion_reliability)
     base_record.update(
         {
             "status": "supported",
@@ -1553,13 +1898,39 @@ def _native_directional_cell_record(
             "uncertainty": {
                 "relative_cell_spread": round(relative_spread, 8),
                 "qualified_component_count": len(qualified),
-                "sample_uncertainty": round(
-                    1.0 / float(np.sqrt(len(qualified))), 8
-                ),
+                "sample_uncertainty": round(sample_uncertainty, 8),
             },
         }
     )
     return base_record, qualification
+
+
+def _native_weight_cell_support_confidence(
+    qualified: Sequence[Mapping[str, Any]],
+    *,
+    direction: str,
+) -> float:
+    """Measure weight-axis cell support without using scale confidence."""
+
+    dimension_key = "height_px" if direction == "ttb" else "width_px"
+    values = np.asarray(
+        [float(fact.get(dimension_key) or 0.0) for fact in qualified],
+        dtype=np.float32,
+    )
+    p20, median, p80 = [
+        float(value) for value in np.percentile(values, [20, 50, 80])
+    ]
+    relative_spread = (p80 - p20) / max(1.0, median)
+    confidence = max(
+        0.58,
+        min(
+            0.96,
+            0.70
+            + min(0.16, (len(qualified) - 2) * 0.02)
+            + min(0.10, max(0.0, 0.45 - relative_spread) * 0.22),
+        ),
+    )
+    return round(confidence, 8)
 
 
 def _measure_independent_source_scale(
@@ -1642,6 +2013,28 @@ def _measure_independent_source_scale(
                 *native.reason_codes,
                 vertical_support,
                 horizontal_support,
+                *(
+                    ["source_scale_fragmented_cell_population_proven"]
+                    if bool(
+                        vertical_qualification.get("source_scale_axis_only")
+                        or horizontal_qualification.get("source_scale_axis_only")
+                    )
+                    else []
+                ),
+                *(
+                    [
+                        "source_scale_terminal_line_joined_cell_population_proven"
+                    ]
+                    if any(
+                        qualification.get("qualification_override_reason")
+                        == "terminal_line_separated_from_coherent_residual_glyph_cells"
+                        for qualification in (
+                            vertical_qualification,
+                            horizontal_qualification,
+                        )
+                    )
+                    else []
+                ),
                 "source_cell_distribution_measured_from_native_authorized_glyphs"
                 if supported
                 else "source_scale_axis_unavailable",
@@ -1797,17 +2190,21 @@ def _source_cell_reference(
 ) -> float:
     supported = [
         float(value)
-        for value, status in (
+        for value, status, qualification in (
             (
                 scale_measurement.vertical_size_px,
                 scale_measurement.vertical_support,
+                scale_measurement.vertical_qualification,
             ),
             (
                 scale_measurement.horizontal_size_px,
                 scale_measurement.horizontal_support,
+                scale_measurement.horizontal_qualification,
             ),
         )
-        if value > 0.0 and str(status).startswith("supported")
+        if value > 0.0
+        and str(status).startswith("supported")
+        and not bool(qualification.get("source_scale_axis_only"))
     ]
     return max(supported, default=0.0)
 
@@ -2573,6 +2970,727 @@ def _observe_outline_axis(
     )
 
 
+def _stroke_profile_quantiles(values: Sequence[float]) -> dict[str, Any]:
+    clean = np.asarray(values, dtype=np.float32).reshape(-1)
+    clean = clean[np.isfinite(clean)]
+    if clean.size <= 0:
+        return {
+            "p10": 0.0,
+            "p20": 0.0,
+            "median": 0.0,
+            "p80": 0.0,
+            "p90": 0.0,
+            "sample_count": 0,
+            "available": False,
+        }
+    quantiles = np.percentile(clean, [10, 20, 50, 80, 90])
+    return {
+        key: round(float(value), 8)
+        for key, value in zip(
+            ("p10", "p20", "median", "p80", "p90"),
+            quantiles,
+        )
+    } | {
+        "sample_count": int(clean.size),
+        "available": True,
+    }
+
+
+def _thin_stroke_profile_component(mask: np.ndarray) -> np.ndarray:
+    """Return a deterministic Zhang-Suen centerline for one source core."""
+
+    skeleton = np.ascontiguousarray(mask, dtype=np.uint8)
+    if skeleton.size <= 0 or not np.any(skeleton):
+        return np.zeros_like(skeleton, dtype=bool)
+    for _ in range(max(skeleton.shape) + 2):
+        changed = False
+        for second_pass in (False, True):
+            padded = np.pad(skeleton, 1, mode="constant")
+            p2 = padded[:-2, 1:-1]
+            p3 = padded[:-2, 2:]
+            p4 = padded[1:-1, 2:]
+            p5 = padded[2:, 2:]
+            p6 = padded[2:, 1:-1]
+            p7 = padded[2:, :-2]
+            p8 = padded[1:-1, :-2]
+            p9 = padded[:-2, :-2]
+            neighbor_count = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+            transitions = np.zeros_like(skeleton, dtype=np.uint8)
+            for first, second in (
+                (p2, p3),
+                (p3, p4),
+                (p4, p5),
+                (p5, p6),
+                (p6, p7),
+                (p7, p8),
+                (p8, p9),
+                (p9, p2),
+            ):
+                transitions += ((first == 0) & (second == 1)).astype(
+                    np.uint8
+                )
+            common = (
+                (skeleton == 1)
+                & (neighbor_count >= 2)
+                & (neighbor_count <= 6)
+                & (transitions == 1)
+            )
+            if second_pass:
+                removable = (
+                    common
+                    & ((p2 * p4 * p8) == 0)
+                    & ((p2 * p6 * p8) == 0)
+                )
+            else:
+                removable = (
+                    common
+                    & ((p2 * p4 * p6) == 0)
+                    & ((p4 * p6 * p8) == 0)
+                )
+            if np.any(removable):
+                skeleton[removable] = 0
+                changed = True
+        if not changed:
+            break
+    return np.asarray(skeleton > 0, dtype=bool)
+
+
+def _stroke_profile_component_measurements(
+    core_mask: np.ndarray,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Measure core components without assigning a weight category."""
+
+    core = np.ascontiguousarray(core_mask, dtype=np.uint8)
+    counts = {
+        "source_core_component_count": 0,
+        "excluded_fragment_component_count": 0,
+        "excluded_punctuation_component_count": 0,
+        "unmeasured_body_component_count": 0,
+    }
+    try:
+        import cv2
+
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            core,
+            connectivity=8,
+        )
+    except Exception:
+        return [], counts
+
+    counts["source_core_component_count"] = max(0, int(count) - 1)
+    body: list[dict[str, Any]] = []
+    for index in range(1, count):
+        x0 = int(stats[index, 0])
+        y0 = int(stats[index, 1])
+        width = int(stats[index, 2])
+        height = int(stats[index, 3])
+        area = int(stats[index, 4])
+        short_span = min(width, height)
+        long_span = max(width, height)
+        if (
+            area < _WEIGHT_PROFILE_COMPONENT_MIN_AREA_PX
+            or short_span < 2
+            or long_span / max(1, short_span)
+            > _WEIGHT_PROFILE_COMPONENT_MAX_ASPECT
+        ):
+            counts["excluded_fragment_component_count"] += 1
+            continue
+
+        component = np.asarray(
+            labels[y0 : y0 + height, x0 : x0 + width] == index,
+            dtype=np.uint8,
+        )
+        external_contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        contour = (
+            max(external_contours, key=cv2.contourArea)
+            if external_contours
+            else None
+        )
+        contour_area = (
+            float(cv2.contourArea(contour))
+            if contour is not None
+            else 0.0
+        )
+        external_perimeter = (
+            float(cv2.arcLength(contour, True))
+            if contour is not None
+            else 0.0
+        )
+        hull = cv2.convexHull(contour) if contour is not None else None
+        hull_area = (
+            float(cv2.contourArea(hull)) if hull is not None else 0.0
+        )
+        occupancy = float(area) / float(max(1, width * height))
+        circularity = (
+            4.0
+            * float(np.pi)
+            * contour_area
+            / max(external_perimeter * external_perimeter, 1e-6)
+            if contour_area > 0.0 and external_perimeter > 0.0
+            else 0.0
+        )
+        solidity = (
+            contour_area / max(hull_area, 1e-6)
+            if hull_area > 0.0
+            else 0.0
+        )
+        punctuation = bool(
+            long_span / max(1, short_span) <= 1.35
+            and occupancy >= 0.50
+            and circularity >= 0.50
+            and solidity >= 0.88
+        )
+        if punctuation:
+            counts["excluded_punctuation_component_count"] += 1
+            continue
+
+        distance = cv2.distanceTransform(
+            component,
+            cv2.DIST_L2,
+            cv2.DIST_MASK_PRECISE,
+        )
+        skeleton = _thin_stroke_profile_component(component)
+        padded = np.pad(
+            np.asarray(skeleton, dtype=np.uint8),
+            1,
+            mode="constant",
+        )
+        p2 = padded[:-2, 1:-1]
+        p3 = padded[:-2, 2:]
+        p4 = padded[1:-1, 2:]
+        p5 = padded[2:, 2:]
+        p6 = padded[2:, 1:-1]
+        p7 = padded[2:, :-2]
+        p8 = padded[1:-1, :-2]
+        p9 = padded[:-2, :-2]
+        degree = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+        opposite_neighbors = (
+            (p2 & p6) | (p4 & p8) | (p3 & p7) | (p5 & p9)
+        ) > 0
+        endpoints = skeleton & (degree <= 1)
+        junctions = skeleton & (degree >= 3)
+        unstable = skeleton & (degree == 2) & ~opposite_neighbors
+        topology = endpoints | junctions
+        near_topology = cv2.dilate(
+            np.asarray(topology, dtype=np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+        ) > 0
+        stable_ridge = (
+            skeleton
+            & (degree == 2)
+            & opposite_neighbors
+            & ~near_topology
+        )
+        ridge_fallback = "stable_opposite_neighbor_ridge"
+        if int(np.count_nonzero(stable_ridge)) < 3:
+            stable_ridge = (
+                skeleton & (degree == 2) & opposite_neighbors
+            )
+            ridge_fallback = "opposite_neighbor_ridge_near_topology"
+        if int(np.count_nonzero(stable_ridge)) < 3:
+            stable_ridge = skeleton & (degree == 2) & ~near_topology
+            ridge_fallback = "degree_two_ridge_without_direction_filter"
+        if int(np.count_nonzero(stable_ridge)) < 3:
+            stable_ridge = skeleton & (degree == 2)
+            ridge_fallback = "degree_two_ridge_minimum_support"
+
+        ridge_widths = np.asarray(
+            2.0 * distance[stable_ridge],
+            dtype=np.float32,
+        )
+        ridge_widths = ridge_widths[
+            np.isfinite(ridge_widths) & (ridge_widths > 0.0)
+        ]
+        ridge_distribution = _stroke_profile_quantiles(ridge_widths)
+        if not ridge_distribution["available"]:
+            counts["unmeasured_body_component_count"] += 1
+
+        all_contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_TREE,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        full_perimeter = float(
+            sum(cv2.arcLength(item, True) for item in all_contours)
+        )
+        area_perimeter_width = (
+            2.0 * float(area) / full_perimeter
+            if full_perimeter > 0.0
+            else 0.0
+        )
+        body.append(
+            {
+                "component_index": int(index),
+                "width_px": float(width),
+                "height_px": float(height),
+                "area_px": int(area),
+                "component_mask": component,
+                "ridge_width_px": ridge_distribution,
+                "area_perimeter_width_px": float(area_perimeter_width),
+                "effective_ridge_sample_count": int(ridge_widths.size),
+                "skeleton_pixel_count": int(np.count_nonzero(skeleton)),
+                "excluded_endpoint_sample_count": int(
+                    np.count_nonzero(endpoints)
+                ),
+                "excluded_junction_sample_count": int(
+                    np.count_nonzero(junctions)
+                ),
+                "excluded_unstable_branch_sample_count": int(
+                    np.count_nonzero(unstable)
+                ),
+                "ridge_selection": ridge_fallback,
+            }
+        )
+    return body, counts
+
+
+def _unavailable_stroke_profile_direction(
+    *,
+    local_cell_reference_px: float,
+    body_component_count: int,
+    eligible_component_count: int,
+    component_counts: Mapping[str, int],
+    excluded_outline_pixel_count: int,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "measurement_state": "unavailable",
+        "measurement_reason": reason,
+        "local_cell_reference_px": round(
+            max(0.0, float(local_cell_reference_px)),
+            6,
+        ),
+        "local_cell_reference_source": (
+            "weight_private_authorized_core_component_population"
+        ),
+        "scale_axis_status_consumed": False,
+        "medial_width_to_cell": _stroke_profile_quantiles(()),
+        "component_median_distribution": _stroke_profile_quantiles(()),
+        "eligible_component_count": int(eligible_component_count),
+        "candidate_body_component_count": int(body_component_count),
+        "effective_ridge_sample_count": 0,
+        "excluded_endpoint_sample_count": 0,
+        "excluded_junction_sample_count": 0,
+        "excluded_unstable_branch_sample_count": 0,
+        "excluded_outline_pixel_count": int(excluded_outline_pixel_count),
+        "excluded_punctuation_component_count": int(
+            component_counts.get("excluded_punctuation_component_count") or 0
+        ),
+        "excluded_fragment_component_count": int(
+            component_counts.get("excluded_fragment_component_count") or 0
+        ),
+        "modality_status": "unavailable",
+        "area_perimeter_width_to_cell": _stroke_profile_quantiles(()),
+        "erosion_survival_curve": [],
+        "estimator_agreement": {
+            "status": "unavailable",
+            "relative_median_delta": 0.0,
+        },
+        "measurement_confidence": 0.0,
+        "classification_confidence": None,
+        "uncertainty": {
+            "relative_medial_spread": 0.0,
+            "component_coverage": 0.0,
+            "ridge_stability": 0.0,
+            "resolution_support": 0.0,
+            "sample_support": 0.0,
+        },
+    }
+
+
+def _stroke_profile_direction(
+    components: Sequence[Mapping[str, Any]],
+    *,
+    direction: str,
+    component_counts: Mapping[str, int],
+    excluded_outline_pixel_count: int,
+) -> dict[str, Any]:
+    try:
+        import cv2
+    except Exception:
+        return _unavailable_stroke_profile_direction(
+            local_cell_reference_px=0.0,
+            body_component_count=len(components),
+            eligible_component_count=0,
+            component_counts=component_counts,
+            excluded_outline_pixel_count=excluded_outline_pixel_count,
+            reason="stroke_profile_opencv_unavailable",
+        )
+
+    span_key = "height_px" if direction == "ttb" else "width_px"
+    spans = [
+        float(component.get(span_key) or 0.0)
+        for component in components
+        if float(component.get(span_key) or 0.0) > 0.0
+    ]
+    if len(spans) < 2:
+        return _unavailable_stroke_profile_direction(
+            local_cell_reference_px=0.0,
+            body_component_count=len(components),
+            eligible_component_count=0,
+            component_counts=component_counts,
+            excluded_outline_pixel_count=excluded_outline_pixel_count,
+            reason="insufficient_weight_private_component_population",
+        )
+
+    local_cell_reference = float(np.percentile(spans, 75))
+    eligible = [
+        component
+        for component in components
+        if local_cell_reference > 0.0
+        and _WEIGHT_PROFILE_ELIGIBLE_SPAN_MIN_RATIO
+        <= float(component.get(span_key) or 0.0) / local_cell_reference
+        <= _WEIGHT_PROFILE_ELIGIBLE_SPAN_MAX_RATIO
+        and bool(
+            dict(component.get("ridge_width_px") or {}).get("available")
+        )
+    ]
+    if len(eligible) < 2:
+        return _unavailable_stroke_profile_direction(
+            local_cell_reference_px=local_cell_reference,
+            body_component_count=len(components),
+            eligible_component_count=len(eligible),
+            component_counts=component_counts,
+            excluded_outline_pixel_count=excluded_outline_pixel_count,
+            reason="insufficient_stable_medial_component_support",
+        )
+
+    quantile_keys = ("p10", "p20", "median", "p80", "p90")
+    component_profiles: list[dict[str, float]] = []
+    area_perimeter_values: list[float] = []
+    raw_median_widths: list[float] = []
+    for component in eligible:
+        raw = dict(component.get("ridge_width_px") or {})
+        normalized = {
+            key: min(
+                1.0,
+                max(
+                    1e-8,
+                    float(raw.get(key) or 0.0) / local_cell_reference,
+                ),
+            )
+            for key in quantile_keys
+        }
+        component_profiles.append(normalized)
+        raw_median_widths.append(float(raw.get("median") or 0.0))
+        diagnostic_width = float(
+            component.get("area_perimeter_width_px") or 0.0
+        )
+        if diagnostic_width > 0.0:
+            area_perimeter_values.append(
+                min(1.0, diagnostic_width / local_cell_reference)
+            )
+
+    medial_distribution = {
+        key: round(
+            float(
+                np.median(
+                    [profile[key] for profile in component_profiles]
+                )
+            ),
+            8,
+        )
+        for key in quantile_keys
+    }
+    medial_distribution.update(
+        {
+            "sample_count": int(
+                sum(
+                    int(
+                        component.get(
+                            "effective_ridge_sample_count"
+                        )
+                        or 0
+                    )
+                    for component in eligible
+                )
+            ),
+            "available": True,
+        }
+    )
+    component_medians = [
+        float(profile["median"]) for profile in component_profiles
+    ]
+    component_distribution = _stroke_profile_quantiles(component_medians)
+    sorted_medians = sorted(component_medians)
+    largest_gap = max(
+        (
+            second - first
+            for first, second in zip(
+                sorted_medians,
+                sorted_medians[1:],
+            )
+        ),
+        default=0.0,
+    )
+    competing_populations = bool(
+        len(sorted_medians) >= 4
+        and largest_gap
+        / max(1e-8, float(medial_distribution["median"]))
+        >= 0.45
+    )
+    modality_status = (
+        "competing_component_populations"
+        if competing_populations
+        else (
+            "limited_component_population"
+            if len(eligible) < 3
+            else "single_robust_component_population"
+        )
+    )
+
+    erosion_curve: list[dict[str, Any]] = []
+    for radius_to_cell in (0.04, 0.06, 0.08):
+        radius_px = max(
+            1,
+            int(round(local_cell_reference * radius_to_cell)),
+        )
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (radius_px * 2 + 1, radius_px * 2 + 1),
+        )
+        survival = [
+            float(
+                np.count_nonzero(
+                    cv2.erode(
+                        np.asarray(
+                            component.get("component_mask"),
+                            dtype=np.uint8,
+                        ),
+                        kernel,
+                    )
+                )
+            )
+            / max(1.0, float(component.get("area_px") or 0.0))
+            for component in eligible
+        ]
+        erosion_curve.append(
+            {
+                "radius_to_cell": radius_to_cell,
+                "radius_px": int(radius_px),
+                "median_surviving_fraction": round(
+                    float(np.median(survival)),
+                    8,
+                ),
+            }
+        )
+
+    area_perimeter_distribution = _stroke_profile_quantiles(
+        area_perimeter_values
+    )
+    area_perimeter_median = float(
+        area_perimeter_distribution.get("median") or 0.0
+    )
+    medial_median = float(medial_distribution["median"])
+    estimator_delta = (
+        abs(area_perimeter_median - medial_median)
+        / max(1e-8, medial_median)
+        if area_perimeter_distribution["available"]
+        else 0.0
+    )
+    effective_samples = int(medial_distribution["sample_count"])
+    endpoint_count = int(
+        sum(
+            int(component.get("excluded_endpoint_sample_count") or 0)
+            for component in eligible
+        )
+    )
+    junction_count = int(
+        sum(
+            int(component.get("excluded_junction_sample_count") or 0)
+            for component in eligible
+        )
+    )
+    unstable_count = int(
+        sum(
+            int(
+                component.get("excluded_unstable_branch_sample_count") or 0
+            )
+            for component in eligible
+        )
+    )
+    component_coverage = len(eligible) / max(1, len(components))
+    ridge_stability = effective_samples / max(
+        1,
+        effective_samples + endpoint_count + junction_count + unstable_count,
+    )
+    raw_median_width = float(np.median(raw_median_widths))
+    resolution_support = min(1.0, raw_median_width / 4.0)
+    sample_support = min(
+        1.0,
+        effective_samples
+        / max(
+            1.0,
+            len(eligible) * max(8.0, local_cell_reference * 1.5),
+        ),
+    )
+    component_support = min(1.0, len(eligible) / 4.0)
+    measurement_confidence = min(
+        0.94,
+        max(
+            0.05,
+            0.25 * component_support
+            + 0.25 * ridge_stability
+            + 0.20 * resolution_support
+            + 0.15 * sample_support
+            + 0.15 * component_coverage,
+        ),
+    )
+    measurement_state = (
+        "unclassified"
+        if competing_populations
+        else (
+            "supported"
+            if len(eligible) >= 3 and measurement_confidence >= 0.55
+            else "provisional"
+        )
+    )
+    relative_spread = (
+        (
+            float(medial_distribution["p80"])
+            - float(medial_distribution["p20"])
+        )
+        / max(1e-8, medial_median)
+    )
+    return {
+        "measurement_state": measurement_state,
+        "measurement_reason": (
+            "stable_medial_width_component_population_measured"
+        ),
+        "local_cell_reference_px": round(local_cell_reference, 6),
+        "local_cell_reference_source": (
+            "weight_private_authorized_core_component_population"
+        ),
+        "scale_axis_status_consumed": False,
+        "medial_width_to_cell": medial_distribution,
+        "component_median_distribution": component_distribution,
+        "eligible_component_count": len(eligible),
+        "candidate_body_component_count": len(components),
+        "effective_ridge_sample_count": effective_samples,
+        "excluded_endpoint_sample_count": endpoint_count,
+        "excluded_junction_sample_count": junction_count,
+        "excluded_unstable_branch_sample_count": unstable_count,
+        "excluded_outline_pixel_count": int(excluded_outline_pixel_count),
+        "excluded_punctuation_component_count": int(
+            component_counts.get("excluded_punctuation_component_count") or 0
+        ),
+        "excluded_fragment_component_count": int(
+            component_counts.get("excluded_fragment_component_count") or 0
+        ),
+        "modality_status": modality_status,
+        "largest_component_median_gap": round(largest_gap, 8),
+        "area_perimeter_width_to_cell": area_perimeter_distribution,
+        "erosion_survival_curve": erosion_curve,
+        "estimator_agreement": {
+            "status": (
+                "corroborating"
+                if area_perimeter_distribution["available"]
+                and estimator_delta <= 0.30
+                else (
+                    "divergent"
+                    if area_perimeter_distribution["available"]
+                    else "unavailable"
+                )
+            ),
+            "relative_median_delta": round(estimator_delta, 8),
+        },
+        "measurement_confidence": round(measurement_confidence, 8),
+        "classification_confidence": None,
+        "uncertainty": {
+            "relative_medial_spread": round(relative_spread, 8),
+            "component_coverage": round(component_coverage, 8),
+            "ridge_stability": round(ridge_stability, 8),
+            "resolution_support": round(resolution_support, 8),
+            "sample_support": round(sample_support, 8),
+            "low_resolution_quantization": raw_median_width < 3.0,
+        },
+    }
+
+
+def _normalized_stroke_profile_v2(
+    *,
+    native_geometry: _NativeAuthorizedGlyphGeometry,
+    paint_geometry: _GrayscalePaintGeometry | None,
+    support_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    authorized = np.ascontiguousarray(
+        native_geometry.authorized_mask,
+        dtype=bool,
+    )
+    if (
+        paint_geometry is not None
+        and paint_geometry.available
+        and np.any(paint_geometry.core_mask)
+    ):
+        core = np.ascontiguousarray(paint_geometry.core_mask, dtype=bool)
+        core_selection = "shared_contrast_resolved_paint_core"
+    else:
+        core = np.ascontiguousarray(
+            native_geometry.glyph_mask,
+            dtype=bool,
+        )
+        core_selection = "weight_private_contrast_resolved_core"
+    authorized_hash = _array_sha256(
+        np.ascontiguousarray(authorized, dtype=np.uint8)
+    )
+    core_hash = _array_sha256(
+        np.ascontiguousarray(core, dtype=np.uint8)
+    )
+    identity_payload = {
+        "authorized_mask_sha256": authorized_hash,
+        "authorized_pixel_sha256": str(
+            support_identity.get("authorized_pixel_sha256") or ""
+        ),
+        "crop_shape": list(support_identity.get("crop_shape") or ()),
+        "source_core_mask_sha256": core_hash,
+    }
+    encoded_identity = json.dumps(
+        identity_payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    components, component_counts = _stroke_profile_component_measurements(
+        core
+    )
+    authorized_count = int(np.count_nonzero(authorized))
+    core_count = int(np.count_nonzero(core))
+    excluded_outline_count = max(0, authorized_count - core_count)
+    directions = {
+        direction: _stroke_profile_direction(
+            components,
+            direction=direction,
+            component_counts=component_counts,
+            excluded_outline_pixel_count=excluded_outline_count,
+        )
+        for direction in ("ttb", "ltr")
+    }
+    return {
+        "schema_version": _NORMALIZED_STROKE_PROFILE_SCHEMA,
+        "core_mask_provenance": (
+            "authorized_source_style_view:contrast_resolved_source_core"
+        ),
+        "core_mask_selection": core_selection,
+        "authorized_mask_pixel_count": authorized_count,
+        "source_core_pixel_count": core_count,
+        "excluded_outline_pixel_count": excluded_outline_count,
+        "authorized_mask_sha256": authorized_hash,
+        "source_core_mask_sha256": core_hash,
+        "source_identity_sha256": hashlib.sha256(
+            encoded_identity
+        ).hexdigest(),
+        "source_core_component_count": int(
+            component_counts.get("source_core_component_count") or 0
+        ),
+        "directions": directions,
+    }
+
+
 def _observe_weight_axis(
     source_crop: np.ndarray,
     mask_crop: np.ndarray,
@@ -2580,6 +3698,7 @@ def _observe_weight_axis(
     support_identity: Mapping[str, Any],
     geometry: _NativeAuthorizedGlyphGeometry | None = None,
     scale_measurement: _IndependentScaleMeasurement | None = None,
+    paint_geometry: _GrayscalePaintGeometry | None = None,
 ) -> SourceStyleAxisEvidence:
     native = geometry or _native_authorized_glyph_geometry(
         source_crop, mask_crop
@@ -2601,6 +3720,20 @@ def _observe_weight_axis(
             if direction == "ttb"
             else scale.horizontal_qualification
         )
+        if bool(qualification.get("source_scale_axis_only")):
+            cell_size = 0.0
+            scale_record = {
+                "status": str(
+                    qualification.get("non_scale_normalization_status")
+                    or "unavailable_competing_glyph_tiers"
+                ),
+                "cell_median_px": 0.0,
+                "confidence": 0.0,
+                "uncertainty": {
+                    "relative_cell_spread": 0.0,
+                    "qualified_component_count": 0,
+                },
+            }
         qualified_indices = {
             int(value)
             for value in qualification.get("qualified_component_indices")
@@ -2705,7 +3838,10 @@ def _observe_weight_axis(
             0.55,
             min(
                 0.95,
-                float(scale_record.get("confidence") or 0.0)
+                _native_weight_cell_support_confidence(
+                    qualified,
+                    direction=direction,
+                )
                 - min(
                     0.18,
                     max(
@@ -2730,9 +3866,15 @@ def _observe_weight_axis(
         confidences.append(confidence)
 
     supported = bool(confidences)
+    stroke_profile = _normalized_stroke_profile_v2(
+        native_geometry=native,
+        paint_geometry=paint_geometry,
+        support_identity=support_identity,
+    )
     value = {
         "schema_version": "native_normalized_weight_evidence_v1",
         "directions": direction_records,
+        _NORMALIZED_STROKE_PROFILE_SCHEMA: stroke_profile,
     }
     support = {
         **dict(native.support),
@@ -2765,35 +3907,242 @@ def _observe_weight_axis(
     )
 
 
-def _axis_local_effect_facts(
+def _shadow_source_cell_reference(
+    core_mask: np.ndarray,
+) -> tuple[float, int, int]:
+    """Return a resolution-tracking glyph-cell reference for shadow geometry."""
+
+    core = np.ascontiguousarray(core_mask, dtype=np.uint8)
+    core_count = int(np.count_nonzero(core))
+    if core_count <= 0:
+        return 0.0, 0, 0
+    try:
+        import cv2
+
+        count, _, stats, _ = cv2.connectedComponentsWithStats(
+            core,
+            connectivity=8,
+        )
+    except Exception:
+        return 0.0, 0, _mask_border_margin(core > 0)
+    minimum_area = max(
+        8,
+        int(
+            round(
+                core_count
+                * _SHADOW_CORE_MIN_COMPONENT_AREA_FRACTION
+            )
+        ),
+    )
+    spans: list[float] = []
+    significant_count = 0
+    for index in range(1, int(count)):
+        _, _, width, height, area = [
+            int(value) for value in stats[index]
+        ]
+        if area < minimum_area or width <= 0 or height <= 0:
+            continue
+        significant_count += 1
+        spans.append(float(min(width, height)))
+    if not spans:
+        return 0.0, significant_count, _mask_border_margin(core > 0)
+    return (
+        float(np.median(np.asarray(spans, dtype=np.float32))),
+        significant_count,
+        _mask_border_margin(core > 0),
+    )
+
+
+def _shadow_axis_facts(
     source_crop: np.ndarray,
     mask_crop: np.ndarray,
-) -> _AxisLocalSpatialFacts:
-    geometry = _independent_glyph_geometry(source_crop, mask_crop)
-    core = np.asarray(geometry.glyph_mask, dtype=bool)
-    mask = np.asarray(geometry.authorized_mask, dtype=bool)
+) -> _ShadowAxisFacts:
+    """Resolve core/effect geometry inside the independent shadow axis.
+
+    The most supported quantized paint cluster is expanded only by local RGB
+    distance to form a shadow-local character hypothesis. The authorized
+    remainder is then split into a narrow concentric shell and a possible
+    displaced effect. No fill/outline decision or downstream target style is
+    consulted.
+    """
+
+    source = np.ascontiguousarray(source_crop, dtype=np.uint8)
+    mask = np.ascontiguousarray(mask_crop, dtype=bool)
+    empty = np.zeros(mask.shape, dtype=bool)
+    pixel_count = int(np.count_nonzero(mask))
+    base_support: dict[str, Any] = {
+        "shadow_fact_contract": _SHADOW_FACT_CONTRACT_VERSION,
+        "authorized_pixel_count": pixel_count,
+        "core_color_bin_width": _SHADOW_CORE_COLOR_BIN_WIDTH,
+        "core_color_radius": _SHADOW_CORE_COLOR_RADIUS,
+    }
+
+    def unavailable(reason: str) -> _ShadowAxisFacts:
+        return _ShadowAxisFacts(
+            source_rgb=_readonly_array(source, dtype=np.uint8),
+            authorized_mask=_readonly_array(mask, dtype=bool),
+            character_core_mask=_readonly_array(empty, dtype=bool),
+            concentric_shell_mask=_readonly_array(empty, dtype=bool),
+            displaced_effect_mask=_readonly_array(empty, dtype=bool),
+            core_color="",
+            core_role_status="unavailable",
+            core_role_reason=reason,
+            core_resolution="shadow_axis_core_unavailable",
+            source_cell_reference_px=0.0,
+            support=base_support,
+        )
+
+    if (
+        source.ndim != 3
+        or source.shape[2] != 3
+        or mask.shape != source.shape[:2]
+        or pixel_count <= 0
+    ):
+        return unavailable("shadow_axis_input_invalid")
+
+    authorized_pixels = source[mask]
+    quantized = (
+        authorized_pixels // _SHADOW_CORE_COLOR_BIN_WIDTH
+    ).astype(np.uint8)
+    try:
+        bins, counts = np.unique(
+            quantized,
+            axis=0,
+            return_counts=True,
+        )
+    except Exception:
+        return unavailable("shadow_axis_color_clustering_unavailable")
+    if len(counts) <= 0:
+        return unavailable("shadow_axis_color_cluster_empty")
+    dominant_index = int(np.argmax(counts))
+    dominant_bin = np.asarray(bins[dominant_index], dtype=np.uint8)
+    quantized_source = (
+        source // _SHADOW_CORE_COLOR_BIN_WIDTH
+    ).astype(np.uint8)
+    seed = mask & np.all(
+        quantized_source == dominant_bin[None, None, :],
+        axis=2,
+    )
+    seed_count = int(np.count_nonzero(seed))
+    minimum_core_pixels = max(
+        8,
+        int(
+            round(
+                pixel_count * _SHADOW_CORE_MIN_MASK_FRACTION
+            )
+        ),
+    )
+    base_support.update(
+        {
+            "dominant_color_bin": [
+                int(value) for value in dominant_bin.tolist()
+            ],
+            "dominant_color_seed_pixel_count": seed_count,
+            "minimum_core_pixel_count": minimum_core_pixels,
+        }
+    )
+    if seed_count < minimum_core_pixels:
+        return unavailable("shadow_axis_dominant_core_support_too_small")
+
+    cluster_rgb = np.median(
+        source[seed].astype(np.float32),
+        axis=0,
+    )
+    rgb_distance = np.linalg.norm(
+        source.astype(np.float32) - cluster_rgb[None, None, :],
+        axis=2,
+    )
+    core = mask & (rgb_distance <= _SHADOW_CORE_COLOR_RADIUS)
+    core_count = int(np.count_nonzero(core))
+    core_fraction = core_count / max(1, pixel_count)
+    source_cell, significant_count, core_border_margin = (
+        _shadow_source_cell_reference(core)
+    )
+    base_support.update(
+        {
+            "character_core_color": _rgb_hex(cluster_rgb),
+            "character_core_pixel_count": core_count,
+            "character_core_mask_fraction": round(core_fraction, 8),
+            "character_core_component_count": significant_count,
+            "character_core_border_margin_px": core_border_margin,
+            "source_cell_reference_px": round(source_cell, 8),
+        }
+    )
+    if core_count < minimum_core_pixels:
+        return unavailable("shadow_axis_character_core_support_too_small")
+    if significant_count <= 0 or source_cell <= 0.0:
+        return unavailable("shadow_axis_character_core_geometry_unavailable")
+    if core_border_margin < 1:
+        return unavailable("shadow_axis_character_core_truncated")
+
+    shell_radius = max(
+        1,
+        int(
+            round(
+                source_cell
+                * _SHADOW_CONCENTRIC_SHELL_TO_CELL_RATIO
+            )
+        ),
+    )
     try:
         import cv2
 
         dilated = cv2.dilate(
             core.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (shell_radius * 2 + 1, shell_radius * 2 + 1),
+            ),
         ).astype(bool)
     except Exception:
-        dilated = core.copy()
+        return unavailable("shadow_axis_spatial_backend_unavailable")
     shell = mask & dilated & ~core
     effect = mask & ~dilated
-    return _AxisLocalSpatialFacts(
-        source_rgb=geometry.source,
-        authorized_mask=geometry.authorized_mask,
+    base_support.update(
+        {
+            "concentric_shell_radius_px": shell_radius,
+            "concentric_shell_to_cell_ratio": round(
+                shell_radius / source_cell,
+                8,
+            ),
+            "character_core_mask_sha256": _array_sha256(
+                np.ascontiguousarray(core, dtype=np.uint8)
+            ),
+            "displaced_effect_mask_sha256": _array_sha256(
+                np.ascontiguousarray(effect, dtype=np.uint8)
+            ),
+        }
+    )
+    return _ShadowAxisFacts(
+        source_rgb=_readonly_array(source, dtype=np.uint8),
+        authorized_mask=_readonly_array(mask, dtype=bool),
         character_core_mask=_readonly_array(core, dtype=bool),
         concentric_shell_mask=_readonly_array(shell, dtype=bool),
         displaced_effect_mask=_readonly_array(effect, dtype=bool),
-        core_color=geometry.fill_color,
-        core_role_status=(
-            "supported" if geometry.fill_cluster_resolved else "unavailable"
+        core_color=_rgb_hex(cluster_rgb),
+        core_role_status="supported",
+        core_role_reason="shadow_axis_dominant_coherent_paint_cluster",
+        core_resolution="shadow_axis_dominant_coherent_paint_cluster",
+        source_cell_reference_px=float(source_cell),
+        support=base_support,
+    )
+
+
+def _rotation_axis_facts(mask_crop: np.ndarray) -> _RotationAxisFacts:
+    """Bind rotation to the authorized foreground, not paint/effect state."""
+
+    authorized = np.ascontiguousarray(mask_crop, dtype=bool)
+    pixel_count = int(np.count_nonzero(authorized))
+    supported = pixel_count >= _ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS
+    return _RotationAxisFacts(
+        authorized_mask=_readonly_array(authorized, dtype=bool),
+        rotation_mask=_readonly_array(authorized, dtype=bool),
+        geometry_status="supported" if supported else "unavailable",
+        geometry_reason=(
+            "authorized_foreground_rotation_geometry"
+            if supported
+            else "authorized_foreground_rotation_support_too_small"
         ),
-        core_resolution="independent_axis_private_glyph_geometry",
     )
 
 
@@ -2838,14 +4187,13 @@ def _axis_record_from_effect_observation(
 
 
 def _observe_rotation_axis(
-    source_crop: np.ndarray,
     mask_crop: np.ndarray,
     *,
     support_identity: Mapping[str, Any],
 ) -> SourceStyleAxisEvidence:
     try:
         observed = _observe_additive_rotation(
-            spatial_facts=_axis_local_effect_facts(source_crop, mask_crop),
+            rotation_facts=_rotation_axis_facts(mask_crop),
         )
     except Exception:
         observed = {
@@ -2865,7 +4213,7 @@ def _observe_shadow_axis(
 ) -> SourceStyleAxisEvidence:
     try:
         observed = _observe_additive_shadow(
-            spatial_facts=_axis_local_effect_facts(source_crop, mask_crop),
+            shadow_facts=_shadow_axis_facts(source_crop, mask_crop),
         )
     except Exception:
         observed = {
@@ -2979,9 +4327,9 @@ def build_authorized_style_observation_inputs(
         support_identity=support_identity,
         geometry=native_geometry,
         scale_measurement=scale_measurement,
+        paint_geometry=grayscale_geometry,
     )
     rotation_axis = _observe_rotation_axis(
-        source_crop,
         mask_crop,
         support_identity=support_identity,
     )
@@ -3351,14 +4699,13 @@ def _bind_source_text_footprint(
 
 def _observe_additive_rotation(
     *,
-    spatial_facts: _AxisLocalSpatialFacts,
+    rotation_facts: _RotationAxisFacts,
 ) -> dict[str, Any]:
-    """Return one pronounced rotation measured from the canonical core."""
+    """Return one pronounced rotation from authorized foreground geometry."""
 
-    facts = spatial_facts
-    source = np.asarray(facts.source_rgb, dtype=np.uint8)
+    facts = rotation_facts
     mask = np.asarray(facts.authorized_mask, dtype=bool)
-    core = np.asarray(facts.character_core_mask, dtype=bool)
+    core = np.asarray(facts.rotation_mask, dtype=bool)
     core_count = int(np.count_nonzero(core))
     unavailable: dict[str, Any] = {
         "support_status": "unavailable",
@@ -3366,28 +4713,23 @@ def _observe_additive_rotation(
         "reason_codes": [],
         "support": {
             "authorized_pixel_count": int(np.count_nonzero(mask)),
-            "canonical_core_pixel_count": core_count,
-            "canonical_core_role_status": facts.core_role_status,
-            "canonical_core_role_reason": facts.core_role_reason,
+            "rotation_geometry_pixel_count": core_count,
+            "rotation_geometry_status": facts.geometry_status,
+            "rotation_geometry_reason": facts.geometry_reason,
         },
         "uncertainty": {},
     }
-    if (
-        source.ndim != 3
-        or source.shape[2] != 3
-        or mask.shape != source.shape[:2]
-        or core.shape != mask.shape
-    ):
+    if mask.ndim != 2 or core.shape != mask.shape:
         unavailable["reason_codes"].append(
             "perceptual_rotation_input_invalid"
         )
         return unavailable
     if (
-        facts.core_role_status != "supported"
+        facts.geometry_status != "supported"
         or core_count < _ADDITIVE_ROTATION_MIN_CLUSTER_PIXELS
     ):
         unavailable["reason_codes"].append(
-            "perceptual_rotation_canonical_core_unavailable"
+            "perceptual_rotation_authorized_geometry_unavailable"
         )
         return unavailable
 
@@ -3546,7 +4888,7 @@ def _observe_additive_rotation(
         "support_status": "supported",
         "confidence": round(confidence, 8),
         "reason_codes": [
-            "perceptual_rotation_canonical_character_core_axis"
+            "source_rotation_authorized_foreground_principal_axis"
         ],
         "support": support,
         "uncertainty": {
@@ -3561,33 +4903,41 @@ def _observe_additive_rotation(
 
 def _observe_additive_shadow(
     *,
-    spatial_facts: _AxisLocalSpatialFacts,
+    shadow_facts: _ShadowAxisFacts,
 ) -> dict[str, Any]:
     """Return one complete displaced glyph-correlated shadow.
 
-    A previously supported chromatic character core supplies only the runtime
-    shape used for correlation. One darker authorized effect must be explained
-    by one displaced copy of that shape. Blur is then estimated from the
-    spatial support extending beyond the displaced core, not from RGB
-    dispersion. Concentric, centered, repeated, clipped, or ambiguous support
-    remains unavailable.
+    A shadow-local character hypothesis supplies only the runtime shape used
+    for correlation. One darker authorized effect must be explained by one
+    displaced copy of that shape. Blur is estimated from the spatial support
+    extending beyond the displaced core. Offset and blur are normalized by
+    the source-cell reference measured inside the same axis. Concentric,
+    centered, repeated, clipped, or ambiguous support remains unavailable.
     """
 
-    facts = spatial_facts
+    facts = shadow_facts
     source = np.asarray(facts.source_rgb, dtype=np.uint8)
     mask = np.asarray(facts.authorized_mask, dtype=bool)
     pixel_count = int(np.count_nonzero(mask))
+    fact_support = (
+        dict(facts.support)
+        if isinstance(facts.support, Mapping)
+        else {}
+    )
     unavailable: dict[str, Any] = {
         "support_status": "unavailable",
         "confidence": 0.0,
         "reason_codes": [],
-        "support": {"authorized_pixel_count": pixel_count},
+        "support": {
+            **fact_support,
+            "authorized_pixel_count": pixel_count,
+        },
         "uncertainty": {},
     }
     if source.ndim != 3 or source.shape[2] != 3 or mask.shape != source.shape[:2]:
         unavailable["reason_codes"].append("perceptual_shadow_input_invalid")
         return unavailable
-    if pixel_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS * 2:
+    if pixel_count < 16:
         unavailable["reason_codes"].append(
             "perceptual_shadow_authorized_support_too_small"
         )
@@ -3605,12 +4955,15 @@ def _observe_additive_shadow(
     fill_color = str(facts.core_color or "")
     if (
         facts.core_role_status != "supported"
-        or int(np.count_nonzero(core)) < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS
+        or int(np.count_nonzero(core)) < 8
     ):
         unavailable["reason_codes"].append(
             "perceptual_shadow_character_core_unavailable"
         )
         unavailable["support"]["character_core_status"] = facts.core_resolution
+        unavailable["support"]["character_core_reason"] = (
+            facts.core_role_reason
+        )
         return unavailable
     if len(fill_color) != 7 or not fill_color.startswith("#"):
         unavailable["reason_codes"].append(
@@ -3629,6 +4982,16 @@ def _observe_additive_shadow(
         return unavailable
 
     core_count = int(np.count_nonzero(core))
+    source_cell = float(facts.source_cell_reference_px or 0.0)
+    minimum_effect_pixels = max(
+        8,
+        int(
+            round(
+                core_count
+                * _ADDITIVE_SHADOW_MIN_EFFECT_TO_CORE_RATIO
+            )
+        ),
+    )
     effect = np.asarray(facts.displaced_effect_mask, dtype=bool)
     effect_count = int(np.count_nonzero(effect))
     effect_fraction = effect_count / max(1, pixel_count)
@@ -3640,22 +5003,29 @@ def _observe_additive_shadow(
             "effect_pixel_count": effect_count,
             "effect_mask_fraction": round(effect_fraction, 8),
             "effect_border_margin_px": effect_border_margin,
+            "minimum_effect_pixel_count": minimum_effect_pixels,
+            "source_cell_reference_px": round(source_cell, 8),
         }
     )
-    if core_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS:
+    if core_count < 8:
         unavailable["reason_codes"].append(
             "perceptual_shadow_character_core_support_too_small"
         )
         return unavailable
+    if source_cell <= 0.0 or not math.isfinite(source_cell):
+        unavailable["reason_codes"].append(
+            "perceptual_shadow_source_cell_reference_unavailable"
+        )
+        return unavailable
     if (
-        effect_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS
+        effect_count < minimum_effect_pixels
         or effect_fraction < _ADDITIVE_SHADOW_MIN_EFFECT_MASK_FRACTION
     ):
         unavailable["reason_codes"].append(
             "perceptual_shadow_displaced_effect_unavailable"
         )
         return unavailable
-    if effect_border_margin < _ADDITIVE_SHADOW_MIN_EFFECT_BORDER_MARGIN_PX:
+    if effect_border_margin < 1:
         unavailable["reason_codes"].append(
             "perceptual_shadow_effect_support_truncated"
         )
@@ -3693,7 +5063,7 @@ def _observe_additive_shadow(
             "central_effect_luma_median": round(central_luma_median, 8),
         }
     )
-    if central_count < _ADDITIVE_SHADOW_MIN_EFFECT_PIXELS:
+    if central_count < minimum_effect_pixels:
         unavailable["reason_codes"].append(
             "perceptual_shadow_central_effect_support_too_small"
         )
@@ -3717,26 +5087,104 @@ def _observe_additive_shadow(
         central.astype(np.float32), template, cv2.TM_CCORR
     )
     peaks: list[dict[str, Any]] = []
-    minimum_offset_sq = _ADDITIVE_SHADOW_MIN_OFFSET_PX**2
-    maximum_offset_sq = _ADDITIVE_SHADOW_MAX_OFFSET_PX**2
-    separation_sq = _ADDITIVE_SHADOW_COMPETING_PEAK_DISTANCE_PX**2
+    minimum_offset = max(
+        2.0,
+        source_cell * _ADDITIVE_SHADOW_MIN_OFFSET_TO_CELL_RATIO,
+    )
+    maximum_offset = max(
+        minimum_offset + 1.0,
+        source_cell * _ADDITIVE_SHADOW_MAX_OFFSET_TO_CELL_RATIO,
+    )
+    peak_separation = max(
+        3.0,
+        source_cell
+        * _ADDITIVE_SHADOW_COMPETING_PEAK_DISTANCE_TO_CELL_RATIO,
+    )
+    minimum_offset_sq = minimum_offset**2
+    maximum_offset_sq = maximum_offset**2
+    separation_sq = peak_separation**2
+    unavailable["support"].update(
+        {
+            "minimum_offset_px": round(minimum_offset, 8),
+            "maximum_offset_px": round(maximum_offset, 8),
+            "competing_peak_separation_px": round(
+                peak_separation,
+                8,
+            ),
+            "correlation_peak_resolution": (
+                "connected_equal_score_plateau_centroid"
+            ),
+        }
+    )
+    correlation_y, correlation_x = np.indices(correlation.shape)
+    correlation_dx = correlation_x - x0
+    correlation_dy = correlation_y - y0
+    correlation_offset_sq = (
+        correlation_dx.astype(np.float32) ** 2
+        + correlation_dy.astype(np.float32) ** 2
+    )
+    valid_correlation = (
+        (correlation_offset_sq >= minimum_offset_sq)
+        & (correlation_offset_sq <= maximum_offset_sq)
+        & (correlation > 0.0)
+    )
+    consumed_correlation = np.zeros(correlation.shape, dtype=bool)
     for flat_index in np.argsort(correlation.ravel())[::-1]:
         match_y, match_x = np.unravel_index(int(flat_index), correlation.shape)
-        dx = int(match_x) - x0
-        dy = int(match_y) - y0
-        offset_sq = float(dx * dx + dy * dy)
-        if offset_sq < minimum_offset_sq or offset_sq > maximum_offset_sq:
+        if (
+            not bool(valid_correlation[match_y, match_x])
+            or bool(consumed_correlation[match_y, match_x])
+        ):
             continue
         overlap = float(correlation[match_y, match_x])
         if overlap <= 0:
             break
+        equal_score = valid_correlation & np.isclose(
+            correlation,
+            overlap,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        _, plateau_labels = cv2.connectedComponents(
+            equal_score.astype(np.uint8),
+            connectivity=8,
+        )
+        plateau_label = int(plateau_labels[match_y, match_x])
+        if plateau_label <= 0:
+            consumed_correlation[match_y, match_x] = True
+            continue
+        plateau = plateau_labels == plateau_label
+        consumed_correlation[plateau] = True
+        plateau_y, plateau_x = np.where(plateau)
+        plateau_centroid_x = float(np.mean(plateau_x))
+        plateau_centroid_y = float(np.mean(plateau_y))
+        centroid_distance_sq = (
+            (plateau_x.astype(np.float64) - plateau_centroid_x) ** 2
+            + (plateau_y.astype(np.float64) - plateau_centroid_y) ** 2
+        )
+        representative_index = int(np.argmin(centroid_distance_sq))
+        match_x = int(plateau_x[representative_index])
+        match_y = int(plateau_y[representative_index])
+        dx = match_x - x0
+        dy = match_y - y0
         if any(
             (dx - int(item["dx"])) ** 2 + (dy - int(item["dy"])) ** 2
             < separation_sq
             for item in peaks
         ):
             continue
-        peaks.append({"dx": dx, "dy": dy, "overlap_pixels": int(round(overlap))})
+        peaks.append(
+            {
+                "dx": dx,
+                "dy": dy,
+                "overlap_pixels": int(round(overlap)),
+                "plateau_pixel_count": int(np.count_nonzero(plateau)),
+                "plateau_centroid_offset": [
+                    round(plateau_centroid_x - x0, 8),
+                    round(plateau_centroid_y - y0, 8),
+                ],
+            }
+        )
         if len(peaks) >= 6:
             break
     unavailable["support"]["correlation_peaks"] = peaks
@@ -3801,10 +5249,21 @@ def _observe_additive_shadow(
     spread_p95 = (
         float(np.percentile(outside_values, 95)) if outside_values.size else 0.0
     )
-    spread_radius = int(min(
-        _ADDITIVE_SHADOW_MAX_SPREAD_RADIUS_PX,
-        max(0, int(np.ceil(spread_p95))),
-    ))
+    maximum_spread_radius = max(
+        2,
+        int(
+            round(
+                source_cell
+                * _ADDITIVE_SHADOW_MAX_SPREAD_TO_CELL_RATIO
+            )
+        ),
+    )
+    spread_radius = int(
+        min(
+            maximum_spread_radius,
+            max(0, int(round(spread_p90))),
+        )
+    )
     if spread_radius > 0:
         predicted_support = cv2.dilate(
             shifted_core.astype(np.uint8),
@@ -3831,6 +5290,7 @@ def _observe_additive_shadow(
             "spatial_spread_p90_px": round(spread_p90, 8),
             "spatial_spread_p95_px": round(spread_p95, 8),
             "predicted_spread_radius_px": spread_radius,
+            "maximum_spread_radius_px": maximum_spread_radius,
             "spatial_effect_recall": round(spatial_recall, 8),
             "spatial_effect_precision": round(spatial_precision, 8),
         }
@@ -3844,11 +5304,15 @@ def _observe_additive_shadow(
         )
         return unavailable
 
-    if outside_values.size == 0 or spread_p90 <= 0.75:
+    minimum_blur_radius = max(
+        0.5,
+        source_cell * _ADDITIVE_SHADOW_MIN_BLUR_TO_CELL_RATIO,
+    )
+    if outside_values.size == 0 or spread_p90 <= minimum_blur_radius:
         blur_radius = 0.0
     else:
         blur_radius = min(
-            float(_ADDITIVE_SHADOW_MAX_SPREAD_RADIUS_PX),
+            float(maximum_spread_radius),
             spread_p90 / _ADDITIVE_SHADOW_BLUR_SPREAD_DIVISOR,
         )
     darkest_threshold = float(np.percentile(luma[central], 10))
@@ -3870,11 +5334,25 @@ def _observe_additive_shadow(
         "uncertainty": {
             "competing_peak_ratio": round(competing_ratio, 8),
             "spatial_blur_support_p90_px": round(spread_p90, 8),
+            "spatial_blur_support_p90_to_cell_ratio": round(
+                spread_p90 / source_cell,
+                8,
+            ),
         },
         "value": {
+            "geometry_schema_version": _SHADOW_GEOMETRY_SCHEMA_VERSION,
             "color": shadow_color,
             "offset_px": [float(dx), float(dy)],
+            "offset_to_cell_ratio": [
+                round(float(dx) / source_cell, 8),
+                round(float(dy) / source_cell, 8),
+            ],
             "blur_radius_px": round(float(blur_radius), 8),
+            "blur_to_cell_ratio": round(
+                float(blur_radius) / source_cell,
+                8,
+            ),
+            "source_cell_reference_px": round(source_cell, 8),
         },
     }
 
@@ -4169,6 +5647,9 @@ def _summarize_source_text_footprint(
             "confidence": 0.0,
             "reason": "unavailable_no_body_component_groups",
         }
+        if bool(scale_qualification.get("source_scale_axis_only")):
+            profile["reason"] = "unavailable_source_scale_not_supported"
+            return profile
         has_body_component = any(
             not bool(fact.get("punctuation_fragment"))
             for fact in component_facts

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -45,11 +46,90 @@ from app.pipeline.parent_style_evidence import (
     SourceStyleAxisEvidence,
     build_authorized_style_observation_inputs,
 )
+from app.pipeline.source_style_contracts import (
+    SOURCE_FONT_SUPPORT_FLOOR_MET,
+    SOURCE_FONT_SUPPORT_TRUNCATED,
+    TARGET_FONT_AFFINITY_OBSERVATION_KEY,
+    TARGET_FONT_AFFINITY_ROLE_IDS,
+    SourceFontCandidate,
+    SourceFontObservationV3,
+    SourceFontScoreSupportV1,
+    SourceStyleEvidenceBindingV1,
+    TargetFontAffinityObservationV1,
+    source_font_overlap_bounds,
+)
 from app.render.font_manager import FontManager
 
 
 FONT_COUNT = 6150
+SOURCE_FONT_RETAINED_MASS_FLOOR = 0.999
+SOURCE_FONT_CANDIDATE_CEILING = 1024
+SOURCE_FONT_SUPPORT_POLICY_VERSION = (
+    "yuzumarker_adaptive_identity_support_mass_0_999_ceiling_1024_v1"
+)
+SOURCE_FONT_SCORE_SUPPORT_KEY = "source_font_score_support_v1"
+TARGET_FONT_AFFINITY_DESCRIPTOR_POLICY_VERSION = (
+    "hellinger_t2__primary__top3_mean"
+)
+TARGET_FONT_AFFINITY_PROBE_POLICY_VERSION = (
+    "fixed_disjoint_cjk_probe_bank_v1"
+)
+TARGET_FONT_AFFINITY_TEMPERATURE = 2.0
+TARGET_FONT_AFFINITY_TOP_PROBE_COUNT = 3
+TARGET_FONT_AFFINITY_ERROR_KEY = "target_font_affinity_error"
+_V3_TARGET_FONT_NEIGHBOR_COUNT = 2
+_V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT = {
+    "sans_regular": 400,
+    "sans_medium": 500,
+    "sans_bold": 700,
+    "sans_black": 900,
+    "serif_regular": 400,
+    "serif_semibold": 600,
+    "serif_bold": 700,
+}
+_V3_TARGET_FONT_ROLE_FAMILY = {
+    role_id: ("sans" if role_id.startswith("sans_") else "serif")
+    for role_id in TARGET_FONT_AFFINITY_ROLE_IDS
+}
+_V3_TARGET_FONT_FAMILY_ROLES = {
+    family: tuple(
+        role_id
+        for role_id in TARGET_FONT_AFFINITY_ROLE_IDS
+        if _V3_TARGET_FONT_ROLE_FAMILY[role_id] == family
+    )
+    for family in ("sans", "serif")
+}
+_V3_TARGET_FONT_WEIGHT_COMPATIBILITY_ALIAS = {
+    "sans_regular": "slender",
+    "sans_medium": "base",
+    "sans_bold": "emphasis",
+    "sans_black": "heavy",
+    "serif_regular": "slender",
+    "serif_semibold": "base",
+    "serif_bold": "emphasis",
+}
+TARGET_FONT_AFFINITY_PROBE_SPECS = (
+    ("cjk_cosmos_single", "天地玄黄宇宙洪荒", 1, 52, 56),
+    ("cjk_seasons_single", "春夏秋冬東西南北", 1, 52, 56),
+    ("cjk_nature_single", "海山川空月星光雨", 1, 52, 56),
+    ("hiragana_single", "あいうえおかきくけこ", 1, 44, 46),
+    ("katakana_single", "アイウエオカキクケコ", 1, 44, 46),
+    ("cjk_life_two_column", "永語愛無人生活仕事", 2, 62, 68),
+    ("cjk_story_two_column", "漢字仮名読書物語心", 2, 62, 68),
+    ("cjk_motion_two_column", "時風道夢声旅力世界", 2, 62, 68),
+)
 FAMILY_POSTERIOR_VERSION = "yuzumarker_complete_family_posterior_v1"
+SOURCE_STYLE_EVIDENCE_V2 = "source_style_evidence_v2"
+NORMALIZED_STROKE_PROFILE_V2 = "normalized_stroke_profile_v2"
+FACTORIZED_ATTRIBUTE_POSTERIOR_VERSION = (
+    "yuzumarker_factorized_attribute_posterior_v1"
+)
+FACTORIZED_ATTRIBUTE_TAXONOMY_VERSION = (
+    "yuzumarker_factorized_attribute_taxonomy_v1"
+)
+FACTORIZED_ATTRIBUTE_VARIANTS_VERSION = (
+    "yuzumarker_factorized_attribute_variants_v1"
+)
 FAMILY_CALIBRATION_VERSION = "stage1a_family_posterior_calibration_v2"
 FAMILY_CALIBRATION_RELIABILITY_METHOD = (
     "wilson_score_lower_bound_95_two_sided"
@@ -131,7 +211,6 @@ V3_POSTERIOR_MARGIN_MINIMUM = 0.70
 V3_WEIGHT_SLENDER_SCORE_RANGE = (0.1395, 0.1630)
 V3_WEIGHT_BASE_SCORE_RANGE = (0.1800, 0.2500)
 V3_WEIGHT_HEAVY_SCORE_RANGE = (0.2600, 0.3400)
-V3_WEIGHT_HEAVY_SOURCE_CELL_MINIMUM_PX = 18.0
 V3_SCALE_PEER_MAXIMUM_MAD_RATIO = 0.10
 TARGET_FONT_REQUEST_VERSION = "target_font_request_v1"
 TARGET_FONT_REQUEST_PROVENANCE = "parent_style_arbitrator_source_label_taxonomy_v1"
@@ -174,6 +253,16 @@ class _FrozenJsonDict(dict[Any, Any]):
         snapshot = _plain_json_mapping_snapshot(self)
         memo[id(self)] = snapshot
         return snapshot
+
+
+@dataclass(frozen=True)
+class _FactorizedAttributeTaxonomy:
+    """Source-label attribute partitions used only to transport posterior mass."""
+
+    label_count: int
+    generic_family_codes: np.ndarray
+    face_character_codes: np.ndarray
+    weight_strength_codes: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -354,6 +443,8 @@ class StyleEvidence:
     analysis_bbox: tuple[int, int, int, int] = ()
     detector_input_sha256: str = ""
     source_text_footprint: SourceTextFootprint | None = None
+    source_font_observation: SourceFontObservationV3 | None = None
+    source_font_style_evidence: SourceStyleAxisEvidence | None = None
     authorized_perceptual_source_identity: Mapping[str, Any] = field(
         default_factory=dict
     )
@@ -424,6 +515,20 @@ class StyleEvidence:
                 self,
                 "family_posterior",
                 FontFamilyPosterior.from_mapping(self.family_posterior),
+            )
+        if self.source_font_observation is not None and not isinstance(
+            self.source_font_observation,
+            SourceFontObservationV3,
+        ):
+            raise TypeError(
+                "source_font_observation must be SourceFontObservationV3"
+            )
+        if self.source_font_style_evidence is not None and not isinstance(
+            self.source_font_style_evidence,
+            SourceStyleAxisEvidence,
+        ):
+            raise TypeError(
+                "source_font_style_evidence must be SourceStyleAxisEvidence"
             )
         object.__setattr__(self, "axis_evidence", tuple(self.axis_evidence or ()))
 
@@ -711,6 +816,14 @@ class StyleEvidence:
         if self.source_text_footprint is not None:
             result["source_text_footprint"] = (
                 self.source_text_footprint.to_audit_dict()
+            )
+        if self.source_font_observation is not None:
+            result["source_font_observation"] = (
+                self.source_font_observation.to_audit_dict()
+            )
+        if self.source_font_style_evidence is not None:
+            result["source_font_style_evidence"] = (
+                self.source_font_style_evidence.to_audit_dict()
             )
         if self.perceptual_axis_evidence:
             result["authorized_perceptual_source_identity"] = (
@@ -1257,12 +1370,46 @@ def _realize_parent_render_style_v3(
 
     family = str(family_axis.value or "")
     weight = str(weight_axis.value or "")
-    matrix_entry = PARENT_RENDER_STYLE_V3_FONT_ROLE_MATRIX.get(family, {}).get(
-        weight
+    weight_support = (
+        weight_axis.peer_support
+        if isinstance(weight_axis.peer_support, Mapping)
+        else {}
     )
-    if matrix_entry is None:
-        raise ValueError("Stage 3B family/weight decision is outside the role matrix")
-    primary_font_role, matrix_role_status = matrix_entry
+    concrete_role_value = weight_support.get("target_font_role")
+    if concrete_role_value is not None:
+        primary_font_role = str(concrete_role_value or "").strip()
+        if primary_font_role not in TARGET_FONT_AFFINITY_ROLE_IDS:
+            raise ValueError("Stage 3B target font role is not registered")
+        expected_family = _V3_TARGET_FONT_ROLE_FAMILY[primary_font_role]
+        expected_weight = _V3_TARGET_FONT_WEIGHT_COMPATIBILITY_ALIAS[
+            primary_font_role
+        ]
+        if family != expected_family or weight != expected_weight:
+            raise ValueError(
+                "Stage 3B target font role conflicts with compatibility axes"
+            )
+        numeric_weight = weight_support.get("target_font_numeric_weight")
+        if (
+            isinstance(numeric_weight, bool)
+            or not isinstance(numeric_weight, (int, float))
+            or not math.isfinite(float(numeric_weight))
+            or int(numeric_weight)
+            != _V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[primary_font_role]
+        ):
+            raise ValueError(
+                "Stage 3B target font numeric weight conflicts with the "
+                "registered role"
+            )
+        matrix_role_status = "registered_role"
+    else:
+        matrix_entry = PARENT_RENDER_STYLE_V3_FONT_ROLE_MATRIX.get(
+            family, {}
+        ).get(weight)
+        if matrix_entry is None:
+            raise ValueError(
+                "Stage 3B family/weight decision is outside the role matrix"
+            )
+        primary_font_role, matrix_role_status = matrix_entry
     role_status = role_inventory.get(primary_font_role)
     if (
         role_status is None
@@ -1279,7 +1426,6 @@ def _realize_parent_render_style_v3(
         raise ValueError("Stage 3B writing mode is invalid")
     profile_resolution = font_manager.target_optical_profile(
         face,
-        str(getattr(bundle, "translated_text", "") or ""),
         writing_mode,
     )
     profile = profile_resolution.profile
@@ -1325,7 +1471,11 @@ def _realize_parent_render_style_v3(
         "status": conversion_status,
         "formula": (
             "source_visual_cell_px/target_visible_ink_height_ratio"
-            if conversion_status == "source_to_target_optical_conversion"
+            if conversion_status
+            in {
+                "source_to_target_optical_conversion",
+                "low_confidence_source_to_target_optical_conversion",
+            }
             else "deterministic_target_fallback_em"
         ),
         "source_visual_cell_p20_px": source_cell.get("p20_px"),
@@ -1341,6 +1491,12 @@ def _realize_parent_render_style_v3(
     }
     if conversion_status == "deterministic_target_fallback":
         conversion_audit["reason"] = "source_visual_cell_unavailable"
+    elif conversion_status == (
+        "low_confidence_source_to_target_optical_conversion"
+    ):
+        conversion_audit["reason"] = (
+            "local_source_scale_below_direct_confidence_after_peer_reconciliation"
+        )
 
     target_visible_ink_height = preferred_em * visible_ratio
     readability = {
@@ -1422,7 +1578,9 @@ def _v3_target_em_from_source_scale(
     target_visible_ink_height_ratio: float,
 ) -> tuple[dict[str, Any], float, tuple[float, float], str]:
     value = dict(scale_axis.value) if isinstance(scale_axis.value, Mapping) else {}
-    if scale_axis.status in {"direct", "peer"}:
+    if scale_axis.status in {"direct", "peer"} or (
+        scale_axis.status == "fallback" and value
+    ):
         interval = _v3_numeric_interval(
             value,
             keys=("p20_px", "median_px", "p80_px"),
@@ -1451,7 +1609,11 @@ def _v3_target_em_from_source_scale(
             source_cell,
             preferred,
             target_interval,
-            "source_to_target_optical_conversion",
+            (
+                "low_confidence_source_to_target_optical_conversion"
+                if scale_axis.status == "fallback"
+                else "source_to_target_optical_conversion"
+            ),
         )
     if scale_axis.status != "fallback" or scale_axis.value is not None:
         raise ValueError("Stage 3B unresolved source scale lacks explicit fallback")
@@ -1477,13 +1639,14 @@ def resolve_parent_style_decision_ledger_v3(
     *,
     parent_execution_bundles: Sequence[Any],
     evidence: Sequence[StyleEvidence],
+    style_context_snapshot: Any | None = None,
 ) -> ParentStyleDecisionLedgerV3:
     """Resolve the immutable non-runtime Stage 2C parent-style ledger.
 
-    Resolution order is binding: calibrated parent-local evidence, then one
-    conservative run-wide peer pass for family/weight/source scale only, then
-    deterministic axis-local fallback.  Page and root identity are used only
-    to bind evidence to its owning parent and never to form a style cohort.
+    Resolution order is binding: calibrated parent-local evidence, compatible
+    current-page cohorts, optional qualified prior-page evidence, then
+    deterministic axis-local fallback.  Cross-page evidence is never part of
+    a current-page cohort.
     """
 
     contexts = _v3_identity_bound_parent_contexts(
@@ -1499,17 +1662,26 @@ def resolve_parent_style_decision_ledger_v3(
         for bundle_id, facts in facts_by_bundle.items()
     }
 
-    _v3_apply_categorical_peer_axis(
-        axis="family",
+    _v3_apply_current_page_target_font_components(
         facts_by_bundle=facts_by_bundle,
         decisions_by_bundle=decisions_by_bundle,
+        style_context_snapshot=style_context_snapshot,
     )
-    _v3_apply_categorical_peer_axis(
-        axis="weight",
+    _v3_apply_family_axis(
         facts_by_bundle=facts_by_bundle,
         decisions_by_bundle=decisions_by_bundle,
+        style_context_snapshot=style_context_snapshot,
+    )
+    _v3_apply_weight_axis(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+        style_context_snapshot=style_context_snapshot,
     )
     _v3_apply_source_scale_peer_axis(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+    )
+    _v3_apply_low_confidence_local_source_scale(
         facts_by_bundle=facts_by_bundle,
         decisions_by_bundle=decisions_by_bundle,
     )
@@ -1625,6 +1797,7 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
     posterior = _v3_family_posterior_fact(
         records.get("family"), evidence_item
     )
+    target_font_affinity = _v3_target_font_affinity_fact(evidence_item)
     scale_fact = _v3_source_scale_fact(
         records.get("scale"), direction=direction_key
     )
@@ -1636,7 +1809,11 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
     )
 
     direct: dict[str, ParentStyleAxisDecisionV3] = {}
-    family = _v3_direct_family(records.get("family"))
+    family = (
+        None
+        if target_font_affinity is not None
+        else _v3_direct_family(records.get("family"))
+    )
     if family is not None:
         direct["family"] = family
     if orientation is not None:
@@ -1648,11 +1825,19 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
     scale = _v3_direct_source_scale(scale_fact)
     if scale is not None:
         direct["source_scale"] = scale
-    weight = _v3_direct_weight(
-        weight_fact=weight_fact,
-        posterior=posterior,
-        role_class=role_class,
-        punctuation_only=punctuation_only,
+    weight_interval_ambiguous_heavy_candidate = (
+        _v3_weight_is_interval_ambiguous_heavy_candidate(
+            weight_fact=weight_fact,
+            punctuation_only=punctuation_only,
+        )
+    )
+    weight = (
+        None
+        if target_font_affinity is not None
+        else _v3_direct_weight(
+            weight_fact=weight_fact,
+            punctuation_only=punctuation_only,
+        )
     )
     if weight is not None:
         direct["weight"] = weight
@@ -1688,6 +1873,7 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "identity_reason_codes": identity_reasons,
         "direct_decisions": direct,
+        "target_font_affinity": target_font_affinity,
         "family_posterior": posterior,
         "weight_fact": weight_fact,
         "weight_interval": (
@@ -1696,7 +1882,12 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
             else None
         ),
         "weight_reliable_unclassified": bool(
-            weight_measurement_reliable and weight is None
+            weight_measurement_reliable
+            and weight is None
+            and not weight_interval_ambiguous_heavy_candidate
+        ),
+        "weight_interval_ambiguous_heavy_candidate": (
+            weight_interval_ambiguous_heavy_candidate
         ),
         "source_scale_fact": scale_fact,
         "scale_interval": (
@@ -1705,6 +1896,7 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
             else None
         ),
         "paint_signature": paint_signature,
+        "family_resolution_reasons": (),
     }
 
 
@@ -1833,6 +2025,12 @@ def _v3_family_posterior_fact(
     return {
         "leading_family": posterior.leading_family,
         "leading_probability": float(leading_probability),
+        "sans_probability": float(
+            posterior.conditional_sans_probability
+        ),
+        "serif_probability": float(
+            posterior.conditional_serif_probability
+        ),
         "known_mass": float(posterior.known_mass),
         "margin": float(posterior.margin),
         "variant_agreement": bool(variant_agreement),
@@ -2124,14 +2322,11 @@ def _v3_weight_fact(
 def _v3_weight_tier_for_score(
     *,
     score: float,
-    leading_family: str,
-    source_cell_median_px: float,
 ) -> str:
     if (
         V3_WEIGHT_SLENDER_SCORE_RANGE[0]
         <= score
         <= V3_WEIGHT_SLENDER_SCORE_RANGE[1]
-        and leading_family == "serif"
     ):
         return "slender"
     if V3_WEIGHT_BASE_SCORE_RANGE[0] <= score <= V3_WEIGHT_BASE_SCORE_RANGE[1]:
@@ -2140,8 +2335,6 @@ def _v3_weight_tier_for_score(
         V3_WEIGHT_HEAVY_SCORE_RANGE[0]
         <= score
         <= V3_WEIGHT_HEAVY_SCORE_RANGE[1]
-        and leading_family == "sans"
-        and source_cell_median_px >= V3_WEIGHT_HEAVY_SOURCE_CELL_MINIMUM_PX
     ):
         return "heavy"
     return ""
@@ -2158,32 +2351,24 @@ def _v3_weight_score_is_transition_gap(score: float) -> bool:
     )
 
 
-def _v3_direct_weight(
+def _v3_direct_weight_candidate(
     *,
     weight_fact: Mapping[str, Any] | None,
-    posterior: Mapping[str, Any] | None,
-    role_class: str,
     punctuation_only: bool,
-) -> ParentStyleAxisDecisionV3 | None:
+) -> tuple[str, float, tuple[str, ...], tuple[float, float, float]] | None:
     if (
         weight_fact is None
         or float(weight_fact["confidence"]) < V3_DIRECT_WEIGHT_MIN_CONFIDENCE
         or punctuation_only
-        or role_class != "speech"
-        or posterior is None
-        or not bool(posterior.get("reliable"))
     ):
         return None
     score = float(weight_fact["score"])
-    leading_family = str(posterior.get("leading_family") or "")
-    source_cell_median_px = float(weight_fact["source_cell_median_px"])
-    tier = _v3_weight_tier_for_score(
-        score=score,
-        leading_family=leading_family,
-        source_cell_median_px=source_cell_median_px,
-    )
+    tier = _v3_weight_tier_for_score(score=score)
     decision_confidence = float(weight_fact["confidence"])
     decision_reason_codes = list(weight_fact["reason_codes"])
+    score_interval = tuple(
+        float(value) for value in tuple(weight_fact["score_interval"])
+    )
     if not tier and _v3_weight_score_is_transition_gap(score):
         direction_neutral_score = _bounded_float(
             weight_fact.get("direction_neutral_score"),
@@ -2200,8 +2385,6 @@ def _v3_direct_weight(
         ):
             tier = _v3_weight_tier_for_score(
                 score=float(direction_neutral_score),
-                leading_family=leading_family,
-                source_cell_median_px=source_cell_median_px,
             )
             if tier:
                 decision_confidence = min(
@@ -2210,20 +2393,88 @@ def _v3_direct_weight(
                 decision_reason_codes.append(
                     "direction_neutral_transition_gap_resolved"
                 )
-    if not tier:
+                direction_neutral_interval = tuple(
+                    float(value)
+                    for value in tuple(
+                        weight_fact.get("direction_neutral_score_interval")
+                        or ()
+                    )
+                )
+                if len(direction_neutral_interval) == 3:
+                    score_interval = direction_neutral_interval
+    if not tier or len(score_interval) != 3:
         return None
-    confidence = min(
+    return (
+        tier,
         decision_confidence,
-        float(posterior.get("leading_probability") or 0.0),
+        tuple(decision_reason_codes),
+        score_interval,
     )
+
+
+def _v3_weight_has_robust_heavy_support(
+    score_interval: Sequence[float],
+    *,
+    reason_codes: Sequence[str] = (),
+) -> bool:
+    values = tuple(float(value) for value in score_interval)
+    return bool(
+        "direction_neutral_transition_gap_resolved" in tuple(reason_codes)
+        or (
+            len(values) == 3
+            and values[0] > V3_WEIGHT_BASE_SCORE_RANGE[1]
+        )
+    )
+
+
+def _v3_weight_is_interval_ambiguous_heavy_candidate(
+    *,
+    weight_fact: Mapping[str, Any] | None,
+    punctuation_only: bool,
+) -> bool:
+    candidate = _v3_direct_weight_candidate(
+        weight_fact=weight_fact,
+        punctuation_only=punctuation_only,
+    )
+    return bool(
+        candidate is not None
+        and candidate[0] == "heavy"
+        and not _v3_weight_has_robust_heavy_support(
+            candidate[3],
+            reason_codes=candidate[2],
+        )
+    )
+
+
+def _v3_direct_weight(
+    *,
+    weight_fact: Mapping[str, Any] | None,
+    punctuation_only: bool,
+) -> ParentStyleAxisDecisionV3 | None:
+    candidate = _v3_direct_weight_candidate(
+        weight_fact=weight_fact,
+        punctuation_only=punctuation_only,
+    )
+    if candidate is None or weight_fact is None:
+        return None
+    tier, decision_confidence, reason_codes, score_interval = candidate
+    decision_reason_codes = list(reason_codes)
+    if tier == "heavy":
+        if not _v3_weight_has_robust_heavy_support(
+            score_interval,
+            reason_codes=reason_codes,
+        ):
+            return None
+        decision_reason_codes.append("robust_heavy_lower_bound_supported")
     return _v3_axis_decision(
         axis="weight",
         value=tier,
         status="direct",
-        confidence=confidence,
+        confidence=decision_confidence,
         provenance=str(weight_fact["provenance"]),
         reason_codes=(
             *decision_reason_codes,
+            "weight_resolution_tier:direct",
             f"calibrated_normalized_weight_region:{tier}",
         ),
     )
@@ -2280,116 +2531,1715 @@ def _v3_source_text_is_punctuation_only(text: str) -> bool:
     )
 
 
-def _v3_apply_categorical_peer_axis(
+def _v3_target_font_affinity_fact(
+    evidence: StyleEvidence | None,
+) -> dict[str, Any] | None:
+    if (
+        evidence is None
+        or evidence.status != "observed"
+        or not evidence.vote_eligible
+    ):
+        return None
+    observation = evidence.source_font_observation
+    if not isinstance(observation, SourceFontObservationV3):
+        return None
+    affinity = observation.target_font_affinity
+    if not isinstance(affinity, TargetFontAffinityObservationV1):
+        return None
+    if (
+        not evidence.detector_input_sha256
+        or evidence.detector_input_sha256 != affinity.source_input_sha256
+    ):
+        return None
+    scores: dict[str, float] = {}
+    for role_id in TARGET_FONT_AFFINITY_ROLE_IDS:
+        try:
+            score = float(affinity.role_scores[role_id])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(score) or score < 0.0 or score > 1.0:
+            return None
+        scores[role_id] = score
+    return {
+        "catalog_identity_sha256": affinity.catalog_identity_sha256,
+        "descriptor_policy_version": affinity.descriptor_policy_version,
+        "model_identity": affinity.model_identity,
+        "label_catalog_version": affinity.label_catalog_version,
+        "role_scores": scores,
+    }
+
+
+def _v3_target_font_family_probabilities(
+    posterior: Any,
+) -> tuple[float, float] | None:
+    if not isinstance(posterior, Mapping):
+        return None
+    for sans_key, serif_key in (
+        ("sans_probability", "serif_probability"),
+        (
+            "conditional_sans_probability",
+            "conditional_serif_probability",
+        ),
+        ("sans", "serif"),
+        ("sans_mass", "serif_mass"),
+    ):
+        if sans_key not in posterior or serif_key not in posterior:
+            continue
+        try:
+            sans = float(posterior[sans_key])
+            serif = float(posterior[serif_key])
+        except (TypeError, ValueError):
+            continue
+        if (
+            math.isfinite(sans)
+            and math.isfinite(serif)
+            and sans >= 0.0
+            and serif >= 0.0
+        ):
+            return sans, serif
+    return None
+
+
+def _v3_target_font_prior_records(
+    style_context_snapshot: Any | None,
+) -> tuple[dict[str, Any], ...]:
+    """Decode only committed, identity-bound target-affinity cache records.
+
+    The cache is deliberately not another component-building input.  It
+    transports prior observations that may stabilize the family choice only
+    after the current page has formed its own components and numeric weights.
+    """
+
+    prefix_page_ids, records = _v3_qualified_prior_snapshot_records(
+        style_context_snapshot
+    )
+    if not prefix_page_ids or not records:
+        return ()
+    prefix_order = {
+        page_id: index for index, page_id in enumerate(prefix_page_ids)
+    }
+    role_ids = tuple(TARGET_FONT_AFFINITY_ROLE_IDS)
+    decoded: dict[tuple[str, str], dict[str, Any]] = {}
+    duplicate_keys: set[tuple[str, str]] = set()
+    for record in records:
+        page_id = str(getattr(record, "page_id", "") or "")
+        bundle_id = str(getattr(record, "bundle_id", "") or "")
+        key = (page_id, bundle_id)
+        if (
+            not page_id
+            or page_id not in prefix_order
+            or not bundle_id
+        ):
+            continue
+        if key in decoded:
+            duplicate_keys.add(key)
+            continue
+        affinity = getattr(record, "target_font_affinity", None)
+        if not isinstance(affinity, Mapping):
+            continue
+        catalog_identity = (
+            str(affinity.get("catalog_identity_sha256") or ""),
+            str(affinity.get("descriptor_policy_version") or ""),
+            str(affinity.get("model_identity") or ""),
+            str(affinity.get("label_catalog_version") or ""),
+        )
+        raw_scores = affinity.get("role_scores")
+        if (
+            not all(catalog_identity)
+            or not isinstance(raw_scores, Mapping)
+            or set(raw_scores) != set(role_ids)
+        ):
+            continue
+        try:
+            scores = np.asarray(
+                [float(raw_scores[role_id]) for role_id in role_ids],
+                dtype=np.float64,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            scores.shape != (len(role_ids),)
+            or not np.all(np.isfinite(scores))
+            or np.any(scores < 0.0)
+            or np.any(scores > 1.0)
+        ):
+            continue
+        leading_role = role_ids[int(np.argmax(scores))]
+        family_probabilities = _v3_target_font_family_probabilities(
+            getattr(record, "family_posterior", None)
+        )
+        if (
+            family_probabilities is None
+            or sum(family_probabilities) <= 0.0
+        ):
+            leading_family = _V3_TARGET_FONT_ROLE_FAMILY[leading_role]
+            family_probabilities = (
+                (1.0, 0.0)
+                if leading_family == "sans"
+                else (0.0, 1.0)
+            )
+        else:
+            family_total = float(sum(family_probabilities))
+            family_probabilities = (
+                float(family_probabilities[0]) / family_total,
+                float(family_probabilities[1]) / family_total,
+            )
+        decoded[key] = {
+            "page_id": page_id,
+            "bundle_id": bundle_id,
+            "catalog_identity": catalog_identity,
+            "role_scores": scores,
+            "leading_role": leading_role,
+            "numeric_weight": _V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[
+                leading_role
+            ],
+            "family_probabilities": family_probabilities,
+        }
+    for key in duplicate_keys:
+        decoded.pop(key, None)
+    return tuple(
+        decoded[key]
+        for key in sorted(
+            decoded,
+            key=lambda item: (prefix_order[item[0]], item[1]),
+        )
+    )
+
+
+def _v3_target_font_components(
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
     *,
-    axis: str,
+    style_context_snapshot: Any | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Resolve target roles from only current-page Yuzu affinity geometry.
+
+    Component membership deliberately excludes semantic role, text, position,
+    paint, source scale, fit state, and cache state.  Identity-incompatible
+    affinity catalogs are resolved independently.
+    """
+
+    role_ids = tuple(TARGET_FONT_AFFINITY_ROLE_IDS)
+    grouped: dict[tuple[str, str, str, str, str], list[str]] = {}
+    valid_scores: dict[str, np.ndarray] = {}
+    for bundle_id in sorted(facts_by_bundle):
+        facts = facts_by_bundle[bundle_id]
+        affinity = facts.get("target_font_affinity")
+        if not isinstance(affinity, Mapping):
+            continue
+        raw_scores = affinity.get("role_scores")
+        if not isinstance(raw_scores, Mapping):
+            continue
+        try:
+            scores = np.asarray(
+                [float(raw_scores[role_id]) for role_id in role_ids],
+                dtype=np.float64,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            scores.shape != (len(role_ids),)
+            or not np.all(np.isfinite(scores))
+            or np.any(scores < 0.0)
+            or np.any(scores > 1.0)
+        ):
+            continue
+        identity = (
+            str(facts.get("page_id") or ""),
+            str(affinity.get("catalog_identity_sha256") or ""),
+            str(affinity.get("descriptor_policy_version") or ""),
+            str(affinity.get("model_identity") or ""),
+            str(affinity.get("label_catalog_version") or ""),
+        )
+        if not all(identity):
+            continue
+        grouped.setdefault(identity, []).append(bundle_id)
+        valid_scores[bundle_id] = scores
+
+    prior_records = _v3_target_font_prior_records(style_context_snapshot)
+    resolved: list[dict[str, Any]] = []
+    for identity in sorted(grouped):
+        member_ids = tuple(sorted(grouped[identity]))
+        affinities = np.stack(
+            [valid_scores[bundle_id] for bundle_id in member_ids],
+            axis=0,
+        )
+        centered = affinities - affinities.mean(axis=1, keepdims=True)
+        norms = np.linalg.norm(centered, axis=1, keepdims=True)
+        descriptors = centered / np.maximum(norms, 1e-12)
+        leading_roles = {
+            bundle_id: role_ids[int(np.argmax(affinities[index]))]
+            for index, bundle_id in enumerate(member_ids)
+        }
+        index_by_bundle = {
+            bundle_id: index
+            for index, bundle_id in enumerate(member_ids)
+        }
+        nearest: dict[str, set[str]] = {}
+        for bundle_id in member_ids:
+            left_index = index_by_bundle[bundle_id]
+            ranked = sorted(
+                (
+                    (
+                        float(
+                            np.dot(
+                                descriptors[left_index],
+                                descriptors[index_by_bundle[other_id]],
+                            )
+                        ),
+                        other_id,
+                    )
+                    for other_id in member_ids
+                    if other_id != bundle_id
+                ),
+                key=lambda item: (-item[0], item[1]),
+            )
+            nearest[bundle_id] = {
+                other_id
+                for similarity, other_id in ranked[
+                    :_V3_TARGET_FONT_NEIGHBOR_COUNT
+                ]
+                if similarity > 0.0
+            }
+
+        parent = {bundle_id: bundle_id for bundle_id in member_ids}
+
+        def find(bundle_id: str) -> str:
+            while parent[bundle_id] != bundle_id:
+                parent[bundle_id] = parent[parent[bundle_id]]
+                bundle_id = parent[bundle_id]
+            return bundle_id
+
+        def union(left_id: str, right_id: str) -> None:
+            left_root = find(left_id)
+            right_root = find(right_id)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for offset, left_id in enumerate(member_ids):
+            for right_id in member_ids[offset + 1 :]:
+                same_numeric_weight = (
+                    _V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[
+                        leading_roles[left_id]
+                    ]
+                    == _V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[
+                        leading_roles[right_id]
+                    ]
+                )
+                reciprocal_neighbor = (
+                    right_id in nearest[left_id]
+                    and left_id in nearest[right_id]
+                )
+                if same_numeric_weight or reciprocal_neighbor:
+                    union(left_id, right_id)
+
+        components_by_root: dict[str, list[str]] = {}
+        for bundle_id in member_ids:
+            components_by_root.setdefault(find(bundle_id), []).append(
+                bundle_id
+            )
+        components = sorted(
+            (
+                tuple(sorted(component_ids))
+                for component_ids in components_by_root.values()
+            ),
+            key=lambda component_ids: component_ids[0],
+        )
+        for component_ids in components:
+            component_indices = [
+                index_by_bundle[bundle_id]
+                for bundle_id in component_ids
+            ]
+            current_pooled = affinities[component_indices].mean(axis=0)
+            current_family_scores = {"sans": 0.0, "serif": 0.0}
+            for bundle_id in component_ids:
+                family_probabilities = (
+                    _v3_target_font_family_probabilities(
+                        facts_by_bundle[bundle_id].get(
+                            "family_posterior"
+                        )
+                    )
+                )
+                if family_probabilities is None:
+                    current_family_scores[
+                        _V3_TARGET_FONT_ROLE_FAMILY[
+                            leading_roles[bundle_id]
+                        ]
+                    ] += 1.0
+                else:
+                    current_family_scores["sans"] += family_probabilities[0]
+                    current_family_scores["serif"] += family_probabilities[1]
+            current_family = max(
+                ("sans", "serif"),
+                key=lambda item: (current_family_scores[item], item),
+            )
+            current_role = max(
+                _V3_TARGET_FONT_FAMILY_ROLES[current_family],
+                key=lambda item: (
+                    float(current_pooled[role_ids.index(item)]),
+                    -_V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[item],
+                    item,
+                ),
+            )
+            numeric_weight = _V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[
+                current_role
+            ]
+            compatible_prior = tuple(
+                record
+                for record in prior_records
+                if (
+                    tuple(record["catalog_identity"])
+                    == identity[1:]
+                    and int(record["numeric_weight"]) == numeric_weight
+                )
+            )
+            prior_effective_weight = min(
+                len(compatible_prior),
+                len(component_ids),
+            )
+            pooled = current_pooled
+            family_scores = dict(current_family_scores)
+            family = current_family
+            role = current_role
+            if prior_effective_weight > 0:
+                prior_role_mean = np.stack(
+                    [
+                        record["role_scores"]
+                        for record in compatible_prior
+                    ],
+                    axis=0,
+                ).mean(axis=0)
+                current_weight = float(len(component_ids))
+                prior_weight = float(prior_effective_weight)
+                pooled = (
+                    current_pooled * current_weight
+                    + prior_role_mean * prior_weight
+                ) / (current_weight + prior_weight)
+                prior_family_mean = np.asarray(
+                    [
+                        (
+                            float(record["family_probabilities"][0]),
+                            float(record["family_probabilities"][1]),
+                        )
+                        for record in compatible_prior
+                    ],
+                    dtype=np.float64,
+                ).mean(axis=0)
+                family_scores = {
+                    "sans": (
+                        float(current_family_scores["sans"])
+                        + float(prior_family_mean[0]) * prior_weight
+                    ),
+                    "serif": (
+                        float(current_family_scores["serif"])
+                        + float(prior_family_mean[1]) * prior_weight
+                    ),
+                }
+                candidate_family = max(
+                    ("sans", "serif"),
+                    key=lambda item: (family_scores[item], item),
+                )
+                same_weight_roles = tuple(
+                    role_id
+                    for role_id in _V3_TARGET_FONT_FAMILY_ROLES[
+                        candidate_family
+                    ]
+                    if _V3_TARGET_FONT_ROLE_NUMERIC_WEIGHT[role_id]
+                    == numeric_weight
+                )
+                if same_weight_roles:
+                    family = candidate_family
+                    role = max(
+                        same_weight_roles,
+                        key=lambda item: (
+                            float(pooled[role_ids.index(item)]),
+                            item,
+                        ),
+                    )
+            component_identity = {
+                "page_id": identity[0],
+                "catalog_identity_sha256": identity[1],
+                "descriptor_policy_version": identity[2],
+                "model_identity": identity[3],
+                "label_catalog_version": identity[4],
+                "member_bundle_ids": component_ids,
+            }
+            component_digest = hashlib.sha256(
+                json.dumps(
+                    component_identity,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            resolved.append(
+                {
+                    "page_id": identity[0],
+                    "member_bundle_ids": component_ids,
+                    "target_font_component_id": (
+                        f"target-font-component-v1:{component_digest}"
+                    ),
+                    "target_font_family": family,
+                    "target_font_role": role,
+                    "target_font_numeric_weight": numeric_weight,
+                    "current_page_target_font_family": current_family,
+                    "current_page_target_font_role": current_role,
+                    "current_page_pooled_role_affinities": {
+                        role_id: float(current_pooled[index])
+                        for index, role_id in enumerate(role_ids)
+                    },
+                    "current_page_pooled_family_scores": (
+                        current_family_scores
+                    ),
+                    "pooled_role_affinities": {
+                        role_id: float(pooled[index])
+                        for index, role_id in enumerate(role_ids)
+                    },
+                    "pooled_family_scores": family_scores,
+                    "prior_cache_compatible_record_count": len(
+                        compatible_prior
+                    ),
+                    "prior_cache_effective_weight": prior_effective_weight,
+                    "prior_cache_donor_bundle_ids": tuple(
+                        str(record["bundle_id"])
+                        for record in compatible_prior
+                    ),
+                    "prior_cache_donor_page_ids": tuple(
+                        sorted(
+                            {
+                                str(record["page_id"])
+                                for record in compatible_prior
+                            }
+                        )
+                    ),
+                    "prior_cache_snapshot_id": (
+                        str(
+                            getattr(
+                                style_context_snapshot,
+                                "snapshot_id",
+                                "",
+                            )
+                            or ""
+                        )
+                        if prior_effective_weight > 0
+                        else ""
+                    ),
+                }
+            )
+    return tuple(resolved)
+
+
+def _v3_apply_current_page_target_font_components(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+    style_context_snapshot: Any | None = None,
+) -> None:
+    for component in _v3_target_font_components(
+        facts_by_bundle,
+        style_context_snapshot=style_context_snapshot,
+    ):
+        member_ids = tuple(component["member_bundle_ids"])
+        family = str(component["target_font_family"])
+        role = str(component["target_font_role"])
+        numeric_weight = int(component["target_font_numeric_weight"])
+        pooled_role_affinities = dict(
+            component["pooled_role_affinities"]
+        )
+        pooled_family_scores = dict(component["pooled_family_scores"])
+        component_support = {
+            "target_font_component_id": str(
+                component["target_font_component_id"]
+            ),
+            "target_font_role": role,
+            "target_font_numeric_weight": numeric_weight,
+            "member_bundle_ids": member_ids,
+            "pooled_role_affinities": pooled_role_affinities,
+            "pooled_family_scores": pooled_family_scores,
+            "current_page_target_font_family": str(
+                component["current_page_target_font_family"]
+            ),
+            "current_page_target_font_role": str(
+                component["current_page_target_font_role"]
+            ),
+            "current_page_pooled_role_affinities": dict(
+                component["current_page_pooled_role_affinities"]
+            ),
+            "current_page_pooled_family_scores": dict(
+                component["current_page_pooled_family_scores"]
+            ),
+            "prior_cache_compatible_record_count": int(
+                component["prior_cache_compatible_record_count"]
+            ),
+            "prior_cache_effective_weight": int(
+                component["prior_cache_effective_weight"]
+            ),
+            "prior_cache_donor_bundle_ids": tuple(
+                component["prior_cache_donor_bundle_ids"]
+            ),
+            "prior_cache_donor_page_ids": tuple(
+                component["prior_cache_donor_page_ids"]
+            ),
+            "prior_cache_snapshot_id": str(
+                component["prior_cache_snapshot_id"]
+            ),
+        }
+        family_total = float(sum(pooled_family_scores.values()))
+        family_confidence = (
+            float(pooled_family_scores[family]) / family_total
+            if family_total > 0.0
+            else 0.0
+        )
+        role_confidence = float(pooled_role_affinities[role])
+        for bundle_id in member_ids:
+            decisions = decisions_by_bundle[bundle_id]
+            decisions["family"] = _v3_axis_decision(
+                axis="family",
+                value=family,
+                status="peer",
+                confidence=family_confidence,
+                provenance=(
+                    "parent_style_arbitrator_v3:"
+                    "current_page_target_font_component"
+                ),
+                reason_codes=(
+                    "typed_yuzu_target_font_affinity",
+                    "component_pooled_target_family",
+                    *(
+                        ("compatible_prior_prefix_target_affinity",)
+                        if int(
+                            component[
+                                "prior_cache_effective_weight"
+                            ]
+                        )
+                        > 0
+                        else ()
+                    ),
+                ),
+                peer_support=component_support,
+            )
+            decisions["weight"] = _v3_axis_decision(
+                axis="weight",
+                value=_V3_TARGET_FONT_WEIGHT_COMPATIBILITY_ALIAS[role],
+                status="peer",
+                confidence=role_confidence,
+                provenance=(
+                    "parent_style_arbitrator_v3:"
+                    "current_page_target_font_component"
+                ),
+                reason_codes=(
+                    "typed_yuzu_target_font_affinity",
+                    "component_pooled_registered_target_role",
+                    f"target_font_role:{role}",
+                    *(
+                        ("compatible_prior_prefix_target_affinity",)
+                        if int(
+                            component[
+                                "prior_cache_effective_weight"
+                            ]
+                        )
+                        > 0
+                        else ()
+                    ),
+                ),
+                peer_support=component_support,
+            )
+
+
+def _v3_apply_family_axis(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+    style_context_snapshot: Any | None,
+) -> None:
+    """Resolve only family, in the architecture-defined evidence order."""
+
+    _v3_apply_current_page_family_cohorts(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+    )
+    _v3_apply_prior_page_family_cache(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+        style_context_snapshot=style_context_snapshot,
+    )
+
+
+def _v3_apply_current_page_family_cohorts(
+    *,
     facts_by_bundle: Mapping[str, Mapping[str, Any]],
     decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
 ) -> None:
     updates: dict[str, ParentStyleAxisDecisionV3] = {}
     for target_id in sorted(facts_by_bundle):
-        if axis in decisions_by_bundle[target_id]:
+        if "family" in decisions_by_bundle[target_id]:
             continue
         target = facts_by_bundle[target_id]
-        if axis == "weight" and bool(target["weight_reliable_unclassified"]):
+        target_candidate = _v3_family_candidate_fact(
+            facts=target,
+            decision=decisions_by_bundle[target_id].get("family"),
+        )
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        for member_id in sorted(facts_by_bundle):
+            member = facts_by_bundle[member_id]
+            if member["page_id"] != target["page_id"]:
+                continue
+            candidate = _v3_family_candidate_fact(
+                facts=member,
+                decision=decisions_by_bundle[member_id].get("family"),
+            )
+            if candidate is None:
+                continue
+            if member_id != target_id and not _v3_family_facts_are_compatible(
+                target,
+                member,
+            ):
+                continue
+            candidates.append((member_id, candidate))
+
+        values = {str(candidate["value"]) for _, candidate in candidates}
+        if len(values) > 1:
+            _v3_add_family_resolution_reason(
+                facts_by_bundle,
+                target_id,
+                "family_candidate_cohort_conflict",
+            )
             continue
-        donors: list[str] = []
+        if not candidates:
+            _v3_add_family_resolution_reason(
+                facts_by_bundle,
+                target_id,
+                "family_candidate_cohort_insufficient",
+            )
+            continue
+
+        cluster_ids = _v3_maximum_pairwise_family_cluster(
+            candidate_ids=[member_id for member_id, _ in candidates],
+            facts_by_id=facts_by_bundle,
+        )
+        candidate_by_id = dict(candidates)
+        if target_candidate is not None:
+            eligible = target_id in cluster_ids and len(cluster_ids) >= 2
+        else:
+            eligible = bool(
+                len(cluster_ids) >= PEER_MINIMUM_DONOR_COUNT
+                and all(
+                    candidate_by_id[member_id]["source"] == "direct"
+                    for member_id in cluster_ids
+                )
+            )
+        if not eligible:
+            _v3_add_family_resolution_reason(
+                facts_by_bundle,
+                target_id,
+                "family_candidate_cohort_insufficient",
+            )
+            continue
+
+        selected = [candidate_by_id[member_id] for member_id in cluster_ids]
+        value = str(selected[0]["value"])
+        if any(str(item["value"]) != value for item in selected):
+            _v3_add_family_resolution_reason(
+                facts_by_bundle,
+                target_id,
+                "family_candidate_cohort_conflict",
+            )
+            continue
+        updates[target_id] = _v3_axis_decision(
+            axis="family",
+            value=value,
+            status="peer",
+            confidence=float(np.mean([item["confidence"] for item in selected])),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "current_page_family_candidate_consensus"
+            ),
+            reason_codes=("current_page_family_candidate_consensus",),
+            peer_support={
+                "evidence_source": "current_page_cohort",
+                "page_id": str(target["page_id"]),
+                "member_bundle_ids": cluster_ids,
+                "member_count": len(cluster_ids),
+                "member_sources": {
+                    member_id: str(candidate_by_id[member_id]["source"])
+                    for member_id in cluster_ids
+                },
+            },
+        )
+    for bundle_id, decision in updates.items():
+        decisions_by_bundle[bundle_id]["family"] = decision
+
+
+def _v3_family_candidate_fact(
+    *,
+    facts: Mapping[str, Any],
+    decision: ParentStyleAxisDecisionV3 | None,
+) -> dict[str, Any] | None:
+    if (
+        decision is not None
+        and decision.status == "direct"
+        and decision.value in {"sans", "serif"}
+        and decision.confidence >= V3_PEER_DONOR_MIN_CONFIDENCE
+    ):
+        return {
+            "value": str(decision.value),
+            "confidence": float(decision.confidence),
+            "source": "direct",
+        }
+    posterior = facts.get("family_posterior")
+    if not isinstance(posterior, Mapping) or not bool(posterior.get("reliable")):
+        return None
+    value = str(posterior.get("leading_family") or "")
+    confidence = _unit_interval(posterior.get("leading_probability"))
+    if value not in {"sans", "serif"} or confidence is None:
+        return None
+    return {
+        "value": value,
+        "confidence": float(confidence),
+        "source": "unpromoted_candidate",
+    }
+
+
+def _v3_family_facts_are_compatible(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+) -> bool:
+    if (
+        first["semantic_role_class"] != second["semantic_role_class"]
+        or not bool(first["writing_mode_reliable"])
+        or not bool(second["writing_mode_reliable"])
+        or first["writing_mode"] != second["writing_mode"]
+        or first["paint_signature"] is None
+        or second["paint_signature"] is None
+        or first["paint_signature"] != second["paint_signature"]
+        or _v3_has_fragmented_cell_population_scale_fact(first)
+        or _v3_has_fragmented_cell_population_scale_fact(second)
+    ):
+        return False
+    return bool(
+        _v3_intervals_are_compatible(
+            first.get("weight_interval"),
+            second.get("weight_interval"),
+        )
+        and _v3_intervals_are_compatible(
+            first.get("scale_interval"),
+            second.get("scale_interval"),
+        )
+    )
+
+
+def _v3_maximum_pairwise_family_cluster(
+    *,
+    candidate_ids: Sequence[str],
+    facts_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    ordered = sorted(set(str(item) for item in candidate_ids if item))
+    clusters: list[tuple[str, ...]] = []
+    for seed in ordered:
+        cluster = [seed]
+        for candidate in ordered:
+            if candidate == seed:
+                continue
+            if all(
+                _v3_family_facts_are_compatible(
+                    facts_by_id[member],
+                    facts_by_id[candidate],
+                )
+                for member in cluster
+            ):
+                cluster.append(candidate)
+        clusters.append(tuple(sorted(cluster)))
+    if not clusters:
+        return []
+    maximum = max(len(cluster) for cluster in clusters)
+    return list(sorted(set(cluster for cluster in clusters if len(cluster) == maximum))[0])
+
+
+def _v3_add_family_resolution_reason(
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    bundle_id: str,
+    reason: str,
+) -> None:
+    facts = facts_by_bundle.get(bundle_id)
+    if not isinstance(facts, dict):
+        return
+    facts["family_resolution_reasons"] = tuple(
+        _unique_strings(
+            [
+                *tuple(facts.get("family_resolution_reasons") or ()),
+                str(reason or ""),
+            ]
+        )
+    )
+
+
+def _v3_apply_prior_page_family_cache(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+    style_context_snapshot: Any | None,
+) -> None:
+    prefix_page_ids = tuple(
+        str(item)
+        for item in tuple(
+            getattr(style_context_snapshot, "prefix_page_ids", ()) or ()
+        )
+        if str(item)
+    )
+    records = tuple(getattr(style_context_snapshot, "records", ()) or ())
+    if not prefix_page_ids or not records:
+        return
+    prefix = set(prefix_page_ids)
+    cache_facts: dict[str, dict[str, Any]] = {}
+    duplicate_keys: set[str] = set()
+    for record in records:
+        page_id = str(getattr(record, "page_id", "") or "")
+        bundle_id = str(getattr(record, "bundle_id", "") or "")
+        if not page_id or page_id not in prefix or not bundle_id:
+            continue
+        key = f"prior::{page_id}::{bundle_id}"
+        if key in cache_facts:
+            duplicate_keys.add(key)
+            continue
+        facts = _v3_cache_family_facts(record)
+        if facts is not None:
+            cache_facts[key] = facts
+    for key in duplicate_keys:
+        cache_facts.pop(key, None)
+    if not cache_facts:
+        return
+
+    updates: dict[str, ParentStyleAxisDecisionV3] = {}
+    for target_id in sorted(facts_by_bundle):
+        if "family" in decisions_by_bundle[target_id]:
+            continue
+        target = facts_by_bundle[target_id]
+        donor_ids = [
+            donor_id
+            for donor_id in sorted(cache_facts)
+            if _v3_family_facts_are_compatible(target, cache_facts[donor_id])
+        ]
+        if len(donor_ids) < PEER_MINIMUM_DONOR_COUNT:
+            continue
+        cluster_ids = _v3_maximum_pairwise_family_cluster(
+            candidate_ids=donor_ids,
+            facts_by_id=cache_facts,
+        )
+        if len(cluster_ids) < PEER_MINIMUM_DONOR_COUNT:
+            continue
+        values = {
+            str(cache_facts[donor_id]["family_decision"].value)
+            for donor_id in cluster_ids
+        }
+        if len(values) != 1:
+            _v3_add_family_resolution_reason(
+                facts_by_bundle,
+                target_id,
+                "prior_page_family_cache_conflict",
+            )
+            continue
+        value = next(iter(values))
+        posterior = target.get("family_posterior")
+        if (
+            isinstance(posterior, Mapping)
+            and bool(posterior.get("reliable"))
+            and str(posterior.get("leading_family") or "") != value
+        ):
+            _v3_add_family_resolution_reason(
+                facts_by_bundle,
+                target_id,
+                "prior_page_family_cache_conflicts_with_local_candidate",
+            )
+            continue
+        donor_decisions = [
+            cache_facts[donor_id]["family_decision"]
+            for donor_id in cluster_ids
+        ]
+        updates[target_id] = _v3_axis_decision(
+            axis="family",
+            value=value,
+            status="peer",
+            confidence=float(
+                np.mean([decision.confidence for decision in donor_decisions])
+            ),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "prior_page_family_cache_consensus"
+            ),
+            reason_codes=("prior_page_family_cache_consensus",),
+            peer_support={
+                "evidence_source": "prior_page_cache",
+                "donor_bundle_ids": [
+                    str(cache_facts[donor_id]["bundle_id"])
+                    for donor_id in cluster_ids
+                ],
+                "donor_page_ids": sorted(
+                    {
+                        str(cache_facts[donor_id]["page_id"])
+                        for donor_id in cluster_ids
+                    }
+                ),
+                "donor_count": len(cluster_ids),
+                "snapshot_id": str(
+                    getattr(style_context_snapshot, "snapshot_id", "") or ""
+                ),
+            },
+        )
+    for bundle_id, decision in updates.items():
+        decisions_by_bundle[bundle_id]["family"] = decision
+
+
+def _v3_cache_family_facts(
+    record: Any,
+    *,
+    require_paint: bool = True,
+) -> dict[str, Any] | None:
+    axis_items = tuple(getattr(record, "assist_axes", ()) or ()) + tuple(
+        getattr(record, "compatibility_axes", ()) or ()
+    )
+    grouped: dict[str, list[Any]] = {}
+    for item in axis_items:
+        axis = str(getattr(item, "axis", "") or "").strip().lower()
+        if axis:
+            grouped.setdefault(axis, []).append(item)
+    required_axes = ("family", "weight", "scale", "orientation")
+    if require_paint:
+        required_axes = (*required_axes, "fill", "outline")
+    if any(
+        len(grouped.get(axis, ())) != 1
+        for axis in required_axes
+    ):
+        return None
+
+    def evidence(axis: str) -> SourceStyleAxisEvidence:
+        item = grouped[axis][0]
+        return SourceStyleAxisEvidence(
+            axis=axis,
+            status="supported",
+            value=getattr(item, "value", {}) or {},
+            confidence=float(getattr(item, "confidence", 0.0) or 0.0),
+            provenance=str(getattr(item, "provenance", "") or ""),
+            support_identity={
+                "qualified_prior_page_support_identity_sha256": str(
+                    getattr(item, "support_identity_sha256", "") or ""
+                )
+            },
+            reason_codes=("qualified_prior_page_cache_axis",),
+        )
+
+    orientation = _v3_direct_orientation(evidence("orientation"))
+    if orientation is None:
+        return None
+    direction = "ltr" if orientation.value == "horizontal" else "ttb"
+    fill = (
+        _v3_direct_fill(evidence("fill"))
+        if len(grouped.get("fill", ())) == 1
+        else None
+    )
+    outline = (
+        _v3_direct_outline(evidence("outline"))
+        if len(grouped.get("outline", ())) == 1
+        else None
+    )
+    family = _v3_direct_family(evidence("family"))
+    weight_fact = _v3_weight_fact(evidence("weight"), direction=direction)
+    scale_fact = _v3_source_scale_fact(evidence("scale"), direction=direction)
+    paint_signature = _v3_paint_signature(fill=fill, outline=outline)
+    if (
+        family is None
+        or weight_fact is None
+        or scale_fact is None
+        or (require_paint and paint_signature is None)
+    ):
+        return None
+    return {
+        "page_id": str(getattr(record, "page_id", "") or ""),
+        "bundle_id": str(getattr(record, "bundle_id", "") or ""),
+        "parent_id": str(getattr(record, "parent_id", "") or ""),
+        "root_id": str(getattr(record, "root_id", "") or ""),
+        "semantic_role_class": _v3_semantic_role_class(record),
+        "writing_mode": str(orientation.value),
+        "writing_mode_reliable": True,
+        "family_decision": family,
+        "weight_fact": weight_fact,
+        "weight_interval": tuple(weight_fact["score_interval"]),
+        "source_scale_fact": scale_fact,
+        "scale_interval": tuple(scale_fact["interval"]),
+        "paint_signature": paint_signature,
+    }
+
+
+def _v3_apply_weight_axis(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+    style_context_snapshot: Any | None,
+) -> None:
+    """Resolve weight without allowing another axis to own a local fact."""
+
+    _v3_reconcile_current_page_direct_weight_conflicts(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+    )
+    _v3_apply_current_page_weight_cohorts(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+    )
+    _v3_apply_prior_page_weight_cache(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+        style_context_snapshot=style_context_snapshot,
+    )
+
+
+def _v3_reconcile_current_page_direct_weight_conflicts(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+) -> None:
+    """Reconcile one proven direct conflict without weakening local evidence.
+
+    A direction-neutral transition-gap decision is the only trigger.  The
+    compatible current-page cohort may replace its direct decisions only when
+    the intervals that actually supported those decisions have one non-empty
+    intersection wholly contained by one existing calibrated tier.
+    """
+
+    proposals: dict[
+        str,
+        list[
+            tuple[
+                str,
+                tuple[str, ...],
+                tuple[float, float],
+                tuple[str, ...],
+            ]
+        ],
+    ] = {}
+    for anchor_id in sorted(facts_by_bundle):
+        anchor_decision = decisions_by_bundle[anchor_id].get("weight")
+        if not _v3_is_transition_gap_direct_weight(anchor_decision):
+            continue
+        anchor = facts_by_bundle[anchor_id]
+        page_id = str(anchor["page_id"])
+        candidate_ids = [
+            bundle_id
+            for bundle_id in sorted(facts_by_bundle)
+            if (
+                str(facts_by_bundle[bundle_id]["page_id"]) == page_id
+                and (
+                    decision := decisions_by_bundle[bundle_id].get("weight")
+                )
+                is not None
+                and decision.status == "direct"
+                and decision.confidence >= V3_PEER_DONOR_MIN_CONFIDENCE
+                and _v3_weight_facts_are_compatible(
+                    anchor,
+                    facts_by_bundle[bundle_id],
+                )
+            )
+        ]
+        cohort_ids = _v3_unique_maximum_weight_compatibility_cluster(
+            candidate_ids=candidate_ids,
+            facts_by_bundle=facts_by_bundle,
+            required_member_id=anchor_id,
+        )
+        if len(cohort_ids) < PEER_MINIMUM_DONOR_COUNT:
+            continue
+        direct_values = tuple(
+            sorted(
+                {
+                    str(decisions_by_bundle[bundle_id]["weight"].value)
+                    for bundle_id in cohort_ids
+                }
+            )
+        )
+        if len(direct_values) < 2:
+            continue
+        intervals = [
+            _v3_effective_direct_weight_interval(
+                facts=facts_by_bundle[bundle_id],
+                decision=decisions_by_bundle[bundle_id]["weight"],
+            )
+            for bundle_id in cohort_ids
+        ]
+        if any(interval is None for interval in intervals):
+            continue
+        consensus = _v3_weight_consensus_bounds(
+            tuple(interval for interval in intervals if interval is not None)
+        )
+        tier = _v3_weight_tier_containing_consensus(consensus)
+        if not tier or tier not in direct_values or consensus is None:
+            continue
+        transition_ids = tuple(
+            bundle_id
+            for bundle_id in cohort_ids
+            if _v3_is_transition_gap_direct_weight(
+                decisions_by_bundle[bundle_id].get("weight")
+            )
+        )
+        proposal = (
+            tier,
+            tuple(cohort_ids),
+            tuple(float(value) for value in consensus),
+            transition_ids,
+        )
+        for bundle_id in cohort_ids:
+            proposals.setdefault(bundle_id, []).append(proposal)
+
+    updates: dict[str, ParentStyleAxisDecisionV3] = {}
+    for bundle_id in sorted(proposals):
+        unique = sorted(set(proposals[bundle_id]))
+        if len(unique) != 1:
+            continue
+        tier, cohort_ids, consensus, transition_ids = unique[0]
+        current = decisions_by_bundle[bundle_id].get("weight")
+        if current is None or current.status != "direct":
+            continue
+        cohort_decisions = [
+            decisions_by_bundle[member_id]["weight"]
+            for member_id in cohort_ids
+        ]
+        updates[bundle_id] = _v3_axis_decision(
+            axis="weight",
+            value=tier,
+            status="peer",
+            confidence=min(
+                float(decision.confidence)
+                for decision in cohort_decisions
+            ),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "current_page_direct_weight_interval_consensus"
+            ),
+            reason_codes=(
+                "weight_resolution_tier:current_page_direct_conflict",
+                "current_page_direct_weight_interval_consensus",
+                f"calibrated_normalized_weight_region:{tier}",
+            ),
+            peer_support={
+                "evidence_source": (
+                    "current_page_direct_weight_interval_consensus"
+                ),
+                "page_id": str(facts_by_bundle[bundle_id]["page_id"]),
+                "cohort_bundle_ids": cohort_ids,
+                "cohort_size": len(cohort_ids),
+                "transition_gap_bundle_ids": transition_ids,
+                "source_weight_consensus_interval": {
+                    "low": float(consensus[0]),
+                    "high": float(consensus[1]),
+                },
+                "observed_direct_values": sorted(
+                    {
+                        str(decision.value)
+                        for decision in cohort_decisions
+                    }
+                ),
+                "replaced_direct_value": str(current.value),
+                "replaced_direct_confidence": float(current.confidence),
+                "replaced_direct_provenance": current.provenance,
+            },
+        )
+    for bundle_id, decision in updates.items():
+        decisions_by_bundle[bundle_id]["weight"] = decision
+
+
+def _v3_is_transition_gap_direct_weight(
+    decision: ParentStyleAxisDecisionV3 | None,
+) -> bool:
+    return bool(
+        isinstance(decision, ParentStyleAxisDecisionV3)
+        and decision.axis == "weight"
+        and decision.status == "direct"
+        and "direction_neutral_transition_gap_resolved"
+        in tuple(decision.reason_codes)
+    )
+
+
+def _v3_effective_direct_weight_interval(
+    *,
+    facts: Mapping[str, Any],
+    decision: ParentStyleAxisDecisionV3,
+) -> tuple[float, float, float] | None:
+    weight_fact = facts.get("weight_fact")
+    if not isinstance(weight_fact, Mapping):
+        return None
+    interval = (
+        weight_fact.get("direction_neutral_score_interval")
+        if _v3_is_transition_gap_direct_weight(decision)
+        else facts.get("weight_interval")
+    )
+    bounds = _v3_weight_interval_bounds(interval)
+    if bounds is None or not _is_plain_sequence(interval):
+        return None
+    return tuple(float(value) for value in interval)
+
+
+def _v3_weight_tier_containing_consensus(
+    consensus: tuple[float, float] | None,
+) -> str:
+    if consensus is None:
+        return ""
+    low, high = [float(value) for value in consensus]
+    matches = [
+        tier
+        for tier, bounds in (
+            ("slender", V3_WEIGHT_SLENDER_SCORE_RANGE),
+            ("base", V3_WEIGHT_BASE_SCORE_RANGE),
+            ("heavy", V3_WEIGHT_HEAVY_SCORE_RANGE),
+        )
+        if low >= float(bounds[0]) and high <= float(bounds[1])
+    ]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _v3_unique_maximum_weight_compatibility_cluster(
+    *,
+    candidate_ids: Sequence[str],
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    required_member_id: str,
+) -> list[str]:
+    clusters: set[tuple[str, ...]] = set()
+    for seed in sorted(candidate_ids):
+        cluster = [seed]
+        for candidate in sorted(candidate_ids):
+            if candidate == seed:
+                continue
+            if all(
+                _v3_weight_facts_are_compatible(
+                    facts_by_bundle[member],
+                    facts_by_bundle[candidate],
+                )
+                for member in cluster
+            ):
+                cluster.append(candidate)
+        normalized = tuple(sorted(cluster))
+        if required_member_id in normalized:
+            clusters.add(normalized)
+    if not clusters:
+        return []
+    maximum = max(len(cluster) for cluster in clusters)
+    maxima = sorted(
+        cluster
+        for cluster in clusters
+        if len(cluster) == maximum
+    )
+    if len(maxima) != 1:
+        return []
+    return list(maxima[0])
+
+
+def _v3_apply_current_page_weight_cohorts(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+) -> None:
+    updates: dict[str, ParentStyleAxisDecisionV3] = {}
+    for target_id in sorted(facts_by_bundle):
+        target = facts_by_bundle[target_id]
+        if (
+            "weight" in decisions_by_bundle[target_id]
+            or bool(target["weight_reliable_unclassified"])
+        ):
+            continue
+        target_page_id = str(target["page_id"])
+        donor_ids: list[str] = []
         for donor_id in sorted(facts_by_bundle):
             if donor_id == target_id:
                 continue
-            donor_decision = decisions_by_bundle[donor_id].get(axis)
+            donor = facts_by_bundle[donor_id]
+            if str(donor["page_id"]) != target_page_id:
+                continue
+            donor_decision = decisions_by_bundle[donor_id].get("weight")
             if (
                 donor_decision is None
                 or donor_decision.status != "direct"
                 or donor_decision.confidence < V3_PEER_DONOR_MIN_CONFIDENCE
+                or not _v3_weight_facts_are_compatible(target, donor)
             ):
                 continue
-            if not _v3_peer_facts_are_compatible(
-                target,
-                facts_by_bundle[donor_id],
-                axis=axis,
-                decisions_by_bundle=decisions_by_bundle,
-                target_id=target_id,
-                donor_id=donor_id,
-            ):
-                continue
-            donors.append(donor_id)
-        selected = _v3_select_categorical_peer_cluster(
-            axis=axis,
-            donor_ids=donors,
-            facts_by_bundle=facts_by_bundle,
-            decisions_by_bundle=decisions_by_bundle,
+            donor_ids.append(donor_id)
+
+        selected = _v3_select_weight_cluster(
+            donor_ids=donor_ids,
+            facts_by_id=facts_by_bundle,
+            decision_for_id={
+                donor_id: decisions_by_bundle[donor_id]["weight"]
+                for donor_id in donor_ids
+            },
+            target_facts=target,
         )
         if len(selected) < PEER_MINIMUM_DONOR_COUNT:
             continue
-        donor_decisions = [decisions_by_bundle[item][axis] for item in selected]
-        value = donor_decisions[0].value
+        donor_decisions = [
+            decisions_by_bundle[donor_id]["weight"]
+            for donor_id in selected
+        ]
         updates[target_id] = _v3_axis_decision(
-            axis=axis,
-            value=value,
+            axis="weight",
+            value=donor_decisions[0].value,
             status="peer",
-            confidence=float(np.mean([item.confidence for item in donor_decisions])),
-            provenance="parent_style_arbitrator_v3:run_wide_axis_specific_peer",
-            reason_codes=(f"run_wide_{axis}_peer_consensus",),
-            peer_support={
-                "group_id": (
-                    f"run-wide:{axis}:{target['semantic_role_class']}:"
-                    f"{target['writing_mode']}"
+            confidence=float(
+                np.mean([decision.confidence for decision in donor_decisions])
+            ),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "current_page_weight_cohort_consensus"
+            ),
+            reason_codes=(
+                *(
+                    ("local_heavy_interval_overlaps_base",)
+                    if bool(
+                        target.get(
+                            "weight_interval_ambiguous_heavy_candidate"
+                        )
+                    )
+                    else ()
                 ),
+                "weight_resolution_tier:current_page_cohort",
+                "current_page_weight_cohort_consensus",
+            ),
+            peer_support={
+                "evidence_source": "current_page_cohort",
+                "page_id": target_page_id,
                 "donor_bundle_ids": selected,
                 "donor_count": len(selected),
             },
         )
     for bundle_id, decision in updates.items():
-        decisions_by_bundle[bundle_id][axis] = decision
+        decisions_by_bundle[bundle_id]["weight"] = decision
 
 
-def _v3_select_categorical_peer_cluster(
+def _v3_apply_prior_page_weight_cache(
     *,
-    axis: str,
-    donor_ids: Sequence[str],
     facts_by_bundle: Mapping[str, Mapping[str, Any]],
-    decisions_by_bundle: Mapping[str, Mapping[str, ParentStyleAxisDecisionV3]],
-) -> list[str]:
-    groups: dict[str, list[str]] = {}
-    for donor_id in donor_ids:
-        value = str(decisions_by_bundle[donor_id][axis].value)
-        groups.setdefault(value, []).append(donor_id)
-    if len(groups) != 1:
-        return []
-    candidates: list[list[str]] = []
-    for value in sorted(groups):
-        group = sorted(groups[value])
-        for seed in group:
-            cluster = [seed]
-            for candidate in group:
-                if candidate == seed:
-                    continue
-                if all(
-                    _v3_peer_facts_are_compatible(
-                        facts_by_bundle[member],
-                        facts_by_bundle[candidate],
-                        axis=axis,
-                        decisions_by_bundle=decisions_by_bundle,
-                        target_id=member,
-                        donor_id=candidate,
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+    style_context_snapshot: Any | None,
+) -> None:
+    prefix_page_ids, records = _v3_qualified_prior_snapshot_records(
+        style_context_snapshot
+    )
+    if not prefix_page_ids or not records:
+        return
+    prefix = set(prefix_page_ids)
+    cache_facts: dict[str, dict[str, Any]] = {}
+    duplicate_keys: set[str] = set()
+    for record in records:
+        page_id = str(getattr(record, "page_id", "") or "")
+        bundle_id = str(getattr(record, "bundle_id", "") or "")
+        if not page_id or page_id not in prefix or not bundle_id:
+            continue
+        key = f"prior::{page_id}::{bundle_id}"
+        if key in cache_facts:
+            duplicate_keys.add(key)
+            continue
+        facts = _v3_cache_weight_facts(record)
+        if facts is not None:
+            cache_facts[key] = facts
+    for key in duplicate_keys:
+        cache_facts.pop(key, None)
+    if not cache_facts:
+        return
+
+    updates: dict[str, ParentStyleAxisDecisionV3] = {}
+    for target_id in sorted(facts_by_bundle):
+        target = facts_by_bundle[target_id]
+        if (
+            "weight" in decisions_by_bundle[target_id]
+            or bool(target["weight_reliable_unclassified"])
+        ):
+            continue
+        donor_ids = [
+            donor_id
+            for donor_id in sorted(cache_facts)
+            if str(cache_facts[donor_id]["page_id"]) != str(target["page_id"])
+            and _v3_weight_facts_are_compatible(
+                target,
+                cache_facts[donor_id],
+            )
+        ]
+        selected = _v3_select_weight_cluster(
+            donor_ids=donor_ids,
+            facts_by_id=cache_facts,
+            decision_for_id={
+                donor_id: cache_facts[donor_id]["weight_decision"]
+                for donor_id in donor_ids
+            },
+            target_facts=target,
+        )
+        if len(selected) < PEER_MINIMUM_DONOR_COUNT:
+            continue
+        donor_decisions = [
+            cache_facts[donor_id]["weight_decision"]
+            for donor_id in selected
+        ]
+        updates[target_id] = _v3_axis_decision(
+            axis="weight",
+            value=donor_decisions[0].value,
+            status="peer",
+            confidence=float(
+                np.mean([decision.confidence for decision in donor_decisions])
+            ),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "prior_page_weight_cache_consensus"
+            ),
+            reason_codes=(
+                *(
+                    ("local_heavy_interval_overlaps_base",)
+                    if bool(
+                        target.get(
+                            "weight_interval_ambiguous_heavy_candidate"
+                        )
                     )
-                    for member in cluster
-                ):
-                    cluster.append(candidate)
-            candidates.append(sorted(cluster))
-    if not candidates:
-        return []
-    maximum = max(len(items) for items in candidates)
-    winners = sorted({tuple(items) for items in candidates if len(items) == maximum})
-    winning_values = {
-        str(decisions_by_bundle[items[0]][axis].value)
-        for items in winners
-        if items
+                    else ()
+                ),
+                "weight_resolution_tier:prior_page_cache",
+                "prior_page_weight_cache_consensus",
+            ),
+            peer_support={
+                "evidence_source": "prior_page_cache",
+                "donor_bundle_ids": [
+                    str(cache_facts[donor_id]["bundle_id"])
+                    for donor_id in selected
+                ],
+                "donor_page_ids": sorted(
+                    {
+                        str(cache_facts[donor_id]["page_id"])
+                        for donor_id in selected
+                    }
+                ),
+                "donor_count": len(selected),
+                "snapshot_id": str(
+                    getattr(style_context_snapshot, "snapshot_id", "") or ""
+                ),
+            },
+        )
+    for bundle_id, decision in updates.items():
+        decisions_by_bundle[bundle_id]["weight"] = decision
+
+
+def _v3_qualified_prior_snapshot_records(
+    style_context_snapshot: Any | None,
+) -> tuple[tuple[str, ...], tuple[Any, ...]]:
+    if style_context_snapshot is None:
+        return (), ()
+    prefix_page_ids = tuple(
+        str(item)
+        for item in tuple(
+            getattr(style_context_snapshot, "prefix_page_ids", ()) or ()
+        )
+        if str(item)
+    )
+    if (
+        not prefix_page_ids
+        or len(prefix_page_ids) != len(set(prefix_page_ids))
+        or int(getattr(style_context_snapshot, "page_index", -1))
+        != len(prefix_page_ids)
+    ):
+        return (), ()
+    committed_delta_ids = tuple(
+        str(item)
+        for item in tuple(
+            getattr(style_context_snapshot, "committed_delta_ids", ()) or ()
+        )
+        if str(item)
+    )
+    if len(committed_delta_ids) != len(prefix_page_ids):
+        return (), ()
+    return (
+        prefix_page_ids,
+        tuple(getattr(style_context_snapshot, "records", ()) or ()),
+    )
+
+
+def _v3_cache_weight_facts(record: Any) -> dict[str, Any] | None:
+    facts = _v3_cache_family_facts(record, require_paint=False)
+    if facts is None:
+        return None
+    weight_fact = facts.get("weight_fact")
+    weight = _v3_direct_weight(
+        weight_fact=weight_fact if isinstance(weight_fact, Mapping) else None,
+        punctuation_only=False,
+    )
+    if (
+        weight is None
+        or weight.status != "direct"
+        or weight.confidence < V3_PEER_DONOR_MIN_CONFIDENCE
+    ):
+        return None
+    result = dict(facts)
+    result["weight_decision"] = weight
+    result["direct_decisions"] = {
+        "family": result["family_decision"],
+        "weight": weight,
     }
-    if maximum < PEER_MINIMUM_DONOR_COUNT or len(winning_values) != 1:
+    return result
+
+
+def _v3_select_weight_cluster(
+    *,
+    donor_ids: Sequence[str],
+    facts_by_id: Mapping[str, Mapping[str, Any]],
+    decision_for_id: Mapping[str, ParentStyleAxisDecisionV3],
+    target_facts: Mapping[str, Any] | None = None,
+) -> list[str]:
+    values = {
+        str(decision_for_id[donor_id].value)
+        for donor_id in donor_ids
+        if donor_id in decision_for_id
+    }
+    if not values:
         return []
-    return list(winners[0])
+    if len(values) == 1:
+        return _v3_maximum_compatible_weight_cluster(
+            donor_ids=donor_ids,
+            facts_by_id=facts_by_id,
+        )
+
+    target_bounds = _v3_weight_interval_bounds(
+        target_facts.get("weight_interval")
+        if isinstance(target_facts, Mapping)
+        else None
+    )
+    if target_bounds is None:
+        return []
+
+    qualifying_clusters: list[list[str]] = []
+    for value in sorted(values):
+        value_donor_ids = [
+            donor_id
+            for donor_id in sorted(donor_ids)
+            if donor_id in decision_for_id
+            and str(decision_for_id[donor_id].value) == value
+        ]
+        cluster = _v3_maximum_compatible_weight_cluster(
+            donor_ids=value_donor_ids,
+            facts_by_id=facts_by_id,
+        )
+        if len(cluster) < PEER_MINIMUM_DONOR_COUNT:
+            continue
+        consensus_bounds = _v3_weight_consensus_bounds(
+            tuple(
+                facts_by_id[donor_id].get("weight_interval")
+                for donor_id in cluster
+            )
+        )
+        if (
+            consensus_bounds is not None
+            and max(target_bounds[0], consensus_bounds[0])
+            <= min(target_bounds[1], consensus_bounds[1])
+        ):
+            qualifying_clusters.append(cluster)
+    if len(qualifying_clusters) != 1:
+        return []
+    return qualifying_clusters[0]
+
+
+def _v3_maximum_compatible_weight_cluster(
+    *,
+    donor_ids: Sequence[str],
+    facts_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    clusters: list[tuple[str, ...]] = []
+    for seed in sorted(donor_ids):
+        cluster = [seed]
+        for candidate in sorted(donor_ids):
+            if candidate == seed:
+                continue
+            if all(
+                _v3_weight_facts_are_compatible(
+                    facts_by_id[member],
+                    facts_by_id[candidate],
+                )
+                for member in cluster
+            ):
+                cluster.append(candidate)
+        clusters.append(tuple(sorted(cluster)))
+    if not clusters:
+        return []
+    maximum = max(len(cluster) for cluster in clusters)
+    if maximum < PEER_MINIMUM_DONOR_COUNT:
+        return []
+    return list(
+        sorted(
+            set(cluster for cluster in clusters if len(cluster) == maximum)
+        )[0]
+    )
+
+
+def _v3_weight_consensus_bounds(
+    intervals: Sequence[Any],
+) -> tuple[float, float] | None:
+    bounds = [_v3_weight_interval_bounds(interval) for interval in intervals]
+    if any(item is None for item in bounds):
+        return None
+    valid_bounds = [item for item in bounds if item is not None]
+    if len(valid_bounds) < PEER_MINIMUM_DONOR_COUNT:
+        return None
+    low = max(item[0] for item in valid_bounds)
+    high = min(item[1] for item in valid_bounds)
+    return (low, high) if low <= high else None
+
+
+def _v3_weight_interval_bounds(
+    interval: Any,
+) -> tuple[float, float] | None:
+    if not _is_plain_sequence(interval) or len(interval) != 3:
+        return None
+    try:
+        low, median, high = [float(value) for value in interval]
+    except (TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(value) for value in (low, median, high))
+        or low > median
+        or median > high
+    ):
+        return None
+    return low, high
+
+
+def _v3_weight_facts_are_compatible(
+    target: Mapping[str, Any],
+    donor: Mapping[str, Any],
+) -> bool:
+    # Paint axes are independently resolved and cannot veto weight assistance.
+    if (
+        target["semantic_role_class"] != donor["semantic_role_class"]
+        or not bool(target["writing_mode_reliable"])
+        or not bool(donor["writing_mode_reliable"])
+        or target["writing_mode"] != donor["writing_mode"]
+        or _v3_has_fragmented_cell_population_scale_fact(target)
+        or _v3_has_fragmented_cell_population_scale_fact(donor)
+    ):
+        return False
+    target_family = _v3_weight_compatibility_family(target)
+    donor_family = _v3_weight_compatibility_family(donor)
+    if not target_family or target_family != donor_family:
+        return False
+    return _v3_intervals_are_compatible(
+        target.get("scale_interval"),
+        donor.get("scale_interval"),
+    )
+
+
+def _v3_weight_compatibility_family(facts: Mapping[str, Any]) -> str:
+    family_decision = facts.get("family_decision")
+    if not isinstance(family_decision, ParentStyleAxisDecisionV3):
+        direct = facts.get("direct_decisions")
+        if isinstance(direct, Mapping):
+            family_decision = direct.get("family")
+    if (
+        isinstance(family_decision, ParentStyleAxisDecisionV3)
+        and family_decision.value in {"sans", "serif"}
+    ):
+        return str(family_decision.value)
+    posterior = facts.get("family_posterior")
+    if isinstance(posterior, Mapping) and bool(posterior.get("reliable")):
+        family = str(posterior.get("leading_family") or "")
+        if family in {"sans", "serif"}:
+            return family
+    return ""
 
 
 def _v3_peer_facts_are_compatible(
@@ -2409,6 +4259,16 @@ def _v3_peer_facts_are_compatible(
         or target["paint_signature"] is None
         or donor["paint_signature"] is None
         or target["paint_signature"] != donor["paint_signature"]
+    ):
+        return False
+    target_fragmented_scale = (
+        _v3_has_fragmented_cell_population_scale_fact(target)
+    )
+    donor_fragmented_scale = (
+        _v3_has_fragmented_cell_population_scale_fact(donor)
+    )
+    if axis in {"family", "weight"} and (
+        target_fragmented_scale or donor_fragmented_scale
     ):
         return False
     if axis == "family":
@@ -2431,18 +4291,72 @@ def _v3_peer_facts_are_compatible(
         )
     if axis == "source_scale":
         for required_axis in ("family", "weight"):
-            target_decision = decisions_by_bundle[target_id].get(required_axis)
-            donor_decision = decisions_by_bundle[donor_id].get(required_axis)
-            if (
-                target_decision is None
-                or donor_decision is None
-                or target_decision.status not in {"direct", "peer"}
-                or donor_decision.status not in {"direct", "peer"}
-                or target_decision.value != donor_decision.value
+            if _v3_effective_target_role_for_scale(
+                axis=required_axis,
+                decisions_by_bundle=decisions_by_bundle,
+                bundle_id=target_id,
+            ) != _v3_effective_target_role_for_scale(
+                axis=required_axis,
+                decisions_by_bundle=decisions_by_bundle,
+                bundle_id=donor_id,
             ):
                 return False
-        return True
+        if not _v3_advisory_family_relation_matches_for_scale(target, donor):
+            return False
+        donor_weight = donor.get("weight_interval")
+        if target_fragmented_scale:
+            if donor_weight is None:
+                return False
+            target_weight = target.get("weight_interval")
+            return bool(
+                target_weight is None
+                or _v3_intervals_are_compatible(target_weight, donor_weight)
+            )
+        return _v3_intervals_are_compatible(
+            target.get("weight_interval"), donor_weight
+        )
     return False
+
+
+def _v3_has_fragmented_cell_population_scale_fact(
+    facts: Mapping[str, Any],
+) -> bool:
+    fact = facts.get("source_scale_fact")
+    return bool(
+        isinstance(fact, Mapping)
+        and "source_scale_fragmented_cell_population_proven"
+        in tuple(fact.get("reason_codes") or ())
+    )
+
+
+def _v3_effective_target_role_for_scale(
+    *,
+    axis: str,
+    decisions_by_bundle: Mapping[
+        str, Mapping[str, ParentStyleAxisDecisionV3]
+    ],
+    bundle_id: str,
+) -> str:
+    decision = decisions_by_bundle[bundle_id].get(axis)
+    if decision is not None and decision.status in {"direct", "peer"}:
+        return str(decision.value)
+    return {"family": "sans", "weight": "base"}[axis]
+
+
+def _v3_advisory_family_relation_matches_for_scale(
+    target: Mapping[str, Any], donor: Mapping[str, Any]
+) -> bool:
+    """Use the unpromoted family relation only to veto unlike scale peers."""
+
+    target_posterior = target.get("family_posterior")
+    donor_posterior = donor.get("family_posterior")
+    if not isinstance(target_posterior, Mapping) or not isinstance(
+        donor_posterior, Mapping
+    ):
+        return False
+    target_family = str(target_posterior.get("leading_family") or "")
+    donor_family = str(donor_posterior.get("leading_family") or "")
+    return bool(target_family and target_family == donor_family)
 
 
 def _v3_intervals_are_compatible(first: Any, second: Any) -> bool:
@@ -2476,6 +4390,10 @@ def _v3_apply_source_scale_peer_axis(
     updates: dict[str, ParentStyleAxisDecisionV3] = {}
     for target_id in sorted(facts_by_bundle):
         if "source_scale" in decisions_by_bundle[target_id]:
+            continue
+        if not isinstance(
+            facts_by_bundle[target_id].get("source_scale_fact"), Mapping
+        ):
             continue
         donors: list[str] = []
         for donor_id in sorted(facts_by_bundle):
@@ -2539,11 +4457,14 @@ def _v3_apply_source_scale_peer_axis(
                     ]
                 )
             ),
-            provenance="parent_style_arbitrator_v3:run_wide_scale_median_mad",
-            reason_codes=("run_wide_source_scale_median_mad_consensus",),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "effective_target_role_scale_median_mad"
+            ),
+            reason_codes=("effective_target_role_source_scale_consensus",),
             peer_support={
                 "group_id": (
-                    "run-wide:source_scale:"
+                    "run-wide:source_scale:effective-target-role:"
                     f"{facts_by_bundle[target_id]['semantic_role_class']}:"
                     f"{facts_by_bundle[target_id]['writing_mode']}"
                 ),
@@ -2557,15 +4478,84 @@ def _v3_apply_source_scale_peer_axis(
         decisions_by_bundle[bundle_id]["source_scale"] = decision
 
 
+def _v3_apply_low_confidence_local_source_scale(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
+) -> None:
+    for bundle_id in sorted(facts_by_bundle):
+        decisions = decisions_by_bundle[bundle_id]
+        if "source_scale" in decisions:
+            continue
+        fact = facts_by_bundle[bundle_id].get("source_scale_fact")
+        if not isinstance(fact, Mapping):
+            continue
+        p20, median, p80 = [float(value) for value in fact["interval"]]
+        decisions["source_scale"] = _v3_axis_decision(
+            axis="source_scale",
+            value={"p20_px": p20, "median_px": median, "p80_px": p80},
+            status="fallback",
+            confidence=float(fact["confidence"]),
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "low_confidence_local_source_scale_fallback"
+            ),
+            reason_codes=(
+                *tuple(fact.get("reason_codes") or ()),
+                "peer_unavailable_low_confidence_local_scale_retained",
+            ),
+        )
+
+
 def _v3_apply_axis_fallbacks(
     *,
     facts: Mapping[str, Any],
     decisions: dict[str, ParentStyleAxisDecisionV3],
 ) -> None:
     reasons = tuple(facts.get("identity_reason_codes") or ())
+    if "family" not in decisions:
+        family_reasons = tuple(facts.get("family_resolution_reasons") or ())
+        decisions["family"] = _v3_axis_decision(
+            axis="family",
+            value=_v3_calibrated_target_family_fallback(facts),
+            status="fallback",
+            confidence=0.0,
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "calibrated_target_family_fallback"
+            ),
+            reason_codes=(
+                *reasons,
+                *family_reasons,
+                "family_calibrated_target_fallback",
+            ),
+        )
+    if "weight" not in decisions:
+        decisions["weight"] = _v3_axis_decision(
+            axis="weight",
+            value="base",
+            status="fallback",
+            confidence=0.0,
+            provenance=(
+                "parent_style_arbitrator_v3:"
+                "calibrated_target_weight_fallback"
+            ),
+            reason_codes=(
+                *reasons,
+                *(
+                    ("local_heavy_interval_overlaps_base",)
+                    if bool(
+                        facts.get(
+                            "weight_interval_ambiguous_heavy_candidate"
+                        )
+                    )
+                    else ()
+                ),
+                "weight_resolution_tier:calibrated_target_fallback",
+                "weight_calibrated_target_fallback",
+            ),
+        )
     fallback_values: dict[str, Any] = {
-        "family": "sans",
-        "weight": "base",
         "source_scale": None,
         "fill": {"color": "#000000", "polarity": "dark"},
         "outline": (
@@ -2605,6 +4595,13 @@ def _v3_apply_axis_fallbacks(
             provenance=f"parent_style_arbitrator_v3:{axis}_unavailable",
             reason_codes=(*reasons, f"{axis}_evidence_unavailable"),
         )
+
+
+def _v3_calibrated_target_family_fallback(facts: Mapping[str, Any]) -> str:
+    role_class = str(facts.get("semantic_role_class") or "").strip().lower()
+    if role_class in {"background", "caption", "narration"}:
+        return "serif"
+    return "sans"
 
 
 def _v3_axis_decision(
@@ -2684,6 +4681,269 @@ class ParentFontDetectionRunResult:
         }
 
 
+def _source_font_candidate_descriptors(
+    label: Mapping[str, Any],
+) -> dict[str, Any]:
+    descriptors: dict[str, Any] = {}
+    path = str(label.get("path") or "")
+    language = str(label.get("language") or "")
+    if path:
+        descriptors["path"] = path
+    if language:
+        descriptors["language"] = language
+    if isinstance(label.get("serif"), bool):
+        descriptors["serif"] = bool(label["serif"])
+    return descriptors
+
+
+def _source_font_label_catalog_version(
+    labels: Sequence[Mapping[str, Any]],
+    *,
+    label_count: int | None = None,
+) -> str:
+    resolved_label_count = (
+        int(label_count) if label_count is not None else len(labels)
+    )
+    if resolved_label_count <= 0:
+        raise ValueError("source-font label catalog must be non-empty")
+    payload = [
+        {
+            "class_index": index,
+            "descriptors": _source_font_candidate_descriptors(
+                _label_at(labels, index)
+            ),
+        }
+        for index in range(resolved_label_count)
+    ]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return "yuzumarker_label_catalog_sha256:" + hashlib.sha256(
+        encoded
+    ).hexdigest()
+
+
+def _source_font_label_identity(
+    *,
+    catalog_version: str,
+    class_index: int,
+    descriptors: Mapping[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {
+            "catalog_version": str(catalog_version),
+            "class_index": int(class_index),
+            "descriptors": dict(descriptors),
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return "yuzumarker_label:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _build_source_font_score_support(
+    probabilities: Any,
+    labels: Sequence[Mapping[str, Any]],
+    *,
+    catalog_version: str,
+) -> SourceFontScoreSupportV1:
+    values = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    if values.size <= 0:
+        raise ValueError("source-font scores must be non-empty")
+    values = np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
+    total = float(values.sum())
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("source-font scores must contain positive finite mass")
+    values = values / total
+
+    indices = np.arange(values.size, dtype=np.int64)
+    ordered = np.lexsort((indices, -values))
+    cumulative = np.cumsum(values[ordered], dtype=np.float64)
+    required_count = int(
+        np.searchsorted(
+            cumulative,
+            SOURCE_FONT_RETAINED_MASS_FLOOR,
+            side="left",
+        )
+        + 1
+    )
+    candidate_ceiling = min(
+        SOURCE_FONT_CANDIDATE_CEILING,
+        int(values.size),
+    )
+    retained_count = min(required_count, candidate_ceiling)
+    retained_indices = ordered[:retained_count]
+    candidates = []
+    for raw_index in retained_indices:
+        class_index = int(raw_index)
+        descriptors = _source_font_candidate_descriptors(
+            _label_at(labels, class_index)
+        )
+        candidates.append(
+            SourceFontCandidate(
+                catalog_version=catalog_version,
+                class_index=class_index,
+                label_identity=_source_font_label_identity(
+                    catalog_version=catalog_version,
+                    class_index=class_index,
+                    descriptors=descriptors,
+                ),
+                normalized_model_score=float(values[class_index]),
+                descriptors=descriptors,
+            )
+        )
+    retained_mass = math.fsum(
+        item.normalized_model_score for item in candidates
+    )
+    residual_mass = max(0.0, min(1.0, 1.0 - retained_mass))
+    positive = values[values > 0.0]
+    normalized_entropy = (
+        float(
+            -np.sum(positive * np.log(positive))
+            / math.log(float(values.size))
+        )
+        if values.size > 1
+        else 0.0
+    )
+    margin = float(
+        values[ordered[0]] - values[ordered[1]]
+        if values.size > 1
+        else values[ordered[0]]
+    )
+    return SourceFontScoreSupportV1(
+        catalog_version=catalog_version,
+        label_count=int(values.size),
+        retained_mass_floor=SOURCE_FONT_RETAINED_MASS_FLOOR,
+        candidate_ceiling=candidate_ceiling,
+        candidates=tuple(candidates),
+        retained_mass=retained_mass,
+        residual_mass=residual_mass,
+        status=(
+            SOURCE_FONT_SUPPORT_FLOOR_MET
+            if required_count <= candidate_ceiling
+            else SOURCE_FONT_SUPPORT_TRUNCATED
+        ),
+        normalized_entropy=max(0.0, min(1.0, normalized_entropy)),
+        margin=max(0.0, min(1.0, margin)),
+    )
+
+
+@dataclass(frozen=True)
+class _TargetFontAffinityCatalog:
+    """Process-local Yuzu descriptors for the installed automatic roles."""
+
+    identity_sha256: str
+    role_probe_vectors: np.ndarray
+    role_records: tuple[Mapping[str, Any], ...]
+
+
+_TARGET_FONT_AFFINITY_CATALOG_CACHE: dict[
+    str,
+    _TargetFontAffinityCatalog,
+] = {}
+_TARGET_FONT_AFFINITY_CATALOG_ERROR_CACHE: dict[str, str] = {}
+_TARGET_FONT_AFFINITY_CATALOG_LOCK = threading.RLock()
+_TARGET_FONT_FILE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _target_font_file_sha256(path: str) -> str:
+    normalized = os.path.abspath(str(path or ""))
+    stat = os.stat(normalized)
+    key = (normalized, int(stat.st_size), int(stat.st_mtime_ns))
+    with _TARGET_FONT_AFFINITY_CATALOG_LOCK:
+        cached = _TARGET_FONT_FILE_SHA256_CACHE.get(key)
+    if cached:
+        return cached
+    digest = hashlib.sha256()
+    with open(normalized, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    with _TARGET_FONT_AFFINITY_CATALOG_LOCK:
+        _TARGET_FONT_FILE_SHA256_CACHE[key] = value
+    return value
+
+
+def _target_font_affinity_descriptor(logits: Any) -> np.ndarray:
+    values = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if values.size != FONT_COUNT or not np.all(np.isfinite(values)):
+        raise ValueError("target-font affinity requires complete finite logits")
+    scaled = values / TARGET_FONT_AFFINITY_TEMPERATURE
+    scaled -= float(scaled.max())
+    exponent = np.exp(scaled)
+    denominator = float(exponent.sum())
+    if denominator <= 0.0 or not math.isfinite(denominator):
+        raise ValueError("target-font affinity softmax is invalid")
+    descriptor = np.sqrt(exponent / denominator)
+    norm = float(np.linalg.norm(descriptor))
+    if norm <= 0.0 or not math.isfinite(norm):
+        raise ValueError("target-font affinity descriptor is empty")
+    return np.asarray(descriptor / norm, dtype=np.float32)
+
+
+def _draw_target_probe_glyph(
+    draw: Any,
+    *,
+    center_x: float,
+    center_y: float,
+    glyph: str,
+    font: Any,
+) -> None:
+    bbox = draw.textbbox((0, 0), glyph, font=font)
+    x = float(center_x) - (float(bbox[0]) + float(bbox[2])) * 0.5
+    y = float(center_y) - (float(bbox[1]) + float(bbox[3])) * 0.5
+    draw.text((round(x), round(y)), glyph, font=font, fill=(0, 0, 0))
+
+
+def _render_target_font_affinity_probe(
+    *,
+    font_path: str,
+    text: str,
+    columns: int,
+    font_size: int,
+    cell_step: int,
+) -> Any:
+    from PIL import Image, ImageDraw, ImageFont
+
+    canvas = Image.new("RGB", (512, 512), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.truetype(str(font_path), int(font_size))
+    glyphs = list(str(text))
+    column_count = max(1, int(columns))
+    per_column = int(math.ceil(len(glyphs) / column_count))
+    if column_count == 1:
+        centers = [256.0]
+    else:
+        column_gap = max(94.0, float(font_size) * 1.65)
+        right = 256.0 + column_gap * 0.5
+        centers = [
+            right - column_gap * index for index in range(column_count)
+        ]
+    for column_index in range(column_count):
+        chunk = glyphs[
+            column_index * per_column : (column_index + 1) * per_column
+        ]
+        if not chunk:
+            continue
+        total_height = float(cell_step) * max(0, len(chunk) - 1)
+        start_y = 256.0 - total_height * 0.5
+        for row_index, glyph in enumerate(chunk):
+            _draw_target_probe_glyph(
+                draw,
+                center_x=centers[column_index],
+                center_y=start_y + row_index * float(cell_step),
+                glyph=glyph,
+                font=font,
+            )
+    return canvas
+
+
 class YuzuMarkerOnnxFontDetector:
     """ONNX adapter for YuzuMarker.FontDetection."""
 
@@ -2701,6 +4961,18 @@ class YuzuMarkerOnnxFontDetector:
         if not self.labels_path or not os.path.isfile(self.labels_path):
             raise FileNotFoundError("YuzuMarker font labels are missing")
         self._labels = _load_font_labels(self.labels_path)
+        self._source_font_label_catalog_version = (
+            _source_font_label_catalog_version(
+                self._labels,
+                label_count=FONT_COUNT,
+            )
+        )
+        self._factorized_attribute_taxonomy = (
+            _build_factorized_attribute_taxonomy(
+                self._labels,
+                label_count=FONT_COUNT,
+            )
+        )
         self._session = _load_onnx_session(self.model_path, use_gpu=use_gpu)
         metadata = _onnx_session_provider_metadata(
             self.model_path,
@@ -2718,8 +4990,15 @@ class YuzuMarkerOnnxFontDetector:
         if not inputs:
             raise RuntimeError("YuzuMarker ONNX model has no inputs")
         self._input_name = inputs[0].name
+        self._target_font_catalog_identity_sha256 = ""
+        self._target_font_catalog_role_records: tuple[
+            dict[str, Any],
+            ...,
+        ] = ()
 
-    def detect(self, image: Any) -> dict[str, Any]:
+    def _infer_vector(self, image: Any) -> np.ndarray:
+        """Run one unchanged 512px Yuzu inference for one image."""
+
         from PIL import ImageOps
 
         prepared = ImageOps.exif_transpose(image).convert("RGB").resize((512, 512))
@@ -2728,12 +5007,295 @@ class YuzuMarkerOnnxFontDetector:
         output = self._session.run(None, {self._input_name: array})[0]
         vector = np.asarray(output, dtype=np.float32).reshape(-1)
         if vector.shape[0] < FONT_COUNT + 12:
-            raise RuntimeError(f"Unexpected YuzuMarker output length: {vector.shape[0]}")
+            raise RuntimeError(
+                f"Unexpected YuzuMarker output length: {vector.shape[0]}"
+            )
+        return vector
+
+    def _target_font_catalog_identity(
+        self,
+    ) -> tuple[str, tuple[dict[str, Any], ...]]:
+        cached_identity = str(
+            getattr(
+                self,
+                "_target_font_catalog_identity_sha256",
+                "",
+            )
+            or ""
+        )
+        cached_records = tuple(
+            getattr(self, "_target_font_catalog_role_records", ()) or ()
+        )
+        if cached_identity and cached_records:
+            return cached_identity, cached_records
+
+        manager = FontManager()
+        inventory = {
+            item.role_id: item for item in manager.required_role_inventory()
+        }
+        role_records: list[dict[str, Any]] = []
+        for role_id in TARGET_FONT_AFFINITY_ROLE_IDS:
+            status = inventory.get(role_id)
+            if status is None or not status.selected_face_id:
+                raise RuntimeError(
+                    f"installed_target_role_unavailable:{role_id}"
+                )
+            face = manager.face(status.selected_face_id)
+            if face is None or not face.path or not os.path.isfile(face.path):
+                raise RuntimeError(
+                    f"installed_target_face_unavailable:{role_id}"
+                )
+            role_records.append(
+                {
+                    "role_id": role_id,
+                    "selected_face_id": face.face_id,
+                    "font_path": face.path,
+                    "font_sha256": _target_font_file_sha256(face.path),
+                }
+            )
+        identity_payload = {
+            "descriptor_policy_version": (
+                TARGET_FONT_AFFINITY_DESCRIPTOR_POLICY_VERSION
+            ),
+            "probe_policy_version": TARGET_FONT_AFFINITY_PROBE_POLICY_VERSION,
+            "model_sha256": _target_font_file_sha256(self.model_path),
+            "labels_sha256": _target_font_file_sha256(self.labels_path),
+            "label_catalog_version": (
+                self._source_font_label_catalog_version
+            ),
+            "roles": [
+                {
+                    "role_id": record["role_id"],
+                    "selected_face_id": record["selected_face_id"],
+                    "font_sha256": record["font_sha256"],
+                }
+                for record in role_records
+            ],
+            "probes": [
+                {
+                    "probe_id": probe_id,
+                    "text": text,
+                    "columns": columns,
+                    "font_size": font_size,
+                    "cell_step": cell_step,
+                }
+                for (
+                    probe_id,
+                    text,
+                    columns,
+                    font_size,
+                    cell_step,
+                ) in TARGET_FONT_AFFINITY_PROBE_SPECS
+            ],
+        }
+        encoded = json.dumps(
+            identity_payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        identity = hashlib.sha256(encoded).hexdigest()
+        records = tuple(role_records)
+        self._target_font_catalog_identity_sha256 = identity
+        self._target_font_catalog_role_records = records
+        return identity, records
+
+    def _target_font_affinity_catalog(
+        self,
+    ) -> tuple[_TargetFontAffinityCatalog | None, str]:
+        try:
+            catalog_identity, role_records = (
+                self._target_font_catalog_identity()
+            )
+        except Exception as exc:
+            return None, (
+                "target_font_catalog_identity_unavailable:"
+                f"{type(exc).__name__}"
+            )
+
+        with _TARGET_FONT_AFFINITY_CATALOG_LOCK:
+            cached = _TARGET_FONT_AFFINITY_CATALOG_CACHE.get(
+                catalog_identity
+            )
+            if cached is not None:
+                return cached, ""
+            cached_error = _TARGET_FONT_AFFINITY_CATALOG_ERROR_CACHE.get(
+                catalog_identity
+            )
+            if cached_error:
+                return None, cached_error
+            try:
+                role_vectors: list[list[np.ndarray]] = []
+                for record in role_records:
+                    probe_vectors: list[np.ndarray] = []
+                    for (
+                        _probe_id,
+                        text,
+                        columns,
+                        font_size,
+                        cell_step,
+                    ) in TARGET_FONT_AFFINITY_PROBE_SPECS:
+                        probe = _render_target_font_affinity_probe(
+                            font_path=str(record["font_path"]),
+                            text=text,
+                            columns=columns,
+                            font_size=font_size,
+                            cell_step=cell_step,
+                        )
+                        vector = self._infer_vector(probe)
+                        probe_vectors.append(
+                            _target_font_affinity_descriptor(
+                                vector[:FONT_COUNT]
+                            )
+                        )
+                    role_vectors.append(probe_vectors)
+                matrix = np.asarray(role_vectors, dtype=np.float32)
+                expected_shape = (
+                    len(TARGET_FONT_AFFINITY_ROLE_IDS),
+                    len(TARGET_FONT_AFFINITY_PROBE_SPECS),
+                    FONT_COUNT,
+                )
+                if matrix.shape != expected_shape:
+                    raise RuntimeError(
+                        "target_font_catalog_shape_invalid:"
+                        f"{matrix.shape}"
+                    )
+                matrix.setflags(write=False)
+                catalog = _TargetFontAffinityCatalog(
+                    identity_sha256=catalog_identity,
+                    role_probe_vectors=matrix,
+                    role_records=role_records,
+                )
+                _TARGET_FONT_AFFINITY_CATALOG_CACHE[
+                    catalog_identity
+                ] = catalog
+                return catalog, ""
+            except Exception as exc:
+                error = (
+                    "target_font_catalog_build_unavailable:"
+                    f"{type(exc).__name__}"
+                )
+                _TARGET_FONT_AFFINITY_CATALOG_ERROR_CACHE[
+                    catalog_identity
+                ] = error
+                return None, error
+
+    def _target_font_affinity_observation(
+        self,
+        *,
+        font_logits: Any,
+        source_input_sha256: str,
+    ) -> tuple[TargetFontAffinityObservationV1 | None, str]:
+        catalog, error = self._target_font_affinity_catalog()
+        if catalog is None:
+            return None, error or "target_font_catalog_unavailable"
+        try:
+            source = _target_font_affinity_descriptor(font_logits)
+            similarities = np.einsum(
+                "d,rpd->rp",
+                source,
+                catalog.role_probe_vectors,
+                optimize=True,
+            )
+            top_count = min(
+                TARGET_FONT_AFFINITY_TOP_PROBE_COUNT,
+                similarities.shape[1],
+            )
+            strongest = np.sort(similarities, axis=1)[:, -top_count:]
+            scores = np.clip(strongest.mean(axis=1), 0.0, 1.0)
+            return (
+                TargetFontAffinityObservationV1(
+                    catalog_identity_sha256=catalog.identity_sha256,
+                    descriptor_policy_version=(
+                        TARGET_FONT_AFFINITY_DESCRIPTOR_POLICY_VERSION
+                    ),
+                    source_input_sha256=str(source_input_sha256 or ""),
+                    model_identity=YUZUMARKER_PROVIDER_MODEL,
+                    label_catalog_version=(
+                        self._source_font_label_catalog_version
+                    ),
+                    provider_provenance={
+                        "gpu_requested": bool(self.gpu_requested),
+                        "requested_execution_provider": (
+                            self.requested_execution_provider
+                        ),
+                        "available_execution_providers": list(
+                            self.available_execution_providers
+                        ),
+                        "active_execution_providers": list(
+                            self.active_execution_providers
+                        ),
+                        "primary_execution_provider": (
+                            self.primary_execution_provider
+                        ),
+                        "provider_fallback_reason": (
+                            self.provider_fallback_reason
+                        ),
+                    },
+                    role_scores={
+                        role_id: float(scores[index])
+                        for index, role_id in enumerate(
+                            TARGET_FONT_AFFINITY_ROLE_IDS
+                        )
+                    },
+                ),
+                "",
+            )
+        except Exception as exc:
+            return None, (
+                "target_font_affinity_projection_unavailable:"
+                f"{type(exc).__name__}"
+            )
+
+    def detect(self, image: Any) -> dict[str, Any]:
+        vector = self._infer_vector(image)
 
         font_prob = _softmax(vector[:FONT_COUNT])
+        source_font_label_catalog_version = str(
+            getattr(self, "_source_font_label_catalog_version", "") or ""
+        )
+        if not source_font_label_catalog_version:
+            source_font_label_catalog_version = (
+                _source_font_label_catalog_version(
+                    self._labels,
+                    label_count=int(font_prob.size),
+                )
+            )
+            self._source_font_label_catalog_version = (
+                source_font_label_catalog_version
+            )
+        source_font_score_support = _build_source_font_score_support(
+            font_prob,
+            self._labels,
+            catalog_version=source_font_label_catalog_version,
+        )
         family_posterior = _font_family_posterior_from_probabilities(
             font_prob,
             self._labels,
+        )
+        factorized_taxonomy = getattr(
+            self,
+            "_factorized_attribute_taxonomy",
+            None,
+        )
+        if (
+            not isinstance(
+                factorized_taxonomy,
+                _FactorizedAttributeTaxonomy,
+            )
+            or factorized_taxonomy.label_count != int(font_prob.size)
+        ):
+            factorized_taxonomy = _build_factorized_attribute_taxonomy(
+                self._labels,
+                label_count=int(font_prob.size),
+            )
+            self._factorized_attribute_taxonomy = factorized_taxonomy
+        model_attribute_posterior = (
+            _factorized_attribute_posterior_from_probabilities(
+                font_prob,
+                factorized_taxonomy,
+            )
         )
         top_indices = np.argsort(-font_prob)[:5]
         top_candidates: list[dict[str, Any]] = []
@@ -2758,7 +5320,7 @@ class YuzuMarkerOnnxFontDetector:
         regression = vector[FONT_COUNT + 2 : FONT_COUNT + 12]
         angle_ratio = _unit_interval(regression[9])
         top = top_candidates[0] if top_candidates else {}
-        return {
+        detection = {
             "font_index": int(top_indices[0]) if len(top_indices) else -1,
             "confidence": float(top.get("confidence") or 0.0),
             "font_path": str(top.get("path") or ""),
@@ -2767,6 +5329,8 @@ class YuzuMarkerOnnxFontDetector:
                 top.get("serif") if isinstance(top.get("serif"), bool) else None
             ),
             "family_posterior": family_posterior.to_audit_dict(),
+            SOURCE_FONT_SCORE_SUPPORT_KEY: source_font_score_support,
+            "model_attribute_posterior": model_attribute_posterior,
             "top_candidates": top_candidates,
             "direction": (
                 ("ltr" if direction_index == 0 else "ttb")
@@ -2785,6 +5349,15 @@ class YuzuMarkerOnnxFontDetector:
                 else None
             ),
         }
+        affinity, affinity_error = self._target_font_affinity_observation(
+            font_logits=vector[:FONT_COUNT],
+            source_input_sha256=_image_sha256(image),
+        )
+        if affinity is not None:
+            detection[TARGET_FONT_AFFINITY_OBSERVATION_KEY] = affinity
+        if affinity_error:
+            detection[TARGET_FONT_AFFINITY_ERROR_KEY] = affinity_error
+        return detection
 
 
 _SESSION_CACHE: dict[tuple[str, bool], Any] = {}
@@ -3011,6 +5584,396 @@ def _replace_axis_records(
     existing = {record.axis: record for record in records}
     existing.update(replacements)
     return tuple(existing[axis] for axis in SOURCE_STYLE_AXES)
+
+
+def _validated_factorized_attribute_posterior(
+    detection: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(detection, Mapping):
+        return {}
+    raw = detection.get("model_attribute_posterior")
+    if not isinstance(raw, Mapping):
+        return {}
+    try:
+        label_count = int(raw.get("label_count") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if (
+        str(raw.get("schema_version") or "")
+        != FACTORIZED_ATTRIBUTE_POSTERIOR_VERSION
+        or str(raw.get("taxonomy_version") or "")
+        != FACTORIZED_ATTRIBUTE_TAXONOMY_VERSION
+        or label_count != FONT_COUNT
+    ):
+        return {}
+    expected_classes = {
+        "generic_family": ("sans", "serif"),
+        "face_character": (
+            "standard_candidate",
+            "slender_candidate",
+        ),
+        "weight_strength": (
+            "normal_candidate",
+            "strong_candidate",
+        ),
+    }
+    for axis, required_classes in expected_classes.items():
+        record = raw.get(axis)
+        if not isinstance(record, Mapping):
+            return {}
+        raw_classes = record.get("classes")
+        if not isinstance(raw_classes, Sequence) or isinstance(
+            raw_classes,
+            (str, bytes),
+        ):
+            return {}
+        classes = tuple(raw_classes)
+        masses = record.get("masses")
+        conditional = record.get("conditional_probabilities")
+        if (
+            str(record.get("schema_version") or "")
+            != "yuzumarker_factorized_attribute_axis_v1"
+            or classes != required_classes
+            or not isinstance(masses, Mapping)
+            or not isinstance(conditional, Mapping)
+        ):
+            return {}
+        try:
+            axis_label_count = int(record.get("label_count") or 0)
+            known_label_count = int(
+                record.get("known_label_count") or 0
+            )
+            unknown_label_count = int(
+                record.get("unknown_label_count") or 0
+            )
+            known_masses = [
+                float(masses.get(name) or 0.0)
+                for name in required_classes
+            ]
+            unknown_mass = float(masses.get("unknown") or 0.0)
+            known_mass = float(record.get("known_mass") or 0.0)
+            recorded_unknown_mass = float(
+                record.get("unknown_mass") or 0.0
+            )
+            conditional_values = [
+                float(conditional.get(name) or 0.0)
+                for name in required_classes
+            ]
+            margin = float(record.get("margin") or 0.0)
+            normalized_entropy = float(
+                record.get("normalized_entropy") or 0.0
+            )
+        except (TypeError, ValueError):
+            return {}
+        numeric_values = [
+            *known_masses,
+            unknown_mass,
+            known_mass,
+            recorded_unknown_mass,
+            *conditional_values,
+            margin,
+            normalized_entropy,
+        ]
+        mass_total = sum(known_masses) + unknown_mass
+        conditional_total = sum(conditional_values)
+        if (
+            axis_label_count != FONT_COUNT
+            or min(known_label_count, unknown_label_count) < 0
+            or known_label_count + unknown_label_count != FONT_COUNT
+            or any(
+                not math.isfinite(value)
+                or value < 0.0
+                or value > 1.0 + 1e-6
+                for value in numeric_values
+            )
+            or abs(mass_total - 1.0) > 1e-6
+            or abs(sum(known_masses) - known_mass) > 1e-6
+            or abs(unknown_mass - recorded_unknown_mass) > 1e-6
+            or (
+                abs(conditional_total - 1.0) > 1e-6
+                if known_mass > 0.0
+                else abs(conditional_total) > 1e-6
+            )
+            or str(record.get("leading_candidate") or "")
+            not in {"", *required_classes}
+        ):
+            return {}
+    return _copy_jsonish(raw)
+
+
+def _validated_normalized_stroke_profile_v2(
+    direct_weight_axis: SourceStyleAxisEvidence | None,
+) -> dict[str, Any]:
+    if direct_weight_axis is None:
+        return {}
+    raw_value = direct_weight_axis.value
+    raw_identity = direct_weight_axis.support_identity
+    if not isinstance(raw_value, Mapping) or not isinstance(
+        raw_identity,
+        Mapping,
+    ):
+        return {}
+    raw_profile = raw_value.get(NORMALIZED_STROKE_PROFILE_V2)
+    if not isinstance(raw_profile, Mapping):
+        return {}
+    if (
+        str(raw_profile.get("schema_version") or "")
+        != NORMALIZED_STROKE_PROFILE_V2
+    ):
+        return {}
+    authorized_mask_sha256 = str(
+        raw_identity.get("authorized_mask_sha256") or ""
+    )
+    source_core_mask_sha256 = str(
+        raw_profile.get("source_core_mask_sha256") or ""
+    )
+    if (
+        not authorized_mask_sha256
+        or str(raw_profile.get("authorized_mask_sha256") or "")
+        != authorized_mask_sha256
+        or not source_core_mask_sha256
+    ):
+        return {}
+    directions = raw_profile.get("directions")
+    if not isinstance(directions, Mapping) or any(
+        not isinstance(directions.get(direction), Mapping)
+        for direction in ("ttb", "ltr")
+    ):
+        return {}
+
+    identity_payload = {
+        "authorized_mask_sha256": authorized_mask_sha256,
+        "authorized_pixel_sha256": str(
+            raw_identity.get("authorized_pixel_sha256") or ""
+        ),
+        "crop_shape": list(raw_identity.get("crop_shape") or ()),
+        "source_core_mask_sha256": source_core_mask_sha256,
+    }
+    encoded_identity = json.dumps(
+        identity_payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    expected_identity_sha256 = hashlib.sha256(encoded_identity).hexdigest()
+    if (
+        str(raw_profile.get("source_identity_sha256") or "")
+        != expected_identity_sha256
+    ):
+        return {}
+    return _copy_jsonish(raw_profile)
+
+
+def _canonical_source_style_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        _copy_jsonish(value),
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_font_observation_v3(
+    *,
+    direct_weight_axis: SourceStyleAxisEvidence | None,
+    support_identity: Mapping[str, Any],
+    primary_detection: Mapping[str, Any],
+    neutral_detection: Mapping[str, Any] | None,
+    primary_input_sha256: str,
+    neutral_input_sha256: str,
+    neutral_error: str,
+) -> SourceFontObservationV3 | None:
+    primary = primary_detection.get(SOURCE_FONT_SCORE_SUPPORT_KEY)
+    if not isinstance(primary, SourceFontScoreSupportV1):
+        return None
+    neutral = (
+        neutral_detection.get(SOURCE_FONT_SCORE_SUPPORT_KEY)
+        if isinstance(neutral_detection, Mapping)
+        else None
+    )
+    if neutral is not None and not isinstance(
+        neutral,
+        SourceFontScoreSupportV1,
+    ):
+        neutral = None
+    target_font_affinity = primary_detection.get(
+        TARGET_FONT_AFFINITY_OBSERVATION_KEY
+    )
+    if not isinstance(
+        target_font_affinity,
+        TargetFontAffinityObservationV1,
+    ):
+        target_font_affinity = None
+    elif (
+        target_font_affinity.source_input_sha256
+        != str(primary_input_sha256 or "")
+        or target_font_affinity.model_identity != YUZUMARKER_PROVIDER_MODEL
+        or target_font_affinity.label_catalog_version
+        != primary.catalog_version
+    ):
+        target_font_affinity = None
+
+    authorized_view_sha256 = _canonical_source_style_sha256(
+        dict(support_identity or {})
+    )
+    profile = _validated_normalized_stroke_profile_v2(
+        direct_weight_axis
+    )
+    profile_source_identity = str(
+        profile.get("source_identity_sha256") or ""
+    )
+    source_identity_sha256 = (
+        profile_source_identity
+        or _canonical_source_style_sha256(
+            {
+                "authorized_view_sha256": authorized_view_sha256,
+                "primary_input_sha256": str(primary_input_sha256 or ""),
+            }
+        )
+    )
+    style_binding = (
+        SourceStyleEvidenceBindingV1(
+            source_identity_sha256=source_identity_sha256,
+            evidence_schema_version=NORMALIZED_STROKE_PROFILE_V2,
+            evidence_sha256=_canonical_source_style_sha256(profile),
+        )
+        if profile
+        else None
+    )
+    overlap_bounds = (
+        source_font_overlap_bounds(primary, neutral)
+        if neutral is not None
+        else None
+    )
+    variant_agreement = (
+        "same_leading_identity"
+        if (
+            neutral is not None
+            and primary.leading_candidate.label_identity
+            == neutral.leading_candidate.label_identity
+        )
+        else "different_leading_identity"
+        if neutral is not None
+        else "neutral_unavailable"
+    )
+    return SourceFontObservationV3(
+        source_identity_sha256=source_identity_sha256,
+        authorized_view_sha256=authorized_view_sha256,
+        model_identity=YUZUMARKER_PROVIDER_MODEL,
+        label_catalog_version=primary.catalog_version,
+        support_policy_version=SOURCE_FONT_SUPPORT_POLICY_VERSION,
+        primary_input_sha256=str(primary_input_sha256 or ""),
+        neutral_input_sha256=(
+            str(neutral_input_sha256 or "") if neutral is not None else ""
+        ),
+        primary=primary,
+        neutral=neutral,
+        neutral_error=(
+            str(neutral_error or "")
+            if neutral is not None
+            else str(
+                neutral_error
+                or "neutral_source_font_identity_support_unavailable"
+            )
+        ),
+        variant_agreement=variant_agreement,
+        variant_overlap_bounds=overlap_bounds,
+        target_font_affinity=target_font_affinity,
+        style_evidence_binding=style_binding,
+    )
+
+
+def _factorized_variant_agreement(
+    primary: Mapping[str, Any],
+    neutral: Mapping[str, Any],
+) -> dict[str, bool]:
+    return {
+        axis: bool(
+            str(dict(primary.get(axis) or {}).get("leading_candidate") or "")
+            and str(
+                dict(primary.get(axis) or {}).get("leading_candidate") or ""
+            )
+            == str(
+                dict(neutral.get(axis) or {}).get("leading_candidate") or ""
+            )
+        )
+        for axis in ("generic_family", "face_character", "weight_strength")
+    }
+
+
+def _source_style_evidence_v2_carrier(
+    *,
+    direct_weight_axis: SourceStyleAxisEvidence | None,
+    primary_detection: Mapping[str, Any],
+    neutral_detection: Mapping[str, Any] | None,
+    primary_input_sha256: str,
+    neutral_input_sha256: str,
+    neutral_error: str,
+) -> dict[str, Any]:
+    profile = _validated_normalized_stroke_profile_v2(
+        direct_weight_axis
+    )
+    primary = _validated_factorized_attribute_posterior(
+        primary_detection
+    )
+    neutral = _validated_factorized_attribute_posterior(
+        neutral_detection
+    )
+    if not profile and not primary and not neutral:
+        return {}
+    model_variants = {
+        "schema_version": FACTORIZED_ATTRIBUTE_VARIANTS_VERSION,
+        "taxonomy_version": FACTORIZED_ATTRIBUTE_TAXONOMY_VERSION,
+        "primary": primary,
+        "neutral": neutral,
+        "primary_input_sha256": str(primary_input_sha256 or ""),
+        "neutral_input_sha256": str(neutral_input_sha256 or ""),
+        "neutral_error": str(neutral_error or ""),
+        "variant_agreement": (
+            _factorized_variant_agreement(primary, neutral)
+            if primary and neutral
+            else {}
+        ),
+    }
+    return {
+        "schema_version": SOURCE_STYLE_EVIDENCE_V2,
+        "source_only": True,
+        "resolved_target_style": False,
+        "geometry_profile": (
+            {NORMALIZED_STROKE_PROFILE_V2: profile}
+            if profile
+            else {}
+        ),
+        "model_attribute_posterior": model_variants,
+        "source_support_identity": (
+            _copy_jsonish(direct_weight_axis.support_identity)
+            if profile and direct_weight_axis is not None
+            else {}
+        ),
+    }
+
+
+def _axis_with_source_style_evidence_v2(
+    record: SourceStyleAxisEvidence,
+    carrier: Mapping[str, Any],
+) -> SourceStyleAxisEvidence:
+    if not carrier:
+        return record
+    value = _copy_jsonish(record.value)
+    value[SOURCE_STYLE_EVIDENCE_V2] = _copy_jsonish(carrier)
+    return SourceStyleAxisEvidence(
+        axis=record.axis,
+        status=record.status,
+        value=value,
+        confidence=record.confidence,
+        provenance=record.provenance,
+        support_identity=record.support_identity,
+        reason_codes=record.reason_codes,
+        support=record.support,
+    )
 
 
 def _direct_only_style_evidence(
@@ -3506,6 +6469,11 @@ def observe_parent_style_evidence(
             evidence_reasons.append(direction_reason)
         if neutral_error:
             evidence_reasons.append(neutral_error)
+        target_affinity_error = str(
+            detection.get(TARGET_FONT_AFFINITY_ERROR_KEY) or ""
+        )
+        if target_affinity_error:
+            evidence_reasons.append(target_affinity_error)
         if parsed_weight is None:
             evidence_reasons.append("source_weight_label_unresolved")
         if not source_scale_supported:
@@ -3516,11 +6484,14 @@ def observe_parent_style_evidence(
             evidence_reasons.append("source_paint_axis_contract_invalid")
         if direction not in {"ltr", "ttb"}:
             evidence_reasons.append("source_orientation_axis_contract_invalid")
+        neutral_input_sha256 = _image_sha256(
+            observation_inputs.neutral_input
+        )
         detector_variant_summary = _detector_variant_summary(
             detection,
             neutral_detection,
             primary_sha256=actual_detector_input_sha256,
-            neutral_sha256=_image_sha256(observation_inputs.neutral_input),
+            neutral_sha256=neutral_input_sha256,
             neutral_error=neutral_error,
         )
         direct_axis_records = _observation_axis_records(
@@ -3606,6 +6577,22 @@ def observe_parent_style_evidence(
             )
         )
         direct_weight_axis = direct_by_axis.get("weight")
+        source_font_observation = _source_font_observation_v3(
+            direct_weight_axis=direct_weight_axis,
+            support_identity=support_identity,
+            primary_detection=detection,
+            neutral_detection=neutral_detection,
+            primary_input_sha256=actual_detector_input_sha256,
+            neutral_input_sha256=neutral_input_sha256,
+            neutral_error=neutral_error,
+        )
+        source_font_style_evidence = (
+            direct_weight_axis
+            if _validated_normalized_stroke_profile_v2(
+                direct_weight_axis
+            )
+            else None
+        )
         direct_weight_value = (
             dict(direct_weight_axis.value)
             if direct_weight_axis is not None
@@ -3677,6 +6664,8 @@ def observe_parent_style_evidence(
                 analysis_bbox=tuple(view.analysis_bbox),
                 detector_input_sha256=actual_detector_input_sha256,
                 source_text_footprint=source_text_footprint,
+                source_font_observation=source_font_observation,
+                source_font_style_evidence=source_font_style_evidence,
                 authorized_perceptual_source_identity={},
                 evidence_provider=provider,
                 evidence_source=source,
@@ -6089,6 +9078,256 @@ def _font_weight_from_label(label: str) -> str | None:
     ) or re.search(r"(?:^|[-_. ])(?:r|l|m|el)(?:[-_. ]|$)", basename):
         return "regular"
     return None
+
+
+def _normalized_factorized_style_name(path_value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(path_value or ""))
+    basename = os.path.splitext(os.path.basename(normalized))[0]
+    basename = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", basename)
+    basename = basename.lower()
+    basename = re.sub(r"[_+.,()\[\]{}-]+", " ", basename)
+    return re.sub(r"\s+", " ", basename).strip()
+
+
+def _factorized_label_attribute_codes(
+    label: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    """Return family, face, and strength codes without resolving a style."""
+
+    family_value = label.get("serif")
+    family_code = (
+        1
+        if family_value is True
+        else 0
+        if family_value is False
+        else 2
+    )
+
+    name = _normalized_factorized_style_name(
+        str(label.get("path") or "")
+    )
+    tokens = name.split()
+    joined = " ".join(tokens)
+
+    def contains_phrase(phrase: str) -> bool:
+        return bool(
+            re.search(
+                rf"(?:^| ){re.escape(phrase)}(?:$| )",
+                joined,
+            )
+        )
+
+    slender = any(
+        contains_phrase(phrase)
+        for phrase in (
+            "hairline",
+            "thin",
+            "ultra thin",
+            "extra thin",
+            "ultra light",
+            "extra light",
+            "demi light",
+            "semi light",
+            "light",
+        )
+    )
+    ordinary = any(
+        contains_phrase(phrase)
+        for phrase in (
+            "book",
+            "text",
+            "regular",
+            "normal",
+            "roman",
+            "medium",
+        )
+    )
+    strong = any(
+        contains_phrase(phrase)
+        for phrase in (
+            "semi bold",
+            "demi bold",
+            "bold",
+            "extra bold",
+            "ultra bold",
+            "super bold",
+            "black",
+            "heavy",
+            "extra black",
+            "ultra black",
+        )
+    )
+
+    for token in tokens:
+        w_match = re.fullmatch(r"w([1-9]|1[0-4])", token)
+        numeric_match = re.fullmatch(
+            r"(100|200|300|400|500|600|700|800|900|950|1000)",
+            token,
+        )
+        number = (
+            int(w_match.group(1)) * 100
+            if w_match
+            else int(numeric_match.group(1))
+            if numeric_match
+            else None
+        )
+        if number is None:
+            continue
+        if number <= 300:
+            slender = True
+        elif number <= 500:
+            ordinary = True
+        else:
+            strong = True
+
+    matched_groups = sum((slender, ordinary, strong))
+    if matched_groups != 1:
+        return family_code, 2, 2
+    if slender:
+        return family_code, 1, 0
+    if ordinary:
+        return family_code, 0, 0
+    return family_code, 0, 1
+
+
+def _build_factorized_attribute_taxonomy(
+    labels: Sequence[Mapping[str, Any]],
+    *,
+    label_count: int,
+) -> _FactorizedAttributeTaxonomy:
+    family_codes = np.full(label_count, 2, dtype=np.uint8)
+    face_codes = np.full(label_count, 2, dtype=np.uint8)
+    strength_codes = np.full(label_count, 2, dtype=np.uint8)
+    for index in range(label_count):
+        family, face, strength = _factorized_label_attribute_codes(
+            _label_at(labels, index)
+        )
+        family_codes[index] = family
+        face_codes[index] = face
+        strength_codes[index] = strength
+    for codes in (family_codes, face_codes, strength_codes):
+        codes.setflags(write=False)
+    return _FactorizedAttributeTaxonomy(
+        label_count=label_count,
+        generic_family_codes=family_codes,
+        face_character_codes=face_codes,
+        weight_strength_codes=strength_codes,
+    )
+
+
+def _factorized_axis_posterior(
+    probabilities: np.ndarray,
+    codes: np.ndarray,
+    *,
+    classes: tuple[str, str],
+) -> dict[str, Any]:
+    values = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    values = np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
+    total = float(values.sum())
+    if total > 0.0:
+        values = values / total
+        bins = np.bincount(
+            np.asarray(codes, dtype=np.int64),
+            weights=values,
+            minlength=len(classes) + 1,
+        )
+    else:
+        bins = np.zeros(len(classes) + 1, dtype=np.float64)
+        bins[-1] = 1.0
+
+    class_masses = [float(bins[index]) for index in range(len(classes))]
+    unknown_mass = float(bins[len(classes)])
+    known_mass = float(sum(class_masses))
+    conditional_values = (
+        [mass / known_mass for mass in class_masses]
+        if known_mass > 0.0
+        else [0.0 for _ in classes]
+    )
+    ordered = sorted(conditional_values, reverse=True)
+    margin = (
+        float(ordered[0] - ordered[1])
+        if len(ordered) >= 2
+        else float(ordered[0])
+        if ordered
+        else 0.0
+    )
+    if known_mass <= 0.0:
+        leading_candidate = ""
+        normalized_entropy = 1.0
+    else:
+        leading_index = int(np.argmax(conditional_values))
+        leading_candidate = (
+            classes[leading_index]
+            if conditional_values.count(conditional_values[leading_index])
+            == 1
+            else ""
+        )
+        entropy = -sum(
+            probability * math.log(probability)
+            for probability in conditional_values
+            if probability > 0.0
+        )
+        normalized_entropy = (
+            entropy / math.log(len(classes))
+            if len(classes) > 1
+            else 0.0
+        )
+
+    masses = {
+        name: class_masses[index]
+        for index, name in enumerate(classes)
+    }
+    masses["unknown"] = unknown_mass
+    conditional = {
+        name: conditional_values[index]
+        for index, name in enumerate(classes)
+    }
+    unknown_code = len(classes)
+    return {
+        "schema_version": "yuzumarker_factorized_attribute_axis_v1",
+        "classes": list(classes),
+        "label_count": int(values.size),
+        "known_label_count": int(np.count_nonzero(codes != unknown_code)),
+        "unknown_label_count": int(np.count_nonzero(codes == unknown_code)),
+        "masses": masses,
+        "known_mass": known_mass,
+        "unknown_mass": unknown_mass,
+        "conditional_probabilities": conditional,
+        "leading_candidate": leading_candidate,
+        "margin": margin,
+        "normalized_entropy": float(normalized_entropy),
+    }
+
+
+def _factorized_attribute_posterior_from_probabilities(
+    probabilities: Any,
+    taxonomy: _FactorizedAttributeTaxonomy,
+) -> dict[str, Any]:
+    values = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    if values.size != taxonomy.label_count:
+        raise ValueError(
+            "factorized attribute taxonomy does not match detector output"
+        )
+    return {
+        "schema_version": FACTORIZED_ATTRIBUTE_POSTERIOR_VERSION,
+        "taxonomy_version": FACTORIZED_ATTRIBUTE_TAXONOMY_VERSION,
+        "label_count": int(values.size),
+        "generic_family": _factorized_axis_posterior(
+            values,
+            taxonomy.generic_family_codes,
+            classes=("sans", "serif"),
+        ),
+        "face_character": _factorized_axis_posterior(
+            values,
+            taxonomy.face_character_codes,
+            classes=("standard_candidate", "slender_candidate"),
+        ),
+        "weight_strength": _factorized_axis_posterior(
+            values,
+            taxonomy.weight_strength_codes,
+            classes=("normal_candidate", "strong_candidate"),
+        ),
+    }
 
 
 def _heuristic_detection(image: Any) -> dict[str, Any]:

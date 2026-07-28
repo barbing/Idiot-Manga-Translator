@@ -26,19 +26,23 @@ from app.render.typesetting_contracts import bbox_from_value, copy_jsonish
 
 
 SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION = (
-    "source_punctuation_geometry_evidence_v1"
+    "source_punctuation_geometry_evidence_v2"
 )
 SOURCE_PUNCTUATION_GEOMETRY_OBSERVER_VERSION = (
-    "source_punctuation_geometry_observer_v2"
+    "source_punctuation_geometry_observer_v3"
 )
 SOURCE_PUNCTUATION_GEOMETRY_SUPPORT_VERSION = (
-    "source_punctuation_geometry_support_v2"
+    "source_punctuation_geometry_support_v3"
 )
 SOURCE_PUNCTUATION_CELL_CALIBRATION_VERSION = (
     "source_punctuation_cell_calibration_v1"
 )
 _SUPPORTED_KINDS = frozenset({"dash", "ellipsis", "wave"})
 _SUPPORTED_INLINE_AXES = frozenset({"ttb", "ltr"})
+SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED = "source_cell_normalized"
+SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE = (
+    "absolute_isolated_stroke"
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,7 @@ class SourcePunctuationGeometryOccurrence:
     group_bbox_page_xywh: tuple[int, int, int, int]
     span_px: float
     pitch_px: float
+    measurement_basis: str
     source_cell_px: float
     normalized_span: float
     normalized_pitch: float
@@ -81,6 +86,7 @@ class SourcePunctuationGeometryOccurrence:
             "group_bbox_page_xywh": list(self.group_bbox_page_xywh),
             "span_px": round(float(self.span_px), 6),
             "pitch_px": round(float(self.pitch_px), 6),
+            "measurement_basis": self.measurement_basis,
             "source_cell_px": round(float(self.source_cell_px), 6),
             "normalized_span": round(float(self.normalized_span), 6),
             "normalized_pitch": round(float(self.normalized_pitch), 6),
@@ -685,8 +691,19 @@ def _observe_parent_geometry(
     reasons = (
         "parent_authorized_source_punctuation_observed",
         "ocr_punctuation_not_consulted",
-        "native_source_cell_calibration_applied",
     )
+    if any(
+        item.measurement_basis
+        == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+        for item in occurrences
+    ):
+        reasons = (*reasons, "native_source_cell_calibration_applied")
+    if any(
+        item.measurement_basis
+        == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE
+        for item in occurrences
+    ):
+        reasons = (*reasons, "absolute_isolated_stroke_measurement_applied")
     if not occurrences:
         reasons = (*reasons, abstention)
     return SourcePunctuationGeometryEvidence(
@@ -711,76 +728,113 @@ def _straight_stroke_occurrences(
     source_cells: Mapping[str, float],
 ) -> list[SourcePunctuationGeometryOccurrence]:
     results: list[SourcePunctuationGeometryOccurrence] = []
-    for axis in ("ttb", "ltr"):
-        cell = float(source_cells.get(axis) or 0.0)
-        if cell <= 0.0:
+    for component in components:
+        component_box = tuple(
+            int(value) for value in component.get("bbox_xywh", ())
+        )
+        if len(component_box) != 4:
             continue
-        runs = _longest_axis_runs(ink, axis)
-        qualifying = [
-            run
-            for run in runs
-            if float(run[2] - run[1]) >= cell * 1.50
-        ]
-        for group in _group_adjacent_runs(qualifying):
-            cross_values = [item[0] for item in group]
-            starts = [item[1] for item in group]
-            ends = [item[2] for item in group]
-            cross_start = min(cross_values)
-            cross_end = max(cross_values) + 1
-            inline_start = int(round(float(np.median(starts))))
-            inline_end = int(round(float(np.median(ends))))
-            if inline_end <= inline_start:
-                continue
-            span = float(inline_end - inline_start)
-            cross_span = float(cross_end - cross_start)
-            if cross_span > max(1.0, cell * 0.36):
-                continue
-            endpoint_spread = float(max(ends) - min(ends) + max(starts) - min(starts))
-            if endpoint_spread > max(2.0, cell * 0.30):
-                continue
-            local_box = (
-                (cross_start, inline_start, cross_end - cross_start, inline_end - inline_start)
-                if axis == "ttb"
-                else (inline_start, cross_start, inline_end - inline_start, cross_end - cross_start)
-            )
-            if _has_aligned_terminal_dot(
-                local_box,
-                components,
-                axis=axis,
-                source_cell=cell,
-            ):
-                continue
-            normalized_span = span / cell
-            confidence = min(
-                0.995,
-                0.72
-                + min(0.18, max(0.0, normalized_span - 1.25) * 0.055)
-                + min(0.08, len(group) * 0.015),
-            )
-            page_box = _page_box(local_box, analysis_bbox)
-            results.append(
-                SourcePunctuationGeometryOccurrence(
-                    occurrence_id="",
-                    kind="dash",
-                    visual_reading_order_ordinal=-1,
-                    kind_ordinal=-1,
-                    inline_axis=axis,
-                    component_bboxes_local_xywh=(tuple(local_box),),
-                    component_bboxes_page_xywh=(tuple(page_box),),
-                    group_bbox_local_xywh=tuple(local_box),
-                    group_bbox_page_xywh=tuple(page_box),
-                    span_px=span,
-                    pitch_px=span,
-                    source_cell_px=cell,
-                    normalized_span=normalized_span,
-                    normalized_pitch=normalized_span,
-                    confidence=confidence,
-                    reason_codes=(
-                        "parallel_source_pixel_runs",
-                        "source_span_independent_of_ocr_count",
-                    ),
+        component_mask = _component_mask(ink, component)
+        for axis in ("ttb", "ltr"):
+            cell = float(source_cells.get(axis) or 0.0)
+            if cell > 0.0:
+                candidates = _normalized_component_stroke_boxes(
+                    component_mask,
+                    component_box=component_box,
+                    axis=axis,
+                    source_cell=cell,
                 )
-            )
+                measurement_basis = (
+                    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+                )
+            else:
+                absolute_box = _absolute_isolated_stroke_box(
+                    component_mask,
+                    component_box=component_box,
+                    analysis_bbox=analysis_bbox,
+                    axis=axis,
+                )
+                candidates = [absolute_box] if absolute_box else []
+                measurement_basis = (
+                    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE
+                )
+
+            for local_box in candidates:
+                span = float(
+                    local_box[3] if axis == "ttb" else local_box[2]
+                )
+                if span <= 0.0:
+                    continue
+                cross_span = float(
+                    local_box[2] if axis == "ttb" else local_box[3]
+                )
+                if _has_aligned_terminal_dot(
+                    local_box,
+                    components,
+                    axis=axis,
+                    source_cell=cell,
+                ):
+                    continue
+                normalized_span = span / cell if cell > 0.0 else 0.0
+                if measurement_basis == (
+                    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+                ):
+                    confidence = min(
+                        0.995,
+                        0.80
+                        + min(
+                            0.14,
+                            max(0.0, normalized_span - 2.0) * 0.08,
+                        )
+                        + min(0.05, cross_span / max(1.0, cell) * 0.12),
+                    )
+                    reason_codes = (
+                        "component_supported_length_bearing_source_stroke",
+                        "source_cell_normalized_measurement",
+                        "source_span_independent_of_ocr_count",
+                    )
+                else:
+                    component_area = float(np.count_nonzero(component_mask))
+                    component_box_area = float(
+                        max(1, component_box[2] * component_box[3])
+                    )
+                    aspect = span / max(1.0, cross_span)
+                    confidence = min(
+                        0.97,
+                        0.78
+                        + min(0.12, max(0.0, aspect - 8.0) * 0.02)
+                        + min(
+                            0.07,
+                            component_area / component_box_area * 0.08,
+                        ),
+                    )
+                    reason_codes = (
+                        "isolated_elongated_source_stroke",
+                        "absolute_source_span_without_fabricated_cell",
+                        "source_span_independent_of_ocr_count",
+                    )
+                page_box = _page_box(local_box, analysis_bbox)
+                results.append(
+                    SourcePunctuationGeometryOccurrence(
+                        occurrence_id="",
+                        kind="dash",
+                        visual_reading_order_ordinal=-1,
+                        kind_ordinal=-1,
+                        inline_axis=axis,
+                        component_bboxes_local_xywh=(tuple(local_box),),
+                        component_bboxes_page_xywh=(tuple(page_box),),
+                        group_bbox_local_xywh=tuple(local_box),
+                        group_bbox_page_xywh=tuple(page_box),
+                        span_px=span,
+                        pitch_px=span,
+                        measurement_basis=measurement_basis,
+                        source_cell_px=cell,
+                        normalized_span=normalized_span,
+                        normalized_pitch=normalized_span,
+                        confidence=confidence,
+                        reason_codes=reason_codes,
+                    )
+                )
     return _prefer_axis_specific_nonoverlap(results)
 
 
@@ -806,15 +860,11 @@ def _wave_occurrences(
             inline_span = float(height if axis == "ttb" else width)
             cross_span = float(width if axis == "ttb" else height)
             cell = float(source_cells.get(axis) or 0.0)
-            if cell <= 0.0 or inline_span < cell * 1.25:
+            if cell <= 0.0 or inline_span < cell * 2.0:
                 continue
             if cross_span > cell * 0.80 or cross_span < 2.0:
                 continue
-            component_mask = np.zeros_like(ink, dtype=bool)
-            pixels = list(component.get("pixels") or [])
-            for px, py in pixels:
-                if 0 <= int(py) < component_mask.shape[0] and 0 <= int(px) < component_mask.shape[1]:
-                    component_mask[int(py), int(px)] = True
+            component_mask = _component_mask(ink, component)
             track = _component_center_track(component_mask, box, axis)
             if len(track) < max(5, int(round(inline_span * 0.45))):
                 continue
@@ -839,6 +889,9 @@ def _wave_occurrences(
                     group_bbox_page_xywh=tuple(page_box),
                     span_px=inline_span,
                     pitch_px=pitch,
+                    measurement_basis=(
+                        SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+                    ),
                     source_cell_px=cell,
                     normalized_span=inline_span / cell,
                     normalized_pitch=pitch / cell,
@@ -929,6 +982,9 @@ def _ellipsis_occurrences(
                     group_bbox_page_xywh=page_group,
                     span_px=span,
                     pitch_px=pitch,
+                    measurement_basis=(
+                        SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+                    ),
                     source_cell_px=cell,
                     normalized_span=span / cell,
                     normalized_pitch=pitch / cell,
@@ -1119,6 +1175,176 @@ def _connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
     )
 
 
+def _component_mask(
+    template: np.ndarray,
+    component: Mapping[str, Any],
+) -> np.ndarray:
+    """Project exactly one connected component into the observer canvas."""
+
+    result = np.zeros_like(template, dtype=bool)
+    for px, py in tuple(component.get("pixels") or ()):
+        x = int(px)
+        y = int(py)
+        if 0 <= y < result.shape[0] and 0 <= x < result.shape[1]:
+            result[y, x] = True
+    return result
+
+
+def _normalized_component_stroke_boxes(
+    component_mask: np.ndarray,
+    *,
+    component_box: Sequence[int],
+    axis: str,
+    source_cell: float,
+) -> list[tuple[int, int, int, int]]:
+    """Return only component-supported strokes spanning at least two cells.
+
+    A candidate may be an isolated stroke or a straight terminal extension of
+    one glyph-sized cap.  Longest runs inside an arbitrary page/parent mask do
+    not qualify: the containing connected component must itself remain narrow,
+    and any non-stroke remainder must fit within one source cell at the other
+    end of the candidate.
+    """
+
+    box = bbox_from_value(component_box)
+    cell = float(source_cell or 0.0)
+    if not box or cell <= 0.0:
+        return []
+    x, y, width, height = box
+    component_inline = float(height if axis == "ttb" else width)
+    component_cross = float(width if axis == "ttb" else height)
+    if (
+        component_inline < cell * 2.0
+        or component_cross > cell * 1.15
+    ):
+        return []
+
+    qualifying = [
+        run
+        for run in _longest_axis_runs(component_mask, axis)
+        if float(run[2] - run[1]) >= cell * 2.0
+    ]
+    component_start = y if axis == "ttb" else x
+    component_end = y + height if axis == "ttb" else x + width
+    results: list[tuple[int, int, int, int]] = []
+    for group in _group_adjacent_runs(qualifying):
+        cross_values = [item[0] for item in group]
+        starts = [item[1] for item in group]
+        ends = [item[2] for item in group]
+        cross_start = min(cross_values)
+        cross_end = max(cross_values) + 1
+        inline_start = int(round(float(np.median(starts))))
+        inline_end = int(round(float(np.median(ends))))
+        line_span = float(inline_end - inline_start)
+        line_cross = float(cross_end - cross_start)
+        if line_span < cell * 2.0 or line_cross < 2.0:
+            continue
+        if line_cross > max(2.0, cell * 0.36):
+            continue
+        endpoint_spread = float(
+            max(ends) - min(ends) + max(starts) - min(starts)
+        )
+        if endpoint_spread > max(2.0, cell * 0.30):
+            continue
+        touches_component_end = min(
+            abs(inline_start - component_start),
+            abs(inline_end - component_end),
+        ) <= 1
+        if not touches_component_end:
+            continue
+        if component_inline - line_span > cell * 1.25:
+            continue
+        line_box = (
+            (
+                cross_start,
+                inline_start,
+                cross_end - cross_start,
+                inline_end - inline_start,
+            )
+            if axis == "ttb"
+            else (
+                inline_start,
+                cross_start,
+                inline_end - inline_start,
+                cross_end - cross_start,
+            )
+        )
+        line_pixels = component_mask[
+            line_box[1] : line_box[1] + line_box[3],
+            line_box[0] : line_box[0] + line_box[2],
+        ]
+        if (
+            line_pixels.size <= 0
+            or float(np.count_nonzero(line_pixels))
+            / float(line_pixels.size)
+            < 0.55
+        ):
+            continue
+        results.append(tuple(line_box))
+    return results
+
+
+def _absolute_isolated_stroke_box(
+    component_mask: np.ndarray,
+    *,
+    component_box: Sequence[int],
+    analysis_bbox: Sequence[int],
+    axis: str,
+) -> tuple[int, int, int, int] | tuple[()]:
+    """Admit a source-pixel span without inventing a missing source cell.
+
+    This variant is intentionally limited to a single isolated, strongly
+    elongated, nearly straight component that occupies a material fraction of
+    the parent axis.  It cannot infer joined glyph extensions because there is
+    no native cell against which to distinguish a cap from ordinary glyph
+    structure.
+    """
+
+    box = bbox_from_value(component_box)
+    analysis = bbox_from_value(analysis_bbox)
+    if not box or not analysis:
+        return ()
+    _x, _y, width, height = box
+    component_inline = float(height if axis == "ttb" else width)
+    component_cross = float(width if axis == "ttb" else height)
+    analysis_inline = float(analysis[3] if axis == "ttb" else analysis[2])
+    analysis_cross = float(analysis[2] if axis == "ttb" else analysis[3])
+    if component_cross < 2.0 or component_inline / component_cross < 8.0:
+        return ()
+    if (
+        analysis_inline <= 0.0
+        or component_inline / analysis_inline < 0.40
+        or analysis_cross <= 0.0
+        or component_cross / analysis_cross > 0.25
+    ):
+        return ()
+    box_pixels = component_mask[
+        box[1] : box[1] + box[3],
+        box[0] : box[0] + box[2],
+    ]
+    if (
+        box_pixels.size <= 0
+        or float(np.count_nonzero(box_pixels)) / float(box_pixels.size) < 0.55
+    ):
+        return ()
+    track = _component_center_track(component_mask, box, axis)
+    if len(track) / component_inline < 0.90:
+        return ()
+    centers = np.asarray([item[1] for item in track], dtype=float)
+    smoothed = _smooth_track(centers)
+    center_range = (
+        float(np.max(smoothed) - np.min(smoothed))
+        if len(smoothed)
+        else 0.0
+    )
+    if (
+        _direction_change_count(smoothed) > 1
+        or center_range > max(1.5, component_cross * 0.35)
+    ):
+        return ()
+    return tuple(box)
+
+
 def _longest_axis_runs(
     mask: np.ndarray,
     axis: str,
@@ -1166,6 +1392,8 @@ def _has_aligned_terminal_dot(
     source_cell: float,
 ) -> bool:
     x, y, width, height = [int(value) for value in line_box]
+    line_inline_span = float(height if axis == "ttb" else width)
+    line_cross_span = float(width if axis == "ttb" else height)
     line_cross_center = (
         float(x) + float(width) / 2.0
         if axis == "ttb"
@@ -1173,26 +1401,47 @@ def _has_aligned_terminal_dot(
     )
     inline_start = y if axis == "ttb" else x
     inline_end = y + height if axis == "ttb" else x + width
+    if source_cell > 0.0:
+        maximum_dot_size = source_cell * 0.46
+        cross_tolerance = source_cell * 0.28
+        maximum_gap = source_cell * 0.80
+    else:
+        maximum_dot_size = max(
+            line_cross_span * 2.5,
+            line_inline_span * 0.16,
+        )
+        cross_tolerance = max(
+            line_cross_span * 2.0,
+            line_inline_span * 0.12,
+        )
+        maximum_gap = max(
+            line_cross_span * 4.0,
+            line_inline_span * 0.25,
+        )
+    aligned_terminal_dots: list[float] = []
     for component in components:
         box = tuple(int(value) for value in component.get("bbox_xywh", ()))
         if len(box) != 4 or _boxes_overlap(line_box, box):
             continue
         bx, by, bw, bh = box
-        if max(bw, bh) > source_cell * 0.46:
+        if max(bw, bh) > maximum_dot_size:
             continue
         cross_center = (
             float(bx) + float(bw) / 2.0
             if axis == "ttb"
             else float(by) + float(bh) / 2.0
         )
-        if abs(cross_center - line_cross_center) > source_cell * 0.28:
+        if abs(cross_center - line_cross_center) > cross_tolerance:
             continue
         dot_start = by if axis == "ttb" else bx
         dot_end = by + bh if axis == "ttb" else bx + bw
         gap = min(abs(dot_start - inline_end), abs(inline_start - dot_end))
-        if gap <= source_cell * 0.80:
-            return True
-    return False
+        if gap <= maximum_gap:
+            aligned_terminal_dots.append(cross_center)
+    # One aligned terminal dot makes the candidate indistinguishable from an
+    # exclamation stem.  Two or more flanking dots are a separate compact
+    # emphasis sequence and must not erase an otherwise proven dash span.
+    return len(aligned_terminal_dots) == 1
 
 
 def _component_center_track(

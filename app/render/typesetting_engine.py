@@ -8,6 +8,7 @@ identity.
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_CEILING
 from typing import Any, Mapping, Sequence
@@ -24,6 +25,9 @@ from app.render.parent_layer_effects import (
     outward_int_xywh,
     resolve_parent_layer_effects,
     shift_layout_geometry,
+)
+from app.render.source_punctuation_hints import (
+    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE,
 )
 from app.render.text_shaper import HarfBuzzShaper, ShapedRun
 from app.render.target_lexical_segmenter import (
@@ -96,6 +100,9 @@ _VERTICAL_NO_COLUMN_START = {
     "︓",
     "︔",
 }
+
+BASE_TEXT_INK_ENVELOPE_VERSION = "base_text_ink_envelope_v1"
+BASE_TEXT_HINTED_DIMENSION_GUARD_PX = 1.0
 
 
 @dataclass(frozen=True)
@@ -438,6 +445,34 @@ class TypesettingEngine:
                     box_model["vertical_layout_profile"] = dict(
                         columns[0]["layout_profile"]
                     )
+            base_ink_fit = _fit_base_text_ink_envelope(
+                placements=placements,
+                lines=lines,
+                columns=columns,
+                shaped_runs=shaped_runs,
+                hard_bounds=hard_bounds,
+                style=plan.resolved_render_style,
+                layout_fit_status=fit_status,
+            )
+            placements = list(base_ink_fit["placements"])
+            lines = list(base_ink_fit["lines"])
+            columns = list(base_ink_fit["columns"])
+            measured_bounds = list(base_ink_fit["measured_bounds"])
+            base_text_ink_envelope = dict(base_ink_fit["audit"])
+            if fit_status == "fits" and not bool(
+                base_text_ink_envelope.get("contained")
+            ):
+                fit_status = "overflow"
+                fit_issues = _unique(
+                    [
+                        *fit_issues,
+                        "base_text_ink_envelope_exceeds_hard_bounds",
+                    ]
+                )
+            elif base_text_ink_envelope.get("status") == "translated":
+                reason_codes.append(
+                    "base_text_ink_envelope_translated_within_hard_bounds"
+                )
             base_measured_bounds = list(measured_bounds)
             base_visual_center = _center_of(base_measured_bounds)
             parent_effect_envelope = fit_effect_envelope(
@@ -475,6 +510,7 @@ class TypesettingEngine:
                 "measured_bounds": list(measured_bounds),
                 "base_measured_bounds": list(base_measured_bounds),
                 "base_visual_center": list(base_visual_center),
+                "base_text_ink_envelope": base_text_ink_envelope,
                 "parent_layer_effect_envelope": parent_effect_envelope.to_audit_dict(),
                 "issues": list(fit_issues),
                 "placements": placements,
@@ -560,6 +596,7 @@ class TypesettingEngine:
         base_measured_bounds = list(selected_attempt["base_measured_bounds"])
         base_visual_center = list(selected_attempt["base_visual_center"])
         parent_effect_envelope = dict(selected_attempt["parent_layer_effect_envelope"])
+        base_text_ink_envelope = dict(selected_attempt["base_text_ink_envelope"])
         fit_status = str(selected_attempt["fit_status"])
         fit_issues = list(selected_attempt["issues"])
         box_model = dict(selected_attempt["box_model"])
@@ -746,6 +783,7 @@ class TypesettingEngine:
             "parent_layer_effect_envelope": parent_effect_envelope,
             "base_measured_bounds": list(base_measured_bounds),
             "base_visual_center": list(base_visual_center),
+            "base_text_ink_envelope": base_text_ink_envelope,
             "drawing_primitives": [
                 item.to_audit_dict() for item in drawing_primitives
             ],
@@ -828,6 +866,9 @@ class TypesettingEngine:
                         ),
                         "parent_layer_effect_envelope": dict(
                             item["parent_layer_effect_envelope"]
+                        ),
+                        "base_text_ink_envelope": dict(
+                            item["base_text_ink_envelope"]
                         ),
                     }
                     for item in attempts
@@ -938,6 +979,7 @@ class TypesettingEngine:
                 "parent_layer_effect_envelope": parent_effect_envelope,
                 "base_measured_bounds": list(base_measured_bounds),
                 "base_visual_center": list(base_visual_center),
+                "base_text_ink_envelope": base_text_ink_envelope,
                 "open_type_metrics_by_face": open_type_metrics_by_face,
                 "box_model": box_model,
                 "fit_contract": {
@@ -2692,6 +2734,399 @@ def _box_inside(box: Sequence[int], container: Sequence[int]) -> bool:
     return bx >= cx and by >= cy and bx + bw <= cx + cw and by + bh <= cy + ch
 
 
+def _fit_base_text_ink_envelope(
+    *,
+    placements: Sequence[GlyphPlacement],
+    lines: Sequence[Mapping[str, Any]],
+    columns: Sequence[Mapping[str, Any]],
+    shaped_runs: Sequence[ShapedRun],
+    hard_bounds: Sequence[int],
+    style: Mapping[str, Any] | None,
+    layout_fit_status: str,
+) -> dict[str, Any]:
+    """Fit one conservative shaped/base-outline envelope as typeset geometry.
+
+    HarfBuzz supplies outline dimensions; the single extra dimension pixel
+    covers integer raster-grid enclosure. The calculation mirrors the
+    rasterizer's crop-and-center policy but never draws or changes shaping.
+    """
+
+    hard = bbox_from_value(hard_bounds)
+    logical_bounds = _union_bounds([item.bbox for item in placements])
+    outline_width = _base_raster_outline_width(style)
+    shaped_by_run = {
+        str(item.metadata.get("font_span_id") or item.metadata.get("run_id") or ""): item
+        for item in shaped_runs
+        if str(item.metadata.get("font_span_id") or item.metadata.get("run_id") or "")
+    }
+    placement_records: list[dict[str, Any]] = []
+    envelope_boxes: list[list[int]] = []
+    for placement in placements:
+        record = _placement_base_text_ink_envelope(
+            placement,
+            shaped_by_run,
+            outline_width=outline_width,
+        )
+        if record:
+            placement_records.append(record)
+            envelope = bbox_from_value(record.get("envelope_bounds"))
+            if envelope:
+                envelope_boxes.append(envelope)
+    input_envelope = _union_bounds(envelope_boxes) or list(logical_bounds)
+    audit: dict[str, Any] = {
+        "base_text_ink_envelope_version": BASE_TEXT_INK_ENVELOPE_VERSION,
+        "policy": "harfbuzz_outline_base_paint_envelope_v1",
+        "policy_owner": "TypesettingEngine",
+        "status": "contained",
+        "contained": bool(hard and input_envelope and _box_inside(input_envelope, hard)),
+        "layout_fit_status_before_envelope": str(layout_fit_status or ""),
+        "parent_hard_bounds": list(hard),
+        "logical_placement_bounds": list(logical_bounds),
+        "input_envelope_bounds": list(input_envelope),
+        "output_envelope_bounds": list(input_envelope),
+        "base_outline_width_px": int(outline_width),
+        "hinted_dimension_guard_px": float(BASE_TEXT_HINTED_DIMENSION_GUARD_PX),
+        "hinted_dimension_guard_policy": "one_total_pixel_after_outward_outline_span",
+        "allowed_shift_x": [],
+        "allowed_shift_y": [],
+        "selected_shift": [0, 0],
+        "relative_geometry_preserved": True,
+        "font_size_changed": False,
+        "breaks_changed": False,
+        "writing_mode_changed": False,
+        "placement_evidence": placement_records,
+        "issues": [],
+    }
+    if not hard or not input_envelope:
+        audit.update(
+            {
+                "status": "invalid",
+                "contained": False,
+                "issues": ["base_text_ink_envelope_bounds_invalid"],
+            }
+        )
+        return {
+            "placements": list(placements),
+            "lines": [deepcopy(dict(item)) for item in lines],
+            "columns": [deepcopy(dict(item)) for item in columns],
+            "measured_bounds": list(logical_bounds),
+            "audit": audit,
+        }
+
+    hard_right = hard[0] + hard[2]
+    hard_bottom = hard[1] + hard[3]
+    envelope_right = input_envelope[0] + input_envelope[2]
+    envelope_bottom = input_envelope[1] + input_envelope[3]
+    min_dx = int(hard[0] - input_envelope[0])
+    max_dx = int(hard_right - envelope_right)
+    min_dy = int(hard[1] - input_envelope[1])
+    max_dy = int(hard_bottom - envelope_bottom)
+    audit["allowed_shift_x"] = [min_dx, max_dx]
+    audit["allowed_shift_y"] = [min_dy, max_dy]
+    if min_dx > max_dx or min_dy > max_dy:
+        audit.update(
+            {
+                "status": "exceeds_hard_bounds",
+                "contained": False,
+                "issues": ["complete_base_text_ink_envelope_exceeds_hard_bounds"],
+            }
+        )
+        return {
+            "placements": list(placements),
+            "lines": [deepcopy(dict(item)) for item in lines],
+            "columns": [deepcopy(dict(item)) for item in columns],
+            "measured_bounds": list(input_envelope),
+            "audit": audit,
+        }
+
+    if str(layout_fit_status or "") != "fits":
+        audit["status"] = "deferred_existing_layout_overflow"
+        audit["contained"] = _box_inside(input_envelope, hard)
+        return {
+            "placements": list(placements),
+            "lines": [deepcopy(dict(item)) for item in lines],
+            "columns": [deepcopy(dict(item)) for item in columns],
+            "measured_bounds": list(input_envelope),
+            "audit": audit,
+        }
+
+    dx = _closest_integer_to_zero(min_dx, max_dx)
+    dy = _closest_integer_to_zero(min_dy, max_dy)
+    audit["selected_shift"] = [dx, dy]
+    output_envelope = [
+        input_envelope[0] + dx,
+        input_envelope[1] + dy,
+        input_envelope[2],
+        input_envelope[3],
+    ]
+    audit["output_envelope_bounds"] = output_envelope
+    audit["contained"] = _box_inside(output_envelope, hard)
+    if not audit["contained"]:
+        audit.update(
+            {
+                "status": "invalid",
+                "issues": ["selected_base_text_ink_shift_not_contained"],
+            }
+        )
+        return {
+            "placements": list(placements),
+            "lines": [deepcopy(dict(item)) for item in lines],
+            "columns": [deepcopy(dict(item)) for item in columns],
+            "measured_bounds": list(input_envelope),
+            "audit": audit,
+        }
+    if dx == 0 and dy == 0:
+        return {
+            "placements": list(placements),
+            "lines": [deepcopy(dict(item)) for item in lines],
+            "columns": [deepcopy(dict(item)) for item in columns],
+            "measured_bounds": output_envelope,
+            "audit": audit,
+        }
+
+    audit["status"] = "translated"
+    shifted_placements = [
+        _shift_glyph_placement(
+            item,
+            dx,
+            dy,
+            metadata_key="base_text_ink_fit_shift",
+        )
+        for item in placements
+    ]
+    return {
+        "placements": shifted_placements,
+        "lines": _shift_base_ink_coordinate_records(lines, dx, dy),
+        "columns": _shift_base_ink_coordinate_records(columns, dx, dy),
+        "measured_bounds": output_envelope,
+        "audit": audit,
+    }
+
+
+def _placement_base_text_ink_envelope(
+    placement: GlyphPlacement,
+    shaped_by_run: Mapping[str, ShapedRun],
+    *,
+    outline_width: int,
+) -> dict[str, Any]:
+    box = bbox_from_value(placement.bbox)
+    text = str(placement.text or "")
+    if not box or not text or text.isspace() or not source_text_requires_visible_glyph(text):
+        return {}
+    metadata = dict(placement.metadata or {})
+    mode = str(metadata.get("placement_mode") or "")
+    if mode in {
+        "vertical_ellipsis_sequence",
+        "vertical_dash_sequence",
+        "vertical_wave_sequence",
+    }:
+        return {
+            "text": text,
+            "run_id": str(metadata.get("run_id") or ""),
+            "placement_mode": mode,
+            "placement_bounds": list(box),
+            "envelope_bounds": list(box),
+            "evidence_status": "typesetting_drawing_primitive_bounds",
+        }
+
+    run_id = str(metadata.get("font_span_id") or metadata.get("run_id") or "")
+    shaped = shaped_by_run.get(run_id)
+    requested = [
+        int(value)
+        for value in list(metadata.get("shaped_glyph_ids") or [])
+    ]
+    position_policy = (
+        "compact_horizontal_sequence_preserved"
+        if mode == "vertical_emphasis_sequence"
+        else "harfbuzz"
+    )
+    core_width, core_height, evidence_status = _predicted_shaped_core_size(
+        shaped,
+        requested,
+        position_policy=position_policy,
+        target_size=(box[2], box[3]),
+    )
+    natural_width = max(1, int(core_width) + int(outline_width) * 2)
+    natural_height = max(1, int(core_height) + int(outline_width) * 2)
+    dest_x = int(round((float(box[2]) - float(core_width)) / 2.0))
+    dest_y = int(round((float(box[3]) - float(core_height)) / 2.0))
+    natural_box = [
+        box[0] + dest_x - int(outline_width),
+        box[1] + dest_y - int(outline_width),
+        natural_width,
+        natural_height,
+    ]
+    envelope = _union_bounds([box, natural_box])
+    return {
+        "text": text,
+        "run_id": run_id,
+        "placement_mode": mode,
+        "placement_bounds": list(box),
+        "predicted_core_size": [int(core_width), int(core_height)],
+        "predicted_natural_raster_size": [natural_width, natural_height],
+        "predicted_natural_raster_bounds": natural_box,
+        "envelope_bounds": envelope,
+        "evidence_status": evidence_status,
+    }
+
+
+def _predicted_shaped_core_size(
+    shaped: ShapedRun | None,
+    requested_glyph_ids: Sequence[int],
+    *,
+    position_policy: str,
+    target_size: tuple[int, int],
+) -> tuple[int, int, str]:
+    if shaped is None:
+        return max(1, int(target_size[0])), max(1, int(target_size[1])), "fallback_logical_cell"
+    glyphs = _select_shaped_glyphs(shaped, requested_glyph_ids)
+    if not glyphs:
+        return max(1, int(target_size[0])), max(1, int(target_size[1])), "fallback_logical_cell"
+    boxes = [_shaped_glyph_outline_box(item, 0.0, 0.0) for item in glyphs]
+    if any(not item for item in boxes):
+        return max(1, int(target_size[0])), max(1, int(target_size[1])), "fallback_logical_cell"
+
+    if position_policy == "compact_horizontal_sequence_preserved":
+        widths = [_hinted_dimension_upper(item[2] - item[0]) for item in boxes]
+        heights = [_hinted_dimension_upper(item[3] - item[1]) for item in boxes]
+        available_gap = max(0.0, float(target_size[0] - sum(widths))) / float(max(1, len(widths) - 1))
+        preferred_gap = max(1.0, round(float(shaped.font_size) * 0.06))
+        gap = 0.0 if len(widths) <= 1 else max(0.0, min(preferred_gap, available_gap))
+        return (
+            max(1, int(round(sum(widths) + gap * max(0, len(widths) - 1)))),
+            max(1, max(heights)),
+            "harfbuzz_outline_extents_compact_horizontal",
+        )
+
+    pen_x = 0.0
+    pen_y = 0.0
+    positioned: list[list[float]] = []
+    for glyph in glyphs:
+        outline = _shaped_glyph_outline_box(glyph, pen_x, pen_y)
+        if not outline:
+            return max(1, int(target_size[0])), max(1, int(target_size[1])), "fallback_logical_cell"
+        positioned.append(outline)
+        pen_x += float(glyph.x_advance)
+        pen_y += float(glyph.y_advance)
+    left = min(item[0] for item in positioned)
+    top = min(item[1] for item in positioned)
+    right = max(item[2] for item in positioned)
+    bottom = max(item[3] for item in positioned)
+    return (
+        _hinted_dimension_upper(right - left),
+        _hinted_dimension_upper(bottom - top),
+        "harfbuzz_outline_extents",
+    )
+
+
+def _select_shaped_glyphs(
+    shaped: ShapedRun,
+    requested_glyph_ids: Sequence[int],
+) -> list[Any]:
+    glyphs = list(shaped.glyphs or [])
+    requested = [int(value) for value in requested_glyph_ids]
+    if not requested:
+        return glyphs
+    available = [int(item.glyph_id) for item in glyphs]
+    if requested == available:
+        return glyphs
+    width = len(requested)
+    for start in range(0, len(available) - width + 1):
+        if available[start : start + width] == requested:
+            return glyphs[start : start + width]
+    return []
+
+
+def _shaped_glyph_outline_box(
+    glyph: Any,
+    pen_x: float,
+    pen_y: float,
+) -> list[float]:
+    metadata = dict(getattr(glyph, "metadata", {}) or {})
+    extents = metadata.get("outline_extents_px")
+    if not isinstance(extents, Mapping):
+        return []
+    try:
+        x_bearing = float(extents["x_bearing"])
+        y_bearing = float(extents["y_bearing"])
+        width = float(extents["width"])
+        height = float(extents["height"])
+        x_offset = float(glyph.x_offset)
+        y_offset = float(glyph.y_offset)
+    except (KeyError, TypeError, ValueError):
+        return []
+    x0 = float(pen_x) + x_offset + x_bearing
+    x1 = x0 + width
+    y0 = -(float(pen_y) + y_offset + y_bearing)
+    y1 = -(float(pen_y) + y_offset + y_bearing + height)
+    return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+
+def _hinted_dimension_upper(value: float) -> int:
+    return max(
+        1,
+        int(
+            math.ceil(
+                max(0.0, float(value))
+                + BASE_TEXT_HINTED_DIMENSION_GUARD_PX
+            )
+        ),
+    )
+
+
+def _base_raster_outline_width(style: Mapping[str, Any] | None) -> int:
+    return max(0, int(round(_style_outline_width(style))))
+
+
+def _closest_integer_to_zero(lower: int, upper: int) -> int:
+    if lower <= 0 <= upper:
+        return 0
+    return int(lower if lower > 0 else upper)
+
+
+def _shift_base_ink_coordinate_records(
+    values: Sequence[Mapping[str, Any]],
+    dx: int,
+    dy: int,
+) -> list[dict[str, Any]]:
+    shifted: list[dict[str, Any]] = []
+    for value in values:
+        item = deepcopy(dict(value))
+        for key in ("x", "raw_x"):
+            if item.get(key) is not None:
+                item[key] = item[key] + dx
+        for key in ("y", "raw_y"):
+            if item.get(key) is not None:
+                item[key] = item[key] + dy
+        for key in (
+            "bbox",
+            "box",
+            "display_box",
+            "raw_box",
+            "centered_block_box",
+            "measured_bounds",
+        ):
+            box = bbox_from_value(item.get(key))
+            if box:
+                item[key] = [box[0] + dx, box[1] + dy, box[2], box[3]]
+        alignment = item.get("layout_visual_alignment")
+        if isinstance(alignment, Mapping):
+            adjusted = deepcopy(dict(alignment))
+            box = bbox_from_value(adjusted.get("measured_bounds"))
+            if box:
+                adjusted["measured_bounds"] = [
+                    box[0] + dx,
+                    box[1] + dy,
+                    box[2],
+                    box[3],
+                ]
+            adjusted["base_text_ink_fit_shift"] = [dx, dy]
+            item["layout_visual_alignment"] = adjusted
+        item["base_text_ink_fit_shift"] = [dx, dy]
+        shifted.append(item)
+    return shifted
+
+
 def _clamp_box(box: Sequence[int], container: Sequence[int]) -> list[int]:
     bx, by, bw, bh = [int(v) for v in box[:4]]
     cx, cy, cw, ch = [int(v) for v in container[:4]]
@@ -2788,14 +3223,20 @@ def _measured_alignment_shift(measured: Sequence[int], center: Sequence[float], 
     return int(dx), int(dy)
 
 
-def _shift_glyph_placement(placement: GlyphPlacement, dx: int, dy: int) -> GlyphPlacement:
+def _shift_glyph_placement(
+    placement: GlyphPlacement,
+    dx: int,
+    dy: int,
+    *,
+    metadata_key: str = "layout_visual_alignment_shift",
+) -> GlyphPlacement:
     bbox = bbox_from_value(placement.bbox)
     shifted_bbox = [bbox[0] + int(dx), bbox[1] + int(dy), bbox[2], bbox[3]] if bbox else list(placement.bbox)
     position = list(placement.position or [])
     if len(position) >= 2:
         position = [float(position[0]) + float(dx), float(position[1]) + float(dy), *position[2:]]
     metadata = dict(placement.metadata or {})
-    metadata["layout_visual_alignment_shift"] = [int(dx), int(dy)]
+    metadata[str(metadata_key)] = [int(dx), int(dy)]
     return replace(placement, bbox=shifted_bbox, position=position, metadata=metadata)
 
 
@@ -2912,6 +3353,9 @@ def _source_punctuation_geometry_match(
         "kind_ordinal": int(occurrence.get("kind_ordinal") or 0),
         "source_span_px": float(occurrence.get("span_px") or 0.0),
         "source_pitch_px": float(occurrence.get("pitch_px") or 0.0),
+        "measurement_basis": str(
+            occurrence.get("measurement_basis") or ""
+        ),
         "source_cell_px": float(occurrence.get("source_cell_px") or 0.0),
         "normalized_span": float(occurrence.get("normalized_span") or 0.0),
         "normalized_pitch": float(occurrence.get("normalized_pitch") or 0.0),
@@ -2975,10 +3419,21 @@ def _vertical_layout_items(
                     float(source_geometry_match.get("source_span_px") or 0.0),
                 )
                 item_height = requested_source_span * candidate_scale
-                row_units = max(
-                    1.0,
-                    float(source_geometry_match.get("normalized_span") or 0.0),
-                )
+                if source_geometry_match.get("measurement_basis") == (
+                    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE
+                ):
+                    row_units = max(
+                        1.0,
+                        float(item_height) / max(1.0, float(font_size)),
+                    )
+                else:
+                    row_units = max(
+                        1.0,
+                        float(
+                            source_geometry_match.get("normalized_span")
+                            or 0.0
+                        ),
+                    )
                 source_geometry_match = {
                     **source_geometry_match,
                     "requested_span_px": requested_source_span,

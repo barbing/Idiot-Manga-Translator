@@ -22,6 +22,8 @@ from app.render.source_punctuation_hints import (
     SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION,
     SOURCE_PUNCTUATION_GEOMETRY_OBSERVER_VERSION,
     SOURCE_PUNCTUATION_GEOMETRY_SUPPORT_VERSION,
+    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE,
+    SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED,
     source_punctuation_cell_calibration_sha256,
     source_punctuation_geometry_fact_set_id,
 )
@@ -502,15 +504,28 @@ def _source_punctuation_geometry_rejection_reasons(
             reasons=reasons,
         )
         inline_axis = str(occurrence.get("inline_axis") or "")
+        measurement_basis = str(
+            occurrence.get("measurement_basis") or ""
+        )
         occurrence_cell = _strict_finite_number(
             occurrence.get("source_cell_px")
         )
         calibration_cell = calibration_cells.get(inline_axis)
-        if (
-            occurrence_cell is None
-            or calibration_cell is None
-            or abs(occurrence_cell - calibration_cell) > 1.0e-6
+        if measurement_basis == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED:
+            calibration_matches = (
+                occurrence_cell is not None
+                and calibration_cell is not None
+                and abs(occurrence_cell - calibration_cell) <= 1.0e-6
+            )
+        elif measurement_basis == (
+            SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE
         ):
+            calibration_matches = (
+                occurrence_cell == 0.0 and calibration_cell is None
+            )
+        else:
+            calibration_matches = False
+        if not calibration_matches:
             reasons.append(
                 f"source_punctuation_geometry_occurrence_calibration_mismatch:{index}"
             )
@@ -710,6 +725,7 @@ def _validate_source_punctuation_occurrence(
             "group_bbox_page_xywh",
             "span_px",
             "pitch_px",
+            "measurement_basis",
             "source_cell_px",
             "normalized_span",
             "normalized_pitch",
@@ -724,6 +740,18 @@ def _validate_source_punctuation_occurrence(
         reasons.append(f"{prefix}_kind_invalid")
     if str(occurrence.get("inline_axis") or "") not in {"ttb", "ltr"}:
         reasons.append(f"{prefix}_inline_axis_invalid")
+    measurement_basis = str(occurrence.get("measurement_basis") or "")
+    if measurement_basis not in {
+        SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED,
+        SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE,
+    }:
+        reasons.append(f"{prefix}_measurement_basis_invalid")
+    if (
+        measurement_basis
+        == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE
+        and kind != "dash"
+    ):
+        reasons.append(f"{prefix}_absolute_basis_kind_invalid")
     if not str(occurrence.get("occurrence_id") or ""):
         reasons.append(f"{prefix}_identity_missing")
     if _strict_nonnegative_int(occurrence.get("visual_reading_order_ordinal")) is None:
@@ -791,17 +819,39 @@ def _validate_source_punctuation_occurrence(
         reasons.append(f"{prefix}_span_invalid")
     if pitch is None or pitch <= 0.0:
         reasons.append(f"{prefix}_pitch_invalid")
-    if cell is None or cell <= 0.0:
-        reasons.append(f"{prefix}_source_cell_invalid")
-    if normalized_span is None or normalized_span <= 0.0:
-        reasons.append(f"{prefix}_normalized_span_invalid")
-    if normalized_pitch is None or normalized_pitch <= 0.0:
-        reasons.append(f"{prefix}_normalized_pitch_invalid")
+    if measurement_basis == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED:
+        if cell is None or cell <= 0.0:
+            reasons.append(f"{prefix}_source_cell_invalid")
+        if normalized_span is None or normalized_span <= 0.0:
+            reasons.append(f"{prefix}_normalized_span_invalid")
+        if normalized_pitch is None or normalized_pitch <= 0.0:
+            reasons.append(f"{prefix}_normalized_pitch_invalid")
+    elif measurement_basis == (
+        SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE
+    ):
+        if cell != 0.0:
+            reasons.append(f"{prefix}_absolute_source_cell_invalid")
+        if normalized_span != 0.0:
+            reasons.append(f"{prefix}_absolute_normalized_span_invalid")
+        if normalized_pitch != 0.0:
+            reasons.append(f"{prefix}_absolute_normalized_pitch_invalid")
     if confidence is None or confidence < 0.0 or confidence > 1.0:
         reasons.append(f"{prefix}_confidence_invalid")
-    if span and cell and normalized_span is not None and abs(normalized_span - span / cell) > 1e-5:
+    if (
+        measurement_basis == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+        and span
+        and cell
+        and normalized_span is not None
+        and abs(normalized_span - span / cell) > 1e-5
+    ):
         reasons.append(f"{prefix}_normalized_span_mismatch")
-    if pitch and cell and normalized_pitch is not None and abs(normalized_pitch - pitch / cell) > 1e-5:
+    if (
+        measurement_basis == SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
+        and pitch
+        and cell
+        and normalized_pitch is not None
+        and abs(normalized_pitch - pitch / cell) > 1e-5
+    ):
         reasons.append(f"{prefix}_normalized_pitch_mismatch")
     inline_axis = str(occurrence.get("inline_axis") or "")
     if local_group and span:

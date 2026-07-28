@@ -27,9 +27,48 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 
 FONT_MANAGER_VERSION = "font_manager_v1"
-TARGET_OPTICAL_PROFILE_VERSION = "target_optical_profile_v1"
+TARGET_OPTICAL_PROFILE_VERSION = "target_optical_profile_v2"
 TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX = 64
-TARGET_OPTICAL_PROFILE_CJK_PROBE = ("永", "国", "語", "文")
+TARGET_OPTICAL_PROFILE_POLICY_VERSION = "fixed_disjoint_cjk_probe_bank_v1"
+TARGET_OPTICAL_PROFILE_AGGREGATION = "median_of_probe_medians_v1"
+TARGET_OPTICAL_PROFILE_PROBE_BANK = (
+    ("cjk_cosmos_single", "天地玄黄宇宙洪荒"),
+    ("cjk_seasons_single", "春夏秋冬東西南北"),
+    ("cjk_nature_single", "海山川空月星光雨"),
+    ("hiragana_single", "あいうえおかきくけこ"),
+    ("katakana_single", "アイウエオカキクケコ"),
+    ("cjk_life_two_column", "永語愛無人生活仕事"),
+    ("cjk_story_two_column", "漢字仮名読書物語心"),
+    ("cjk_motion_two_column", "時風道夢声旅力世界"),
+)
+TARGET_OPTICAL_PROFILE_CJK_PROBE = tuple(
+    sorted(
+        {
+            cluster
+            for _, text in TARGET_OPTICAL_PROFILE_PROBE_BANK
+            for cluster in strict_grapheme_clusters(text)
+        }
+    )
+)
+_target_optical_policy_digest = hashlib.sha256()
+for _target_optical_policy_part in (
+    TARGET_OPTICAL_PROFILE_VERSION,
+    TARGET_OPTICAL_PROFILE_POLICY_VERSION,
+    TARGET_OPTICAL_PROFILE_AGGREGATION,
+    str(TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX),
+    *(
+        f"{probe_id}\x00{text}"
+        for probe_id, text in TARGET_OPTICAL_PROFILE_PROBE_BANK
+    ),
+):
+    _target_optical_policy_digest.update(
+        str(_target_optical_policy_part).encode("utf-8")
+    )
+    _target_optical_policy_digest.update(b"\x00")
+TARGET_OPTICAL_PROFILE_POLICY_ID = (
+    f"{TARGET_OPTICAL_PROFILE_POLICY_VERSION}:"
+    f"{_target_optical_policy_digest.hexdigest()}"
+)
 DEFAULT_FALLBACK_CHAIN = "cjk-sc"
 TARGET_FONT_REQUEST_VERSION = "target_font_request_v1"
 TARGET_FONT_REQUEST_PROVENANCE = "parent_style_arbitrator_source_label_taxonomy_v1"
@@ -333,13 +372,16 @@ class TargetOpticalGlyphSelection:
 
 @dataclass(frozen=True)
 class TargetFontOpticalProfile:
-    """Cached realized target-face metrics without request or style policy."""
+    """Fixed registered-face metrics independent of translated glyph content."""
 
     profile_id: str
     face_id: str
     font_path: str
+    font_sha256: str
+    profile_policy_id: str
     reference_em_px: int
     writing_mode: str
+    probe_ids: tuple[str, ...]
     glyph_set: tuple[str, ...]
     glyph_set_sha256: str
     visible_ink_height_px: float
@@ -357,7 +399,11 @@ class TargetFontOpticalProfile:
 
     @property
     def cache_key(self) -> tuple[str, str, str]:
-        return (self.face_id, self.glyph_set_sha256, self.writing_mode)
+        return (
+            self.font_sha256,
+            self.profile_policy_id,
+            self.writing_mode,
+        )
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
@@ -366,8 +412,12 @@ class TargetFontOpticalProfile:
             "profile_id": self.profile_id,
             "face_id": self.face_id,
             "font_path": self.font_path,
+            "font_sha256": self.font_sha256,
+            "profile_policy_id": self.profile_policy_id,
             "reference_em_px": int(self.reference_em_px),
             "writing_mode": self.writing_mode,
+            "probe_ids": list(self.probe_ids),
+            "probe_count": len(self.probe_ids),
             "glyph_set": list(self.glyph_set),
             "glyph_set_sha256": self.glyph_set_sha256,
             "glyph_count": self.glyph_count,
@@ -517,6 +567,7 @@ class FontManager:
         self._glyph_metrics_cache: dict[tuple[str, int, str], GlyphMetrics] = {}
         self._text_metrics_cache: dict[tuple[str, int, str, str], TextMetrics] = {}
         self._open_type_metrics_cache: dict[tuple[str, int], OpenTypeMetrics] = {}
+        self._font_sha256_cache: dict[str, str] = {}
         self._target_optical_profile_cache: dict[
             tuple[str, str, str], TargetFontOpticalProfile
         ] = {}
@@ -1277,14 +1328,13 @@ class FontManager:
     def target_optical_profile(
         self,
         face: FontFace,
-        translated_text: str,
         writing_mode: str,
     ) -> TargetFontOpticalProfileResolution:
-        """Measure one registered target face at the fixed reference em.
+        """Measure one fixed registered-face profile at the reference em.
 
         The returned value contains continuous realized metrics only. Source
         style tiers, target em selection, readability, fitting, and layout are
-        deliberately outside this owner.
+        deliberately outside this owner. Translation content is not an input.
         """
 
         registered = self.face(face.face_id) if face is not None else None
@@ -1295,52 +1345,105 @@ class FontManager:
         ):
             raise FontManagerError("target optical profile requires a registered Noto CJK SC face")
         mode = _normalize_optical_writing_mode(writing_mode)
-        glyph_set = _usable_optical_cjk_graphemes(self, registered, translated_text)
-        fallback_probe_used = not glyph_set
-        if fallback_probe_used:
-            glyph_set = _usable_optical_cjk_graphemes(
-                self,
-                registered,
-                "".join(TARGET_OPTICAL_PROFILE_CJK_PROBE),
-            )
-        if not glyph_set:
-            raise FontManagerError("registered target face has no usable CJK optical probe glyph")
-
-        glyph_set_sha256 = _optical_glyph_set_sha256(glyph_set)
-        selection = TargetOpticalGlyphSelection(
-            glyph_set=glyph_set,
-            glyph_set_sha256=glyph_set_sha256,
-            evidence_source=(
-                "fixed_cjk_probe_fallback"
-                if fallback_probe_used
-                else "translated_cjk_glyph_set"
-            ),
-            fallback_probe_used=fallback_probe_used,
+        font_sha256 = self._font_file_sha256(registered.path)
+        key = (
+            font_sha256,
+            TARGET_OPTICAL_PROFILE_POLICY_ID,
+            mode,
         )
-        key = (registered.face_id, glyph_set_sha256, mode)
         cached = self._target_optical_profile_cache.get(key)
         if cached is not None:
             self._cache_hits["target_optical_profile"] += 1
             return TargetFontOpticalProfileResolution(
-                selection=selection,
+                selection=TargetOpticalGlyphSelection(
+                    glyph_set=cached.glyph_set,
+                    glyph_set_sha256=cached.glyph_set_sha256,
+                    evidence_source="fixed_disjoint_cjk_probe_bank",
+                    fallback_probe_used=False,
+                ),
                 profile=cached,
             )
         self._cache_misses["target_optical_profile"] += 1
 
+        probe_glyph_sets = _fixed_optical_probe_glyph_sets(
+            self,
+            registered,
+        )
+        glyph_set = tuple(
+            sorted(
+                {
+                    glyph
+                    for _, probe_glyphs in probe_glyph_sets
+                    for glyph in probe_glyphs
+                }
+            )
+        )
+        if not glyph_set:
+            raise FontManagerError(
+                "registered target face has no usable fixed optical probe glyph"
+            )
+        glyph_set_sha256 = _optical_glyph_set_sha256(glyph_set)
+        selection = TargetOpticalGlyphSelection(
+            glyph_set=glyph_set,
+            glyph_set_sha256=glyph_set_sha256,
+            evidence_source="fixed_disjoint_cjk_probe_bank",
+            fallback_probe_used=False,
+        )
         font = self.load_font(registered, TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX)
-        measurements = tuple(
-            _measure_optical_glyph(font, glyph, writing_mode=mode)
-            for glyph in glyph_set
+        probe_measurements = tuple(
+            tuple(
+                _measure_optical_glyph(
+                    font,
+                    glyph,
+                    writing_mode=mode,
+                )
+                for glyph in probe_glyphs
+            )
+            for _, probe_glyphs in probe_glyph_sets
+        )
+        per_probe = tuple(
+            {
+                "visible_ink_height_px": statistics.median(
+                    item["visible_ink_height_px"]
+                    for item in measurements
+                ),
+                "advance_px": statistics.median(
+                    item["advance_px"]
+                    for item in measurements
+                ),
+                "stem_width_px": statistics.median(
+                    item["stem_width_px"]
+                    for item in measurements
+                ),
+                "stem_to_ink_ratio": statistics.median(
+                    item["stem_width_px"]
+                    for item in measurements
+                )
+                / statistics.median(
+                    item["visible_ink_height_px"]
+                    for item in measurements
+                ),
+                "ink_coverage_ratio": statistics.median(
+                    item["ink_coverage_ratio"]
+                    for item in measurements
+                ),
+            }
+            for measurements in probe_measurements
         )
         visible_ink_height_px = statistics.median(
-            item["visible_ink_height_px"] for item in measurements
+            item["visible_ink_height_px"] for item in per_probe
         )
-        advance_px = statistics.median(item["advance_px"] for item in measurements)
+        advance_px = statistics.median(
+            item["advance_px"] for item in per_probe
+        )
         stem_width_px = statistics.median(
-            item["stem_width_px"] for item in measurements
+            item["stem_width_px"] for item in per_probe
+        )
+        stem_to_ink_ratio = statistics.median(
+            item["stem_to_ink_ratio"] for item in per_probe
         )
         ink_coverage_ratio = statistics.median(
-            item["ink_coverage_ratio"] for item in measurements
+            item["ink_coverage_ratio"] for item in per_probe
         )
         reference_em = float(TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX)
         profile_digest = hashlib.sha256(
@@ -1348,7 +1451,8 @@ class FontManager:
                 (
                     TARGET_OPTICAL_PROFILE_VERSION,
                     registered.face_id,
-                    glyph_set_sha256,
+                    font_sha256,
+                    TARGET_OPTICAL_PROFILE_POLICY_ID,
                     mode,
                 )
             ).encode("utf-8")
@@ -1357,8 +1461,13 @@ class FontManager:
             profile_id=f"{TARGET_OPTICAL_PROFILE_VERSION}:{profile_digest}",
             face_id=registered.face_id,
             font_path=registered.path,
+            font_sha256=font_sha256,
+            profile_policy_id=TARGET_OPTICAL_PROFILE_POLICY_ID,
             reference_em_px=TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX,
             writing_mode=mode,
+            probe_ids=tuple(
+                probe_id for probe_id, _ in probe_glyph_sets
+            ),
             glyph_set=glyph_set,
             glyph_set_sha256=glyph_set_sha256,
             visible_ink_height_px=round(float(visible_ink_height_px), 6),
@@ -1369,15 +1478,37 @@ class FontManager:
             advance_to_cell_ratio=round(float(advance_px) / reference_em, 8),
             stem_width_px=round(float(stem_width_px), 6),
             stem_to_ink_ratio=round(
-                float(stem_width_px) / float(visible_ink_height_px), 8
+                float(stem_to_ink_ratio), 8
             ),
             ink_coverage_ratio=round(float(ink_coverage_ratio), 8),
+            measurement_source=(
+                "fixed_disjoint_cjk_probe_bank_median_of_probe_medians_"
+                "pillow_raster_opencv_distance_transform"
+            ),
         )
         self._target_optical_profile_cache[key] = profile
         return TargetFontOpticalProfileResolution(
             selection=selection,
             profile=profile,
         )
+
+    def _font_file_sha256(self, path: str) -> str:
+        normalized = os.path.abspath(str(path or ""))
+        cached = self._font_sha256_cache.get(normalized)
+        if cached:
+            return cached
+        digest = hashlib.sha256()
+        try:
+            with open(normalized, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise FontManagerError(
+                f"registered target font hash unavailable: {normalized}"
+            ) from exc
+        value = digest.hexdigest()
+        self._font_sha256_cache[normalized] = value
+        return value
 
     def required_role_inventory(self) -> list[FontRoleStatus]:
         statuses: list[FontRoleStatus] = []
@@ -1762,6 +1893,26 @@ def _usable_optical_cjk_graphemes(
         if manager.coverage_for_text(face, cluster).supports_text:
             candidates.add(cluster)
     return tuple(sorted(candidates))
+
+
+def _fixed_optical_probe_glyph_sets(
+    manager: FontManager,
+    face: FontFace,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    probes: list[tuple[str, tuple[str, ...]]] = []
+    for probe_id, text in TARGET_OPTICAL_PROFILE_PROBE_BANK:
+        glyph_set = _usable_optical_cjk_graphemes(
+            manager,
+            face,
+            text,
+        )
+        if not glyph_set:
+            raise FontManagerError(
+                "registered target face lacks fixed optical probe support: "
+                f"{probe_id}"
+            )
+        probes.append((probe_id, glyph_set))
+    return tuple(probes)
 
 
 def _is_cjk_codepoint(char: str) -> bool:

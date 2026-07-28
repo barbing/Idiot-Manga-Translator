@@ -173,7 +173,10 @@ class HarfBuzzShaper:
                     y_advance=float(pos.y_advance) / 64.0,
                     x_offset=float(pos.x_offset) / 64.0,
                     y_offset=float(pos.y_offset) / 64.0,
-                    metadata={"glyph_index": index},
+                    metadata={
+                        "glyph_index": index,
+                        **_glyph_outline_extents_metadata(hb_font, glyph_id),
+                    },
                 )
             )
 
@@ -263,3 +266,31 @@ def _cluster_text(text: str, cluster: int, clusters: list[int] | None = None) ->
             end = value
             break
     return text[cluster:end] or text[cluster]
+
+
+def _glyph_outline_extents_metadata(font: Any, glyph_id: int) -> dict[str, Any]:
+    """Expose immutable HarfBuzz outline geometry for the fit owner.
+
+    The shaper reports geometry only. It does not use the extents to choose a
+    layout, alter shaping, or approximate a raster placement.
+    """
+
+    try:
+        extents = font.get_glyph_extents(int(glyph_id))
+    except Exception:
+        extents = None
+    if extents is None:
+        return {
+            "outline_extents_status": "unavailable",
+            "outline_extents_source": "harfbuzz_glyph_extents",
+        }
+    return {
+        "outline_extents_status": "measured",
+        "outline_extents_source": "harfbuzz_glyph_extents",
+        "outline_extents_px": {
+            "x_bearing": float(extents.x_bearing) / 64.0,
+            "y_bearing": float(extents.y_bearing) / 64.0,
+            "width": float(extents.width) / 64.0,
+            "height": float(extents.height) / 64.0,
+        },
+    }
