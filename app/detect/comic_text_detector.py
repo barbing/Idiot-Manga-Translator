@@ -187,6 +187,7 @@ class ComicTextDetector:
         input_size: int = 1024,
         *,
         keep_undetected_mask: bool = True,
+        refinement_scopes: list[tuple[int, int, int, int]] | None = None,
     ) -> ComicTextSegmentationResult:
         image = _read_image(image_path)
         if image is None:
@@ -200,6 +201,7 @@ class ComicTextDetector:
             image,
             input_size=input_size,
             keep_undetected_mask=keep_undetected_mask,
+            refinement_scopes=refinement_scopes,
             provenance={"image_path": image_path},
         )
 
@@ -209,6 +211,7 @@ class ComicTextDetector:
         input_size: int = 1024,
         *,
         keep_undetected_mask: bool = True,
+        refinement_scopes: list[tuple[int, int, int, int]] | None = None,
         provenance: dict[str, Any] | None = None,
     ) -> ComicTextSegmentationResult:
         """Return CTD detections and raw/refined text masks without changing detect_image."""
@@ -233,6 +236,7 @@ class ComicTextDetector:
             mask,
             mask_refined,
             blk_list,
+            refinement_scopes=refinement_scopes,
         )
         detections = _detections_from_blocks(blk_list)
         height, width = _image_hw(image)
@@ -368,7 +372,14 @@ def _confidence_stats(blk_list) -> dict[str, Any]:
     }
 
 
-def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, blocks) -> tuple[Any, dict[str, Any]]:
+def _recover_line_continuation_refinement_gaps(
+    image,
+    raw_mask,
+    refined_mask,
+    blocks,
+    *,
+    refinement_scopes: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[Any, dict[str, Any]]:
     """Recover CTD raw-mask text strokes that refinement dropped inside known text blocks.
 
     ComicTextDetector raw masks sometimes contain long vertical punctuation strokes
@@ -385,6 +396,14 @@ def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, bl
         "punctuation_endpoint_components_considered": 0,
         "punctuation_endpoint_components_recovered": 0,
         "punctuation_endpoint_pixels_recovered": 0,
+        "source_ink_components_considered": 0,
+        "source_ink_components_recovered": 0,
+        "source_ink_pixels_recovered": 0,
+        "punctuation_bridge_pairs_considered": 0,
+        "punctuation_bridge_pairs_recovered": 0,
+        "punctuation_bridge_components_considered": 0,
+        "punctuation_bridge_components_recovered": 0,
+        "punctuation_bridge_pixels_recovered": 0,
     }
     if image is None or raw_mask is None or refined_mask is None:
         return refined_mask, audit
@@ -407,6 +426,12 @@ def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, bl
 
     height, width = raw_bool.shape
     gray = _image_gray(image)
+    normalized_scopes = _normalize_refinement_scopes(
+        refinement_scopes,
+        width=width,
+        height=height,
+    )
+    audit["refinement_scope_count"] = len(normalized_scopes)
     admitted = np.zeros_like(raw_bool, dtype=bool)
     for block in blocks or []:
         block_bbox = _coerce_bbox(getattr(block, "xyxy", None), width, height)
@@ -446,7 +471,7 @@ def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, bl
             local_y = int(stats[label, cv2.CC_STAT_TOP])
             component = labels[local_y : local_y + comp_h, local_x : local_x + comp_w] == label
             audit["components_considered"] += 1
-            if not _is_recoverable_line_continuation_component(
+            if _is_recoverable_line_continuation_component(
                 comp_bbox=comp_bbox,
                 area=area,
                 component=component,
@@ -456,12 +481,42 @@ def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, bl
                 vertical=vertical,
                 gray=gray,
             ):
+                page_component = admitted[comp_y : comp_y + comp_h, comp_x : comp_x + comp_w]
+                new_component = np.logical_and(component, np.logical_not(page_component))
+                new_pixel_count = int(np.count_nonzero(new_component))
+                if new_pixel_count:
+                    page_component[new_component] = True
+                    admitted[comp_y : comp_y + comp_h, comp_x : comp_x + comp_w] = page_component
+                    audit["components_recovered"] += 1
+                    audit["pixels_recovered"] += new_pixel_count
                 continue
-            page_component = admitted[comp_y : comp_y + comp_h, comp_x : comp_x + comp_w]
-            page_component[component] = True
-            admitted[comp_y : comp_y + comp_h, comp_x : comp_x + comp_w] = page_component
-            audit["components_recovered"] += 1
-            audit["pixels_recovered"] += area
+            source_components, source_audit = _source_ink_continuation_subcomponents(
+                comp_bbox=comp_bbox,
+                component=component,
+                block_bbox=block_bbox,
+                line_bbox=line_bbox,
+                search_bbox=search_bbox,
+                vertical=vertical,
+                gray=gray,
+                refined_bool=refined_bool,
+                refinement_scopes=normalized_scopes,
+            )
+            audit["source_ink_components_considered"] += int(
+                source_audit.get("components_considered", 0) or 0
+            )
+            for source_bbox, source_component in source_components:
+                sx0, sy0, sx1, sy1 = source_bbox
+                page_component = admitted[sy0:sy1, sx0:sx1]
+                new_component = np.logical_and(source_component, np.logical_not(page_component))
+                new_pixel_count = int(np.count_nonzero(new_component))
+                if not new_pixel_count:
+                    continue
+                page_component[new_component] = True
+                admitted[sy0:sy1, sx0:sx1] = page_component
+                audit["components_recovered"] += 1
+                audit["pixels_recovered"] += new_pixel_count
+                audit["source_ink_components_recovered"] += 1
+                audit["source_ink_pixels_recovered"] += new_pixel_count
         endpoint_mask, endpoint_audit = _recover_punctuation_endpoint_components(
             raw_bool=raw_bool,
             refined_bool=np.logical_or(refined_bool, admitted),
@@ -486,6 +541,29 @@ def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, bl
                 audit["punctuation_endpoint_components_recovered"] += endpoint_components
                 audit["punctuation_endpoint_pixels_recovered"] += endpoint_pixels
 
+    bridge_mask, bridge_audit = _recover_internal_punctuation_bridges(
+        raw_bool=raw_bool,
+        refined_bool=np.logical_or(refined_bool, admitted),
+        refinement_scopes=normalized_scopes,
+        gray=gray,
+    )
+    for key in (
+        "punctuation_bridge_pairs_considered",
+        "punctuation_bridge_pairs_recovered",
+        "punctuation_bridge_components_considered",
+        "punctuation_bridge_components_recovered",
+        "punctuation_bridge_pixels_recovered",
+    ):
+        audit[key] += int(bridge_audit.get(key, 0) or 0)
+    if bridge_mask is not None and np.any(bridge_mask):
+        new_pixels = np.logical_and(bridge_mask, np.logical_not(admitted))
+        if np.any(new_pixels):
+            admitted = np.logical_or(admitted, new_pixels)
+            audit["components_recovered"] += int(
+                bridge_audit.get("punctuation_bridge_components_recovered", 0) or 0
+            )
+            audit["pixels_recovered"] += int(np.count_nonzero(new_pixels))
+
     if not np.any(admitted):
         return refined_mask, audit
 
@@ -501,6 +579,431 @@ def _recover_line_continuation_refinement_gaps(image, raw_mask, refined_mask, bl
     except Exception as exc:
         audit["status"] = f"repair_failed:{type(exc).__name__}"
         return refined_mask, audit
+
+
+def _normalize_refinement_scopes(
+    scopes,
+    *,
+    width: int,
+    height: int,
+) -> list[tuple[int, int, int, int]]:
+    normalized: list[tuple[int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for scope in scopes or []:
+        bbox = _coerce_bbox(scope, width, height)
+        if bbox is None or bbox in seen:
+            continue
+        seen.add(bbox)
+        normalized.append(bbox)
+    return normalized
+
+
+def _source_ink_continuation_subcomponents(
+    *,
+    comp_bbox: tuple[int, int, int, int],
+    component,
+    block_bbox: tuple[int, int, int, int],
+    line_bbox: tuple[int, int, int, int],
+    search_bbox: tuple[int, int, int, int],
+    vertical: bool,
+    gray,
+    refined_bool,
+    refinement_scopes: list[tuple[int, int, int, int]],
+) -> tuple[list[tuple[tuple[int, int, int, int], Any]], dict[str, int]]:
+    audit = {"components_considered": 0}
+    if gray is None or refined_bool is None or not refinement_scopes:
+        return [], audit
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return [], audit
+
+    cx0, cy0, cx1, cy1 = comp_bbox
+    gray_crop = gray[cy0:cy1, cx0:cx1]
+    if gray_crop.size == 0 or gray_crop.shape[:2] != component.shape[:2]:
+        return [], audit
+    foreground_is_dark = _line_foreground_is_dark(
+        gray=gray,
+        refined_bool=refined_bool,
+        line_bbox=line_bbox,
+    )
+    if foreground_is_dark is None:
+        return [], audit
+    _threshold, bright = cv2.threshold(
+        gray_crop.astype("uint8", copy=False),
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    source_ink = bright == 0 if foreground_is_dark else bright > 0
+    source_seed = np.logical_and(component, source_ink)
+    if not np.any(source_seed):
+        return [], audit
+
+    labels_count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        source_seed.astype("uint8"),
+        connectivity=8,
+    )
+    lx0, ly0, lx1, ly1 = line_bbox
+    line_cross = max(1, (lx1 - lx0) if vertical else (ly1 - ly0))
+    cross_limit = min(6, max(3, int(line_cross * 0.25)))
+    recovered: list[tuple[tuple[int, int, int, int], Any]] = []
+    for label in range(1, labels_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 18:
+            continue
+        local_x = int(stats[label, cv2.CC_STAT_LEFT])
+        local_y = int(stats[label, cv2.CC_STAT_TOP])
+        comp_w = int(stats[label, cv2.CC_STAT_WIDTH])
+        comp_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        source_bbox = (
+            cx0 + local_x,
+            cy0 + local_y,
+            cx0 + local_x + comp_w,
+            cy0 + local_y + comp_h,
+        )
+        axis_len = comp_h if vertical else comp_w
+        cross_len = comp_w if vertical else comp_h
+        if axis_len < 20 or axis_len > 96:
+            continue
+        if cross_len > cross_limit or axis_len < cross_len * 6:
+            continue
+        center_x = cx0 + float(centroids[label][0])
+        center_y = cy0 + float(centroids[label][1])
+        if not any(
+            sx0 <= center_x < sx1 and sy0 <= center_y < sy1
+            for sx0, sy0, sx1, sy1 in refinement_scopes
+        ):
+            continue
+        center_axis = center_y if vertical else center_x
+        line_axis_start = ly0 if vertical else lx0
+        line_axis_end = ly1 if vertical else lx1
+        if line_axis_start <= center_axis <= line_axis_end:
+            continue
+        local_component = (
+            labels[local_y : local_y + comp_h, local_x : local_x + comp_w] == label
+        )
+        audit["components_considered"] += 1
+        if not _is_recoverable_line_continuation_component(
+            comp_bbox=source_bbox,
+            area=area,
+            component=local_component,
+            search_bbox=search_bbox,
+            block_bbox=block_bbox,
+            line_bbox=line_bbox,
+            vertical=vertical,
+            gray=gray,
+        ):
+            continue
+        recovered.append((source_bbox, local_component))
+    return recovered, audit
+
+
+def _line_foreground_is_dark(*, gray, refined_bool, line_bbox) -> bool | None:
+    try:
+        import cv2
+        import numpy as np
+
+        x0, y0, x1, y1 = line_bbox
+        x0 = max(0, min(gray.shape[1], int(x0)))
+        y0 = max(0, min(gray.shape[0], int(y0)))
+        x1 = max(0, min(gray.shape[1], int(x1)))
+        y1 = max(0, min(gray.shape[0], int(y1)))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        gray_roi = gray[y0:y1, x0:x1]
+        refined_roi = refined_bool[y0:y1, x0:x1]
+        foreground = gray_roi[refined_roi]
+        if foreground.size < 8:
+            return None
+        expanded = cv2.dilate(refined_roi.astype("uint8"), np.ones((3, 3), dtype="uint8")) > 0
+        background = gray_roi[~expanded]
+        if background.size < 8:
+            background = gray_roi[~refined_roi]
+        if background.size < 8:
+            return None
+        background_median = float(np.median(background))
+        dark_distance = background_median - float(np.percentile(foreground, 20))
+        bright_distance = float(np.percentile(foreground, 80)) - background_median
+        return dark_distance >= bright_distance
+    except Exception:
+        return None
+
+
+def _recover_internal_punctuation_bridges(
+    *,
+    raw_bool,
+    refined_bool,
+    refinement_scopes: list[tuple[int, int, int, int]],
+    gray,
+) -> tuple[Any | None, dict[str, int]]:
+    """Recover complete source punctuation sequences between two refined runs."""
+
+    audit = {
+        "punctuation_bridge_pairs_considered": 0,
+        "punctuation_bridge_pairs_recovered": 0,
+        "punctuation_bridge_components_considered": 0,
+        "punctuation_bridge_components_recovered": 0,
+        "punctuation_bridge_pixels_recovered": 0,
+    }
+    if raw_bool is None or refined_bool is None or gray is None or not refinement_scopes:
+        return None, audit
+    try:
+        import numpy as np
+    except Exception:
+        return None, audit
+
+    admitted = np.zeros_like(raw_bool, dtype=bool)
+    accepted_keys: set[tuple[int, int, int, int]] = set()
+    for scope_bbox in refinement_scopes:
+        sx0, sy0, sx1, sy1 = scope_bbox
+        refined_roi = refined_bool[sy0:sy1, sx0:sx1]
+        anchors = _punctuation_endpoint_dot_components(
+            refined_roi,
+            offset=(sx0, sy0),
+        )
+        if len(anchors) < 6:
+            continue
+        for vertical in (True, False):
+            runs = _punctuation_endpoint_runs(anchors, vertical=vertical)
+            runs.sort(
+                key=lambda run: min(
+                    float(item["center"][1] if vertical else item["center"][0])
+                    for item in run
+                )
+            )
+            for first_run, second_run in zip(runs, runs[1:]):
+                bridge_profile = _punctuation_bridge_profile(
+                    first_run,
+                    second_run,
+                    gray=gray,
+                    vertical=vertical,
+                )
+                if bridge_profile is None:
+                    continue
+                audit["punctuation_bridge_pairs_considered"] += 1
+                candidates: list[tuple[tuple[int, int, int, int], Any]] = []
+                candidate_keys: set[tuple[int, int, int, int]] = set()
+                complete = True
+                for expected_axis in bridge_profile["expected_axes"]:
+                    candidate, considered = _punctuation_bridge_source_candidate(
+                        raw_bool=raw_bool,
+                        refined_bool=np.logical_or(refined_bool, admitted),
+                        gray=gray,
+                        scope_bbox=scope_bbox,
+                        expected_axis=float(expected_axis),
+                        profile=bridge_profile,
+                        vertical=vertical,
+                    )
+                    audit["punctuation_bridge_components_considered"] += considered
+                    if candidate is None:
+                        complete = False
+                        break
+                    bbox, component = candidate
+                    if bbox in accepted_keys or bbox in candidate_keys:
+                        complete = False
+                        break
+                    candidate_keys.add(bbox)
+                    candidates.append((bbox, component))
+                if not complete or len(candidates) != len(bridge_profile["expected_axes"]):
+                    continue
+                for bbox, component in candidates:
+                    x0, y0, x1, y1 = bbox
+                    page_slice = admitted[y0:y1, x0:x1]
+                    page_slice[component] = True
+                    admitted[y0:y1, x0:x1] = page_slice
+                    accepted_keys.add(bbox)
+                    audit["punctuation_bridge_components_recovered"] += 1
+                    audit["punctuation_bridge_pixels_recovered"] += int(
+                        np.count_nonzero(component)
+                    )
+                audit["punctuation_bridge_pairs_recovered"] += 1
+
+    if not np.any(admitted):
+        return None, audit
+    return admitted, audit
+
+
+def _punctuation_bridge_profile(
+    first_run: list[dict[str, Any]],
+    second_run: list[dict[str, Any]],
+    *,
+    gray,
+    vertical: bool,
+) -> dict[str, Any] | None:
+    if len(first_run) < 3 or len(second_run) < 3:
+        return None
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    first = _punctuation_endpoint_profile(first_run, gray=gray, vertical=vertical)
+    second = _punctuation_endpoint_profile(second_run, gray=gray, vertical=vertical)
+    if first is None or second is None:
+        return None
+
+    first_spacing = float(first.get("spacing") or 0.0)
+    second_spacing = float(second.get("spacing") or 0.0)
+    spacing = float(np.median(np.asarray([first_spacing, second_spacing])))
+    if spacing < 4.0 or spacing > 30.0:
+        return None
+    if abs(first_spacing - second_spacing) > max(1.5, spacing * 0.20):
+        return None
+    cross = float(np.median(np.asarray([first["cross"], second["cross"]])))
+    axis_size = float(np.median(np.asarray([first["axis"], second["axis"]])))
+    area = float(np.median(np.asarray([first["area"], second["area"]])))
+    for key in ("cross", "axis", "area"):
+        low = min(float(first[key]), float(second[key]))
+        high = max(float(first[key]), float(second[key]))
+        if low <= 0.0 or high / low > 1.85:
+            return None
+    cross_tolerance = max(2.5, min(8.0, cross * 0.80))
+    if abs(float(first["cross_center"]) - float(second["cross_center"])) > cross_tolerance:
+        return None
+    first_dark = float(first["foreground"]) <= float(first["background"])
+    second_dark = float(second["foreground"]) <= float(second["background"])
+    if first_dark != second_dark:
+        return None
+
+    first_axis = max(
+        float(item["center"][1] if vertical else item["center"][0])
+        for item in first_run
+    )
+    second_axis = min(
+        float(item["center"][1] if vertical else item["center"][0])
+        for item in second_run
+    )
+    gap = second_axis - first_axis
+    step_count = int(round(gap / spacing))
+    missing_count = step_count - 1
+    if missing_count < 1 or missing_count > 4:
+        return None
+    if abs(gap - step_count * spacing) > max(1.5, spacing * 0.20):
+        return None
+
+    return {
+        "foreground": float(
+            np.median(np.asarray([first["foreground"], second["foreground"]]))
+        ),
+        "background": float(
+            np.median(np.asarray([first["background"], second["background"]]))
+        ),
+        "spacing": spacing,
+        "cross": cross,
+        "axis": axis_size,
+        "area": area,
+        "cross_center": float(
+            np.median(np.asarray([first["cross_center"], second["cross_center"]]))
+        ),
+        "expected_axes": [
+            first_axis + spacing * index
+            for index in range(1, step_count)
+        ],
+    }
+
+
+def _punctuation_bridge_source_candidate(
+    *,
+    raw_bool,
+    refined_bool,
+    gray,
+    scope_bbox: tuple[int, int, int, int],
+    expected_axis: float,
+    profile: dict[str, Any],
+    vertical: bool,
+) -> tuple[tuple[tuple[int, int, int, int], Any] | None, int]:
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None, 0
+
+    sx0, sy0, sx1, sy1 = scope_bbox
+    spacing = float(profile["spacing"])
+    cross_size = float(profile["cross"])
+    axis_size = float(profile["axis"])
+    expected_cross = float(profile["cross_center"])
+    cross_radius = max(4, int(round(cross_size * 1.35)))
+    axis_radius = max(4, int(round(max(axis_size * 1.25, spacing * 0.35))))
+    if vertical:
+        wx0 = max(sx0, int(round(expected_cross - cross_radius)))
+        wx1 = min(sx1, int(round(expected_cross + cross_radius + 1)))
+        wy0 = max(sy0, int(round(expected_axis - axis_radius)))
+        wy1 = min(sy1, int(round(expected_axis + axis_radius + 1)))
+        expected_x, expected_y = expected_cross, expected_axis
+    else:
+        wx0 = max(sx0, int(round(expected_axis - axis_radius)))
+        wx1 = min(sx1, int(round(expected_axis + axis_radius + 1)))
+        wy0 = max(sy0, int(round(expected_cross - cross_radius)))
+        wy1 = min(sy1, int(round(expected_cross + cross_radius + 1)))
+        expected_x, expected_y = expected_axis, expected_cross
+    if wx1 <= wx0 or wy1 <= wy0:
+        return None, 0
+
+    residual = np.logical_and(
+        raw_bool[wy0:wy1, wx0:wx1],
+        np.logical_not(refined_bool[wy0:wy1, wx0:wx1]),
+    )
+    if not np.any(residual):
+        return None, 0
+    gray_roi = gray[wy0:wy1, wx0:wx1]
+    foreground = float(profile["foreground"])
+    background = float(profile["background"])
+    tolerance = max(
+        38.0,
+        min(82.0, abs(foreground - background) * 0.75 + 18.0),
+    )
+    if foreground <= background:
+        source_ink = gray_roi <= min(230.0, foreground + tolerance)
+    else:
+        source_ink = gray_roi >= max(25.0, foreground - tolerance)
+    seed = np.logical_and(residual, source_ink)
+    if not np.any(seed):
+        return None, 0
+
+    labels_count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        seed.astype("uint8"),
+        connectivity=8,
+    )
+    anchor_area = float(profile["area"])
+    candidates: list[tuple[float, tuple[int, int, int, int], Any]] = []
+    for label in range(1, labels_count):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if not _punctuation_endpoint_dot_shape(width=width, height=height, area=area):
+            continue
+        if area < max(3.0, anchor_area * 0.30) or area > max(18.0, anchor_area * 2.30):
+            continue
+        bbox = (wx0 + x, wy0 + y, wx0 + x + width, wy0 + y + height)
+        center_x = wx0 + float(centroids[label][0])
+        center_y = wy0 + float(centroids[label][1])
+        cross_delta = abs(
+            (center_x if vertical else center_y) - expected_cross
+        )
+        axis_delta = abs(
+            (center_y if vertical else center_x) - expected_axis
+        )
+        if cross_delta > max(2.5, cross_size * 0.75):
+            continue
+        if axis_delta > max(2.5, spacing * 0.30):
+            continue
+        component = labels[y : y + height, x : x + width] == label
+        if not _component_has_local_contrast(
+            component=component,
+            comp_bbox=bbox,
+            gray=gray,
+        ):
+            continue
+        candidates.append((cross_delta + axis_delta, bbox, component))
+    considered = max(0, labels_count - 1)
+    if len(candidates) != 1:
+        return None, considered
+    _distance, bbox, component = candidates[0]
+    return (bbox, component), considered
 
 
 def _mask_bool(mask, *, threshold: int = 30) -> Any | None:

@@ -1366,6 +1366,7 @@ class PipelineWorker(QtCore.QThread):
                         input_size=int(getattr(self._settings, "detector_input_size", 1024) or 1024),
                         page_id=page_id,
                         debug_context=debug_context,
+                        text_area_plan=text_area_plan,
                     )
                     _page014_timeout_checkpoint(
                         "text_foreground_segmentation",
@@ -3328,6 +3329,7 @@ def _build_text_foreground_segmentation_mask(
     input_size: int,
     page_id: str,
     debug_context: dict | None,
+    text_area_plan=None,
 ):
     from app.pipeline.cleanup_contracts import TextForegroundSegmentationMask
 
@@ -3339,11 +3341,16 @@ def _build_text_foreground_segmentation_mask(
             provenance={"status": "segmentation_api_unavailable"},
         )
     try:
+        refinement_scopes = _text_area_ctd_refinement_scope_geometry(
+            text_area_plan,
+            image_size=image_size,
+        )
         try:
             result = detector.detect_with_segmentation(
                 source_path,
                 input_size=input_size,
                 keep_undetected_mask=True,
+                refinement_scopes=refinement_scopes,
             )
         except TypeError:
             result = detector.detect_with_segmentation(source_path)
@@ -3392,6 +3399,53 @@ def _build_text_foreground_segmentation_mask(
     if debug_context is not None:
         debug_context["text_foreground_segmentation_mask"] = contract.to_audit_dict()
     return contract
+
+
+def _text_area_ctd_refinement_scope_geometry(
+    text_area_plan,
+    *,
+    image_size: tuple[int, int] | None,
+) -> list[tuple[int, int, int, int]]:
+    if text_area_plan is None:
+        return []
+    scopes = (
+        text_area_plan.get("scopes", [])
+        if isinstance(text_area_plan, dict)
+        else getattr(text_area_plan, "scopes", [])
+    )
+    page_width = int(image_size[0]) if image_size else 0
+    page_height = int(image_size[1]) if image_size else 0
+    rectangles: list[tuple[int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for scope in scopes or []:
+        if isinstance(scope, dict):
+            eligible = bool(scope.get("comic_text_detector_scope_eligible", False))
+            bbox = scope.get("bbox") or []
+        else:
+            eligible = bool(getattr(scope, "comic_text_detector_scope_eligible", False))
+            bbox = getattr(scope, "bbox", None) or []
+        if not eligible or len(bbox) < 4:
+            continue
+        try:
+            x, y, width, height = [int(round(float(value))) for value in bbox[:4]]
+        except (TypeError, ValueError):
+            continue
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = x + max(0, width)
+        y1 = y + max(0, height)
+        if page_width > 0:
+            x0 = min(page_width, x0)
+            x1 = min(page_width, x1)
+        if page_height > 0:
+            y0 = min(page_height, y0)
+            y1 = min(page_height, y1)
+        rectangle = (x0, y0, x1, y1)
+        if x1 <= x0 or y1 <= y0 or rectangle in seen:
+            continue
+        seen.add(rectangle)
+        rectangles.append(rectangle)
+    return rectangles
 
 
 def _save_segmentation_mask_ref(mask, debug_context: dict | None, subdir: str, filename: str) -> str:
@@ -3493,6 +3547,7 @@ def _begin_scoped_ocr_trace(
         "crop_image_path": crop_path if crop_saved else "",
         "crop_saved": crop_saved,
         "crop_save_error": crop_error,
+        "ocr_raw_text": "",
         "ocr_text": "",
         "ocr_confidence": None,
         "ocr_backend": "",
@@ -3500,6 +3555,14 @@ def _begin_scoped_ocr_trace(
         "ocr_mmproj_path": "",
         "ocr_endpoint": "",
         "ocr_prompt_version": "",
+        "ocr_finish_reason": "",
+        "ocr_prompt_tokens": None,
+        "ocr_completion_tokens": None,
+        "ocr_total_tokens": None,
+        "ocr_max_tokens": None,
+        "ocr_response_complete": None,
+        "ocr_response_authoritative": None,
+        "ocr_response_rejection_reason": "",
         "ocr_transaction_state": "",
         "ocr_transaction_reason": "",
         "ocr_outcome_class": "",
@@ -3670,6 +3733,7 @@ def _recognize_with_fallback(
         else None
     )
     ocr_failed = False
+    recognition_metadata: dict[str, Any] = {}
     try:
         if hasattr(ocr_engine, "recognize_with_confidence"):
             text, conf = ocr_engine.recognize_with_confidence(crop)
@@ -3688,6 +3752,30 @@ def _recognize_with_fallback(
                 elapsed_seconds=time.perf_counter() - perf_ocr_start,
                 failed=ocr_failed,
             )
+
+    raw_text = _clean_ocr_text(text)
+    if hasattr(ocr_engine, "last_recognition_metadata"):
+        try:
+            recognition_metadata = dict(ocr_engine.last_recognition_metadata() or {})
+        except Exception:
+            recognition_metadata = {}
+    if trace_record is not None:
+        trace_record["ocr_raw_text"] = raw_text
+        for key in (
+            "ocr_finish_reason",
+            "ocr_prompt_tokens",
+            "ocr_completion_tokens",
+            "ocr_total_tokens",
+            "ocr_max_tokens",
+            "ocr_response_complete",
+            "ocr_response_authoritative",
+            "ocr_response_rejection_reason",
+        ):
+            if key in recognition_metadata:
+                trace_record[key] = recognition_metadata[key]
+    if recognition_metadata.get("ocr_response_authoritative") is False:
+        text = ""
+        conf = 0.0
 
     if settings and getattr(settings, 'debug_ocr', False):
          backend = getattr(ocr_engine, "backend_name", ocr_engine.__class__.__name__)
@@ -4506,6 +4594,8 @@ def _existing_parent_punctuation_identity_source(
             quality_state = str(getattr(parent_unit, "source_contract_quality_state", "") or "")
         if unit_parent_id != parent_id:
             continue
+        if _source_reconstruction_is_applied(parent_unit):
+            return ""
         cleaned = _clean_ocr_text(source_text)
         if not cleaned:
             return ""
@@ -4529,6 +4619,8 @@ def _existing_region_punctuation_identity_source(
     candidates: list[str] = []
     for region in regions:
         if not isinstance(region, dict) or bool(region.get("parent_boundary_ocr_source_contract")):
+            continue
+        if _source_reconstruction_is_applied(region):
             continue
         text = _clean_ocr_text(str(region.get("ocr_text") or ""))
         if not text:
@@ -4571,8 +4663,39 @@ def _existing_region_punctuation_identity_source(
         candidates.append(text)
     if not candidates:
         return ""
-    candidates.sort(key=lambda value: (len(value), value), reverse=True)
-    return candidates[0]
+    unique_candidates = list(dict.fromkeys(candidates))
+    if len(unique_candidates) != 1:
+        return ""
+    return unique_candidates[0]
+
+
+def _source_reconstruction_is_applied(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        render = value.get("render") if isinstance(value.get("render"), Mapping) else {}
+
+        def read(key: str) -> Any:
+            return value.get(key) if value.get(key) is not None else render.get(key)
+    else:
+        render = getattr(value, "render", None)
+
+        def read(key: str) -> Any:
+            direct = getattr(value, key, None)
+            if direct is not None:
+                return direct
+            if isinstance(render, Mapping):
+                return render.get(key)
+            return None
+
+    if any(
+        bool(read(key))
+        for key in (
+            "source_reconstruction_applied",
+            "root_reconstruction_applied",
+            "logical_text_source_reconstruction_applied",
+        )
+    ):
+        return True
+    return str(read("source_reconstruction_status") or "").strip().lower() == "applied"
 
 
 def _is_identity_punctuation_source_text(text: str) -> bool:
@@ -5432,6 +5555,7 @@ def _reconstruct_text_block_roots(
             attempts.append(root_attempt)
             continue
         best_candidate: dict[str, Any] | None = None
+        root_crop_candidates: list[dict[str, Any]] = []
         visual_split_candidates: list[dict[str, Any]] = []
         internal_candidate = _multi_scope_ctd_evidence_candidate(
             root,
@@ -5498,6 +5622,11 @@ def _reconstruct_text_block_roots(
                         "score": float(internal_candidate.get("score") or 0.0) + 30.0,
                         "child_fragment_status": list(internal_candidate.get("child_fragment_status") or []),
                         "root_internal_child_candidates": list(internal_candidate.get("candidates") or []),
+                        "represented_child_region_ids": [
+                            str(candidate.get("source_region_id") or "")
+                            for candidate in (internal_candidate.get("candidates") or [])
+                            if str(candidate.get("source_region_id") or "")
+                        ],
                     }
         for variant_name, crop_bbox in crop_variants:
             crop_attempt = {
@@ -5538,6 +5667,13 @@ def _reconstruct_text_block_roots(
             recovered_text = _clean_ocr_text(str(recovered_text or ""))
             crop_attempt["recovered_source_text"] = recovered_text
             crop_attempt["ocr_confidence"] = float(recovered_conf or 0.0)
+            represented_child_region_ids = (
+                _derive_exact_represented_child_scope_for_root_reconstruction(
+                    recovered_text,
+                    root_children,
+                )
+            )
+            crop_attempt["represented_child_region_ids"] = list(represented_child_region_ids)
             accepted, reasons, score, child_status = _root_reconstruction_candidate_acceptance(
                 root,
                 root_parents,
@@ -5545,6 +5681,7 @@ def _reconstruct_text_block_roots(
                 recovered_text,
                 float(recovered_conf or 0.0),
                 quality_func,
+                represented_child_region_ids=represented_child_region_ids,
             )
             crop_attempt["acceptance_reasons"] = reasons
             crop_attempt["score"] = score
@@ -5563,8 +5700,8 @@ def _reconstruct_text_block_roots(
                     }
                 )
                 continue
-            if best_candidate is None or score > float(best_candidate.get("score") or 0.0):
-                best_candidate = {
+            root_crop_candidates.append(
+                {
                     "variant": variant_name,
                     "crop_bbox": crop_bbox,
                     "recovered_source_text": recovered_text,
@@ -5572,7 +5709,16 @@ def _reconstruct_text_block_roots(
                     "reasons": reasons,
                     "score": score,
                     "child_fragment_status": child_status,
+                    "represented_child_region_ids": list(represented_child_region_ids),
                 }
+            )
+        stable_crop_candidate = _select_stable_root_crop_candidate(root_crop_candidates)
+        if stable_crop_candidate is not None and (
+            best_candidate is None
+            or float(stable_crop_candidate.get("score") or 0.0)
+            > float(best_candidate.get("score") or 0.0)
+        ):
+            best_candidate = stable_crop_candidate
         if visual_split_candidates:
             applied_records: list[dict[str, Any]] = []
             for split_candidate in visual_split_candidates:
@@ -6761,6 +6907,11 @@ def _root_parent_candidate_acceptance_v2(
         text,
         ocr_conf,
         quality_func,
+        represented_child_region_ids=[
+            str(candidate.get("source_region_id") or "")
+            for candidate in selected
+            if str(candidate.get("source_region_id") or "")
+        ],
     )
     missing_meaningful = [
         item for item in child_status
@@ -7023,6 +7174,11 @@ def _evaluate_multiscope_ctd_assembly(
         text,
         conf,
         quality_func,
+        represented_child_region_ids=[
+            str(candidate.get("source_region_id") or "")
+            for candidate in ordered
+            if str(candidate.get("source_region_id") or "")
+        ],
     )
     return {
         "accepted": accepted,
@@ -7215,6 +7371,83 @@ def _root_reconstruction_crop_variants(
     return variants
 
 
+def _select_stable_root_crop_candidate(
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    normalized_texts = [
+        re.sub(
+            r"\s+",
+            "",
+            _clean_ocr_text(str(candidate.get("recovered_source_text") or "")),
+        )
+        for candidate in candidates
+    ]
+    agreement_counts = {
+        text: normalized_texts.count(text)
+        for text in set(normalized_texts)
+        if text
+    }
+    ranked: list[dict[str, Any]] = []
+    for candidate, normalized_text in zip(candidates, normalized_texts):
+        enriched = dict(candidate)
+        enriched["crop_agreement_count"] = int(agreement_counts.get(normalized_text, 0))
+        enriched["crop_agreement_source"] = normalized_text
+        ranked.append(enriched)
+    best_rank = max(
+        (
+            int(candidate.get("crop_agreement_count") or 0),
+            round(float(candidate.get("score") or 0.0), 6),
+            round(float(candidate.get("ocr_confidence") or 0.0), 6),
+        )
+        for candidate in ranked
+    )
+    finalists = [
+        candidate
+        for candidate in ranked
+        if (
+            int(candidate.get("crop_agreement_count") or 0),
+            round(float(candidate.get("score") or 0.0), 6),
+            round(float(candidate.get("ocr_confidence") or 0.0), 6),
+        )
+        == best_rank
+    ]
+    if len(
+        {
+            str(candidate.get("crop_agreement_source") or "")
+            for candidate in finalists
+        }
+    ) != 1:
+        return None
+    return sorted(finalists, key=lambda candidate: str(candidate.get("variant") or ""))[0]
+
+
+def _derive_exact_represented_child_scope_for_root_reconstruction(
+    recovered_text: str,
+    children: list[Any],
+) -> list[str]:
+    recovered = re.sub(r"\s+", "", _clean_ocr_text(str(recovered_text or "")))
+    if not recovered or not children:
+        return []
+    ordered_ids: list[str] = []
+    ordered_sources: list[str] = []
+    for child in children:
+        region_id = str(getattr(child, "source_region_id", "") or "").strip()
+        source = re.sub(
+            r"\s+",
+            "",
+            _clean_ocr_text(str(getattr(child, "ocr_text", "") or "")),
+        )
+        if not region_id or not source:
+            return []
+        ordered_ids.append(region_id)
+        ordered_sources.append(source)
+    if recovered != "".join(ordered_sources):
+        return []
+    return list(dict.fromkeys(ordered_ids))
+
+
 def _root_reconstruction_candidate_acceptance(
     root,
     parents: list[Any],
@@ -7222,9 +7455,59 @@ def _root_reconstruction_candidate_acceptance(
     recovered_text: str,
     ocr_conf: float,
     quality_func,
+    *,
+    represented_child_region_ids: Iterable[str] | None = None,
 ) -> tuple[bool, list[str], float, list[dict[str, Any]]]:
     root_type = str(getattr(root, "root_type", "") or "")
-    text = _clean_ocr_text(str(recovered_text or ""))
+    raw_text = str(recovered_text or "")
+    text = _clean_ocr_text(raw_text)
+    scope_ids = list(
+        dict.fromkeys(
+            str(region_id or "").strip()
+            for region_id in (represented_child_region_ids or [])
+            if str(region_id or "").strip()
+        )
+    )
+    if not scope_ids:
+        return False, ["unscoped_root_reconstruction_candidate"], 0.0, []
+    children_by_region = {
+        str(getattr(child, "source_region_id", "") or "").strip(): child
+        for child in children
+        if str(getattr(child, "source_region_id", "") or "").strip()
+    }
+    if any(region_id not in children_by_region for region_id in scope_ids):
+        return False, ["unrelated_child_scope"], 0.0, []
+    scoped_children = [children_by_region[region_id] for region_id in scope_ids]
+    parent_ids_by_child: dict[str, set[str]] = {}
+    for parent in parents:
+        parent_id = str(getattr(parent, "parent_id", "") or "").strip()
+        for child_id in getattr(parent, "child_segment_ids", []) or []:
+            parent_ids_by_child.setdefault(str(child_id or ""), set()).add(parent_id)
+    represented_parent_ids: set[str] = set()
+    for child in scoped_children:
+        child_id = str(getattr(child, "child_id", "") or "")
+        represented_parent_ids.update(
+            parent_id
+            for parent_id in parent_ids_by_child.get(child_id, set())
+            if parent_id
+        )
+    child_status = _root_reconstruction_child_fragment_status(recovered_text, scoped_children)
+    if len(represented_parent_ids) > 1:
+        return (
+            False,
+            ["candidate_scope_spans_multiple_parent_obligations"],
+            0.0,
+            child_status,
+        )
+    scoped_parents = [
+        parent
+        for parent in parents
+        if str(getattr(parent, "parent_id", "") or "").strip() in represented_parent_ids
+    ]
+    if not scoped_parents and len(parents) == 1:
+        scoped_parents = list(parents)
+    if "\ufffd" in raw_text:
+        return False, ["malformed_recovered_source"], 0.0, child_status
     body = _root_reconstruction_source_body(text)
     speech_short_source = root_type == "speech_bubble" and _is_speech_short_or_ellipsis_source(text)
     reasons: list[str] = []
@@ -7247,14 +7530,17 @@ def _root_reconstruction_candidate_acceptance(
             if len(body) < 5 and not _is_short_reaction_source(text):
                 return False, ["speech_recovered_source_too_short"], 0.0, []
 
-    child_status = _root_reconstruction_child_fragment_status(recovered_text, children)
     missing_meaningful = [
         item for item in child_status
         if item.get("status") == "missing_meaningful_child_fragment"
     ]
-    existing_sources = [str(getattr(parent, "source_text", "") or "") for parent in parents if str(getattr(parent, "source_text", "") or "").strip()]
+    existing_sources = [
+        str(getattr(parent, "source_text", "") or "")
+        for parent in scoped_parents
+        if str(getattr(parent, "source_text", "") or "").strip()
+    ]
     existing_body_max = max([len(_root_reconstruction_source_body(source)) for source in existing_sources] or [0])
-    conserves_active = _root_reconstruction_conserves_existing_sources(text, parents)
+    conserves_active = _root_reconstruction_conserves_existing_sources(text, scoped_parents)
     quality_gain = max(0, len(body) - existing_body_max)
     score = float(ocr_conf or 0.0) * 100.0 + quality_gain
     score += max(0, len(child_status) - len(missing_meaningful)) * 4.0

@@ -4961,6 +4961,17 @@ def _v3_peer_facts_are_compatible(
             )
         )
     if axis == "source_scale":
+        target_scale_fact = target.get("source_scale_fact")
+        donor_scale_fact = donor.get("source_scale_fact")
+        if (
+            not isinstance(target_scale_fact, Mapping)
+            or not isinstance(donor_scale_fact, Mapping)
+            or not _v3_intervals_are_compatible(
+                target_scale_fact.get("interval"),
+                donor_scale_fact.get("interval"),
+            )
+        ):
+            return False
         for required_axis in ("family", "weight"):
             if _v3_effective_target_role_for_scale(
                 axis=required_axis,

@@ -53,6 +53,7 @@ class PaddleOcrVlEngine:
         self._stderr_handle = None
         self._prompt = os.environ.get("MT_PADDLEOCR_VL_PROMPT", DEFAULT_PROMPT)
         self._timeout = float(os.environ.get("MT_PADDLEOCR_VL_TIMEOUT_SEC", "240") or 240)
+        self._last_recognition_metadata: dict[str, Any] = {}
         if self.endpoint:
             self._assert_endpoint_ready(trust_custom_endpoint=True)
             return
@@ -72,7 +73,13 @@ class PaddleOcrVlEngine:
     def recognize_with_confidence(self, image) -> tuple[str, float]:
         pil_image = _to_rgb_image(image)
         if pil_image is None:
+            self._last_recognition_metadata = {
+                "ocr_response_authoritative": False,
+                "ocr_response_complete": False,
+                "ocr_response_rejection_reason": "invalid_ocr_image",
+            }
             return "", 0.0
+        max_tokens = int(os.environ.get("MT_PADDLEOCR_VL_MAX_TOKENS", "192") or 192)
         payload = {
             "model": self.model_path,
             "messages": [
@@ -88,7 +95,7 @@ class PaddleOcrVlEngine:
                 }
             ],
             "temperature": 0,
-            "max_tokens": int(os.environ.get("MT_PADDLEOCR_VL_MAX_TOKENS", "192") or 192),
+            "max_tokens": max_tokens,
         }
         response = self._request_session().post(
             f"{self.endpoint}/chat/completions",
@@ -96,9 +103,19 @@ class PaddleOcrVlEngine:
             timeout=self._timeout,
         )
         response.raise_for_status()
-        text = _extract_chat_text(response.json())
+        response_payload = response.json()
+        text = _extract_chat_text(response_payload)
         text = _clean_model_response(text)
-        return text, 1.0 if text else 0.0
+        self._last_recognition_metadata = _recognition_metadata(
+            response_payload,
+            max_tokens=max_tokens,
+            has_text=bool(text),
+        )
+        confidence = 0.95 if self._last_recognition_metadata["ocr_response_authoritative"] else 0.0
+        return text, confidence
+
+    def last_recognition_metadata(self) -> dict[str, Any]:
+        return dict(getattr(self, "_last_recognition_metadata", {}) or {})
 
     def backend_metadata(self) -> dict[str, Any]:
         return {
@@ -269,6 +286,42 @@ def _extract_chat_text(payload: dict[str, Any]) -> str:
     first = choices[0] if isinstance(choices[0], dict) else {}
     message = first.get("message") if isinstance(first, dict) else {}
     return str(message.get("content") or "").strip() if isinstance(message, dict) else ""
+
+
+def _recognition_metadata(
+    payload: dict[str, Any],
+    *,
+    max_tokens: int,
+    has_text: bool,
+) -> dict[str, Any]:
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    finish_reason = str(first.get("finish_reason") or "").strip().lower()
+    usage = payload.get("usage") if isinstance(payload, dict) and isinstance(payload.get("usage"), dict) else {}
+    response_complete = finish_reason != "length"
+    authoritative = bool(has_text and response_complete)
+    rejection_reason = ""
+    if finish_reason == "length":
+        rejection_reason = "ocr_response_token_limit_reached"
+    elif not has_text:
+        rejection_reason = "empty_ocr_response"
+    return {
+        "ocr_finish_reason": finish_reason,
+        "ocr_prompt_tokens": _optional_int(usage.get("prompt_tokens")),
+        "ocr_completion_tokens": _optional_int(usage.get("completion_tokens")),
+        "ocr_total_tokens": _optional_int(usage.get("total_tokens")),
+        "ocr_max_tokens": int(max_tokens),
+        "ocr_response_complete": bool(response_complete),
+        "ocr_response_authoritative": bool(authoritative),
+        "ocr_response_rejection_reason": rejection_reason,
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _clean_model_response(text: str) -> str:

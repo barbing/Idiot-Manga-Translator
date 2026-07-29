@@ -1732,6 +1732,329 @@ def _terminal_line_joined_directional_cell_record(
     return record, qualification
 
 
+def _native_component_bbox(
+    fact: Mapping[str, Any],
+) -> tuple[float, float, float, float] | None:
+    bbox = fact.get("bbox_xywh")
+    if not isinstance(bbox, Sequence) or len(bbox) != 4:
+        return None
+    x0, y0, width, height = [float(value) for value in bbox]
+    if width <= 0.0 or height <= 0.0:
+        return None
+    return x0, y0, x0 + width, y0 + height
+
+
+def _native_component_center(
+    fact: Mapping[str, Any],
+) -> tuple[float, float] | None:
+    center = fact.get("center_xy")
+    if isinstance(center, Sequence) and len(center) == 2:
+        return float(center[0]), float(center[1])
+    bbox = _native_component_bbox(fact)
+    if bbox is None:
+        return None
+    x0, y0, x1, y1 = bbox
+    return (x0 + x1) * 0.5, (y0 + y1) * 0.5
+
+
+def _native_component_boxes_overlap(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+) -> bool:
+    first_bbox = _native_component_bbox(first)
+    second_bbox = _native_component_bbox(second)
+    if first_bbox is None or second_bbox is None:
+        return False
+    first_x0, first_y0, first_x1, first_y1 = first_bbox
+    second_x0, second_y0, second_x1, second_y1 = second_bbox
+    return bool(
+        min(first_x1, second_x1) >= max(first_x0, second_x0)
+        and min(first_y1, second_y1) >= max(first_y0, second_y0)
+    )
+
+
+def _native_aligned_punctuation_landmark(
+    facts: Sequence[Mapping[str, Any]],
+    *,
+    direction: str,
+) -> dict[str, Any] | None:
+    """Collapse one regular compact-mark run into a spacing landmark.
+
+    Compact-mark size is deliberately excluded. Only mark centers establish
+    alignment and regular spacing; the landmark can support a visual grid but
+    can never become source-cell size evidence itself.
+    """
+
+    if len(facts) < 3:
+        return None
+    centers = [
+        (fact, _native_component_center(fact))
+        for fact in facts
+    ]
+    if any(center is None for _, center in centers):
+        return None
+    inline_index = 1 if direction == "ttb" else 0
+    cross_index = 0 if direction == "ttb" else 1
+    ordered = sorted(
+        centers,
+        key=lambda item: float(item[1][inline_index]),
+    )
+    inline = np.asarray(
+        [float(center[inline_index]) for _, center in ordered],
+        dtype=np.float32,
+    )
+    cross = np.asarray(
+        [float(center[cross_index]) for _, center in ordered],
+        dtype=np.float32,
+    )
+    gaps = np.diff(inline)
+    if gaps.size < 2 or np.any(gaps <= 0.0):
+        return None
+    gap_p20, gap_median, gap_p80 = [
+        float(value) for value in np.percentile(gaps, [20, 50, 80])
+    ]
+    gap_relative_spread = (
+        gap_p80 - gap_p20
+    ) / max(1.0, gap_median)
+    cross_spread = float(np.max(cross) - np.min(cross))
+    if (
+        gap_relative_spread > 0.35
+        or cross_spread > max(1.0, gap_median * 0.35)
+    ):
+        return None
+    return {
+        "kind": "punctuation_cluster",
+        "inline_center_px": float(np.median(inline)),
+        "cross_center_px": float(np.median(cross)),
+        "component_indices": [
+            int(fact.get("component_index") or 0) for fact, _ in ordered
+        ],
+        "mark_count": len(ordered),
+        "mark_center_gap_median_px": round(gap_median, 6),
+        "mark_center_gap_relative_spread": round(
+            gap_relative_spread,
+            8,
+        ),
+        "mark_cross_center_spread_px": round(cross_spread, 6),
+    }
+
+
+def _native_content_normalized_directional_cell_record(
+    geometry: _NativeAuthorizedGlyphGeometry,
+    *,
+    direction: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Measure a source visual cell from grid pitch and its full-cell tier."""
+
+    dimension_key = "height_px" if direction == "ttb" else "width_px"
+    inline_index = 1 if direction == "ttb" else 0
+    cross_index = 0 if direction == "ttb" else 1
+    body_facts = [
+        fact
+        for fact in geometry.component_facts
+        if not bool(fact.get("punctuation_fragment"))
+        and _native_component_center(fact) is not None
+        and float(fact.get(dimension_key) or 0.0) > 0.0
+    ]
+    punctuation_facts = [
+        fact
+        for fact in geometry.component_facts
+        if bool(fact.get("punctuation_fragment"))
+        and _native_component_center(fact) is not None
+    ]
+    if not body_facts:
+        return None
+
+    associated_fragments = [
+        fact
+        for fact in punctuation_facts
+        if any(
+            _native_component_boxes_overlap(fact, body)
+            for body in body_facts
+        )
+    ]
+    associated_ids = {
+        int(fact.get("component_index") or 0)
+        for fact in associated_fragments
+    }
+    free_punctuation = [
+        fact
+        for fact in punctuation_facts
+        if int(fact.get("component_index") or 0) not in associated_ids
+    ]
+    punctuation_landmark = _native_aligned_punctuation_landmark(
+        free_punctuation,
+        direction=direction,
+    )
+
+    landmarks: list[dict[str, Any]] = []
+    for fact in body_facts:
+        center = _native_component_center(fact)
+        if center is None:
+            continue
+        landmarks.append(
+            {
+                "kind": "body",
+                "inline_center_px": float(center[inline_index]),
+                "cross_center_px": float(center[cross_index]),
+                "component_indices": [
+                    int(fact.get("component_index") or 0)
+                ],
+            }
+        )
+    if punctuation_landmark is not None:
+        landmarks.append(punctuation_landmark)
+    if len(landmarks) < 2:
+        return None
+
+    ordered = sorted(
+        landmarks,
+        key=lambda item: float(item["inline_center_px"]),
+    )
+    body_spans = np.asarray(
+        [float(fact.get(dimension_key) or 0.0) for fact in body_facts],
+        dtype=np.float32,
+    )
+    maximum_body_span = float(np.max(body_spans))
+    raw_gaps = np.asarray(
+        [
+            float(second["inline_center_px"])
+            - float(first["inline_center_px"])
+            for first, second in zip(ordered, ordered[1:])
+        ],
+        dtype=np.float32,
+    )
+    grid_gaps = raw_gaps[
+        raw_gaps >= max(1.0, maximum_body_span * 0.80)
+    ]
+    if grid_gaps.size <= 0:
+        return None
+    gap_p20, pitch, gap_p80 = [
+        float(value)
+        for value in np.percentile(grid_gaps, [20, 50, 80])
+    ]
+    if pitch <= 0.0:
+        return None
+    grid_relative_spread = (gap_p80 - gap_p20) / max(1.0, pitch)
+    cross_centers = np.asarray(
+        [float(item["cross_center_px"]) for item in ordered],
+        dtype=np.float32,
+    )
+    cross_spread = float(np.max(cross_centers) - np.min(cross_centers))
+    maximum_body_occupancy = maximum_body_span / pitch
+    if (
+        grid_relative_spread > 0.25
+        or cross_spread > max(1.0, pitch * 0.45)
+        or maximum_body_occupancy < 0.68
+    ):
+        return None
+
+    full_cell_band = pitch * 0.10
+    full_cell_facts = [
+        fact
+        for fact in body_facts
+        if float(fact.get(dimension_key) or 0.0)
+        >= maximum_body_span - full_cell_band
+    ]
+    if not full_cell_facts:
+        return None
+    full_cell_ids = {
+        int(fact.get("component_index") or 0)
+        for fact in full_cell_facts
+    }
+    full_cell_spans = np.asarray(
+        [
+            float(fact.get(dimension_key) or 0.0)
+            for fact in full_cell_facts
+        ],
+        dtype=np.float32,
+    )
+    if full_cell_spans.size == 1:
+        median = float(full_cell_spans[0])
+        p20 = max(1.0, median - 1.0)
+        p80 = median + 1.0
+        measurement_uncertainty_px = 1.0
+    else:
+        p20, median, p80 = [
+            float(value)
+            for value in np.percentile(full_cell_spans, [20, 50, 80])
+        ]
+        measurement_uncertainty_px = 0.0
+    relative_spread = (p80 - p20) / max(1.0, median)
+    landmark_count = len(ordered)
+    sample_uncertainty = 1.0 / float(np.sqrt(landmark_count))
+    confidence = min(
+        max(0.0, 1.0 - sample_uncertainty),
+        max(0.0, 1.0 - grid_relative_spread),
+        max(0.0, 1.0 - relative_spread),
+    )
+    qualification = {
+        "direction": direction,
+        "dimension_key": dimension_key,
+        "density_spans": [],
+        "qualified_component_indices": sorted(full_cell_ids),
+        "qualified_component_spans_px": [
+            round(float(value), 6) for value in full_cell_spans
+        ],
+        "body_component_count": len(body_facts),
+        "punctuation_component_count": len(punctuation_facts),
+        "rejected_fragment_count": int(
+            geometry.support.get("rejected_fragment_count") or 0
+        ),
+        "content_normalized_source_cell": True,
+        "visual_grid_pitch_px": round(pitch, 6),
+        "visual_grid_gap_interval_px": [
+            round(gap_p20, 6),
+            round(pitch, 6),
+            round(gap_p80, 6),
+        ],
+        "visual_grid_gaps_px": [
+            round(float(value), 6) for value in grid_gaps
+        ],
+        "visual_grid_relative_spread": round(
+            grid_relative_spread,
+            8,
+        ),
+        "visual_grid_cross_center_spread_px": round(cross_spread, 6),
+        "visual_grid_landmark_count": landmark_count,
+        "punctuation_landmark_count": (
+            1 if punctuation_landmark is not None else 0
+        ),
+        "punctuation_landmark": punctuation_landmark or {},
+        "associated_fragment_component_indices": sorted(associated_ids),
+        "full_cell_component_indices": sorted(full_cell_ids),
+        "subcell_component_indices": sorted(
+            int(fact.get("component_index") or 0)
+            for fact in body_facts
+            if int(fact.get("component_index") or 0) not in full_cell_ids
+        ),
+        "full_cell_band_px": round(full_cell_band, 6),
+        "maximum_body_occupancy_of_grid": round(
+            maximum_body_occupancy,
+            8,
+        ),
+        "relative_cell_spread": round(relative_spread, 8),
+    }
+    record = {
+        "status": "supported",
+        "cell_p20_px": round(p20, 6),
+        "cell_median_px": round(median, 6),
+        "cell_p80_px": round(p80, 6),
+        "confidence": round(confidence, 8),
+        "uncertainty": {
+            "relative_cell_spread": round(relative_spread, 8),
+            "qualified_component_count": len(full_cell_facts),
+            "sample_uncertainty": round(sample_uncertainty, 8),
+            "measurement_uncertainty_px": measurement_uncertainty_px,
+            "visual_grid_relative_spread": round(
+                grid_relative_spread,
+                8,
+            ),
+        },
+    }
+    return record, qualification
+
+
 def _native_directional_cell_record(
     geometry: _NativeAuthorizedGlyphGeometry,
     *,
@@ -1772,6 +2095,15 @@ def _native_directional_cell_record(
         )
         if terminal_line_record is not None:
             return terminal_line_record
+    content_normalized_record = (
+        _native_content_normalized_directional_cell_record(
+            geometry,
+            direction=direction,
+        )
+    )
+    if content_normalized_record is not None:
+        return content_normalized_record
+    if not geometry.available:
         return base_record, qualification
 
     body_facts = [
@@ -2013,6 +2345,18 @@ def _measure_independent_source_scale(
                 *native.reason_codes,
                 vertical_support,
                 horizontal_support,
+                *(
+                    ["source_scale_content_normalized_visual_grid_proven"]
+                    if bool(
+                        vertical_qualification.get(
+                            "content_normalized_source_cell"
+                        )
+                        or horizontal_qualification.get(
+                            "content_normalized_source_cell"
+                        )
+                    )
+                    else []
+                ),
                 *(
                     ["source_scale_fragmented_cell_population_proven"]
                     if bool(

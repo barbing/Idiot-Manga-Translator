@@ -2,6 +2,7 @@
 """HarfBuzz shaping boundary for the Stage 4 typesetting engine."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,6 +104,17 @@ class HarfBuzzShaper:
             raise RuntimeError("harfbuzz_unavailable")
         if face is None:
             raise RuntimeError("font_face_unavailable")
+        requested_face_id = str(getattr(face, "face_id", "") or "").strip()
+        registered_face = self.font_manager.face(requested_face_id)
+        if registered_face is None:
+            raise RuntimeError("font_face_not_registered")
+        requested_path = _canonical_font_path(
+            str(getattr(face, "path", "") or "")
+        )
+        registered_path = _canonical_font_path(registered_face.path)
+        if not requested_path or requested_path != registered_path:
+            raise RuntimeError("font_face_registration_mismatch")
+        face = registered_face
         text_value = str(text or "")
         size = max(1, int(font_size))
         mode = str(writing_mode or "").lower()
@@ -214,6 +226,11 @@ class HarfBuzzShaper:
                 "position_scale": "26.6_to_px",
                 "complex_script": final_script in COMPLEX_SCRIPTS or final_direction == "rtl",
                 "writing_mode": writing_mode,
+                "registered_font_face": True,
+                "registered_font_face_id": face.face_id,
+                "registered_font_path": face.path,
+                "registered_font_source": face.source,
+                "font_face_authority": "font_manager_registry",
                 **default_ignorable_metadata,
             },
         )
@@ -251,6 +268,13 @@ def _normalize_direction(direction: str, writing_mode: str) -> str:
     if mode.startswith("vert"):
         return "ttb"
     return "ltr"
+
+
+def _canonical_font_path(path: str) -> str:
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    return os.path.normcase(os.path.realpath(os.path.abspath(value)))
 
 
 def _cluster_text(text: str, cluster: int, clusters: list[int] | None = None) -> str:
