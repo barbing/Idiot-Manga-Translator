@@ -14128,9 +14128,6 @@ def _clean_translation(text: str) -> str:
     cleaned = re.sub(r"<\s*e=\d+\s*>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\be=\d+\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"e=\d+", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"(?<=[。！？…])・+$", "", cleaned)
-    cleaned = re.sub(r"・{2,}", "…", cleaned)
-    cleaned = cleaned.replace("・", "·")
     cleaned = cleaned.replace("□", "")
     cleaned = re.sub(r"(?:口|□){2,}", "", cleaned)
     if _placeholder_ratio(cleaned) >= 0.15:
@@ -14255,8 +14252,6 @@ def _clean_translation(text: str) -> str:
         ):
             continue
         head = head.replace("文本：", "").replace("文本:", "")
-        if _is_punct_only(head):
-            continue
         for phrase in strip_phrases:
             head = head.replace(phrase, "")
         if not head.strip():
@@ -14407,8 +14402,7 @@ def _source_has_stutter_prefix(text: str) -> bool:
     text = str(text or "").strip()
     if not text:
         return False
-    normalized = _normalize_retry_source(text)
-    if normalized and normalized != text:
+    if re.search(r"([ぁ-んァ-ンー])\1+", text):
         return True
     return bool(re.match(r"^[ぁ-んァ-ンー]{2,}[一-龯々ァ-ヶぁ-ゖA-Za-z0-9！？!?…]", text))
 
@@ -14456,13 +14450,7 @@ def _looks_like_repetition_loop(translation: str, source_text: str = "") -> bool
 
 
 def _normalize_retry_source(text: str) -> str:
-    text = str(text or "").strip()
-    if not text:
-        return ""
-    text = re.sub(r"^([ぁ-んァ-ンー])\1+", r"\1", text)
-    text = re.sub(r"([ぁ-んァ-ンー])\1{1,}", r"\1", text)
-    text = re.sub(r"([ぁ-んァ-ンー])\1(?=[ぁ-んァ-ンー]*[。！？!?…])", r"\1", text)
-    return text
+    return str(text or "").strip()
 
 
 def _is_ellipsis_like(text: str) -> bool:
@@ -14486,6 +14474,20 @@ def _short_reaction_key(text: str) -> str:
     normalized = re.sub(r"[!！?？〜～♡❤♥「」『』（）()]+", "", normalized)
     normalized = normalized.rstrip("ー-—―－")
     return normalized
+
+
+_SHORT_REACTION_TERMINAL_SYMBOLS = frozenset(".．…‥・･ー—―－-〜～~〰!?！？♡❤♥")
+
+
+def _split_short_reaction_terminal_symbols(text: str) -> tuple[str, str]:
+    index = len(text)
+    while index > 0 and text[index - 1] in _SHORT_REACTION_TERMINAL_SYMBOLS:
+        index -= 1
+    return text[:index], text[index:]
+
+
+def _normalize_short_reaction_terminal_symbols(symbols: str) -> str:
+    return re.sub(r"ー+", "——", symbols)
 
 
 def _is_short_reaction_source(text: str) -> bool:
@@ -14725,9 +14727,13 @@ def _translate_short_reaction_fallback(text: str, target_lang: str) -> str:
         return ""
     stripped = "".join(ch for ch in cleaned if ch.strip())
     if _is_ellipsis_like(stripped):
-        return "……"
+        return _normalize_short_reaction_terminal_symbols(stripped)
 
-    key = _short_reaction_key(cleaned)
+    lexical_text, terminal_symbols = _split_short_reaction_terminal_symbols(cleaned)
+    if not lexical_text:
+        return _normalize_short_reaction_terminal_symbols(terminal_symbols)
+
+    key = _short_reaction_key(lexical_text)
     mapping = {
         "あ": "啊",
         "あっ": "啊",
@@ -14759,7 +14765,7 @@ def _translate_short_reaction_fallback(text: str, target_lang: str) -> str:
     }
     base = mapping.get(key, "")
     if not base:
-        body = _non_punct_chars(cleaned)
+        body = _non_punct_chars(lexical_text)
         if body and len(body) <= 4 and all(_is_kana(ch) or ch == "ー" for ch in body):
             seed = "".join(ch for ch in body if ch != "ー")
             if seed and len(set(seed)) == 1:
@@ -14776,22 +14782,9 @@ def _translate_short_reaction_fallback(text: str, target_lang: str) -> str:
                 syllable = seed_map.get(seed[0], "")
                 if syllable:
                     base = syllable * len(seed)
-                    if "ー" in body:
-                        base += "——"
-                    elif any(ch in cleaned for ch in "…．。"):
-                        base += "……"
     if not base:
         return ""
-
-    if any(ch in cleaned for ch in "!?！？"):
-        if base.endswith("——"):
-            return base + "！！"
-        return base + "！！"
-    if any(ch in cleaned for ch in ".．…‥・･"):
-        if base.endswith(("——", "……")):
-            return base
-        return base + "……"
-    return base
+    return base + _normalize_short_reaction_terminal_symbols(terminal_symbols)
 
 
 def _translation_bad_shape_reasons(translation: str, source_text: str = "") -> list[str]:

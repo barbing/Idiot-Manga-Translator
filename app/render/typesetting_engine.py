@@ -3277,7 +3277,6 @@ def _source_punctuation_geometry_match(
     """Match a lossless target run to one validated source visual occurrence."""
 
     expected_kind = {
-        "ellipsis_sequence": "ellipsis",
         "dash_sequence": "dash",
         "wave_sequence": "wave",
     }.get(str(run.role or ""), "")
@@ -3395,11 +3394,15 @@ def _vertical_layout_items(
                 font_size,
                 style,
             )
-            source_geometry_match = _source_punctuation_geometry_match(
-                plan,
-                runs,
-                run,
-                "vertical",
+            source_geometry_match = (
+                _source_punctuation_geometry_match(
+                    plan,
+                    runs,
+                    run,
+                    "vertical",
+                )
+                if run.role in {"dash_sequence", "wave_sequence"}
+                else {}
             )
             row_units = _vertical_sequence_row_units(run)
             if source_geometry_match.get("status") == "applied":
@@ -3744,6 +3747,10 @@ def _drawing_primitive_for_placement(
         primitive_metadata.update(
             {
                 "ellipsis_policy": "one_continuous_uniform_dot_sequence",
+                "ellipsis_geometry_basis": (
+                    "immutable_target_token_and_resolved_font"
+                ),
+                "ellipsis_count_basis": "immutable_target_token",
                 "dot_column_count": 1,
                 "continuous_sequence": True,
             }

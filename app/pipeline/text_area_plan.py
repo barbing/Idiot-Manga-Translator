@@ -68,6 +68,7 @@ SEMANTIC_KIND_UNKNOWN = "unknown"
 
 TEXT_AREA_COMPONENT_AUTHORIZATION_MAP_VERSION = "text_area_component_authorization_map_v1"
 OGKALU_SINGLE_MODEL_AUTHORITY_CONFIDENCE = 0.85
+OGKALU_RETAINED_PAIRED_TEXT_EVIDENCE_CONFIDENCE = 0.50
 OGKALU_TEXT_FREE_BACKGROUND_ROOT_CONFIDENCE = 0.70
 
 PROJECTION_READY = "projection_ready"
@@ -11496,6 +11497,97 @@ def _luma_bbox_has_sparse_vertical_text_components(
     return True
 
 
+def _luma_bbox_has_multicolumn_vertical_text_components(
+    luma_image: Any,
+    bbox: Sequence[Any],
+    image_size: Tuple[int, int],
+) -> bool:
+    if luma_image is None or np is None or cv2 is None:
+        return False
+    x, y, w, h = _normalize_xywh(bbox, image_size)
+    if w < 48 or h < 64:
+        return False
+    try:
+        crop = luma_image.crop((x, y, x + w, y + h)).convert("L")
+    except Exception:
+        return False
+    arr = np.asarray(crop)
+    if arr.size <= 0:
+        return False
+    dark_mask = (arr <= 120).astype("uint8")
+    dark_count = int(dark_mask.sum())
+    area = int(arr.size)
+    dark_ratio = dark_count / float(max(1, area))
+    if dark_ratio < 0.025 or dark_ratio > 0.20:
+        return False
+    bright_ratio = float((arr >= 220).sum()) / float(max(1, area))
+    if bright_ratio < 0.70:
+        return False
+    try:
+        _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(dark_mask, 8)
+    except Exception:
+        return False
+
+    components: List[Tuple[float, float, int, int, int]] = []
+    oversized = 0
+    for label in range(1, int(stats.shape[0])):
+        cx, cy, cw, ch, component_area = [int(value) for value in stats[label][:5]]
+        if component_area < 20:
+            continue
+        if cw > max(48, int(w * 0.72)) or ch > max(72, int(h * 0.72)):
+            oversized += 1
+            continue
+        density = component_area / float(max(1, cw * ch))
+        if 0.10 <= density <= 0.95 and 4 <= cw <= max(42, int(w * 0.65)) and 6 <= ch <= max(48, int(h * 0.45)):
+            components.append((cx + cw / 2.0, cy + ch / 2.0, cw, ch, component_area))
+    if oversized > 0 or len(components) < 6:
+        return False
+
+    widths = sorted(component[2] for component in components)
+    median_width = float(widths[len(widths) // 2])
+    column_gap = max(8.0, median_width * 0.95)
+    columns: List[List[Tuple[float, float, int, int, int]]] = []
+    for component in sorted(components, key=lambda item: item[0]):
+        if not columns or component[0] - columns[-1][-1][0] > column_gap:
+            columns.append([component])
+        else:
+            columns[-1].append(component)
+
+    qualifying_columns: List[List[Tuple[float, float, int, int, int]]] = []
+    for column in columns:
+        if len(column) < 3:
+            continue
+        y_centers = [component[1] for component in column]
+        if max(y_centers) - min(y_centers) < max(28.0, h * 0.18):
+            continue
+        qualifying_columns.append(column)
+    if len(qualifying_columns) < 2:
+        return False
+
+    column_centers = [
+        sum(component[0] for component in column) / float(len(column))
+        for column in qualifying_columns
+    ]
+    column_centers.sort()
+    if min(
+        right - left
+        for left, right in zip(column_centers, column_centers[1:])
+    ) < max(10.0, median_width * 0.75):
+        return False
+
+    accepted_component_area = sum(component[4] for component in components)
+    qualifying_component_area = sum(
+        component[4]
+        for column in qualifying_columns
+        for component in column
+    )
+    if qualifying_component_area / float(max(1, accepted_component_area)) < 0.72:
+        return False
+    if accepted_component_area / float(max(1, dark_count)) < 0.58:
+        return False
+    return True
+
+
 def _paired_ogkalu_text_presence_proven(
     *,
     luma_image: Any,
@@ -11510,12 +11602,34 @@ def _paired_ogkalu_text_presence_proven(
     if not entries:
         return False
     for entry in entries:
-        if _optional_float(entry.get("confidence")) is not None and float(entry.get("confidence") or 0.0) < OGKALU_SINGLE_MODEL_AUTHORITY_CONFIDENCE:
+        if (
+            _optional_float(entry.get("confidence")) is not None
+            and float(entry.get("confidence") or 0.0) < OGKALU_RETAINED_PAIRED_TEXT_EVIDENCE_CONFIDENCE
+        ):
             continue
         bbox = _text_evidence_bbox_xywh(entry, image_size)
         if _luma_bbox_has_text_like_dark_components(luma_image, bbox, image_size):
             return True
         if _luma_bbox_has_sparse_vertical_text_components(luma_image, bbox, image_size):
+            return True
+        if _luma_bbox_has_multicolumn_vertical_text_components(luma_image, bbox, image_size):
+            return True
+    return False
+
+
+def _semantic_role_has_strong_ogkalu_bubble_evidence(
+    semantic_role_evidence: Mapping[str, Any],
+) -> bool:
+    entries = semantic_role_evidence.get("model_evidence_bboxes") or []
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        return False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("class_name") or "") != "bubble":
+            continue
+        confidence = _optional_float(entry.get("confidence"))
+        if confidence is not None and confidence >= OGKALU_SINGLE_MODEL_AUTHORITY_CONFIDENCE:
             return True
     return False
 
@@ -11546,7 +11660,7 @@ def _looks_like_paired_ogkalu_speech_bubble(
     conflicts = set(_semantic_role_values(semantic_role_evidence, "conflict_evidence"))
     if any(any(token in conflict.lower() for token in ("sfx", "decorative", "preserve", "art", "non_text", "non-text")) for conflict in conflicts):
         return False
-    if _semantic_role_model_confidence(semantic_role_evidence) < OGKALU_SINGLE_MODEL_AUTHORITY_CONFIDENCE:
+    if not _semantic_role_has_strong_ogkalu_bubble_evidence(semantic_role_evidence):
         return False
     x, y, w, h = _coerce_xywh(bbox)
     width, height = max(1, int(image_size[0])), max(1, int(image_size[1]))

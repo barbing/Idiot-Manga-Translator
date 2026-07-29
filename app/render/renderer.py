@@ -358,36 +358,45 @@ def _stamp_parent_bundle_render_layout_summaries(
         parent_layer_final_alpha_contained = bool(
             parent_layer_final_alpha_containment.get("accepted")
         )
+        parent_layer_final_alpha_page_safe = bool(
+            parent_layer_final_alpha_containment.get(
+                "inside_page_bounds",
+                parent_layer_final_alpha_contained,
+            )
+        )
         parent_layer_untransformed_fallback_used = bool(
             parent_layer_composition.get("untransformed_fallback_used")
         )
         parent_layer_effect_degraded = bool(
             parent_layer_effects_status == "degraded_to_base"
             and parent_layer_untransformed_fallback_used
-            and parent_layer_final_alpha_contained
+            and parent_layer_final_alpha_page_safe
         )
         if parent_layer_effect_requested:
             parent_layer_effect_commit_complete = bool(
-                parent_layer_effect_degraded
-                or (
-                    parent_layer_effect_contract_status == "resolved"
-                    and not parent_layer_untransformed_fallback_used
-                    and (
-                        (
-                            parent_layer_effect_active
-                            and parent_layer_effects_status == "applied"
-                            and parent_layer_final_alpha_contained
-                        )
-                        or (
-                            not parent_layer_effect_active
-                            and parent_layer_effects_status == "no_visible_effect"
+                parent_layer_final_alpha_page_safe
+                and (
+                    parent_layer_effect_degraded
+                    or (
+                        parent_layer_effect_contract_status == "resolved"
+                        and not parent_layer_untransformed_fallback_used
+                        and (
+                            (
+                                parent_layer_effect_active
+                                and parent_layer_effects_status == "applied"
+                            )
+                            or (
+                                not parent_layer_effect_active
+                                and parent_layer_effects_status == "no_visible_effect"
+                            )
                         )
                     )
                 )
             )
         else:
             parent_layer_effect_commit_complete = bool(
-                parent_layer_effect_contract_status == "unavailable"
+                parent_layer_final_alpha_page_safe
+                and parent_layer_effect_contract_status == "unavailable"
                 and parent_layer_effects_status == "unavailable"
                 and not parent_layer_effect_active
                 and not parent_layer_untransformed_fallback_used
@@ -395,21 +404,20 @@ def _stamp_parent_bundle_render_layout_summaries(
         render_commit_complete = (
             layer_drawn
             and failed_raster_placement_count == 0
-            and hard_bound_containment_failure_count == 0
             and parent_layer_composition_status == "committed"
             and parent_layer_page_composite_count == 1
+            and parent_layer_final_alpha_page_safe
             and parent_layer_effect_commit_complete
         )
         conservation_complete = (
             translated_matches_original
             and normalized_matches_glyphs
             and full_text_placed
-            and hard_bounds_contained
             and glyph_text_matches_layout
             and render_commit_complete
         )
         summary = {
-            "parent_render_layout_summary_version": "parent_render_layout_summary_v3",
+            "parent_render_layout_summary_version": "parent_render_layout_summary_v4",
             "renderer_audit_id": str(getattr(bundle, "renderer_audit_id", "") or ""),
             "page_id": str(
                 layout.get("page_id") or getattr(bundle, "page_id", "") or ""
@@ -450,6 +458,9 @@ def _stamp_parent_bundle_render_layout_summaries(
             "parent_layer_effect_active": parent_layer_effect_active,
             "parent_layer_effects_status": parent_layer_effects_status,
             "parent_layer_final_alpha_contained": parent_layer_final_alpha_contained,
+            "parent_layer_final_alpha_page_safe": (
+                parent_layer_final_alpha_page_safe
+            ),
             "parent_layer_untransformed_fallback_used": (
                 parent_layer_untransformed_fallback_used
             ),

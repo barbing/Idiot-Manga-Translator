@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Typed source-visual punctuation geometry for renderer presentation.
+"""Typed source-visual dash and wave geometry for renderer presentation.
 
 The observer consumes original pixels only through an accepted, parent-bound
 ``AuthorizedSourceStyleView``.  It never reads OCR punctuation to decide
 whether an occurrence exists, never rewrites translated text, and never owns
-render admission.  Only compact immutable evidence leaves this module.
+render admission.  Ellipsis count and geometry remain target-token-owned and
+are intentionally outside this observer.  Only compact immutable evidence
+leaves this module.
 """
 from __future__ import annotations
 
@@ -26,18 +28,18 @@ from app.render.typesetting_contracts import bbox_from_value, copy_jsonish
 
 
 SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION = (
-    "source_punctuation_geometry_evidence_v2"
+    "source_punctuation_geometry_evidence_v3"
 )
 SOURCE_PUNCTUATION_GEOMETRY_OBSERVER_VERSION = (
-    "source_punctuation_geometry_observer_v3"
+    "source_punctuation_geometry_observer_v4"
 )
 SOURCE_PUNCTUATION_GEOMETRY_SUPPORT_VERSION = (
-    "source_punctuation_geometry_support_v3"
+    "source_punctuation_geometry_support_v4"
 )
 SOURCE_PUNCTUATION_CELL_CALIBRATION_VERSION = (
     "source_punctuation_cell_calibration_v1"
 )
-_SUPPORTED_KINDS = frozenset({"dash", "ellipsis", "wave"})
+SOURCE_PUNCTUATION_GEOMETRY_SUPPORTED_KINDS = frozenset({"dash", "wave"})
 _SUPPORTED_INLINE_AXES = frozenset({"ttb", "ltr"})
 SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED = "source_cell_normalized"
 SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE = (
@@ -672,13 +674,6 @@ def _observe_parent_geometry(
             ],
         )
     )
-    occurrences.extend(
-        _ellipsis_occurrences(
-            components,
-            analysis_bbox=analysis_bbox,
-            source_cells=source_cells,
-        )
-    )
     occurrences = _assign_visual_ordinals(_deduplicate_occurrences(occurrences))
     status = "observed" if occurrences else "abstained"
     abstention = (
@@ -903,102 +898,6 @@ def _wave_occurrences(
                 )
             )
             break
-    return _prefer_axis_specific_nonoverlap(results)
-
-
-def _ellipsis_occurrences(
-    components: Sequence[Mapping[str, Any]],
-    *,
-    analysis_bbox: Sequence[int],
-    source_cells: Mapping[str, float],
-) -> list[SourcePunctuationGeometryOccurrence]:
-    results: list[SourcePunctuationGeometryOccurrence] = []
-    for axis in ("ttb", "ltr"):
-        cell = float(source_cells.get(axis) or 0.0)
-        if cell <= 0.0:
-            continue
-        dot_components: list[Mapping[str, Any]] = []
-        for component in components:
-            box = tuple(int(value) for value in component.get("bbox_xywh", ()))
-            if len(box) != 4:
-                continue
-            _x, _y, comp_w, comp_h = box
-            major = float(max(comp_w, comp_h))
-            minor = float(min(comp_w, comp_h))
-            fill_ratio = float(component.get("area") or 0) / float(max(1, comp_w * comp_h))
-            if (
-                major > cell * 0.44
-                or minor < 1.0
-                or major > minor * 2.5
-                or fill_ratio < 0.20
-            ):
-                continue
-            dot_components.append(component)
-        if len(dot_components) < 3:
-            continue
-        groups = _collinear_dot_groups(dot_components, axis=axis)
-        for group in groups:
-            if len(group) < 3:
-                continue
-            boxes = [tuple(int(value) for value in item["bbox_xywh"]) for item in group]
-            group_box = _union_boxes(boxes)
-            if not group_box:
-                continue
-            if any(
-                _dot_has_aligned_stem(box, components, axis=axis, source_cell=cell)
-                for box in boxes
-            ):
-                continue
-            inline_centers = [
-                (box[1] + box[3] / 2.0) if axis == "ttb" else (box[0] + box[2] / 2.0)
-                for box in boxes
-            ]
-            inline_centers.sort()
-            pitches = [
-                inline_centers[index + 1] - inline_centers[index]
-                for index in range(len(inline_centers) - 1)
-            ]
-            if not pitches or min(pitches) <= 0.0:
-                continue
-            pitch = float(np.median(pitches))
-            pitch_spread = float(max(pitches) - min(pitches))
-            if pitch_spread > max(2.0, pitch * 0.38):
-                continue
-            span = float(group_box[3] if axis == "ttb" else group_box[2])
-            page_boxes = tuple(
-                tuple(_page_box(box, analysis_bbox)) for box in boxes
-            )
-            page_group = tuple(_page_box(group_box, analysis_bbox))
-            results.append(
-                SourcePunctuationGeometryOccurrence(
-                    occurrence_id="",
-                    kind="ellipsis",
-                    visual_reading_order_ordinal=-1,
-                    kind_ordinal=-1,
-                    inline_axis=axis,
-                    component_bboxes_local_xywh=tuple(boxes),
-                    component_bboxes_page_xywh=page_boxes,
-                    group_bbox_local_xywh=tuple(group_box),
-                    group_bbox_page_xywh=page_group,
-                    span_px=span,
-                    pitch_px=pitch,
-                    measurement_basis=(
-                        SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED
-                    ),
-                    source_cell_px=cell,
-                    normalized_span=span / cell,
-                    normalized_pitch=pitch / cell,
-                    confidence=max(
-                        0.72,
-                        min(0.98, 0.90 - pitch_spread / max(1.0, pitch) * 0.20),
-                    ),
-                    reason_codes=(
-                        "collinear_source_dot_group",
-                        "uniform_source_dot_pitch",
-                        "source_dot_count_not_target_identity_authority",
-                    ),
-                )
-            )
     return _prefer_axis_specific_nonoverlap(results)
 
 
@@ -1485,103 +1384,6 @@ def _direction_change_count(values: np.ndarray) -> int:
         if not signs or signs[-1] != sign:
             signs.append(sign)
     return max(0, len(signs) - 1)
-
-
-def _collinear_dot_groups(
-    components: Sequence[Mapping[str, Any]],
-    *,
-    axis: str,
-) -> list[list[Mapping[str, Any]]]:
-    records = []
-    for component in components:
-        x, y, width, height = [int(value) for value in component["bbox_xywh"]]
-        cross = x + width / 2.0 if axis == "ttb" else y + height / 2.0
-        inline = y + height / 2.0 if axis == "ttb" else x + width / 2.0
-        size = max(width, height)
-        records.append((cross, inline, float(size), component))
-    if not records:
-        return []
-    typical = max(1.0, float(np.median([item[2] for item in records])))
-    groups: list[list[tuple[float, float, float, Mapping[str, Any]]]] = []
-    for record in sorted(records, key=lambda item: (item[0], item[1])):
-        target = None
-        for group in groups:
-            center = float(np.median([item[0] for item in group]))
-            if abs(record[0] - center) <= typical * 0.65:
-                target = group
-                break
-        if target is None:
-            groups.append([record])
-        else:
-            target.append(record)
-    return [
-        [item[3] for item in sorted(group, key=lambda item: item[1])]
-        for group in groups
-        if len(group) >= 3
-    ]
-
-
-def _dot_has_aligned_stem(
-    dot_box: Sequence[int],
-    components: Sequence[Mapping[str, Any]],
-    *,
-    axis: str,
-    source_cell: float,
-) -> bool:
-    x, y, width, height = [int(value) for value in dot_box]
-    cross_center = (
-        x + width / 2.0 if axis == "ttb" else y + height / 2.0
-    )
-    inline_center = (
-        y + height / 2.0 if axis == "ttb" else x + width / 2.0
-    )
-    inline_start = y if axis == "ttb" else x
-    inline_end = y + height if axis == "ttb" else x + width
-    cross_start = x if axis == "ttb" else y
-    cross_end = x + width if axis == "ttb" else y + height
-    for component in components:
-        box = tuple(int(value) for value in component.get("bbox_xywh", ()))
-        if len(box) != 4 or tuple(dot_box) == box:
-            continue
-        bx, by, bw, bh = box
-        component_inline = float(bh if axis == "ttb" else bw)
-        component_cross = float(bw if axis == "ttb" else bh)
-        component_cross_center = (
-            bx + bw / 2.0 if axis == "ttb" else by + bh / 2.0
-        )
-        component_inline_center = (
-            by + bh / 2.0 if axis == "ttb" else bx + bw / 2.0
-        )
-        component_start = by if axis == "ttb" else bx
-        component_end = by + bh if axis == "ttb" else bx + bw
-        if (
-            component_inline
-            >= max(source_cell * 0.75, component_cross * 2.0)
-            and abs(component_cross_center - cross_center)
-            <= source_cell * 0.28
-        ):
-            gap = min(
-                abs(component_start - inline_end),
-                abs(inline_start - component_end),
-            )
-            if gap <= source_cell * 0.90:
-                return True
-
-        component_cross_start = bx if axis == "ttb" else by
-        component_cross_end = bx + bw if axis == "ttb" else by + bh
-        if (
-            component_cross
-            >= max(source_cell * 0.75, component_inline * 2.0)
-            and abs(component_inline_center - inline_center)
-            <= source_cell * 0.28
-        ):
-            cross_gap = min(
-                abs(component_cross_start - cross_end),
-                abs(cross_start - component_cross_end),
-            )
-            if cross_gap <= source_cell * 0.90:
-                return True
-    return False
 
 
 def _assign_visual_ordinals(

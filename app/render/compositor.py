@@ -38,8 +38,8 @@ except Exception:  # pragma: no cover - optional runtime dependency
     ImageDraw = None
     ImageFilter = None
 
-RENDERER_COMPOSITOR_VERSION = "renderer_compositor_stage5_v5"
-PARENT_LAYER_COMPOSITION_VERSION = "isolated_parent_layer_atomic_effects_v3"
+RENDERER_COMPOSITOR_VERSION = "renderer_compositor_stage5_v6"
+PARENT_LAYER_COMPOSITION_VERSION = "isolated_parent_layer_atomic_effects_v4"
 
 
 class RendererCompositor:
@@ -84,6 +84,11 @@ class RendererCompositor:
             report,
             glyphs,
         )
+        if (
+            not bool(report.hard_bounds_contained)
+            or not bool(layout.hard_bounds_contained)
+        ):
+            issues.append("parent_layer_base_layout_not_contained")
         optional_effect_degradation = _optional_effect_degradation_reason(
             parent_effects,
             layout,
@@ -300,8 +305,10 @@ class RendererCompositor:
             rejection_reasons.append("parent_layer_visible_placement_count_mismatch")
         if expected_visible_count and not parent_alpha_bounds:
             rejection_reasons.append("parent_layer_visible_alpha_empty")
-        if parent_alpha_bounds and not bool(combined_containment.get("accepted")):
-            rejection_reasons.append("parent_layer_combined_ink_exceeds_hard_bounds")
+        if parent_alpha_bounds and not _page_safe_containment(combined_containment):
+            rejection_reasons.append("parent_layer_combined_ink_exceeds_page_bounds")
+        elif parent_alpha_bounds and not bool(combined_containment.get("accepted")):
+            issues.append("parent_layer_combined_ink_exceeds_hard_bounds")
 
         commit_surface = parent_surface
         final_containment = combined_containment
@@ -500,7 +507,7 @@ def _draw_glyph(
             **base_audit,
             **primitive_evidence,
             "raster_authority": "typesetting_drawing_primitive_v1",
-            "status": "primitive" if bool(containment.get("accepted")) else "failed",
+            "status": "primitive" if _page_safe_containment(containment) else "failed",
             "primitive_id": primitive_id,
             "primitive_type": str(primitive.get("kind") or mode),
             "policy_owner": "TypesettingEngine",
@@ -519,9 +526,15 @@ def _draw_glyph(
             "hard_bound_containment": containment,
             "composite_dest": [x0, y0],
             "composite_bounds": list(containment.get("raster_alpha_bounds") or []),
-            "issues": [] if bool(containment.get("accepted")) else ["raster_ink_exceeds_parent_hard_bounds"],
+            "issues": (
+                []
+                if bool(containment.get("accepted"))
+                else ["raster_ink_exceeds_parent_hard_bounds"]
+                if _page_safe_containment(containment)
+                else ["raster_ink_exceeds_page_bounds"]
+            ),
         }
-        if bool(containment.get("accepted")):
+        if _page_safe_containment(containment):
             page.alpha_composite(layer, dest=(x0, y0))
         return primitive_audit
 
@@ -570,7 +583,7 @@ def _draw_glyph(
         raster_audit["hard_bound_containment"] = containment
         raster_audit["composite_dest"] = list(composite_dest)
         raster_audit["composite_bounds"] = list(containment.get("raster_alpha_bounds") or [])
-        if not bool(containment.get("accepted")):
+        if not _page_safe_containment(containment):
             rasterized_ids = list(raster_audit.get("drawn_glyph_ids") or [])
             raster_audit.update(
                 {
@@ -580,12 +593,19 @@ def _draw_glyph(
                     "issues": _unique_strings(
                         [
                             *(raster_audit.get("issues") or []),
-                            "raster_ink_exceeds_parent_hard_bounds",
+                            "raster_ink_exceeds_page_bounds",
                         ]
                     ),
                 }
             )
         else:
+            if not bool(containment.get("accepted")):
+                raster_audit["issues"] = _unique_strings(
+                    [
+                        *(raster_audit.get("issues") or []),
+                        "raster_ink_exceeds_parent_hard_bounds",
+                    ]
+                )
             page.alpha_composite(result.image, dest=composite_dest)
     return raster_audit
 
@@ -978,11 +998,6 @@ def _base_layout_preflight_issue(
         or not bool(layout.text_placement_complete)
     ):
         return "parent_layer_base_layout_not_renderable"
-    if (
-        not bool(report.hard_bounds_contained)
-        or not bool(layout.hard_bounds_contained)
-    ):
-        return "parent_layer_base_layout_not_contained"
     if str(layout.original_text or "") != str(plan.translated_text or ""):
         return "parent_layer_layout_source_text_mismatch"
     glyph_text = "".join(str(item.get("text") or "") for item in glyphs)
@@ -1762,6 +1777,14 @@ def _hard_bound_containment(
         "inside_page_bounds": bool(inside_page),
         "inside_parent_hard_bounds": bool(inside_parent),
     }
+
+
+def _page_safe_containment(value: Mapping[str, Any] | None) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("raster_alpha_bounds")
+        and value.get("inside_page_bounds")
+    )
 
 
 def _xyxy_contains(outer: Sequence[int], inner: Sequence[int]) -> bool:

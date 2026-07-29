@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
     Image = None
 
 
-PAGE_RENDER_EXECUTOR_VERSION = "page_render_executor_v3"
+PAGE_RENDER_EXECUTOR_VERSION = "page_render_executor_v4"
 
 
 class PageRenderTransactionError(RuntimeError):
@@ -183,7 +183,6 @@ class PageRenderExecutor:
         adjusted_plans: list[RenderLayerPlan] = []
         occupied_bounds: list[dict[str, Any]] = []
         failed_layer_ids: list[str] = []
-        failure_reason = ""
         for plan in page_slotted_plans:
             adjusted_plan = self.layout_planner.plan_layer(
                 immutable_cleaned_page,
@@ -253,7 +252,7 @@ class PageRenderExecutor:
             reports.append(report)
             layer_audits.append(audit)
             issues.extend(str(item) for item in audit.get("issues", []) or [])
-            transaction_failures = _required_layer_transaction_failures(
+            transaction_failures = _parent_layer_rejection_reasons(
                 adjusted_plan,
                 layout,
                 report,
@@ -261,7 +260,7 @@ class PageRenderExecutor:
             )
             if transaction_failures:
                 audit["page_transaction"] = {
-                    "status": "rejected",
+                    "status": "parent_rejected_page_continues",
                     "required_parent": True,
                     "reasons": list(transaction_failures),
                     "output_committed": False,
@@ -270,14 +269,13 @@ class PageRenderExecutor:
                     [
                         *(audit.get("issues") or []),
                         *transaction_failures,
-                        "page_render_transaction_rejected",
+                        "parent_render_rejected_page_continues",
                     ]
                 )
                 issues.extend(transaction_failures)
-                issues.append("page_render_transaction_rejected")
+                issues.append("parent_render_rejected_page_continues")
                 failed_layer_ids.append(str(adjusted_plan.layer_id or adjusted_plan.parent_id))
-                failure_reason = transaction_failures[0]
-                break
+                continue
             if audit.get("drawn"):
                 audit["page_transaction"] = {
                     "status": "staged",
@@ -311,32 +309,6 @@ class PageRenderExecutor:
                 )
 
         elapsed = (time.perf_counter() - start) * 1000.0
-        if failed_layer_ids:
-            _finalize_page_transaction_audits(
-                layer_audits,
-                committed=False,
-                failure_reason=failure_reason or "page_render_transaction_rejected",
-            )
-            return PageRenderResult(
-                cleaned_page_base_path=cleaned_page_base_path,
-                output_path=output_path,
-                plans=adjusted_plans,
-                layouts=layouts,
-                fit_reports=reports,
-                layer_audits=layer_audits,
-                elapsed_ms=elapsed,
-                status="failed",
-                issues=_unique_strings(issues),
-                canvas_size=canvas_size,
-                page_slot_owner=type(self.layout_planner).__name__,
-                render_layout_planner_version=str(
-                    getattr(self.layout_planner, "version", "") or "unversioned"
-                ),
-                output_committed=False,
-                requested_layer_count=len(ordered_plans),
-                failed_layer_ids=failed_layer_ids,
-                failure_reason=failure_reason or "page_render_transaction_rejected",
-            )
         try:
             _save_image_atomic(output_page, output_path)
         except Exception as exc:
@@ -368,9 +340,11 @@ class PageRenderExecutor:
                 ),
                 output_committed=False,
                 requested_layer_count=len(ordered_plans),
-                failed_layer_ids=[],
+                failed_layer_ids=failed_layer_ids,
                 failure_reason="page_output_atomic_commit_failed",
             )
+        if failed_layer_ids:
+            issues.append("page_committed_with_parent_diagnostics")
         _finalize_page_transaction_audits(layer_audits, committed=True)
         return PageRenderResult(
             cleaned_page_base_path=cleaned_page_base_path,
@@ -389,7 +363,7 @@ class PageRenderExecutor:
             ),
             output_committed=True,
             requested_layer_count=len(ordered_plans),
-            failed_layer_ids=[],
+            failed_layer_ids=failed_layer_ids,
             failure_reason="",
         )
 
@@ -557,7 +531,7 @@ def _annotate_optional_effect_fallback(
     )
 
 
-def _required_layer_transaction_failures(
+def _parent_layer_rejection_reasons(
     plan: RenderLayerPlan,
     layout: TypesetLayout,
     report: FitReport,
@@ -583,25 +557,21 @@ def _required_layer_transaction_failures(
         or not bool(layout.text_placement_complete)
     ):
         failures.append("required_parent_layout_not_composable")
-    if (
-        not bool(report.hard_bounds_contained)
-        or not bool(layout.hard_bounds_contained)
-    ):
-        failures.append("required_parent_layout_hard_bounds_failed")
     if not bool(audit.get("drawn")):
         failures.append("required_parent_base_text_not_drawn")
     if not bool(audit.get("glyph_text_matches_layout")):
         failures.append("required_parent_glyph_text_not_conserved")
     if int(audit.get("failed_raster_placement_count") or 0) > 0:
         failures.append("required_parent_raster_placement_failed")
-    if int(audit.get("hard_bound_containment_failure_count") or 0) > 0:
-        failures.append("required_parent_raster_containment_failed")
     if str(composition.get("status") or "") != "committed":
         failures.append("required_parent_layer_not_committed")
     if int(composition.get("page_composite_count") or 0) != 1:
         failures.append("required_parent_atomic_commit_count_invalid")
-    if not bool(final_containment.get("accepted")):
-        failures.append("required_parent_final_alpha_not_contained")
+    if (
+        final_containment.get("raster_alpha_bounds")
+        and not bool(final_containment.get("inside_page_bounds"))
+    ):
+        failures.append("required_parent_final_alpha_outside_page_canvas")
     if int(composition.get("final_alpha_sum") or 0) <= 0:
         failures.append("required_parent_visible_alpha_empty")
     return _unique_strings(failures)

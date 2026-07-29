@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
-BUBBLE_DETECTION_VERSION = "phase4b23_bubble_detection_semantic_authority_contract_v5"
-BUBBLE_DETECTION_CACHE_VERSION = "phase4b23_bubble_detection_semantic_authority_cache_v5"
+BUBBLE_DETECTION_VERSION = "phase4b23_bubble_detection_semantic_authority_contract_v6"
+BUBBLE_DETECTION_CACHE_VERSION = "phase4b23_bubble_detection_semantic_authority_cache_v6"
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = ROOT / "scripts"
@@ -51,6 +51,7 @@ SEMANTIC_EVIDENCE_PROVIDER_VERSION = "semantic_evidence_provider_v2"
 SEMANTIC_EVIDENCE_CONTRACT_VERSION = "semantic_authority_contract_v2"
 OGKALU_NEIGHBORING_SPEECH_CONTEXT_VERSION = "ogkalu_neighboring_speech_context_v1"
 OGKALU_STRONG_SINGLE_MODEL_CONFIDENCE = 0.85
+OGKALU_RETAINED_TEXT_PAIR_CONFIDENCE = OGKALU_CONFIDENCE_THRESHOLD
 OGKALU_BUBBLE_TEXT_PAIR_REASON = "ogkalu_text_bubble_inside_unmasked_bubble_support"
 OGKALU_TEXT_EVIDENCE_ATTACHED_REASON = "ogkalu_text_bubble_attached_to_unmasked_bubble_container"
 PROVIDER_KITSUMED_SPEECH_MASK = "kitsumed_speech_mask_evidence"
@@ -386,6 +387,7 @@ def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> B
                 "kitsumed_nms_iou": KITSUMED_NMS_IOU_THRESHOLD,
                 "kitsumed_mask": KITSUMED_MASK_THRESHOLD,
                 "ogkalu_confidence": OGKALU_CONFIDENCE_THRESHOLD,
+                "ogkalu_retained_text_pair": OGKALU_RETAINED_TEXT_PAIR_CONFIDENCE,
             },
         }
 
@@ -1393,7 +1395,10 @@ def _associate_unmasked_ogkalu_bubble_text_pairs(
             continue
         text_box = _ogkalu_bbox_xyxy(text_record)
         text_area = _bbox_area_xyxy(text_box)
-        if text_area <= 0.0 or _fused_ogkalu_confidence(text_container, records_by_id) < OGKALU_STRONG_SINGLE_MODEL_CONFIDENCE:
+        if text_area <= 0.0 or _fused_ogkalu_confidence(
+            text_container,
+            records_by_id,
+        ) < OGKALU_RETAINED_TEXT_PAIR_CONFIDENCE:
             continue
         best: tuple[float, float, Dict[str, Any]] | None = None
         for bubble_container in bubble_containers:

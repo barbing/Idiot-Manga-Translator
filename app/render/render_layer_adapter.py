@@ -21,6 +21,7 @@ from app.render.source_punctuation_hints import (
     SOURCE_PUNCTUATION_CELL_CALIBRATION_VERSION,
     SOURCE_PUNCTUATION_GEOMETRY_EVIDENCE_VERSION,
     SOURCE_PUNCTUATION_GEOMETRY_OBSERVER_VERSION,
+    SOURCE_PUNCTUATION_GEOMETRY_SUPPORTED_KINDS,
     SOURCE_PUNCTUATION_GEOMETRY_SUPPORT_VERSION,
     SOURCE_PUNCTUATION_MEASUREMENT_BASIS_ABSOLUTE_STROKE,
     SOURCE_PUNCTUATION_MEASUREMENT_BASIS_NORMALIZED,
@@ -736,7 +737,7 @@ def _validate_source_punctuation_occurrence(
         prefix,
     )
     kind = str(occurrence.get("kind") or "")
-    if kind not in {"dash", "ellipsis", "wave"}:
+    if kind not in SOURCE_PUNCTUATION_GEOMETRY_SUPPORTED_KINDS:
         reasons.append(f"{prefix}_kind_invalid")
     if str(occurrence.get("inline_axis") or "") not in {"ttb", "ltr"}:
         reasons.append(f"{prefix}_inline_axis_invalid")

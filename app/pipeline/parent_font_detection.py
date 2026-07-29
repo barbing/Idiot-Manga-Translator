@@ -16,7 +16,7 @@ import re
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -58,7 +58,10 @@ from app.pipeline.source_style_contracts import (
     TargetFontAffinityObservationV1,
     source_font_overlap_bounds,
 )
-from app.render.font_manager import FontManager
+from app.render.font_manager import (
+    TARGET_OPTICAL_PROFILE_POLICY_ID,
+    FontManager,
+)
 
 
 FONT_COUNT = 6150
@@ -121,6 +124,16 @@ TARGET_FONT_AFFINITY_PROBE_SPECS = (
 FAMILY_POSTERIOR_VERSION = "yuzumarker_complete_family_posterior_v1"
 SOURCE_STYLE_EVIDENCE_V2 = "source_style_evidence_v2"
 NORMALIZED_STROKE_PROFILE_V2 = "normalized_stroke_profile_v2"
+PARENT_STYLE_OPTICAL_REALIZATION_BRIDGE_VERSION = (
+    "parent_style_optical_realization_bridge_v1"
+)
+PARENT_STYLE_OPTICAL_ESTIMATOR_POLICY = (
+    "median_supported_nonduplicate_sans_target_to_source_fixed_probe_ratio_v1"
+)
+PARENT_STYLE_OPTICAL_ESTIMATOR_CONVERSION = 0.8680860635000001
+PARENT_STYLE_TARGET_OUTLINE_REALIZATION_VERSION = (
+    "fixed_target_outline_carrier_v1"
+)
 FACTORIZED_ATTRIBUTE_POSTERIOR_VERSION = (
     "yuzumarker_factorized_attribute_posterior_v1"
 )
@@ -1339,7 +1352,12 @@ def realize_parent_render_styles_v3(
                 role_inventory=inventory,
             )
         )
-    return ParentRenderStyleLedgerV3(styles=tuple(styles))
+    return ParentRenderStyleLedgerV3(
+        styles=_v3_standardize_target_outline_realization(
+            styles=tuple(styles),
+            decisions_by_id=decisions_by_id,
+        )
+    )
 
 
 def _v3_require_matching_parent_identity(
@@ -1440,6 +1458,26 @@ def _realize_parent_render_style_v3(
             target_visible_ink_height_ratio=visible_ratio,
         )
     )
+    source_optical_support = weight_support.get(
+        "source_optical_realization"
+    )
+    (
+        preferred_em,
+        preferred_interval,
+        source_optical_bridge_audit,
+    ) = _v3_apply_source_optical_realization_bridge(
+        source_cell=source_cell,
+        height_preferred_em=preferred_em,
+        height_interval=preferred_interval,
+        source_optical_support=(
+            source_optical_support
+            if isinstance(source_optical_support, Mapping)
+            else None
+        ),
+        target_visible_ink_height_ratio=visible_ratio,
+        target_stem_to_ink_ratio=float(profile.stem_to_ink_ratio),
+        target_profile_policy_id=str(profile.profile_policy_id),
+    )
     fill_value = dict(fill_axis.value) if isinstance(fill_axis.value, Mapping) else {}
     outline_value = (
         dict(outline_axis.value) if isinstance(outline_axis.value, Mapping) else {}
@@ -1458,25 +1496,57 @@ def _realize_parent_render_style_v3(
         outline_ratio = 0.0
     if not outline_present:
         outline_ratio = 0.0
+    outline_reference = _v3_target_outline_reference(
+        family=family,
+        writing_mode=writing_mode,
+        font_manager=font_manager,
+        role_inventory=role_inventory,
+    )
+    outline_reference_ratio = float(
+        outline_reference["target_outline_reference_ratio"]
+    )
+    source_requested_outline_width = (
+        float(outline_ratio) * preferred_em if outline_present else 0.0
+    )
+    target_reference_outline_width = (
+        outline_reference_ratio * preferred_em if outline_present else 0.0
+    )
+    direct_wider_source_outline = bool(
+        outline_present
+        and outline_axis.status == "direct"
+        and float(outline_ratio) > outline_reference_ratio + 1e-12
+    )
+    continuous_target_outline_width = (
+        source_requested_outline_width
+        if direct_wider_source_outline
+        else target_reference_outline_width
+    )
     outline = {
         "present": outline_present,
         "color": _hex_color(outline_value.get("color")) or "#FFFFFF",
         "source_width_to_cell_ratio": float(outline_ratio),
-        "target_width_px": round(float(outline_ratio) * preferred_em, 6),
+        "target_width_px": round(continuous_target_outline_width, 6),
     }
 
     profile_audit = profile.to_audit_dict()
     selection_audit = profile_resolution.selection.to_audit_dict()
+    optical_bridge_applied = (
+        source_optical_bridge_audit.get("status") == "applied"
+    )
     conversion_audit: dict[str, Any] = {
         "status": conversion_status,
         "formula": (
-            "source_visual_cell_px/target_visible_ink_height_ratio"
-            if conversion_status
-            in {
-                "source_to_target_optical_conversion",
-                "low_confidence_source_to_target_optical_conversion",
-            }
-            else "deterministic_target_fallback_em"
+            "height_if_sufficient_else_sqrt_height_times_stem"
+            if optical_bridge_applied
+            else (
+                "source_visual_cell_px/target_visible_ink_height_ratio"
+                if conversion_status
+                in {
+                    "source_to_target_optical_conversion",
+                    "low_confidence_source_to_target_optical_conversion",
+                }
+                else "deterministic_target_fallback_em"
+            )
         ),
         "source_visual_cell_p20_px": source_cell.get("p20_px"),
         "source_visual_cell_median_px": source_cell.get("median_px"),
@@ -1486,6 +1556,45 @@ def _realize_parent_render_style_v3(
         "target_face_profile_id": profile.profile_id,
         "target_profile_selection": selection_audit,
         "target_profile_metrics": profile_audit,
+        "source_optical_realization": source_optical_bridge_audit,
+        "target_outline_realization": {
+            "policy_version": (
+                PARENT_STYLE_TARGET_OUTLINE_REALIZATION_VERSION
+            ),
+            "status": (
+                "pending_local_thick_source_outline"
+                if direct_wider_source_outline
+                else (
+                    "pending_current_page_standardization"
+                    if outline_present
+                    else "outline_absent"
+                )
+            ),
+            "reference_role": outline_reference["reference_role"],
+            "reference_profile_id": outline_reference[
+                "reference_profile_id"
+            ],
+            "reference_profile_policy_id": outline_reference[
+                "reference_profile_policy_id"
+            ],
+            "target_outline_reference_ratio": outline_reference_ratio,
+            "source_requested_width_px": source_requested_outline_width,
+            "target_reference_width_px": target_reference_outline_width,
+            "continuous_target_width_px": (
+                continuous_target_outline_width
+            ),
+            "eligible_for_current_page_standardization": bool(
+                outline_present and not direct_wider_source_outline
+            ),
+            "source_authority_status": str(outline_axis.status),
+            "direct_wider_source_outline": direct_wider_source_outline,
+            "cohort_member_bundle_ids": (),
+            "quantization": "deterministic_half_up_integer_px",
+            "target_width_px": 0.0,
+            "paint_authority_changed": False,
+            "translation_content_consulted": False,
+            "render_admission": False,
+        },
         "diagnostic_only": True,
         "render_admission": False,
     }
@@ -1569,6 +1678,400 @@ def _realize_parent_render_style_v3(
         readability_diagnostic=readability,
         parent_layer_effects=effects,
     )
+
+
+def _v3_target_outline_reference(
+    *,
+    family: str,
+    writing_mode: str,
+    font_manager: FontManager,
+    role_inventory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the fixed regular-face carrier reference for one target family."""
+
+    if family not in {"sans", "serif"}:
+        raise ValueError("Stage 3B outline reference family is invalid")
+    reference_role = f"{family}_regular"
+    role_status = role_inventory.get(reference_role)
+    if (
+        role_status is None
+        or not bool(getattr(role_status, "native_asset_available", False))
+        or not str(getattr(role_status, "selected_face_id", "") or "")
+    ):
+        raise ValueError(
+            "Stage 3B target outline reference role is unavailable: "
+            f"{reference_role}"
+        )
+    face = font_manager.face(role_status.selected_face_id)
+    if face is None:
+        raise ValueError(
+            "Stage 3B target outline reference face is unavailable: "
+            f"{reference_role}"
+        )
+    profile = font_manager.target_optical_profile(
+        face,
+        writing_mode,
+    ).profile
+    reference_ratio = (
+        float(profile.visible_ink_height_ratio)
+        * float(profile.stem_to_ink_ratio)
+    )
+    if not math.isfinite(reference_ratio) or reference_ratio <= 0.0:
+        raise ValueError("Stage 3B target outline reference ratio is invalid")
+    return {
+        "reference_role": reference_role,
+        "reference_profile_id": str(profile.profile_id),
+        "reference_profile_policy_id": str(profile.profile_policy_id),
+        "target_outline_reference_ratio": reference_ratio,
+    }
+
+
+def _v3_standardize_target_outline_realization(
+    *,
+    styles: Sequence[ResolvedParentRenderStyleV3],
+    decisions_by_id: Mapping[str, ParentStyleParentDecisionV3],
+) -> tuple[ResolvedParentRenderStyleV3, ...]:
+    """Quantize compatible already-authorized target outlines exactly once."""
+
+    ordered = tuple(sorted(tuple(styles or ()), key=lambda item: item.bundle_id))
+    by_id = {style.bundle_id: style for style in ordered}
+    standard_groups: dict[tuple[Any, ...], list[str]] = {}
+    thick_local: list[str] = []
+
+    for style in ordered:
+        if not bool(style.outline.get("present")):
+            continue
+        outline_audit = style.target_em_conversion_audit.get(
+            "target_outline_realization"
+        )
+        if not isinstance(outline_audit, Mapping):
+            raise ValueError(
+                "Stage 3B target outline realization audit is unavailable"
+            )
+        if not bool(
+            outline_audit.get(
+                "eligible_for_current_page_standardization"
+            )
+        ):
+            thick_local.append(style.bundle_id)
+            continue
+        decision = decisions_by_id[style.bundle_id]
+        weight_support = decision.axis("weight").peer_support
+        component_id = (
+            str(weight_support.get("target_font_component_id") or "")
+            if isinstance(weight_support, Mapping)
+            else ""
+        )
+        if not component_id:
+            component_id = f"parent-local:{style.bundle_id}"
+        key = (
+            style.page_id,
+            component_id,
+            style.primary_font_role,
+            style.writing_mode,
+            str(style.fill.get("color") or ""),
+            str(style.fill.get("polarity") or ""),
+            str(style.outline.get("color") or ""),
+            str(outline_audit.get("reference_profile_id") or ""),
+        )
+        standard_groups.setdefault(key, []).append(style.bundle_id)
+
+    replacements: dict[str, ResolvedParentRenderStyleV3] = {}
+    for member_ids in standard_groups.values():
+        for cohort_ids in _v3_outline_scale_cohorts(
+            member_ids=tuple(sorted(member_ids)),
+            styles_by_id=by_id,
+        ):
+            continuous_width = max(
+                float(
+                    by_id[bundle_id]
+                    .target_em_conversion_audit[
+                        "target_outline_realization"
+                    ]["continuous_target_width_px"]
+                )
+                for bundle_id in cohort_ids
+            )
+            target_width = float(
+                max(1, math.floor(continuous_width + 0.5))
+            )
+            for bundle_id in cohort_ids:
+                replacements[bundle_id] = (
+                    _v3_with_final_target_outline_width(
+                        style=by_id[bundle_id],
+                        target_width=target_width,
+                        status=(
+                            "standardized_current_page_outline_cohort"
+                            if len(cohort_ids) > 1
+                            else "local_fixed_target_outline_reference"
+                        ),
+                        cohort_member_bundle_ids=cohort_ids,
+                    )
+                )
+
+    for bundle_id in sorted(thick_local):
+        style = by_id[bundle_id]
+        continuous_width = float(
+            style.target_em_conversion_audit[
+                "target_outline_realization"
+            ]["continuous_target_width_px"]
+        )
+        replacements[bundle_id] = _v3_with_final_target_outline_width(
+            style=style,
+            target_width=float(
+                max(1, math.floor(continuous_width + 0.5))
+            ),
+            status="local_direct_thick_source_outline",
+            cohort_member_bundle_ids=(bundle_id,),
+        )
+
+    for style in ordered:
+        if bool(style.outline.get("present")):
+            continue
+        replacements[style.bundle_id] = (
+            _v3_with_final_target_outline_width(
+                style=style,
+                target_width=0.0,
+                status="outline_absent",
+                cohort_member_bundle_ids=(),
+            )
+        )
+
+    return tuple(replacements.get(style.bundle_id, style) for style in ordered)
+
+
+def _v3_outline_scale_cohorts(
+    *,
+    member_ids: Sequence[str],
+    styles_by_id: Mapping[str, ResolvedParentRenderStyleV3],
+) -> tuple[tuple[str, ...], ...]:
+    """Partition one paint/component group by a shared realized-em range."""
+
+    ordered = sorted(
+        (str(item) for item in member_ids),
+        key=lambda bundle_id: (
+            float(styles_by_id[bundle_id].target_preferred_em_px),
+            bundle_id,
+        ),
+    )
+    cohorts: list[tuple[str, ...]] = []
+    active: list[str] = []
+    shared_low = 0.0
+    shared_high = 0.0
+    for bundle_id in ordered:
+        interval = styles_by_id[
+            bundle_id
+        ].target_preferred_em_interval_px
+        interval_low, interval_high = (
+            float(interval[0]),
+            float(interval[1]),
+        )
+        if not active:
+            active = [bundle_id]
+            shared_low, shared_high = interval_low, interval_high
+            continue
+        next_low = max(shared_low, interval_low)
+        next_high = min(shared_high, interval_high)
+        if next_low <= next_high + 1e-12:
+            active.append(bundle_id)
+            shared_low, shared_high = next_low, next_high
+            continue
+        cohorts.append(tuple(sorted(active)))
+        active = [bundle_id]
+        shared_low, shared_high = interval_low, interval_high
+    if active:
+        cohorts.append(tuple(sorted(active)))
+    return tuple(cohorts)
+
+
+def _v3_with_final_target_outline_width(
+    *,
+    style: ResolvedParentRenderStyleV3,
+    target_width: float,
+    status: str,
+    cohort_member_bundle_ids: Sequence[str],
+) -> ResolvedParentRenderStyleV3:
+    outline = dict(style.outline)
+    outline["target_width_px"] = float(target_width)
+    conversion_audit = dict(style.target_em_conversion_audit)
+    outline_audit = dict(
+        conversion_audit.get("target_outline_realization") or {}
+    )
+    outline_audit.update(
+        {
+            "status": str(status),
+            "cohort_member_bundle_ids": tuple(
+                sorted(str(item) for item in cohort_member_bundle_ids)
+            ),
+            "target_width_px": float(target_width),
+        }
+    )
+    conversion_audit["target_outline_realization"] = outline_audit
+    return replace(
+        style,
+        outline=outline,
+        target_em_conversion_audit=conversion_audit,
+    )
+
+
+def _v3_apply_source_optical_realization_bridge(
+    *,
+    source_cell: Mapping[str, Any],
+    height_preferred_em: float,
+    height_interval: tuple[float, float],
+    source_optical_support: Mapping[str, Any] | None,
+    target_visible_ink_height_ratio: float,
+    target_stem_to_ink_ratio: float,
+    target_profile_policy_id: str,
+) -> tuple[float, tuple[float, float], dict[str, Any]]:
+    """Apply the one-sided current-page source-to-target optical bridge."""
+
+    preferred = float(height_preferred_em)
+    interval = (
+        float(height_interval[0]),
+        float(height_interval[1]),
+    )
+    support = (
+        dict(source_optical_support)
+        if isinstance(source_optical_support, Mapping)
+        else {}
+    )
+    audit: dict[str, Any] = {
+        "bridge_version": PARENT_STYLE_OPTICAL_REALIZATION_BRIDGE_VERSION,
+        "status": "not_applied",
+        "reason": str(
+            support.get("reason")
+            or "current_page_source_optical_fact_unavailable"
+        ),
+        "render_admission": False,
+        "cache_contributor_count": int(
+            support.get("cache_contributor_count") or 0
+        ),
+        "qualification": str(support.get("qualification") or ""),
+        "component_member_bundle_ids": tuple(
+            support.get("member_bundle_ids") or ()
+        ),
+        "source_contributor_bundle_ids": tuple(
+            support.get("contributor_bundle_ids") or ()
+        ),
+        "estimator_conversion_policy": (
+            PARENT_STYLE_OPTICAL_ESTIMATOR_POLICY
+        ),
+        "estimator_conversion": (
+            PARENT_STYLE_OPTICAL_ESTIMATOR_CONVERSION
+        ),
+        "target_profile_policy_id": str(
+            target_profile_policy_id or ""
+        ),
+        "height_preferred_em_px": preferred,
+        "height_interval_px": interval,
+    }
+    if support.get("status") != "qualified":
+        return preferred, interval, audit
+    if target_profile_policy_id != TARGET_OPTICAL_PROFILE_POLICY_ID:
+        audit["reason"] = "target_optical_profile_policy_mismatch"
+        return preferred, interval, audit
+    try:
+        source_cells = tuple(
+            float(source_cell[key])
+            for key in ("p20_px", "median_px", "p80_px")
+        )
+        source_stem_ratios = tuple(
+            float(support[key]) for key in ("p20", "median", "p80")
+        )
+        visible_ratio = float(target_visible_ink_height_ratio)
+        stem_to_ink = float(target_stem_to_ink_ratio)
+    except (KeyError, TypeError, ValueError):
+        audit["reason"] = "source_or_target_optical_value_invalid"
+        return preferred, interval, audit
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                *source_cells,
+                *source_stem_ratios,
+                visible_ratio,
+                stem_to_ink,
+                preferred,
+                *interval,
+            )
+        )
+        or not (
+            0.0 < source_cells[0]
+            <= source_cells[1]
+            <= source_cells[2]
+        )
+        or not (
+            0.0 < source_stem_ratios[0]
+            <= source_stem_ratios[1]
+            <= source_stem_ratios[2]
+            <= 1.0
+        )
+        or visible_ratio <= 0.0
+        or stem_to_ink <= 0.0
+        or not (0.0 < interval[0] <= preferred <= interval[1])
+    ):
+        audit["reason"] = "source_or_target_optical_value_invalid"
+        return preferred, interval, audit
+
+    target_stem_per_em = visible_ratio * stem_to_ink
+    height_estimates = (interval[0], preferred, interval[1])
+    stem_estimates = tuple(
+        source_cell_px
+        * source_stem_ratio
+        * PARENT_STYLE_OPTICAL_ESTIMATOR_CONVERSION
+        / target_stem_per_em
+        for source_cell_px, source_stem_ratio in zip(
+            source_cells,
+            source_stem_ratios,
+        )
+    )
+    realized = tuple(
+        height_em
+        if stem_em <= height_em
+        else math.sqrt(height_em * stem_em)
+        for height_em, stem_em in zip(
+            height_estimates,
+            stem_estimates,
+        )
+    )
+    if not (
+        0.0 < realized[0] <= realized[1] <= realized[2]
+        and all(math.isfinite(value) for value in realized)
+    ):
+        audit["reason"] = "source_optical_realization_interval_invalid"
+        return preferred, interval, audit
+
+    final_preferred = float(realized[1])
+    final_interval = (float(realized[0]), float(realized[2]))
+    audit.update(
+        {
+            "status": (
+                "applied"
+                if final_preferred > preferred
+                else "not_applied"
+            ),
+            "reason": (
+                "source_stem_requires_optical_size_raise"
+                if final_preferred > preferred
+                else "height_baseline_already_sufficient"
+            ),
+            "source_stem_ratio_p20": source_stem_ratios[0],
+            "source_stem_ratio_median": source_stem_ratios[1],
+            "source_stem_ratio_p80": source_stem_ratios[2],
+            "target_visible_ink_height_ratio": visible_ratio,
+            "target_stem_to_ink_ratio": stem_to_ink,
+            "target_stem_per_em": target_stem_per_em,
+            "stem_estimate_p20_px": stem_estimates[0],
+            "stem_estimate_median_px": stem_estimates[1],
+            "stem_estimate_p80_px": stem_estimates[2],
+            "final_preferred_em_px": final_preferred,
+            "final_interval_px": final_interval,
+            "formula": (
+                "height_if_sufficient_else_sqrt_height_times_stem"
+            ),
+        }
+    )
+    return final_preferred, final_interval, audit
 
 
 def _v3_target_em_from_source_scale(
@@ -1801,6 +2304,11 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
     scale_fact = _v3_source_scale_fact(
         records.get("scale"), direction=direction_key
     )
+    source_optical_fact = _v3_source_optical_fact(
+        records.get("weight"),
+        direction=direction_key,
+        bundle_id=str(getattr(bundle, "bundle_id", "") or ""),
+    )
     weight_fact = _v3_weight_fact(
         records.get("weight"), direction=direction_key
     )
@@ -1890,6 +2398,7 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
             weight_interval_ambiguous_heavy_candidate
         ),
         "source_scale_fact": scale_fact,
+        "source_optical_fact": source_optical_fact,
         "scale_interval": (
             tuple(scale_fact["interval"])
             if scale_fact is not None
@@ -2706,6 +3215,156 @@ def _v3_target_font_prior_records(
     )
 
 
+def _v3_component_source_optical_fact(
+    member_bundle_ids: Sequence[str],
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Resolve one current-page optical fact without changing components."""
+
+    member_ids = tuple(
+        sorted(str(bundle_id or "") for bundle_id in member_bundle_ids)
+    )
+    contributors: list[dict[str, Any]] = []
+    for bundle_id in member_ids:
+        facts = facts_by_bundle.get(bundle_id)
+        fact = (
+            facts.get("source_optical_fact")
+            if isinstance(facts, Mapping)
+            else None
+        )
+        if not isinstance(fact, Mapping):
+            continue
+        if (
+            str(fact.get("bundle_id") or "") != bundle_id
+            or str(fact.get("direction") or "") not in {"ttb", "ltr"}
+        ):
+            continue
+        try:
+            p20 = float(fact.get("p20"))
+            median = float(fact.get("median"))
+            p80 = float(fact.get("p80"))
+            expanded = tuple(
+                float(value)
+                for value in fact.get("expanded_interval") or ()
+            )
+            confidence = float(fact.get("measurement_confidence"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            len(expanded) != 2
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    p20,
+                    median,
+                    p80,
+                    expanded[0],
+                    expanded[1],
+                    confidence,
+                )
+            )
+            or not (0.0 < p20 <= median <= p80 <= 1.0)
+            or not (0.0 < expanded[0] <= expanded[1] <= 1.0)
+            or not (0.0 <= confidence <= 1.0)
+        ):
+            continue
+        contributors.append(dict(fact))
+
+    base = {
+        "bridge_version": PARENT_STYLE_OPTICAL_REALIZATION_BRIDGE_VERSION,
+        "status": "unavailable",
+        "render_admission": False,
+        "member_bundle_ids": member_ids,
+        "contributor_bundle_ids": tuple(
+            str(fact["bundle_id"]) for fact in contributors
+        ),
+        "contributor_count": len(contributors),
+        "cache_contributor_count": 0,
+    }
+    if not contributors:
+        return {
+            **base,
+            "reason": "current_page_source_optical_fact_unavailable",
+        }
+
+    directions = {
+        str(fact.get("direction") or "") for fact in contributors
+    }
+    if len(directions) != 1:
+        return {
+            **base,
+            "reason": "current_page_source_optical_direction_mismatch",
+        }
+
+    if len(contributors) == 1:
+        if contributors[0].get("singleton_authoritative") is not True:
+            return {
+                **base,
+                "reason": (
+                    "singleton_source_optical_fact_not_authoritative"
+                ),
+            }
+        qualification = "supported_corroborating_singleton"
+        consensus_interval = tuple(
+            float(value)
+            for value in contributors[0]["expanded_interval"]
+        )
+    else:
+        consensus_interval = (
+            max(
+                float(fact["expanded_interval"][0])
+                for fact in contributors
+            ),
+            min(
+                float(fact["expanded_interval"][1])
+                for fact in contributors
+            ),
+        )
+        if consensus_interval[0] > consensus_interval[1]:
+            return {
+                **base,
+                "reason": (
+                    "current_page_source_optical_intervals_disjoint"
+                ),
+                "consensus_interval": consensus_interval,
+            }
+        qualification = "current_page_component_interval_consensus"
+
+    p20 = float(np.median([fact["p20"] for fact in contributors]))
+    median = float(
+        np.median([fact["median"] for fact in contributors])
+    )
+    p80 = float(np.median([fact["p80"] for fact in contributors]))
+    return {
+        **base,
+        "status": "qualified",
+        "reason": "current_page_source_optical_fact_qualified",
+        "qualification": qualification,
+        "direction": next(iter(directions)),
+        "p20": p20,
+        "median": median,
+        "p80": p80,
+        "interval": (p20, p80),
+        "consensus_interval": consensus_interval,
+        "measurement_states": tuple(
+            str(fact.get("measurement_state") or "")
+            for fact in contributors
+        ),
+        "estimator_agreements": tuple(
+            str(fact.get("estimator_agreement") or "")
+            for fact in contributors
+        ),
+        "source_identity_sha256": tuple(
+            str(fact.get("source_identity_sha256") or "")
+            for fact in contributors
+        ),
+        "measurement_confidence": min(
+            float(fact["measurement_confidence"])
+            for fact in contributors
+        ),
+    }
+
+
 def _v3_target_font_components(
     facts_by_bundle: Mapping[str, Mapping[str, Any]],
     *,
@@ -2971,6 +3630,12 @@ def _v3_target_font_components(
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
+            source_optical_realization = (
+                _v3_component_source_optical_fact(
+                    component_ids,
+                    facts_by_bundle,
+                )
+            )
             resolved.append(
                 {
                     "page_id": identity[0],
@@ -3022,6 +3687,9 @@ def _v3_target_font_components(
                         )
                         if prior_effective_weight > 0
                         else ""
+                    ),
+                    "source_optical_realization": (
+                        source_optical_realization
                     ),
                 }
             )
@@ -3081,6 +3749,9 @@ def _v3_apply_current_page_target_font_components(
             ),
             "prior_cache_snapshot_id": str(
                 component["prior_cache_snapshot_id"]
+            ),
+            "source_optical_realization": dict(
+                component["source_optical_realization"]
             ),
         }
         family_total = float(sum(pooled_family_scores.values()))
@@ -5763,6 +6434,103 @@ def _validated_normalized_stroke_profile_v2(
     ):
         return {}
     return _copy_jsonish(raw_profile)
+
+
+def _v3_source_optical_fact(
+    direct_weight_axis: SourceStyleAxisEvidence | None,
+    *,
+    direction: str,
+    bundle_id: str,
+) -> dict[str, Any] | None:
+    """Extract one identity-bound, scale-independent source-stroke fact."""
+
+    direction_key = str(direction or "").strip().lower()
+    if direction_key not in {"ttb", "ltr"}:
+        return None
+    profile = _validated_normalized_stroke_profile_v2(
+        direct_weight_axis
+    )
+    directions = profile.get("directions")
+    if not isinstance(directions, Mapping):
+        return None
+    raw = directions.get(direction_key)
+    if not isinstance(raw, Mapping):
+        return None
+    measurement_state = str(
+        raw.get("measurement_state") or ""
+    ).strip().lower()
+    if measurement_state not in {
+        "supported",
+        "provisional",
+        "unclassified",
+    }:
+        return None
+    distribution = raw.get("medial_width_to_cell")
+    if not isinstance(distribution, Mapping) or (
+        distribution.get("available") is not True
+    ):
+        return None
+    try:
+        p20 = float(distribution.get("p20"))
+        median = float(distribution.get("median"))
+        p80 = float(distribution.get("p80"))
+        local_cell = float(raw.get("local_cell_reference_px"))
+        confidence = float(raw.get("measurement_confidence"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (p20, median, p80, local_cell, confidence)
+        )
+        or not (0.0 < p20 <= median <= p80 <= 1.0)
+        or local_cell <= 0.0
+        or not (0.0 <= confidence <= 1.0)
+    ):
+        return None
+    agreement_record = raw.get("estimator_agreement")
+    estimator_agreement = (
+        str(agreement_record.get("status") or "").strip().lower()
+        if isinstance(agreement_record, Mapping)
+        else ""
+    )
+    if estimator_agreement not in {
+        "corroborating",
+        "divergent",
+        "unavailable",
+    }:
+        estimator_agreement = "unavailable"
+    tolerance = min(1.0, 0.5 / local_cell)
+    source_identity_sha256 = str(
+        profile.get("source_identity_sha256") or ""
+    )
+    if not source_identity_sha256:
+        return None
+    return {
+        "bundle_id": str(bundle_id or ""),
+        "direction": direction_key,
+        "measurement_state": measurement_state,
+        "measurement_confidence": confidence,
+        "estimator_agreement": estimator_agreement,
+        "local_cell_reference_px": local_cell,
+        "resolution_tolerance_ratio": tolerance,
+        "p20": p20,
+        "median": median,
+        "p80": p80,
+        "interval": (p20, p80),
+        "expanded_interval": (
+            max(1e-8, p20 - tolerance),
+            min(1.0, p80 + tolerance),
+        ),
+        "source_identity_sha256": source_identity_sha256,
+        "modality_status": str(
+            raw.get("modality_status") or ""
+        ).strip(),
+        "singleton_authoritative": bool(
+            measurement_state == "supported"
+            and estimator_agreement == "corroborating"
+        ),
+    }
 
 
 def _canonical_source_style_sha256(value: Any) -> str:
