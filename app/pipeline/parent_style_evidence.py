@@ -1088,6 +1088,179 @@ def _independent_glyph_geometry(
     )
 
 
+def _classify_compact_punctuation_fragments(
+    component_facts: list[dict[str, Any]],
+) -> bool:
+    """Classify a regular compact-mark train before body-scale estimation.
+
+    Individual contour morphology is intentionally only the seed. Source
+    antialiasing can hollow one dot and thresholding can join two neighboring
+    dots, so a minority of otherwise aligned marks may not satisfy the seed
+    predicate. Promotion is allowed only from source geometry: a compact
+    majority must establish one cross-axis track and regular inline coverage.
+    """
+
+    compact_marks = [
+        fact
+        for fact in component_facts
+        if bool(fact.get("normalized_compact_mark"))
+    ]
+    if len(compact_marks) >= 3:
+        compact_tier = float(
+            np.median(
+                [
+                    float(fact.get("long_span_px") or 0.0)
+                    for fact in compact_marks
+                ]
+            )
+        )
+        for fact in compact_marks:
+            span = float(fact.get("long_span_px") or 0.0)
+            if compact_tier > 0.0 and 0.65 <= span / compact_tier <= 1.35:
+                fact["punctuation_fragment"] = True
+
+    seeds = [
+        fact
+        for fact in component_facts
+        if bool(fact.get("normalized_compact_mark"))
+        and bool(fact.get("punctuation_fragment"))
+    ]
+    fact_count = len(component_facts)
+    if (
+        fact_count < 5
+        or len(seeds) < 3
+        or len(seeds) / max(1, fact_count) < 0.60
+    ):
+        return False
+
+    seed_centers = np.asarray(
+        [fact.get("center_xy") or (0.0, 0.0) for fact in seeds],
+        dtype=np.float64,
+    )
+    if seed_centers.ndim != 2 or seed_centers.shape[1] != 2:
+        return False
+    lower_quartile, upper_quartile = np.percentile(
+        seed_centers,
+        (25.0, 75.0),
+        axis=0,
+    )
+    robust_center_spans = upper_quartile - lower_quartile
+    inline_axis = int(np.argmax(robust_center_spans))
+    cross_axis = 1 - inline_axis
+    if float(robust_center_spans[inline_axis]) <= float(
+        robust_center_spans[cross_axis]
+    ):
+        return False
+
+    inline_key = "width_px" if inline_axis == 0 else "height_px"
+    cross_key = "height_px" if inline_axis == 0 else "width_px"
+    seed_inline_span = float(
+        np.median(
+            [float(fact.get(inline_key) or 0.0) for fact in seeds]
+        )
+    )
+    seed_cross_span = float(
+        np.median(
+            [float(fact.get(cross_key) or 0.0) for fact in seeds]
+        )
+    )
+    if seed_inline_span <= 0.0 or seed_cross_span <= 0.0:
+        return False
+
+    seed_cross_center = float(np.median(seed_centers[:, cross_axis]))
+    cross_tolerance = max(1.25, seed_cross_span * 0.55)
+    track_seeds = [
+        fact
+        for fact in seeds
+        if abs(
+            float((fact.get("center_xy") or (0.0, 0.0))[cross_axis])
+            - seed_cross_center
+        )
+        <= cross_tolerance
+    ]
+    if (
+        len(track_seeds) < max(3, int(math.ceil(len(seeds) * 0.80)))
+        or len(track_seeds) / max(1, fact_count) < 0.60
+    ):
+        return False
+
+    track_cross_center = float(
+        np.median(
+            [
+                float((fact.get("center_xy") or (0.0, 0.0))[cross_axis])
+                for fact in track_seeds
+            ]
+        )
+    )
+    selected: list[dict[str, Any]] = []
+    promoted: list[dict[str, Any]] = []
+    for fact in component_facts:
+        center = fact.get("center_xy") or (0.0, 0.0)
+        inline_span = float(fact.get(inline_key) or 0.0)
+        cross_span = float(fact.get(cross_key) or 0.0)
+        if (
+            abs(float(center[cross_axis]) - track_cross_center)
+            > cross_tolerance
+            or not 0.60 <= cross_span / seed_cross_span <= 1.45
+            or not 0.60 <= inline_span / seed_inline_span <= 2.40
+        ):
+            continue
+        inline_ratio = inline_span / seed_inline_span
+        inline_multiple = max(1, int(round(inline_ratio)))
+        if (
+            inline_multiple > 2
+            or abs(inline_ratio - inline_multiple) > 0.45
+        ):
+            continue
+        selected.append(fact)
+        if not bool(fact.get("punctuation_fragment")):
+            promoted.append(fact)
+
+    if (
+        not promoted
+        or len(selected) < 5
+        or len(selected) / max(1, fact_count) < 0.80
+    ):
+        return False
+
+    intervals: list[tuple[float, float]] = []
+    for fact in selected:
+        bbox = fact.get("bbox_xywh") or (0.0, 0.0, 0.0, 0.0)
+        start = float(bbox[inline_axis])
+        span = float(bbox[2 + inline_axis])
+        intervals.append((start, start + span))
+    intervals.sort()
+    train_extent = max(end for _, end in intervals) - min(
+        start for start, _ in intervals
+    )
+    if train_extent < seed_inline_span * 4.0:
+        return False
+    gaps = [
+        intervals[index + 1][0] - intervals[index][1]
+        for index in range(len(intervals) - 1)
+    ]
+    if not gaps or min(gaps) < -seed_inline_span * 0.35:
+        return False
+    nonnegative_gaps = np.maximum(np.asarray(gaps, dtype=np.float64), 0.0)
+    median_gap = float(np.median(nonnegative_gaps))
+    gap_mad = float(np.median(np.abs(nonnegative_gaps - median_gap)))
+    if (
+        float(np.max(nonnegative_gaps))
+        > median_gap + max(2.0, seed_inline_span * 0.90)
+        or gap_mad > max(2.0, seed_inline_span * 0.75)
+    ):
+        return False
+
+    orientation = "horizontal" if inline_axis == 0 else "vertical"
+    for fact in selected:
+        fact["punctuation_train_fragment"] = True
+        fact["punctuation_train_orientation"] = orientation
+    for fact in promoted:
+        fact["punctuation_fragment"] = True
+        fact["punctuation_train_promoted"] = True
+    return True
+
+
 def _native_authorized_candidate(
     authorized_mask: np.ndarray,
     luma: np.ndarray,
@@ -1248,24 +1421,16 @@ def _native_authorized_candidate(
         labels = np.zeros_like(glyph, dtype=np.int32)
         reasons.append("native_component_geometry_unavailable")
 
+    punctuation_train_promoted = _classify_compact_punctuation_fragments(
+        component_facts
+    )
     compact_marks = [
         fact
         for fact in component_facts
         if bool(fact.get("normalized_compact_mark"))
     ]
-    if len(compact_marks) >= 3:
-        compact_tier = float(
-            np.median(
-                [
-                    float(fact.get("long_span_px") or 0.0)
-                    for fact in compact_marks
-                ]
-            )
-        )
-        for fact in compact_marks:
-            span = float(fact.get("long_span_px") or 0.0)
-            if compact_tier > 0.0 and 0.65 <= span / compact_tier <= 1.35:
-                fact["punctuation_fragment"] = True
+    if punctuation_train_promoted:
+        reasons.append("regular_aligned_punctuation_train_promoted")
 
     yy, xx = np.where(mask)
     authorized_width = int(np.ptp(xx)) + 1 if xx.size else 0
@@ -5878,19 +6043,7 @@ def _fill_component_facts(fill: np.ndarray) -> list[dict[str, Any]]:
                 "punctuation_fragment": punctuation_fragment,
             }
         )
-    compact_marks = [
-        fact for fact in facts if bool(fact.get("normalized_compact_mark"))
-    ]
-    if len(compact_marks) >= 3:
-        compact_tier = float(
-            np.median(
-                [float(fact.get("long_span_px") or 0.0) for fact in compact_marks]
-            )
-        )
-        for fact in compact_marks:
-            span = float(fact.get("long_span_px") or 0.0)
-            if compact_tier > 0.0 and 0.65 <= span / compact_tier <= 1.35:
-                fact["punctuation_fragment"] = True
+    _classify_compact_punctuation_fragments(facts)
     return facts
 
 

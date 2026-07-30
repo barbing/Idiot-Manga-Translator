@@ -9134,7 +9134,9 @@ def _top_band_caption_background_authority_allowed(
         return False
     reason = str(search_reason)
     if "localized_ink" in reason:
-        return True
+        # Ink localization narrows a search scope, but it does not establish
+        # the semantic identity required to create an executable root.
+        return False
     if "search_scope_only" in reason:
         # Broad static top-band scopes are candidate search areas. They can only
         # carry OCR/projection context. Semantic authority must come from
@@ -9444,57 +9446,26 @@ def _append_deterministic_vertical_side_caption_containers(
             continue
         search_bbox = trimmed
         paired_text_boxes = _side_caption_paired_text_boundary_bboxes(result, item, search_bbox, image_size)
-        paired_text_boundary = bool(paired_text_boxes)
-        localized = None if paired_text_boundary else _localize_side_caption_bbox(luma_image, search_bbox, image_size)
-        localized_boxes = (
-            paired_text_boxes
-            if paired_text_boundary
-            else ([localized] if localized else _side_caption_character_column_bboxes(luma_image, search_bbox, image_size))
-        )
-        if not localized_boxes:
-            localized_boxes = [search_bbox]
+        if not paired_text_boxes:
+            # Visual localization can support search and review, but only an
+            # upstream typed text boundary may originate executable ownership.
+            continue
+        localized_boxes = paired_text_boxes
         item_id = str(item.get("model_evidence_id") or item.get("evidence_id") or item.get("fused_container_id") or "")
         authority_by_bbox: Dict[int, str] = {}
-        if paired_text_boundary:
-            for pre_index, pre_bbox in enumerate(localized_boxes):
-                if _caption_search_overlaps_blocking_container(pre_bbox, plan.containers):
-                    continue
-                authority_by_bbox[pre_index] = (
-                    "text_area_plan:deterministic_side_narration_background_authority:paired_text_boundary"
-                )
-        else:
-            for pre_index, pre_bbox in enumerate(localized_boxes):
-                if _caption_search_overlaps_blocking_container(pre_bbox, plan.containers):
-                    continue
-                pre_visual = _container_visual_stats(luma_image, pre_bbox, image_size)
-                pre_authority_reason = _side_caption_scope_authority_reason(item_id, pre_bbox, plan.containers)
-                if not pre_authority_reason and _side_caption_signal_item_has_background_authority(
-                    item=item,
-                    bbox=pre_bbox,
-                    visual=pre_visual,
-                    image_size=image_size,
-                    luma_image=luma_image,
-                    existing_containers=plan.containers,
-                ):
-                    pre_authority_reason = "text_area_plan:deterministic_side_narration_background_authority"
-                if pre_authority_reason:
-                    authority_by_bbox[pre_index] = pre_authority_reason
-            if authority_by_bbox and len(localized_boxes) >= 2:
-                for pre_index, pre_bbox in enumerate(localized_boxes):
-                    if pre_index in authority_by_bbox:
-                        continue
-                    if _caption_search_overlaps_blocking_container(pre_bbox, plan.containers):
-                        continue
-                    authority_by_bbox[pre_index] = (
-                        "text_area_plan:deterministic_side_narration_background_authority:sibling_column"
-                    )
+        for pre_index, pre_bbox in enumerate(localized_boxes):
+            if _caption_search_overlaps_blocking_container(pre_bbox, plan.containers):
+                continue
+            authority_by_bbox[pre_index] = (
+                "text_area_plan:deterministic_side_narration_background_authority:paired_text_boundary"
+            )
         if not authority_by_bbox:
             continue
         authorized_indexes = [index for index in range(len(localized_boxes)) if index in authority_by_bbox]
         if not authorized_indexes:
             continue
         caption_candidates: List[Dict[str, Any]] = []
-        if (paired_text_boundary or not localized) and len(authorized_indexes) >= 2:
+        if len(authorized_indexes) >= 2:
             group_bbox = _text_area_graph_union_xywh([localized_boxes[index] for index in authorized_indexes])
             if not group_bbox:
                 continue
@@ -9511,7 +9482,7 @@ def _append_deterministic_vertical_side_caption_containers(
                     "authority_reasons": authority_reasons,
                     "source_indexes": list(authorized_indexes),
                     "grouped_columns": True,
-                    "paired_text_boundary": paired_text_boundary,
+                    "paired_text_boundary": True,
                 }
             )
         else:
@@ -9524,7 +9495,7 @@ def _append_deterministic_vertical_side_caption_containers(
                         "authority_reasons": [authority_by_bbox.get(bbox_index, "")],
                         "source_indexes": [bbox_index],
                         "grouped_columns": False,
-                        "paired_text_boundary": paired_text_boundary,
+                        "paired_text_boundary": True,
                     }
                 )
         for candidate in caption_candidates:
@@ -9551,14 +9522,7 @@ def _append_deterministic_vertical_side_caption_containers(
             reason_codes.append(authority_reason)
             if bool(candidate.get("grouped_columns")):
                 reason_codes.append("text_area_plan:vertical_side_caption_authorized_columns_grouped_root")
-            if bool(candidate.get("paired_text_boundary")):
-                reason_codes.append("text_area_plan:vertical_side_caption_paired_text_boundary")
-            elif localized:
-                reason_codes.append("text_area_plan:vertical_side_caption_localized_ink")
-            elif list(bbox) != list(search_bbox):
-                reason_codes.append("text_area_plan:vertical_side_caption_localized_character_column")
-            else:
-                reason_codes.append("text_area_plan:vertical_side_caption_seed_scope")
+            reason_codes.append("text_area_plan:vertical_side_caption_paired_text_boundary")
             role_signals = ["side_narration_candidate"]
             role_signals.append("side_narration_background_authority")
             semantic_role_evidence: Dict[str, Any] = {
