@@ -56,7 +56,23 @@ If installation fails on Windows, verify the CUDA/cuDNN compatibility required b
 python -m app.main
 ```
 
-On first launch, the app checks for fixed runtime assets such as OCR and detection models. If required assets are missing, use the built-in download prompt or place the models under the local `models` folder.
+On first launch, the app checks for fixed runtime assets such as OCR and
+detection models. On Windows CPython 3.10 x64 it also verifies the exact
+PyICU 2.16.2 / ICU4C 78.3 runtime required by the renderer. If that runtime is
+not already active, the same built-in download prompt installs the
+SHA-256-pinned, self-contained runtime below `%LOCALAPPDATA%\YomiFrame` and
+activates it for the current process. Later launches reuse the validated local
+copy without another download or installation. No manual Conda, compiler, or
+`pip install PyICU` step is required for an ordinary source launch.
+
+Deployment binaries used by first-run setup are published in the versioned
+`runtime-dependencies-v1` GitHub Release rather than committed to the source
+tree. This catalog can hold additional immutable deployment assets in the
+future without being confused with an application release.
+
+Packaged YomiFrame builds validate their bundled private ICU runtime and never
+download a replacement at startup. Other required assets can be downloaded by
+the same prompt or placed under the local `models` folder.
 
 ### Translation Model Setup
 
@@ -89,9 +105,17 @@ For Ollama:
 To package the app with PyInstaller:
 
 ```powershell
+conda activate manga-llm
+powershell -ExecutionPolicy Bypass -File .\scripts\deployment\install_icu4c_pyicu_windows.ps1
 pip install pyinstaller
 pyinstaller manga_translator.spec
 ```
+
+The installer command in this build recipe is maintainer-only: it reproducibly
+builds the native artifact consumed by the startup downloader and supplies the
+private files required by PyInstaller. End users do not run it. The onedir
+package carries its own ICU runtime and does not depend on a system or Qt ICU
+installation. See `BUILD_EXE.md` for the artifact and validation contract.
 
 The packaged app is written to:
 

@@ -14,18 +14,28 @@ from typing import Any, Mapping, Sequence
 from app.render.typesetting_text import BreakOpportunity, classify_grapheme
 
 
-LINE_BREAK_PLANNER_VERSION = "line_break_planner_v2_target_lexical"
+LINE_BREAK_PLANNER_VERSION = "line_break_planner_v3_target_priority"
 LEXICOGRAPHIC_VERTICAL_ORDER = [
     "hard_legality",
     "fit",
     "source_relative_preferred_size",
     "lexical_span_integrity",
     "punctuation_attachment",
+    "target_topology_economy",
     "optical_balance",
     "advisory_source_footprint_distribution",
     "rtl_frontload_fallback",
 ]
-LEXICOGRAPHIC_HORIZONTAL_ORDER = LEXICOGRAPHIC_VERTICAL_ORDER[:-1]
+LEXICOGRAPHIC_HORIZONTAL_ORDER = [
+    "hard_legality",
+    "fit",
+    "source_relative_preferred_size",
+    "lexical_span_integrity",
+    "punctuation_attachment",
+    "target_topology_economy",
+    "optical_balance",
+    "advisory_source_footprint_distribution",
+]
 
 _OPEN_PUNCTUATION = {"(", "（", "[", "［", "{", "｛", "「", "『", "【", "〈", "《", "“", "‘"}
 _CONTINUATION_PUNCTUATION = {
@@ -124,7 +134,7 @@ class LineBreakPlanner:
         row_limit = max(1, int(max_rows or len(values)))
         total_units = _items_row_units(values)
         minimum_fit_columns = max(1, int(math.ceil(total_units / float(row_limit))))
-        minimum_columns = min(limit, max(desired, minimum_fit_columns))
+        minimum_columns = min(limit, minimum_fit_columns)
         column_counts = list(range(minimum_columns, limit + 1))
         if not column_counts:
             column_counts = [limit]
@@ -186,6 +196,9 @@ class LineBreakPlanner:
                     "strategy": "unpartitioned_explicit_failure",
                     "desired_columns": desired,
                     "selected_columns": 1,
+                    "minimum_hard_fit_columns": minimum_fit_columns,
+                    "enumerated_column_counts": list(column_counts),
+                    "source_desired_columns_advisory": True,
                     "max_columns": limit,
                     "max_rows": row_limit,
                     "lexicographic_decision_order": list(LEXICOGRAPHIC_VERTICAL_ORDER),
@@ -210,6 +223,9 @@ class LineBreakPlanner:
             "lexicographic_decision_order": list(LEXICOGRAPHIC_VERTICAL_ORDER),
             "desired_columns": desired,
             "selected_columns": len(groups),
+            "minimum_hard_fit_columns": minimum_fit_columns,
+            "enumerated_column_counts": list(column_counts),
+            "source_desired_columns_advisory": True,
             "max_columns": limit,
             "max_rows": row_limit,
             "source_columns": int(profile_value.get("source_columns") or 0),
@@ -236,6 +252,7 @@ class LineBreakPlanner:
                 for split in selected_path.breaks[:-1]
             ],
             "extra_columns_beyond_desired": extra_columns,
+            "columns_below_desired": max(0, desired - len(groups)),
             "non_phrase_extra_break_penalty": float(
                 _vertical_structure_penalty(
                     profile_value,
@@ -321,8 +338,8 @@ class LineBreakPlanner:
                 0,
                 round(path.lexical_penalty, 6),
                 round(path.punctuation_penalty, 6),
-                round(path.raggedness, 6),
                 line_count,
+                round(path.raggedness, 6),
                 0,
                 path.breaks,
             )
@@ -338,7 +355,8 @@ class LineBreakPlanner:
                     "source_relative_preferred_size": 0,
                     "lexical_span_integrity": round(path.lexical_penalty, 3),
                     "punctuation_attachment": round(path.punctuation_penalty, 3),
-                    "optical_balance": [round(path.raggedness, 3), line_count],
+                    "target_topology_economy": line_count,
+                    "optical_balance": round(path.raggedness, 3),
                     "advisory_source_footprint_distribution": 0,
                 },
             }
@@ -575,6 +593,11 @@ def _vertical_candidate_key(
     desired_columns: int,
     columns: int,
 ) -> tuple[Any, ...]:
+    advisory_source_error = (
+        path.source_layout_error
+        + structural_penalty
+        + abs(columns - desired_columns)
+    )
     return (
         0,
         path.fit_overflow_count,
@@ -582,9 +605,9 @@ def _vertical_candidate_key(
         0,
         round(path.lexical_penalty, 6),
         round(path.punctuation_penalty, 6),
+        columns,
         round(path.balance_penalty, 6),
-        max(0, columns - desired_columns),
-        round(path.source_layout_error + structural_penalty, 6),
+        round(advisory_source_error, 6),
         round(path.frontload_penalty, 6),
         path.breaks,
     )
@@ -601,6 +624,11 @@ def _vertical_candidate_audit(
     legal_candidate_count: int,
     structural_penalty: float,
 ) -> dict[str, Any]:
+    advisory_source_error = (
+        path.source_layout_error
+        + structural_penalty
+        + abs(columns - desired_columns)
+    )
     return {
         "columns": columns,
         "desired_columns": desired_columns,
@@ -615,9 +643,10 @@ def _vertical_candidate_audit(
             "source_relative_preferred_size": 0,
             "lexical_span_integrity": round(path.lexical_penalty, 3),
             "punctuation_attachment": round(path.punctuation_penalty, 3),
-            "optical_balance": [round(path.balance_penalty, 3), max(0, columns - desired_columns)],
+            "target_topology_economy": columns,
+            "optical_balance": round(path.balance_penalty, 3),
             "advisory_source_footprint_distribution": round(
-                path.source_layout_error + structural_penalty,
+                advisory_source_error,
                 3,
             ),
             "rtl_frontload_fallback": round(path.frontload_penalty, 3),

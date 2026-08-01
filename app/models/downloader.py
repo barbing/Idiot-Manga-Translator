@@ -1,6 +1,19 @@
 # -*- coding: utf-8 -*-
 """Model downloader logic."""
+import contextlib
+from email.parser import Parser
+import importlib
+import importlib.metadata
+import json
 import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import time
+import uuid
 import requests
 from PySide6 import QtCore
 from app.config.defaults import (
@@ -32,7 +45,7 @@ from app.config.defaults import (
 
 import hashlib
 from dataclasses import dataclass
-from typing import List
+from typing import Iterator, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import tarfile
@@ -49,6 +62,35 @@ from app.models.resolution import (
     resolve_ner_system_snapshot,
 )
 
+
+PYICU_RUNTIME_PYICU_VERSION = "2.16.2"
+PYICU_RUNTIME_ICU_VERSION = "78.3"
+PYICU_RUNTIME_WHEEL_NAME = "pyicu-2.16.2-cp310-cp310-win_amd64.whl"
+PYICU_RUNTIME_SHA256 = "a20721fe04dcfd8b34c17e2f45ba45beebaf32f1a03bd07efc07a512c2b3f830"
+PYICU_RUNTIME_URL = (
+    "https://github.com/barbing/YomiFrame-LLM_Manga_Translator/releases/download/"
+    "runtime-dependencies-v1/"
+    f"{PYICU_RUNTIME_WHEEL_NAME}"
+)
+PYICU_RUNTIME_ID = (
+    f"pyicu-{PYICU_RUNTIME_PYICU_VERSION}-icu-{PYICU_RUNTIME_ICU_VERSION}"
+    "-cp310-win_amd64"
+)
+PYICU_RUNTIME_REQUIRED_FILES = {
+    "icu/__init__.py": 1589,
+    "icu/_icu_.cp310-win_amd64.pyd": 1239552,
+    "icu/icudt78.dll": 33110528,
+    "icu/icuin78.dll": 3408896,
+    "icu/icuuc78.dll": 2576384,
+}
+
+_PYICU_DLL_DIRECTORY_HANDLES: list[object] = []
+_PYICU_ACTIVATED_PATHS: set[str] = set()
+
+
+class PyICURuntimeError(RuntimeError):
+    """Raised when the required application-private PyICU runtime is invalid."""
+
 @dataclass
 class DownloadTarget:
     url: str
@@ -61,11 +103,30 @@ class ModelDownloader(QtCore.QObject):
     status_changed = QtCore.Signal(str)
     finished = QtCore.Signal(bool, str)  # success, message
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        pyicu_runtime_url: str | None = None,
+        pyicu_runtime_sha256: str | None = None,
+        pyicu_runtime_root: str | os.PathLike[str] | None = None,
+    ):
         super().__init__(parent)
         self._cancel_requested = False
         self._session = self._create_session()
         self._pending_targets: List[DownloadTarget] = []
+        self._pyicu_runtime_url = str(pyicu_runtime_url or PYICU_RUNTIME_URL)
+        self._pyicu_runtime_sha256 = str(
+            pyicu_runtime_sha256 or PYICU_RUNTIME_SHA256
+        ).lower()
+        self._pyicu_runtime_root_override = (
+            Path(pyicu_runtime_root).resolve()
+            if pyicu_runtime_root is not None
+            else None
+        )
+        self._pyicu_install_requested = False
+        self._pyicu_wheel_path: Path | None = None
+        self._pyicu_last_error = ""
 
     def _create_session(self) -> requests.Session:
         """Create a robust requests session with retries."""
@@ -84,8 +145,428 @@ class ModelDownloader(QtCore.QObject):
         })
         return session
 
+    @property
+    def pyicu_runtime_error(self) -> str:
+        return self._pyicu_last_error
+
+    @staticmethod
+    def is_frozen_application() -> bool:
+        return bool(getattr(sys, "frozen", False))
+
+    @staticmethod
+    def _source_runtime_supported() -> bool:
+        return (
+            os.name == "nt"
+            and sys.version_info[:2] == (3, 10)
+            and sys.maxsize > 2**32
+        )
+
+    def can_install_pyicu_runtime(self) -> bool:
+        return not self.is_frozen_application() and self._source_runtime_supported()
+
+    def _pyicu_runtime_root(self) -> Path:
+        if self._pyicu_runtime_root_override is not None:
+            return self._pyicu_runtime_root_override
+        local_app_data = str(os.environ.get("LOCALAPPDATA", "")).strip()
+        if not local_app_data:
+            raise PyICURuntimeError("LOCALAPPDATA is unavailable")
+        return (Path(local_app_data) / "YomiFrame" / "runtime").resolve()
+
+    def _pyicu_install_dir(self) -> Path:
+        return self._pyicu_runtime_root() / PYICU_RUNTIME_ID
+
+    def _pyicu_download_path(self) -> Path:
+        return self._pyicu_runtime_root() / "downloads" / PYICU_RUNTIME_WHEEL_NAME
+
+    @staticmethod
+    def _path_is_within(path: Path, root: Path) -> bool:
+        try:
+            return os.path.commonpath([str(path.resolve()), str(root.resolve())]) == str(
+                root.resolve()
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _require_runtime_path(self, path: Path) -> Path:
+        root = self._pyicu_runtime_root()
+        resolved = path.resolve()
+        if not self._path_is_within(resolved, root):
+            raise PyICURuntimeError(f"Runtime path escapes managed root: {resolved}")
+        return resolved
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def request_cancel(self):
         self._cancel_requested = True
+
+    @staticmethod
+    def _probe_pyicu_module(icu_module) -> None:
+        pyicu_version = str(getattr(icu_module, "VERSION", ""))
+        icu_version = str(getattr(icu_module, "ICU_VERSION", ""))
+        if pyicu_version != PYICU_RUNTIME_PYICU_VERSION:
+            raise PyICURuntimeError(
+                f"PyICU {PYICU_RUNTIME_PYICU_VERSION} is required; found {pyicu_version or 'unknown'}"
+            )
+        if icu_version != PYICU_RUNTIME_ICU_VERSION:
+            raise PyICURuntimeError(
+                f"ICU {PYICU_RUNTIME_ICU_VERSION} is required; found {icu_version or 'unknown'}"
+            )
+        try:
+            locale = icu_module.Locale("zh@lb=strict")
+            iterator = icu_module.BreakIterator.createLineInstance(locale)
+            probe_text = "甲～乙"
+            iterator.setText(probe_text)
+            boundaries = tuple(int(value) for value in iterator)
+        except Exception as exc:
+            raise PyICURuntimeError(f"PyICU strict line-break probe failed: {exc}") from exc
+        if not boundaries or boundaries[-1] != len(probe_text):
+            raise PyICURuntimeError(
+                f"PyICU strict line-break probe returned invalid boundaries: {boundaries}"
+            )
+
+    @staticmethod
+    def _loaded_pyicu_module():
+        return sys.modules.get("icu")
+
+    @classmethod
+    def _validate_loaded_pyicu(cls) -> bool:
+        module = cls._loaded_pyicu_module()
+        if module is None:
+            return False
+        cls._probe_pyicu_module(module)
+        return True
+
+    def _managed_runtime_layout_valid(self, runtime_dir: Path) -> bool:
+        try:
+            runtime_dir = self._require_runtime_path(runtime_dir)
+            marker_path = runtime_dir / "runtime.json"
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if marker != {
+                "icu_version": PYICU_RUNTIME_ICU_VERSION,
+                "pyicu_version": PYICU_RUNTIME_PYICU_VERSION,
+                "runtime_id": PYICU_RUNTIME_ID,
+                "wheel_name": PYICU_RUNTIME_WHEEL_NAME,
+                "wheel_sha256": PYICU_RUNTIME_SHA256,
+            }:
+                return False
+            for relative_path, expected_size in PYICU_RUNTIME_REQUIRED_FILES.items():
+                file_path = self._require_runtime_path(runtime_dir / relative_path)
+                if not file_path.is_file() or file_path.stat().st_size != expected_size:
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, PyICURuntimeError, json.JSONDecodeError):
+            return False
+
+    def _activate_managed_pyicu(self, runtime_dir: Path) -> None:
+        runtime_dir = self._require_runtime_path(runtime_dir)
+        if not self._managed_runtime_layout_valid(runtime_dir):
+            raise PyICURuntimeError(f"Managed PyICU runtime is incomplete: {runtime_dir}")
+
+        loaded = self._loaded_pyicu_module()
+        if loaded is not None:
+            self._probe_pyicu_module(loaded)
+            loaded_path = Path(str(getattr(loaded, "__file__", ""))).resolve()
+            if not self._path_is_within(loaded_path, runtime_dir):
+                raise PyICURuntimeError(
+                    "A different PyICU runtime is already loaded; restart YomiFrame "
+                    "to activate the managed runtime"
+                )
+            return
+
+        runtime_text = str(runtime_dir)
+        package_dir = runtime_dir / "icu"
+        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+            normalized_package = str(package_dir.resolve()).lower()
+            if normalized_package not in _PYICU_ACTIVATED_PATHS:
+                handle = os.add_dll_directory(str(package_dir))
+                _PYICU_DLL_DIRECTORY_HANDLES.append(handle)
+                _PYICU_ACTIVATED_PATHS.add(normalized_package)
+        if runtime_text not in sys.path:
+            sys.path.insert(0, runtime_text)
+        importlib.invalidate_caches()
+        try:
+            module = importlib.import_module("icu")
+            self._probe_pyicu_module(module)
+            loaded_path = Path(str(getattr(module, "__file__", ""))).resolve()
+            if not self._path_is_within(loaded_path, runtime_dir):
+                raise PyICURuntimeError(
+                    f"PyICU resolved outside the managed runtime: {loaded_path}"
+                )
+        except Exception:
+            sys.modules.pop("icu._icu_", None)
+            sys.modules.pop("icu", None)
+            if runtime_text in sys.path:
+                sys.path.remove(runtime_text)
+            importlib.invalidate_caches()
+            raise
+
+    def _activate_environment_pyicu_if_exact(self) -> bool:
+        try:
+            if importlib.metadata.version("PyICU") != PYICU_RUNTIME_PYICU_VERSION:
+                return False
+        except importlib.metadata.PackageNotFoundError:
+            return False
+        module = importlib.import_module("icu")
+        self._probe_pyicu_module(module)
+        return True
+
+    def check_pyicu_runtime(self) -> bool:
+        """Activate and validate the required PyICU runtime without network I/O."""
+
+        self._pyicu_last_error = ""
+        try:
+            if self._loaded_pyicu_module() is not None:
+                return self._validate_loaded_pyicu()
+
+            if self.is_frozen_application():
+                module = importlib.import_module("icu")
+                self._probe_pyicu_module(module)
+                return True
+
+            runtime_dir = self._pyicu_install_dir()
+            if self._managed_runtime_layout_valid(runtime_dir):
+                self._activate_managed_pyicu(runtime_dir)
+                return True
+
+            if self._activate_environment_pyicu_if_exact():
+                return True
+
+            self._pyicu_last_error = (
+                f"PyICU {PYICU_RUNTIME_PYICU_VERSION} with ICU "
+                f"{PYICU_RUNTIME_ICU_VERSION} is not installed"
+            )
+            return False
+        except Exception as exc:
+            self._pyicu_last_error = str(exc)
+            return False
+
+    def prepare_pyicu_runtime(self) -> None:
+        """Queue the pinned application-private PyICU runtime when required."""
+
+        if self.check_pyicu_runtime():
+            return
+        self._pyicu_install_requested = True
+        if self.is_frozen_application():
+            self._pyicu_last_error = (
+                "The packaged application is missing its bundled PyICU runtime; "
+                "startup download is disabled for frozen builds"
+            )
+            return
+        if not self._source_runtime_supported():
+            self._pyicu_last_error = (
+                "Managed PyICU installation requires Windows CPython 3.10 x64"
+            )
+            return
+        wheel_path = self._require_runtime_path(self._pyicu_download_path())
+        self._pyicu_wheel_path = wheel_path
+        self.queue_targets(
+            [
+                DownloadTarget(
+                    url=self._pyicu_runtime_url,
+                    save_path=str(wheel_path),
+                    label=(
+                        f"Downloading PyICU {PYICU_RUNTIME_PYICU_VERSION} / "
+                        f"ICU {PYICU_RUNTIME_ICU_VERSION} runtime..."
+                    ),
+                    sha256=self._pyicu_runtime_sha256,
+                )
+            ]
+        )
+
+    @contextlib.contextmanager
+    def _pyicu_install_lock(self) -> Iterator[None]:
+        runtime_root = self._require_runtime_path(self._pyicu_runtime_root())
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        lock_path = self._require_runtime_path(runtime_root / ".pyicu-install.lock")
+        deadline = time.monotonic() + 30.0
+        acquired = False
+        while not acquired:
+            if self._cancel_requested:
+                raise PyICURuntimeError("Cancelled")
+            try:
+                descriptor = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+                try:
+                    os.write(descriptor, f"{os.getpid()}\n{time.time()}\n".encode("ascii"))
+                finally:
+                    os.close(descriptor)
+                acquired = True
+            except FileExistsError:
+                try:
+                    if time.time() - lock_path.stat().st_mtime > 600:
+                        lock_path.unlink()
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise PyICURuntimeError(
+                        "Timed out waiting for another PyICU installation"
+                    )
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            if acquired:
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _extract_pyicu_wheel(self, wheel_path: Path, destination: Path) -> None:
+        wheel_path = self._require_runtime_path(wheel_path)
+        destination = self._require_runtime_path(destination)
+        with zipfile.ZipFile(wheel_path, "r") as archive:
+            names = set(archive.namelist())
+            missing = sorted(set(PYICU_RUNTIME_REQUIRED_FILES) - names)
+            if missing:
+                raise PyICURuntimeError(
+                    f"PyICU wheel is missing required files: {', '.join(missing)}"
+                )
+            metadata_name = (
+                f"pyicu-{PYICU_RUNTIME_PYICU_VERSION}.dist-info/METADATA"
+            )
+            if metadata_name not in names:
+                raise PyICURuntimeError("PyICU wheel metadata is missing")
+            metadata_text = archive.read(metadata_name).decode("utf-8", errors="strict")
+            metadata = Parser().parsestr(metadata_text, headersonly=True)
+            distribution_names = metadata.get_all("Name", [])
+            distribution_versions = metadata.get_all("Version", [])
+            canonical_name = (
+                re.sub(r"[-_.]+", "-", distribution_names[0]).lower()
+                if len(distribution_names) == 1
+                else ""
+            )
+            if (
+                canonical_name != "pyicu"
+                or distribution_versions != [PYICU_RUNTIME_PYICU_VERSION]
+            ):
+                raise PyICURuntimeError("PyICU wheel metadata does not match the runtime pin")
+
+            for member in archive.infolist():
+                if self._cancel_requested:
+                    raise PyICURuntimeError("Cancelled")
+                mode = (member.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise PyICURuntimeError(
+                        f"Unsafe PyICU wheel entry (link): {member.filename}"
+                    )
+                target = Path(_safe_extract_path(str(destination), member.filename))
+                self._require_runtime_path(target)
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member, "r") as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+
+        for relative_path, expected_size in PYICU_RUNTIME_REQUIRED_FILES.items():
+            extracted = self._require_runtime_path(destination / relative_path)
+            if not extracted.is_file() or extracted.stat().st_size != expected_size:
+                raise PyICURuntimeError(
+                    f"Extracted PyICU runtime file is invalid: {relative_path}"
+                )
+
+    def _install_pyicu_runtime(self, wheel_path: Path) -> Path:
+        wheel_path = self._require_runtime_path(wheel_path)
+        if not wheel_path.is_file():
+            raise PyICURuntimeError("Downloaded PyICU wheel is missing")
+        actual_sha256 = self._hash_file(wheel_path)
+        if actual_sha256.lower() != self._pyicu_runtime_sha256:
+            raise PyICURuntimeError("Downloaded PyICU wheel checksum mismatch")
+        if self._pyicu_runtime_sha256 != PYICU_RUNTIME_SHA256:
+            raise PyICURuntimeError("PyICU runtime hash differs from the production pin")
+
+        runtime_root = self._require_runtime_path(self._pyicu_runtime_root())
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        destination = self._require_runtime_path(self._pyicu_install_dir())
+        with self._pyicu_install_lock():
+            if self._managed_runtime_layout_valid(destination):
+                return destination
+
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{PYICU_RUNTIME_ID}-staging-",
+                    dir=str(runtime_root),
+                )
+            ).resolve()
+            staging = self._require_runtime_path(staging)
+            backup: Path | None = None
+            installed = False
+            try:
+                self._extract_pyicu_wheel(wheel_path, staging)
+                marker = {
+                    "icu_version": PYICU_RUNTIME_ICU_VERSION,
+                    "pyicu_version": PYICU_RUNTIME_PYICU_VERSION,
+                    "runtime_id": PYICU_RUNTIME_ID,
+                    "wheel_name": PYICU_RUNTIME_WHEEL_NAME,
+                    "wheel_sha256": PYICU_RUNTIME_SHA256,
+                }
+                (staging / "runtime.json").write_text(
+                    json.dumps(marker, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                if not self._managed_runtime_layout_valid(staging):
+                    raise PyICURuntimeError("Staged PyICU runtime validation failed")
+
+                if destination.exists():
+                    backup = self._require_runtime_path(
+                        runtime_root
+                        / f".{PYICU_RUNTIME_ID}-replaced-{uuid.uuid4().hex}"
+                    )
+                    os.replace(destination, backup)
+                os.replace(staging, destination)
+                installed = True
+                if backup is not None:
+                    shutil.rmtree(backup, ignore_errors=True)
+                return destination
+            except Exception:
+                if backup is not None and backup.exists() and not destination.exists():
+                    os.replace(backup, destination)
+                raise
+            finally:
+                if not installed and staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+
+    def _complete_pyicu_runtime_install(self) -> bool:
+        if not self._pyicu_install_requested:
+            return True
+        try:
+            if self.check_pyicu_runtime():
+                self._pyicu_install_requested = False
+                return True
+            if self._pyicu_wheel_path is None:
+                raise PyICURuntimeError(
+                    self._pyicu_last_error or "PyICU runtime cannot be installed"
+                )
+            self.status_changed.emit("Installing application-private PyICU runtime...")
+            runtime_dir = self._install_pyicu_runtime(self._pyicu_wheel_path)
+            self._activate_managed_pyicu(runtime_dir)
+            if not self.check_pyicu_runtime():
+                raise PyICURuntimeError(
+                    self._pyicu_last_error or "Installed PyICU runtime validation failed"
+                )
+            self._pyicu_install_requested = False
+            self.status_changed.emit(
+                f"PyICU {PYICU_RUNTIME_PYICU_VERSION} / ICU "
+                f"{PYICU_RUNTIME_ICU_VERSION} runtime is ready."
+            )
+            try:
+                self._pyicu_wheel_path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        except Exception as exc:
+            self._pyicu_last_error = str(exc)
+            self.finished.emit(False, f"PyICU runtime setup failed: {exc}")
+            return False
 
     def _check_hf_cache(self, user: str, repo: str, filename: str = None) -> bool:
         """Check Hugging Face system caches (respects HF_HOME)."""
@@ -303,7 +784,11 @@ class ModelDownloader(QtCore.QObject):
 
     def process_queue(self):
         """Process queued targets (Slot)."""
-        if not self._pending_targets and not getattr(self, "_download_ner", False):
+        if (
+            not self._pending_targets
+            and not getattr(self, "_download_ner", False)
+            and not self._pyicu_install_requested
+        ):
             self.finished.emit(True, "No tasks.")
             return
 
@@ -311,6 +796,14 @@ class ModelDownloader(QtCore.QObject):
             self.download_targets(self._pending_targets)
             self._pending_targets.clear()
              
+        if self._cancel_requested:
+            self.finished.emit(False, "Cancelled")
+            return
+
+        if self._pyicu_install_requested:
+            if not self._complete_pyicu_runtime_install():
+                return
+
         if self._cancel_requested:
             self.finished.emit(False, "Cancelled")
             return

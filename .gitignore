@@ -41,9 +41,6 @@ dist/
 app/tests/*
 !app/tests/__init__.py
 
-# Local scripts
-Scripts/
-
 # Local validation workflow
 validation/
 

@@ -42,6 +42,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._review_dialog: RegionReviewDialog | None = None
         self._page_review: QtWidgets.QDialog | None = None
         self._running = False
+        self._pyicu_runtime_ready = False
         self._page_cache: dict[int, dict] = {}
         self._thumb_cache: dict[str, QtGui.QPixmap] = {}
         self._processing_phase = 0
@@ -57,6 +58,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._download_worker: ModelDownloader | None = None
         self._setup_ui()
         self._connect_signals()
+        self.start_btn.setEnabled(False)
         self._pipeline.status.consistency_issue.connect(self._on_consistency_issue)
         
         
@@ -111,8 +113,23 @@ class MainWindow(QtWidgets.QMainWindow):
         """Check for critical models and download if missing."""
         downloader = ModelDownloader(self)
         models_dir = os.path.join(os.getcwd(), "models")
-        
+
         missing = []
+        runtime_ready = downloader.check_pyicu_runtime()
+        self._set_pyicu_runtime_ready(runtime_ready)
+        if not runtime_ready:
+            if downloader.can_install_pyicu_runtime():
+                missing.append("pyicu_runtime")
+            else:
+                runtime_error = downloader.pyicu_runtime_error or (
+                    "The required PyICU runtime is unavailable."
+                )
+                self._set_pyicu_runtime_ready(False, runtime_error)
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Required Runtime Unavailable",
+                    runtime_error,
+                )
         if not downloader.check_comic_text_detector(models_dir):
             missing.append("comic_text_detector")
         if not downloader.check_bubble_detection(models_dir):
@@ -130,15 +147,31 @@ class MainWindow(QtWidgets.QMainWindow):
             
         if missing:
             reply = QtWidgets.QMessageBox.warning(
-                self, 
-                "Missing Models", 
-                f"The following models are missing: {', '.join(missing)}.\nDownload them now?",
+                self,
+                "Missing Runtime or Models",
+                f"The following required assets are missing: {', '.join(missing)}.\n"
+                "Download them now?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
             )
             if reply == QtWidgets.QMessageBox.Yes:
                 self._run_model_download(missing) # Pass list
             else:
-                self.status_bar.showMessage("Warning: Models missing.", 5000)
+                if "pyicu_runtime" in missing:
+                    self._set_pyicu_runtime_ready(
+                        False,
+                        "Required PyICU runtime was not installed; translation rendering is disabled.",
+                    )
+                else:
+                    self.status_bar.showMessage("Warning: Models missing.", 5000)
+
+    def _set_pyicu_runtime_ready(self, ready: bool, message: str = "") -> None:
+        self._pyicu_runtime_ready = bool(ready)
+        if not self._running:
+            self.start_btn.setEnabled(self._pyicu_runtime_ready)
+        if message:
+            self.status_bar.showMessage(message, 10000)
+            if self.log_view:
+                self.log_view.appendPlainText(message)
 
     def _ai_inpaint_runtime_available(self) -> bool:
         try:
@@ -168,7 +201,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Queue tasks BEFORE moving to thread
         models_dir = os.path.join(os.getcwd(), "models")
-        
+
+        if "pyicu_runtime" in model_keys:
+             downloader.prepare_pyicu_runtime()
         if "comic_text_detector" in model_keys:
              downloader.prepare_comic_text_detector(models_dir)
         if "bubble_detection" in model_keys:
@@ -219,6 +254,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_download_complete(self, model_key: str):
         """Post-download actions."""
         self._refresh_gguf_models() # Refreshes all lists
+        runtime_was_required = not self._pyicu_runtime_ready
+        runtime_checker = ModelDownloader(self)
+        runtime_ready = runtime_checker.check_pyicu_runtime()
+        runtime_message = ""
+        if not runtime_ready and runtime_was_required:
+            runtime_message = runtime_checker.pyicu_runtime_error or (
+                "Required PyICU runtime setup did not complete; rendering remains disabled."
+            )
+        self._set_pyicu_runtime_ready(runtime_ready, runtime_message)
         
         if model_key == "sakura":
             # Auto-set the path
@@ -2174,7 +2218,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
         else:
-            self.start_btn.setEnabled(True)
+            self.start_btn.setEnabled(self._pyicu_runtime_ready)
             self.stop_btn.setEnabled(False)
 
     def _refresh_item_text(self, item: QtWidgets.QListWidgetItem) -> None:
@@ -2629,6 +2673,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_pipeline(self, whitelist: list[str] = None) -> bool:
         logger.info(f"Attempting to start pipeline. Whitelist: {whitelist}")
+        runtime_checker = ModelDownloader(self)
+        if not runtime_checker.check_pyicu_runtime():
+            runtime_error = runtime_checker.pyicu_runtime_error or (
+                "PyICU 2.16.2 with ICU 78.3 is required before rendering can start."
+            )
+            self._set_pyicu_runtime_ready(False, runtime_error)
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Required Runtime Unavailable",
+                runtime_error,
+            )
+            return False
+        self._set_pyicu_runtime_ready(True)
         self._sync_settings_to_models()
         self._sync_paths_from_settings()
         if not self.import_dir.text().strip():

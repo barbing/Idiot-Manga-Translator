@@ -7,6 +7,7 @@ TypesettingEngine.
 """
 from __future__ import annotations
 
+import threading
 import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -1173,6 +1174,7 @@ def compute_break_opportunities(
     *,
     writing_mode: str,
     target_lexical_spans: Sequence["TargetLexicalSpan"] | None = None,
+    language_hint: str = "zh",
 ) -> list[BreakOpportunity]:
     items = list(runs or [])
     lexical_spans = list(target_lexical_spans or [])
@@ -1188,6 +1190,14 @@ def compute_break_opportunities(
             if int(span.token_start) < token_boundary < int(span.token_end)
             and int(span.grapheme_end) - int(span.grapheme_start) > 1
         ]
+        boundary_confidence = (
+            _target_lexical_boundary_confidence(
+                lexical_spans,
+                token_boundary,
+            )
+            if lexical_evidence_supplied and not covering_lexical_spans
+            else {}
+        )
         reason = "generic_run_boundary"
         strength = "normal"
         allowed = True
@@ -1244,10 +1254,329 @@ def compute_break_opportunities(
                     "lexical_span_texts": [
                         span.text for span in covering_lexical_spans
                     ],
+                    "target_lexical_boundary_confidence": str(
+                        boundary_confidence.get("classification")
+                        or "standard"
+                    ),
+                    "target_lexical_boundary_confidence_basis": str(
+                        boundary_confidence.get("basis")
+                        or "primary_partition"
+                    ),
+                    "lexical_preceding_primary_span_ids": list(
+                        boundary_confidence.get("preceding_span_ids")
+                        or []
+                    ),
+                    "lexical_starting_primary_span_ids": list(
+                        boundary_confidence.get("starting_span_ids")
+                        or []
+                    ),
+                    "lexical_following_singleton_span_ids": list(
+                        boundary_confidence.get(
+                            "following_singleton_span_ids"
+                        )
+                        or []
+                    ),
                 },
             )
         )
-    return opportunities
+    if writing_mode == "vertical":
+        index = 0
+        while index < len(items):
+            if items[index].break_class != "space":
+                index += 1
+                continue
+            space_start = index
+            while index < len(items) and items[index].break_class == "space":
+                index += 1
+            if space_start <= 0 or index >= len(items):
+                continue
+            before = items[space_start - 1]
+            after = items[index]
+            allowed = True
+            strength = "preferred"
+            reason = "vertical_no_ink_space_boundary"
+            if (
+                after.text in CLOSE_PUNCTUATION
+                or (
+                    after.role
+                    in {
+                        "ellipsis_sequence",
+                        "dash_sequence",
+                        "punctuation_sequence",
+                    }
+                    and after.text[:1] in CLOSE_PUNCTUATION
+                )
+            ):
+                allowed = False
+                strength = "forbidden"
+                reason = "kinsoku_rejected_before_closing_punctuation"
+            elif before.text in OPEN_PUNCTUATION:
+                allowed = False
+                strength = "forbidden"
+                reason = "kinsoku_rejected_after_opening_punctuation"
+            skipped_spaces = items[space_start:index]
+            opportunities.append(
+                BreakOpportunity(
+                    before_run_id=before.run_id,
+                    after_run_id=after.run_id,
+                    position=after.grapheme_start,
+                    strength=strength,
+                    reason=reason,
+                    allowed=allowed,
+                    metadata={
+                        "writing_mode": writing_mode,
+                        "before_text": before.text,
+                        "after_text": after.text,
+                        "token_boundary": int(after.token_start),
+                        "target_lexical_boundary": (
+                            "between_spans"
+                            if lexical_evidence_supplied
+                            else "unavailable"
+                        ),
+                        "lexical_integrity_penalty": 0.0,
+                        "lexical_span_ids": [],
+                        "lexical_span_texts": [],
+                        "no_ink_space_transport": True,
+                        "skipped_space_run_ids": [
+                            item.run_id for item in skipped_spaces
+                        ],
+                        "skipped_space_text": "".join(
+                            item.text for item in skipped_spaces
+                        ),
+                        "skipped_space_token_start": int(
+                            skipped_spaces[0].token_start
+                        ),
+                        "skipped_space_token_end": int(
+                            skipped_spaces[-1].token_end
+                        ),
+                    },
+                )
+            )
+    return _apply_pyicu_strict_line_break_legality(
+        items,
+        opportunities,
+        language_hint=language_hint,
+    )
+
+
+_PYICU_STRICT_PROVIDER_ID = "icu_zh_strict"
+_PYICU_STRICT_ITERATORS = threading.local()
+
+
+def _require_pyicu() -> Any:
+    """Load the required renderer legality provider without a silent fallback."""
+
+    try:
+        import icu
+    except Exception as exc:  # pragma: no cover - exercised by packaged smoke
+        raise RuntimeError("pyicu_strict_line_break_provider_unavailable") from exc
+    if not hasattr(icu, "BreakIterator") or not hasattr(icu, "Locale"):
+        raise RuntimeError("pyicu_strict_line_break_provider_invalid")
+    return icu
+
+
+def _pyicu_strict_locale_id(language_hint: str) -> str:
+    """Resolve the target-language locale while forcing ICU strict line rules."""
+
+    raw = str(language_hint or "zh").strip()
+    raw = raw.split("@", 1)[0].split("-u-", 1)[0].strip()
+    if not raw or raw.lower() in {"auto", "und", "unknown"}:
+        raw = "zh"
+    language_tag = raw.replace("_", "-")
+    if not all(part.isalnum() for part in language_tag.split("-") if part):
+        raise RuntimeError(f"pyicu_strict_locale_invalid:{language_hint}")
+    icu = _require_pyicu()
+    locale = icu.Locale.forLanguageTag(language_tag)
+    locale_name = str(locale.getName() or "").strip()
+    if not locale_name:
+        raise RuntimeError(f"pyicu_strict_locale_invalid:{language_hint}")
+    return f"{locale_name}@lb=strict"
+
+
+def _pyicu_utf16_boundary_map(text: str) -> dict[int, int]:
+    mapping = {0: 0}
+    offset = 0
+    for index, character in enumerate(text):
+        offset += 2 if ord(character) > 0xFFFF else 1
+        mapping[offset] = index + 1
+    return mapping
+
+
+def pyicu_strict_line_break_boundaries(
+    text: str,
+    *,
+    language_hint: str = "zh",
+) -> tuple[int, ...]:
+    """Return strict ICU line boundaries as Python code-point offsets.
+
+    ICU exposes UTF-16 offsets.  The renderer's immutable translated spans use
+    Python code-point offsets, so every returned boundary is converted and
+    checked before it can participate in legality filtering.
+    """
+
+    value = str(text or "")
+    if not value:
+        return (0,)
+    icu = _require_pyicu()
+    locale_id = _pyicu_strict_locale_id(language_hint)
+    iterators = getattr(_PYICU_STRICT_ITERATORS, "by_locale", None)
+    if iterators is None:
+        iterators = {}
+        _PYICU_STRICT_ITERATORS.by_locale = iterators
+    iterator = iterators.get(locale_id)
+    if iterator is None:
+        iterator = icu.BreakIterator.createLineInstance(icu.Locale(locale_id))
+        iterators[locale_id] = iterator
+
+    utf16_to_codepoint = _pyicu_utf16_boundary_map(value)
+    iterator.setText(value)
+    positions = [0]
+    for raw_offset in iterator:
+        utf16_offset = int(raw_offset)
+        if utf16_offset not in utf16_to_codepoint:
+            raise RuntimeError(
+                "pyicu_line_boundary_not_codepoint_aligned:"
+                f"{locale_id}:{utf16_offset}"
+            )
+        positions.append(utf16_to_codepoint[utf16_offset])
+    boundaries = tuple(sorted(set(positions)))
+    if not boundaries or boundaries[0] != 0 or boundaries[-1] != len(value):
+        raise RuntimeError(f"pyicu_line_boundary_sequence_not_conserved:{locale_id}")
+    return boundaries
+
+
+def _translated_text_from_runs(runs: Sequence[InlineTextRun]) -> str:
+    cursor = 0
+    chunks: list[str] = []
+    for run in runs:
+        start = int(run.translated_start)
+        end = int(run.translated_end)
+        original = str(run.original_text or "")
+        if start != cursor or end != start + len(original):
+            raise RuntimeError(
+                "pyicu_line_break_translated_run_provenance_not_contiguous"
+            )
+        chunks.append(original)
+        cursor = end
+    return "".join(chunks)
+
+
+def _apply_pyicu_strict_line_break_legality(
+    runs: Sequence[InlineTextRun],
+    opportunities: Sequence[BreakOpportunity],
+    *,
+    language_hint: str,
+) -> list[BreakOpportunity]:
+    items = list(runs or [])
+    candidates = list(opportunities or [])
+    if not items or not candidates:
+        return candidates
+
+    translated_text = _translated_text_from_runs(items)
+    locale_id = _pyicu_strict_locale_id(language_hint)
+    provider_boundaries = set(
+        pyicu_strict_line_break_boundaries(
+            translated_text,
+            language_hint=language_hint,
+        )
+    )
+    runs_by_id = {run.run_id: run for run in items}
+    icu = _require_pyicu()
+    filtered: list[BreakOpportunity] = []
+    for opportunity in candidates:
+        after = runs_by_id.get(opportunity.after_run_id)
+        if after is None:
+            raise RuntimeError("pyicu_line_break_after_run_missing")
+        translated_position = int(after.translated_start)
+        if translated_position < 0 or translated_position > len(translated_text):
+            raise RuntimeError("pyicu_line_break_translated_position_invalid")
+        provider_allowed = translated_position in provider_boundaries
+        original_allowed = bool(opportunity.allowed)
+        effective_allowed = original_allowed and provider_allowed
+        reason = opportunity.reason
+        strength = opportunity.strength
+        if original_allowed and not provider_allowed:
+            reason = "uax14_provider_rejected_boundary"
+            strength = "forbidden"
+        filtered.append(
+            replace(
+                opportunity,
+                allowed=effective_allowed,
+                reason=reason,
+                strength=strength,
+                metadata={
+                    **dict(opportunity.metadata),
+                    "uax14_provider_id": _PYICU_STRICT_PROVIDER_ID,
+                    "uax14_provider_role": "legal_opportunity_filter",
+                    "uax14_provider_locale": locale_id,
+                    "uax14_translated_position": translated_position,
+                    "uax14_provider_allowed": provider_allowed,
+                    "uax14_original_allowed": original_allowed,
+                    "uax14_only_narrows": True,
+                    "jieba_lexical_evidence_retained": True,
+                    "pyicu_version": str(icu.VERSION),
+                    "icu_version": str(icu.ICU_VERSION),
+                    "icu_unicode_version": str(icu.UNICODE_VERSION),
+                    "icu_offset_contract": "utf16_to_python_codepoint",
+                },
+            )
+        )
+    return filtered
+
+
+def _target_lexical_boundary_confidence(
+    lexical_spans: Sequence["TargetLexicalSpan"],
+    token_boundary: int,
+) -> dict[str, Any]:
+    """Describe confidence in one primary-segmentation boundary.
+
+    A multi-token primary span followed by two consecutive singleton primary
+    spans is retained as a legal boundary, but its compound-word evidence is
+    weaker than an ordinary primary partition.  The renderer does not infer a
+    word or alter the segmentation; it exposes this deterministic evidence so
+    a same-size layout retry cannot trade worse balance for one marginal
+    column while newly selecting that boundary.
+    """
+
+    primary = [span for span in lexical_spans if bool(span.primary)]
+    preceding = [
+        span
+        for span in primary
+        if int(span.token_end) == int(token_boundary)
+        and int(span.token_end) - int(span.token_start) > 1
+    ]
+    starting = [
+        span
+        for span in primary
+        if int(span.token_start) == int(token_boundary)
+        and int(span.token_end) - int(span.token_start) == 1
+    ]
+    following = [
+        following_span
+        for starting_span in starting
+        for following_span in primary
+        if (
+            int(following_span.token_start)
+            == int(starting_span.token_end)
+            and int(following_span.token_end)
+            - int(following_span.token_start)
+            == 1
+        )
+    ]
+    if not preceding or not starting or not following:
+        return {
+            "classification": "standard",
+            "basis": "primary_partition",
+        }
+    return {
+        "classification": "lower_adjacent_primary_singletons",
+        "basis": "multi_token_span_followed_by_adjacent_singletons",
+        "preceding_span_ids": [span.span_id for span in preceding],
+        "starting_span_ids": [span.span_id for span in starting],
+        "following_singleton_span_ids": [
+            span.span_id for span in following
+        ],
+    }
 
 
 def _symbol_supported(font_manager, face, symbol: str) -> bool:

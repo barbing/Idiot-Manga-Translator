@@ -11,6 +11,8 @@ jieba==0.42.1
 uharfbuzz
 python-bidi
 freetype-py
+# Windows PyICU/ICU is installed by the GUI startup downloader from the
+# project's pinned, self-contained runtime artifact.
 
 # OCR / detection
 manga-ocr
