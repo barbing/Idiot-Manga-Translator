@@ -101,10 +101,22 @@ def resolve_ogkalu_text_bubble_config(base_dir: Optional[str] = None) -> Optiona
 
 
 def has_bubble_detection_runtime(base_dir: Optional[str] = None) -> bool:
-    return bool(
+    if not (
         resolve_kitsumed_speech_bubble_model(base_dir)
         and resolve_ogkalu_text_bubble_model(base_dir)
         and resolve_ogkalu_text_bubble_config(base_dir)
+    ):
+        return False
+    try:
+        from app.pipeline import bubble_detection_runtime as runtime
+    except Exception:
+        return False
+    return bool(
+        callable(getattr(runtime.kit, "letterbox", None))
+        and callable(getattr(runtime.kit, "decode_outputs", None))
+        and callable(getattr(runtime.og, "preprocess", None))
+        and callable(getattr(runtime, "link_regions", None))
+        and callable(getattr(runtime, "build_fusion", None))
     )
 
 

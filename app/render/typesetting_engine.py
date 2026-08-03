@@ -19,7 +19,11 @@ from app.render.font_manager import (
     FontSpanResolution,
     RunFontResolution,
 )
-from app.render.line_break_planner import LineBreakPlanner
+from app.render.line_break_planner import (
+    LineBreakPlanner,
+    canonical_break_quality_key,
+    canonical_break_quality_summary,
+)
 from app.render.parent_layer_effects import (
     fit_effect_envelope,
     outward_int_xywh,
@@ -275,6 +279,11 @@ class TypesettingEngine:
                 if target_lexical_segmentation.available
                 else None
             ),
+            target_lexical_boundaries=(
+                target_lexical_segmentation.boundaries
+                if target_lexical_segmentation.available
+                else None
+            ),
         )
         runs_by_id = {run.run_id: run for run in runs}
         breaks = [
@@ -306,7 +315,6 @@ class TypesettingEngine:
         script_policy = _script_policy(runs, writing_mode, self.policy)
         attempts: list[dict[str, Any]] = []
         selected_attempt: dict[str, Any] | None = None
-        first_fit_within_source_interval: dict[str, Any] | None = None
         source_preferred_interval_floor = _source_preferred_interval_floor(
             preferred_font_size,
             plan.resolved_render_style,
@@ -536,61 +544,32 @@ class TypesettingEngine:
                 "same_size_break_quality_layout_expansion_used": bool(
                     break_quality_retry is not None
                 ),
-                "selected_intra_span_break_count": (
-                    _selected_intra_span_break_count(break_plan)
+                "selected_confirmed_lexical_break_count": (
+                    _selected_lexical_break_count(
+                        break_plan,
+                        "confirmed_lexical_break_rank",
+                    )
                 ),
-                "selected_lexical_integrity_penalty": (
-                    _selected_lexical_integrity_penalty(break_plan)
+                "selected_weak_lexical_break_count": (
+                    _selected_lexical_break_count(
+                        break_plan,
+                        "weak_lexical_break_rank",
+                    )
+                ),
+                "canonical_break_quality": canonical_break_quality_summary(
+                    break_plan
                 ),
             }
             attempts.append(attempt)
             selected_attempt = attempt
             if fit_status != "fits":
                 continue
-
-            selected_intra_span_breaks = int(
-                attempt["selected_intra_span_break_count"]
-            )
-            if selected_intra_span_breaks <= 0:
+            lexical_candidate_selection_reason = (
+                "same_size_authorized_layout_expansion"
                 if bool(
                     attempt["same_size_break_quality_layout_expansion_used"]
-                ):
-                    lexical_candidate_selection_reason = (
-                        "same_size_authorized_layout_expansion"
-                    )
-                elif font_size < preferred_font_size:
-                    lexical_candidate_selection_reason = (
-                        "source_preferred_interval_size_adjustment"
-                    )
-                else:
-                    lexical_candidate_selection_reason = (
-                        "preferred_candidate_lexically_intact"
-                    )
-                break
-
-            if _font_size_is_locked(plan.resolved_render_style):
-                lexical_candidate_selection_reason = (
-                    "locked_size_intra_span_break_retained"
                 )
-                break
-            if source_preferred_interval_floor is None:
-                lexical_candidate_selection_reason = (
-                    "source_preferred_interval_unavailable_intra_span_break_retained"
-                )
-                break
-            if font_size >= source_preferred_interval_floor:
-                if first_fit_within_source_interval is None:
-                    first_fit_within_source_interval = attempt
-                if font_size > source_preferred_interval_floor:
-                    continue
-                selected_attempt = first_fit_within_source_interval
-                lexical_candidate_selection_reason = (
-                    "no_lexically_intact_candidate_within_source_preferred_interval"
-                )
-                break
-
-            lexical_candidate_selection_reason = (
-                "first_technical_fit_below_source_preferred_interval"
+                else "first_technical_fit"
             )
             break
         if selected_attempt is None:
@@ -615,14 +594,7 @@ class TypesettingEngine:
         font_span_cluster_map = _font_span_cluster_ledger(runs, shaped_runs)
         effective_line_height = float(selected_attempt.get("effective_line_height") or _line_height(plan.resolved_render_style))
         if font_size < preferred_font_size:
-            if lexical_candidate_selection_reason == (
-                "source_preferred_interval_size_adjustment"
-            ):
-                reason_codes.append(
-                    "font_size_reduced_within_source_preferred_interval_for_target_lexical_integrity"
-                )
-            else:
-                reason_codes.append("font_size_reduced_to_fit_translated_text")
+            reason_codes.append("font_size_reduced_to_fit_translated_text")
             if parent_layer_effects.active and any(
                 not bool(item["parent_layer_effect_envelope"].get("contained"))
                 for item in attempts
@@ -733,6 +705,14 @@ class TypesettingEngine:
             else "complete_layout_scale_to_box_fallback"
         )
         full_text_placed = text_placement_complete
+        typesetting_candidate_quality = _typesetting_candidate_quality_summary(
+            preferred_font_size=preferred_font_size,
+            selected_font_size=font_size,
+            fit_status=fit_status,
+            text_placement_complete=text_placement_complete,
+            hard_bounds_contained=hard_bounds_contained,
+            break_plan=break_plan,
+        )
         if not text_placement_complete:
             all_issues = _unique(
                 [*all_issues, "required_text_placement_incomplete"]
@@ -756,17 +736,19 @@ class TypesettingEngine:
             "break_opportunities": [item.to_audit_dict() for item in breaks],
             "chosen_breaks": list(break_plan.get("selected_breaks") or []),
             "break_plan": break_plan,
+            "typesetting_candidate_quality": typesetting_candidate_quality,
             "kinsoku_adjustments": kinsoku_adjustments,
             "line_break_policy": {
-                "policy_version": "line_break_policy_stage4_target_lexical_v1",
+                "policy_version": "line_break_policy_stage4_target_lexical_v2",
                 "locale_hint": _language_hint(plan),
                 "writing_mode": writing_mode,
                 "selection_authority": "explicit_break_opportunities",
                 "planner_version": self.break_planner.version,
                 "accepted_tailoring_rules": [
                     "space_word_boundary",
-                    "target_lexical_word_boundary",
-                    "target_lexical_intra_word_penalty",
+                    "target_lexical_confirmed_keep_boundary",
+                    "target_lexical_weak_keep_boundary",
+                    "target_lexical_conflict_abstention",
                     "cjk_grapheme_boundary_degraded_fallback",
                 ],
                 "rejected_fallback_rules": ["raw_character_count_splitting"],
@@ -840,9 +822,15 @@ class TypesettingEngine:
                     "source_preferred_interval_is_render_admission": False,
                     "technical_fit_continues_below_interval": True,
                     "second_break_selector_added": False,
-                    "selected_intra_span_break_count": int(
+                    "selected_confirmed_lexical_break_count": int(
                         selected_attempt.get(
-                            "selected_intra_span_break_count"
+                            "selected_confirmed_lexical_break_count"
+                        )
+                        or 0
+                    ),
+                    "selected_weak_lexical_break_count": int(
+                        selected_attempt.get(
+                            "selected_weak_lexical_break_count"
                         )
                         or 0
                     ),
@@ -860,12 +848,16 @@ class TypesettingEngine:
                         "layout_intent_box": list(item["layout_intent_box"]),
                         "measured_bounds": list(item["measured_bounds"]),
                         "issues": list(item["issues"]),
-                        "selected_intra_span_break_count": int(
-                            item.get("selected_intra_span_break_count") or 0
+                        "selected_confirmed_lexical_break_count": int(
+                            item.get("selected_confirmed_lexical_break_count")
+                            or 0
                         ),
-                        "selected_lexical_integrity_penalty": float(
-                            item.get("selected_lexical_integrity_penalty")
+                        "selected_weak_lexical_break_count": int(
+                            item.get("selected_weak_lexical_break_count")
                             or 0.0
+                        ),
+                        "canonical_break_quality": dict(
+                            item.get("canonical_break_quality") or {}
                         ),
                         "same_size_break_quality_layout_expansion_used": bool(
                             item.get(
@@ -974,6 +966,7 @@ class TypesettingEngine:
                 "break_opportunities": metadata["break_opportunities"],
                 "chosen_breaks": metadata["chosen_breaks"],
                 "break_plan": break_plan,
+                "typesetting_candidate_quality": typesetting_candidate_quality,
                 "kinsoku_adjustments": kinsoku_adjustments,
                 "normalization_notes": normalization_notes,
                 "inline_runs": metadata["inline_runs"],
@@ -1005,6 +998,40 @@ class TypesettingEngine:
             },
         )
         return layout, report
+
+    def candidate_quality_summary(
+        self,
+        plan: RenderLayerPlan,
+        layout: TypesetLayout,
+        report: FitReport,
+    ) -> dict[str, Any]:
+        """Expose opaque typography quality to the mechanical slot owner."""
+
+        existing = (
+            layout.metadata.get("typesetting_candidate_quality")
+            if isinstance(layout.metadata, Mapping)
+            else None
+        )
+        if isinstance(existing, Mapping) and existing.get("sort_key"):
+            return deepcopy(dict(existing))
+        return _typesetting_candidate_quality_summary(
+            preferred_font_size=_font_size_from_style(
+                dict(plan.resolved_render_style or {})
+            ),
+            selected_font_size=float(layout.selected_font_size or 0.0),
+            fit_status=str(report.fit_status or layout.fit_status or ""),
+            text_placement_complete=bool(
+                report.full_text_placed and layout.text_placement_complete
+            ),
+            hard_bounds_contained=bool(
+                report.hard_bounds_contained and layout.hard_bounds_contained
+            ),
+            break_plan=(
+                layout.metadata.get("break_plan")
+                if isinstance(layout.metadata, Mapping)
+                else {}
+            ),
+        )
 
     def typeset_layers(self, plans: Sequence[RenderLayerPlan]) -> tuple[list[TypesetLayout], list[FitReport]]:
         layouts: list[TypesetLayout] = []
@@ -1880,14 +1907,14 @@ class TypesettingEngine:
         """Try a minimally larger intent for a strictly better target plan.
 
         This remains orchestration around the sole ``LineBreakPlanner``.  The
-        full hard box is used only to compare target-language break quality at
-        the same font size.  Source-footprint advisory fields are deliberately
-        excluded from the comparison.  A better executable partition is then
+        full hard box is used only to compare the planner's canonical quality
+        record at the same font size. Source-footprint evidence remains the
+        final advisory field in that record. A better executable partition is then
         reduced to the smallest centered expansion that can hold it; the
         upstream hard box never changes.
         """
 
-        initial_quality = _vertical_break_plan_target_quality_key(break_plan)
+        initial_quality = canonical_break_quality_key(break_plan)
         if not _vertical_break_quality_probe_is_relevant(break_plan):
             return None
         hard = bbox_from_value(hard_bounds)
@@ -1913,9 +1940,7 @@ class TypesettingEngine:
             plan,
             candidate_capacity_box=hard,
         )
-        probe_quality = _vertical_break_plan_target_quality_key(
-            probe_break_plan
-        )
+        probe_quality = canonical_break_quality_key(probe_break_plan)
         if probe_fit_status != "fits" or not probe_quality < initial_quality:
             return None
 
@@ -1934,18 +1959,8 @@ class TypesettingEngine:
         )
         if retry is None:
             return None
-        selected_quality = _vertical_break_plan_target_quality_key(
-            retry["break_plan"]
-        )
+        selected_quality = canonical_break_quality_key(retry["break_plan"])
         if not selected_quality < initial_quality:
-            return None
-        boundary_confidence_guard = (
-            _vertical_retry_boundary_confidence_guard(
-                break_plan,
-                retry["break_plan"],
-            )
-        )
-        if boundary_confidence_guard["rejected"]:
             return None
         retry["reason_codes"] = _unique(
             [
@@ -1961,21 +1976,24 @@ class TypesettingEngine:
             "break_selector": self.break_planner.version,
             "second_break_selector_added": False,
             "comparison_order": [
-                "lexical_span_integrity",
-                "punctuation_attachment",
-                "target_topology_economy",
-                "optical_balance",
+                "canonical_line_break_quality_v1",
             ],
-            "source_footprint_used_in_comparison": False,
+            "source_footprint_used_in_comparison": True,
             "initial_target_quality_key": list(initial_quality),
             "full_hard_bounds_target_quality_key": list(probe_quality),
             "selected_target_quality_key": list(selected_quality),
-            "boundary_confidence_guard": boundary_confidence_guard,
-            "initial_intra_span_break_count": (
-                _selected_intra_span_break_count(break_plan)
+            "special_case_boundary_guard": False,
+            "initial_confirmed_lexical_break_count": (
+                _selected_lexical_break_count(
+                    break_plan,
+                    "confirmed_lexical_break_rank",
+                )
             ),
-            "selected_intra_span_break_count": (
-                _selected_intra_span_break_count(retry["break_plan"])
+            "selected_confirmed_lexical_break_count": (
+                _selected_lexical_break_count(
+                    retry["break_plan"],
+                    "confirmed_lexical_break_rank",
+                )
             ),
             "hard_bounds_unchanged": True,
             "full_hard_bounds_probe_is_executable_box": False,
@@ -2172,6 +2190,44 @@ def _font_size_from_style(style: dict[str, Any]) -> int:
     return max(1, int(round(number)))
 
 
+def _typesetting_candidate_quality_summary(
+    *,
+    preferred_font_size: float,
+    selected_font_size: float,
+    fit_status: str,
+    text_placement_complete: bool,
+    hard_bounds_contained: bool,
+    break_plan: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the sole typography summary consumed by slot selection."""
+
+    preferred = max(1.0, float(preferred_font_size or 1.0))
+    selected = max(0.0, float(selected_font_size or 0.0))
+    size_loss = max(0.0, preferred - selected)
+    break_quality = canonical_break_quality_summary(break_plan)
+    break_key = canonical_break_quality_key(break_plan)
+    sort_key = (
+        int(not bool(text_placement_complete)),
+        int(str(fit_status or "") != "fits"),
+        int(not bool(hard_bounds_contained)),
+        round(size_loss, 6),
+        *break_key[5:],
+    )
+    return {
+        "quality_version": "typesetting_candidate_quality_v1",
+        "selection_authority": "TypesettingEngine",
+        "full_text_placed": bool(text_placement_complete),
+        "fit_status": str(fit_status or ""),
+        "hard_bounds_contained": bool(hard_bounds_contained),
+        "preferred_font_size": round(preferred, 6),
+        "selected_font_size": round(selected, 6),
+        "preferred_size_loss": round(size_loss, 6),
+        "break_quality": break_quality,
+        "sort_key": list(sort_key),
+        "readability_is_render_admission": False,
+    }
+
+
 def _font_size_candidates(
     preferred: int,
     style: dict[str, Any],
@@ -2213,171 +2269,52 @@ def _source_preferred_interval_floor(
     return max(1, min(int(preferred), rounded_lower))
 
 
-def _selected_intra_span_break_count(
+def _selected_lexical_break_count(
     break_plan: Mapping[str, Any] | None,
+    rank_field: str,
 ) -> int:
-    return sum(
-        1
-        for item in list(dict(break_plan or {}).get("selected_breaks") or [])
-        if str(
-            (item.get("opportunity_metadata") or {}).get(
-                "target_lexical_boundary"
-            )
-            or ""
-        )
-        == "intra_span"
-    )
-
-
-def _selected_lexical_integrity_penalty(
-    break_plan: Mapping[str, Any] | None,
-) -> float:
-    total = 0.0
+    count = 0
     for item in list(dict(break_plan or {}).get("selected_breaks") or []):
         try:
-            total += max(
-                0.0,
-                float(
-                    (item.get("opportunity_metadata") or {}).get(
-                        "lexical_integrity_penalty"
-                    )
-                    or 0.0
-                ),
+            rank = int(
+                (item.get("opportunity_metadata") or {}).get(rank_field)
+                or 0
             )
         except (TypeError, ValueError):
             continue
-    return float(total)
+        count += int(rank > 0)
+    return int(count)
 
 
 def _vertical_break_plan_target_quality_key(
     break_plan: Mapping[str, Any] | None,
-) -> tuple[float, float, int, float]:
-    values = dict(break_plan or {})
-    selected = dict(values.get("selected_lexicographic_key") or {})
-    lexical = _break_quality_scalar(
-        selected.get("lexical_span_integrity"),
-        default=_selected_lexical_integrity_penalty(values),
-    )
-    punctuation = _break_quality_scalar(
-        selected.get("punctuation_attachment"),
-        default=0.0,
-    )
-    topology = max(
-        1,
-        int(
-            selected.get("target_topology_economy")
-            or values.get("selected_columns")
-            or 1
-        ),
-    )
-    balance = _break_quality_scalar(
-        selected.get("optical_balance"),
-        default=0.0,
-    )
-    return (
-        round(lexical, 6),
-        round(punctuation, 6),
-        topology,
-        round(balance, 6),
-    )
+) -> tuple[Any, ...]:
+    return canonical_break_quality_key(break_plan)
 
 
 def _vertical_break_quality_probe_is_relevant(
     break_plan: Mapping[str, Any] | None,
 ) -> bool:
-    lexical, punctuation, topology, _balance = (
-        _vertical_break_plan_target_quality_key(break_plan)
+    quality = canonical_break_quality_summary(break_plan)
+    evidence_defect = bool(
+        any(quality.get("confirmed_lexical_integrity") or [])
+        or float(quality.get("punctuation_attachment") or 0.0) != 0.0
+        or any(quality.get("row_unit_segment_quality") or [])
+        or any(quality.get("weak_lexical_evidence") or [])
     )
-    return bool(topology > 1 or lexical > 0.0 or punctuation > 0.0)
+    if evidence_defect:
+        return True
 
-
-def _vertical_retry_boundary_confidence_guard(
-    initial_plan: Mapping[str, Any] | None,
-    candidate_plan: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """Reject one marginal retry that newly selects weaker lexical evidence.
-
-    The boundary remains legal and the sole planner remains authoritative.
-    This guard applies only to the optional same-size intent expansion: a
-    one-column reduction may not introduce a lower-confidence primary
-    partition while also worsening optical balance.
-    """
-
-    initial_quality = _vertical_break_plan_target_quality_key(initial_plan)
-    candidate_quality = _vertical_break_plan_target_quality_key(
-        candidate_plan
+    # A topology-only retry may remove columns that the constrained intent box
+    # added beyond the planner's source-aware desired topology. It may not
+    # collapse an otherwise clean desired composition merely because the full
+    # hard box can hold fewer columns.
+    selected_topology = int(quality.get("target_topology_economy") or 1)
+    desired_topology = max(
+        1,
+        int(dict(break_plan or {}).get("desired_columns") or selected_topology),
     )
-    initial_lower_confidence = (
-        _selected_lower_confidence_lexical_break_count(initial_plan)
-    )
-    candidate_lower_confidence = (
-        _selected_lower_confidence_lexical_break_count(candidate_plan)
-    )
-    introduced_lower_confidence = (
-        candidate_lower_confidence > initial_lower_confidence
-    )
-    topology_reduction = int(initial_quality[2] - candidate_quality[2])
-    balance_delta = round(
-        float(candidate_quality[3] - initial_quality[3]),
-        6,
-    )
-    rejected = bool(
-        introduced_lower_confidence
-        and topology_reduction == 1
-        and balance_delta > 0.0
-    )
-    return {
-        "policy": (
-            "do_not_trade_worse_balance_for_one_column_when_retry_"
-            "introduces_lower_confidence_primary_boundary"
-        ),
-        "initial_lower_confidence_break_count": (
-            initial_lower_confidence
-        ),
-        "candidate_lower_confidence_break_count": (
-            candidate_lower_confidence
-        ),
-        "introduced_lower_confidence_boundary": (
-            introduced_lower_confidence
-        ),
-        "topology_reduction": topology_reduction,
-        "balance_delta": balance_delta,
-        "rejected": rejected,
-    }
-
-
-def _selected_lower_confidence_lexical_break_count(
-    break_plan: Mapping[str, Any] | None,
-) -> int:
-    return sum(
-        1
-        for item in list(
-            dict(break_plan or {}).get("selected_breaks") or []
-        )
-        if str(
-            (item.get("opportunity_metadata") or {}).get(
-                "target_lexical_boundary_confidence"
-            )
-            or ""
-        )
-        == "lower_adjacent_primary_singletons"
-    )
-
-
-def _break_quality_scalar(value: Any, *, default: float) -> float:
-    candidate = value
-    if isinstance(candidate, Sequence) and not isinstance(
-        candidate,
-        (str, bytes, bytearray),
-    ):
-        candidate = next(iter(candidate), default)
-    try:
-        result = float(candidate)
-    except (TypeError, ValueError):
-        result = float(default)
-    if not math.isfinite(result):
-        return float(default)
-    return result
+    return bool(selected_topology > desired_topology)
 
 
 def _font_size_is_locked(style: Mapping[str, Any] | None) -> bool:

@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
     cv2 = None
 
 
-RENDER_LAYOUT_PLANNER_VERSION = "render_layout_planner_v4"
+RENDER_LAYOUT_PLANNER_VERSION = "render_layout_planner_v5_typography_aware"
 PARENT_RENDER_SLOT_VERSION = "parent_render_slot_v2"
 
 _MASK_OUTSIDE_PENALTY_WEIGHT = 600.0
@@ -320,7 +320,9 @@ def _visual_slot_scored_plan(
     if not candidates:
         return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "no_visual_slot_candidates"})
 
-    scored: list[tuple[float, RenderLayerPlan, dict[str, Any]]] = []
+    scored: list[
+        tuple[tuple[Any, ...], float, RenderLayerPlan, dict[str, Any]]
+    ] = []
     original_metadata = (
         original_plan.metadata
         if isinstance(original_plan.metadata, Mapping)
@@ -361,6 +363,11 @@ def _visual_slot_scored_plan(
                 alignment=alignment,
             )
             layout, report = typesetting_engine.typeset_layer(candidate_plan)
+            typesetting_quality = typesetting_engine.candidate_quality_summary(
+                candidate_plan,
+                layout,
+                report,
+            )
             score, score_meta = _score_visual_slot(
                 candidate_plan,
                 layout,
@@ -374,6 +381,7 @@ def _visual_slot_scored_plan(
             )
             scored.append(
                 (
+                    tuple(typesetting_quality.get("sort_key") or ()),
                     float(score),
                     candidate_plan,
                     {
@@ -387,6 +395,9 @@ def _visual_slot_scored_plan(
                             else []
                         ),
                         "score": round(float(score), 4),
+                        "typesetting_quality": copy_jsonish(
+                            typesetting_quality
+                        ),
                         **score_meta,
                     },
                 )
@@ -394,13 +405,19 @@ def _visual_slot_scored_plan(
 
     if not scored:
         return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "no_scoreable_visual_slot_candidates"})
-    scored.sort(key=lambda item: (item[0], _area(item[1].target_box)))
-    _score, selected_plan, selected_meta = scored[0]
-    rejected = [item[2] for item in scored[1:12]]
+    scored.sort(
+        key=lambda item: _visual_slot_sort_key(
+            item[0],
+            item[1],
+            item[2].target_box,
+        )
+    )
+    _typography_key, _score, selected_plan, selected_meta = scored[0]
+    rejected = [item[3] for item in scored[1:12]]
     anchor_aligned = [
-        item[2]
+        item[3]
         for item in scored
-        if str(item[2].get("alignment_policy") or "")
+        if str(item[3].get("alignment_policy") or "")
         in {
             "source_text_footprint_union_center",
             "source_contract_bbox_center",
@@ -408,7 +425,7 @@ def _visual_slot_scored_plan(
     ]
     final_audit = {
         "applied": True,
-        "source": "shape_aware_visual_slot_scoring_v2",
+        "source": "shape_aware_typography_first_slot_scoring_v3",
         "selected_source": selected_meta.get("source"),
         "selected_alignment_policy": selected_meta.get("alignment_policy"),
         "selected_box": list(selected_plan.target_box),
@@ -427,6 +444,20 @@ def _visual_slot_scored_plan(
         "rejected_candidates": rejected,
     }
     return _plan_with_visual_slot_audit(selected_plan, final_audit)
+
+
+def _visual_slot_sort_key(
+    typesetting_quality_key: Sequence[Any],
+    visual_score: float,
+    target_box: Sequence[int],
+) -> tuple[Any, ...]:
+    """Keep typography ahead of mask/centering without redoing break logic."""
+
+    return (
+        tuple(typesetting_quality_key or ()),
+        float(visual_score),
+        _area(target_box),
+    )
 
 
 def _plan_with_visual_slot_audit(plan: RenderLayerPlan, audit: Mapping[str, Any]) -> RenderLayerPlan:

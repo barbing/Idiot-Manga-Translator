@@ -14,14 +14,16 @@ from typing import Any, Mapping, Sequence
 from app.render.typesetting_text import BreakOpportunity, classify_grapheme
 
 
-LINE_BREAK_PLANNER_VERSION = "line_break_planner_v3_target_priority"
+LINE_BREAK_PLANNER_VERSION = "line_break_planner_v4_ordered_evidence"
 LEXICOGRAPHIC_VERTICAL_ORDER = [
     "hard_legality",
     "fit",
     "source_relative_preferred_size",
-    "lexical_span_integrity",
+    "confirmed_lexical_integrity",
     "punctuation_attachment",
     "target_topology_economy",
+    "row_unit_segment_quality",
+    "weak_lexical_evidence",
     "optical_balance",
     "advisory_source_footprint_distribution",
     "rtl_frontload_fallback",
@@ -30,9 +32,11 @@ LEXICOGRAPHIC_HORIZONTAL_ORDER = [
     "hard_legality",
     "fit",
     "source_relative_preferred_size",
-    "lexical_span_integrity",
+    "confirmed_lexical_integrity",
     "punctuation_attachment",
     "target_topology_economy",
+    "row_unit_segment_quality",
+    "weak_lexical_evidence",
     "optical_balance",
     "advisory_source_footprint_distribution",
 ]
@@ -78,8 +82,14 @@ class _VerticalPath:
     previous_units: float
     fit_overflow_count: int
     fit_overflow_units: float
-    lexical_penalty: float
+    confirmed_lexical_break_count: int
+    confirmed_lexical_rank_loss: int
     punctuation_penalty: float
+    phrase_boundary_crossing_count: int
+    segment_quality_penalty: float
+    weak_lexical_break_count: int
+    weak_lexical_rank_loss: int
+    lexical_conflict_break_count: int
     balance_penalty: float
     source_layout_error: float
     frontload_penalty: float
@@ -90,9 +100,183 @@ class _HorizontalPath:
     breaks: tuple[int, ...]
     width_overflow_count: int
     width_overflow_amount: float
-    lexical_penalty: float
+    confirmed_lexical_break_count: int
+    confirmed_lexical_rank_loss: int
     punctuation_penalty: float
+    phrase_boundary_crossing_count: int
+    segment_quality_penalty: float
+    weak_lexical_break_count: int
+    weak_lexical_rank_loss: int
+    lexical_conflict_break_count: int
     raggedness: float
+
+
+def canonical_break_quality_key(
+    break_plan: Mapping[str, Any] | None,
+) -> tuple[Any, ...]:
+    """Return the planner's sole ordered quality key for a selected plan."""
+
+    return _canonical_quality_record_key(
+        canonical_break_quality_summary(break_plan)
+    )
+
+
+def canonical_break_quality_summary(
+    break_plan: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Normalize one selected plan to the public, opaque quality record."""
+
+    values = dict(break_plan or {})
+    selected = dict(
+        values.get("canonical_break_quality")
+        or values.get("selected_lexicographic_key")
+        or {}
+    )
+    if selected:
+        return _canonical_quality_record(
+            writing_mode=str(
+                selected.get("writing_mode")
+                or ("vertical" if "selected_columns" in values else "horizontal")
+            ),
+            fit=_numeric_sequence(selected.get("fit"), length=3),
+            confirmed=_numeric_sequence(
+                selected.get("confirmed_lexical_integrity")
+                or selected.get("lexical_span_integrity"),
+                length=2,
+            ),
+            punctuation=_number(selected.get("punctuation_attachment")),
+            topology=_integer(
+                selected.get("target_topology_economy")
+                or values.get("selected_columns")
+                or values.get("selected_lines")
+                or 1
+            ),
+            segment_quality=_numeric_sequence(
+                selected.get("row_unit_segment_quality"),
+                length=2,
+            ),
+            weak=_numeric_sequence(
+                selected.get("weak_lexical_evidence"),
+                length=3,
+            ),
+            balance=_number(selected.get("optical_balance")),
+            source=_number(
+                selected.get("advisory_source_footprint_distribution")
+            ),
+            frontload=_number(selected.get("rtl_frontload_fallback")),
+            hard_legality=_integer(selected.get("hard_legality")),
+            preferred_size_loss=_number(
+                selected.get("source_relative_preferred_size")
+            ),
+        )
+    failed = bool(
+        set(str(item) for item in list(values.get("issues") or []))
+        & {"no_legal_break_partition", "line_break_fit_failure"}
+    )
+    return _canonical_quality_record(
+        writing_mode=("vertical" if "selected_columns" in values else "horizontal"),
+        fit=(1 if failed else 0, 1_000_000.0 if failed else 0.0, 0),
+        confirmed=(0, 0),
+        punctuation=0.0,
+        topology=_integer(
+            values.get("selected_columns") or values.get("selected_lines") or 1
+        ),
+        segment_quality=(0, 0.0),
+        weak=(0, 0, 0),
+        balance=0.0,
+        source=0.0,
+        frontload=0.0,
+        hard_legality=1 if failed else 0,
+    )
+
+
+def _canonical_quality_record(
+    *,
+    writing_mode: str,
+    fit: Sequence[Any],
+    confirmed: Sequence[Any],
+    punctuation: Any,
+    topology: Any,
+    segment_quality: Any,
+    weak: Sequence[Any],
+    balance: Any,
+    source: Any,
+    frontload: Any,
+    hard_legality: Any = 0,
+    preferred_size_loss: Any = 0,
+) -> dict[str, Any]:
+    fit_values = _numeric_sequence(fit, length=3)
+    confirmed_values = _numeric_sequence(confirmed, length=2)
+    segment_quality_values = _numeric_sequence(segment_quality, length=2)
+    weak_values = _numeric_sequence(weak, length=3)
+    return {
+        "quality_version": "line_break_quality_v1",
+        "writing_mode": str(writing_mode or "vertical"),
+        "hard_legality": _integer(hard_legality),
+        "fit": [
+            _integer(fit_values[0]),
+            round(float(fit_values[1]), 6),
+            _integer(fit_values[2]),
+        ],
+        "source_relative_preferred_size": round(
+            _number(preferred_size_loss),
+            6,
+        ),
+        "confirmed_lexical_integrity": [
+            _integer(confirmed_values[0]),
+            _integer(confirmed_values[1]),
+        ],
+        "punctuation_attachment": round(_number(punctuation), 6),
+        "target_topology_economy": max(1, _integer(topology)),
+        "row_unit_segment_quality": [
+            _integer(segment_quality_values[0]),
+            round(float(segment_quality_values[1]), 6),
+        ],
+        "weak_lexical_evidence": [
+            _integer(weak_values[0]),
+            _integer(weak_values[1]),
+            _integer(weak_values[2]),
+        ],
+        "optical_balance": round(_number(balance), 6),
+        "advisory_source_footprint_distribution": round(_number(source), 6),
+        "rtl_frontload_fallback": round(_number(frontload), 6),
+    }
+
+
+def _canonical_quality_record_key(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    values = dict(record or {})
+    fit = _numeric_sequence(values.get("fit"), length=3)
+    confirmed = _numeric_sequence(
+        values.get("confirmed_lexical_integrity"),
+        length=2,
+    )
+    segment_quality = _numeric_sequence(
+        values.get("row_unit_segment_quality"),
+        length=2,
+    )
+    weak = _numeric_sequence(values.get("weak_lexical_evidence"), length=3)
+    return (
+        _integer(values.get("hard_legality")),
+        _integer(fit[0]),
+        round(_number(fit[1]), 6),
+        _integer(fit[2]),
+        round(_number(values.get("source_relative_preferred_size")), 6),
+        _integer(confirmed[0]),
+        _integer(confirmed[1]),
+        round(_number(values.get("punctuation_attachment")), 6),
+        max(1, _integer(values.get("target_topology_economy"))),
+        _integer(segment_quality[0]),
+        round(_number(segment_quality[1]), 6),
+        _integer(weak[0]),
+        _integer(weak[1]),
+        _integer(weak[2]),
+        round(_number(values.get("optical_balance")), 6),
+        round(
+            _number(values.get("advisory_source_footprint_distribution")),
+            6,
+        ),
+        round(_number(values.get("rtl_frontload_fallback")), 6),
+    )
 
 
 class LineBreakPlanner:
@@ -233,13 +417,31 @@ class LineBreakPlanner:
             "column_lengths": [len(group) for group in groups],
             "column_row_units": [round(_items_row_units(group), 3) for group in groups],
             "right_to_left_frontload_penalty": round(selected_path.frontload_penalty, 3),
-            "vertical_break_quality_rules": ["terminal_cjk_widow_before_punctuation_tail"],
+            "vertical_break_quality_rules": [
+                "strong_phrase_boundary_alignment_within_same_topology",
+                "terminal_cjk_widow_before_punctuation_tail",
+            ],
             "segment_quality_adjustments": punctuation_adjustments,
             "break_penalties": [
                 {
                     "split_after": split,
                     "previous": str(values[split - 1].get("text") or ""),
                     "next": str(values[split].get("text") or ""),
+                    "confirmed_lexical_break": list(
+                        _boundary_lexical_evidence(
+                            boundary_by_split.get(split)
+                        )[:2]
+                    ),
+                    "weak_lexical_break": list(
+                        _boundary_lexical_evidence(
+                            boundary_by_split.get(split)
+                        )[2:]
+                    ),
+                    "lexical_conflict_uncertainty": int(
+                        _boundary_conflict_uncertainty(
+                            boundary_by_split.get(split)
+                        )
+                    ),
                     "lexical_integrity_penalty": round(
                         _boundary_lexical_penalty(boundary_by_split.get(split)),
                         3,
@@ -266,6 +468,13 @@ class LineBreakPlanner:
                 extra_columns and _profile_needs_speech_column_conservation(profile_value)
             ),
             "selected_lexicographic_key": selected_record.get("lexicographic_key", {}),
+            "canonical_break_quality": selected_record.get(
+                "canonical_break_quality",
+                {},
+            ),
+            "canonical_break_quality_sort_key": list(
+                selected_record.get("canonical_break_quality_sort_key") or []
+            ),
         }
         issues = ["line_break_fit_failure"] if fit_overflow else []
         return BreakPlanResult(
@@ -331,34 +540,44 @@ class LineBreakPlanner:
                 continue
             groups = _groups_from_breaks(values, path.breaks)
             height_overflow = max(0, line_count - line_limit)
-            key = (
-                path.width_overflow_count,
-                round(path.width_overflow_amount, 6),
-                height_overflow,
-                0,
-                round(path.lexical_penalty, 6),
-                round(path.punctuation_penalty, 6),
-                line_count,
-                round(path.raggedness, 6),
-                0,
-                path.breaks,
+            quality = _canonical_quality_record(
+                writing_mode="horizontal",
+                fit=(
+                    path.width_overflow_count,
+                    path.width_overflow_amount,
+                    height_overflow,
+                ),
+                confirmed=(
+                    path.confirmed_lexical_break_count,
+                    path.confirmed_lexical_rank_loss,
+                ),
+                punctuation=path.punctuation_penalty,
+                topology=line_count,
+                segment_quality=(
+                    path.phrase_boundary_crossing_count,
+                    path.segment_quality_penalty,
+                ),
+                weak=(
+                    path.weak_lexical_break_count,
+                    path.weak_lexical_rank_loss,
+                    path.lexical_conflict_break_count,
+                ),
+                balance=path.raggedness,
+                source=0.0,
+                frontload=0.0,
             )
+            key = (*_canonical_quality_record_key(quality), path.breaks)
             record = {
                 "lines": line_count,
                 "line_widths": [round(_items_advance(group), 3) for group in groups],
                 "split_points": list(path.breaks[:-1]),
                 "legal_candidate_count": evaluated,
                 "selected": False,
-                "lexicographic_key": {
-                    "hard_legality": 0,
-                    "fit": [path.width_overflow_count, round(path.width_overflow_amount, 3), height_overflow],
-                    "source_relative_preferred_size": 0,
-                    "lexical_span_integrity": round(path.lexical_penalty, 3),
-                    "punctuation_attachment": round(path.punctuation_penalty, 3),
-                    "target_topology_economy": line_count,
-                    "optical_balance": round(path.raggedness, 3),
-                    "advisory_source_footprint_distribution": 0,
-                },
+                "lexicographic_key": quality,
+                "canonical_break_quality": quality,
+                "canonical_break_quality_sort_key": list(
+                    _canonical_quality_record_key(quality)
+                ),
             }
             candidate_records.append(record)
             candidates.append((key, path, groups, record))
@@ -414,6 +633,13 @@ class LineBreakPlanner:
             "split_points": list(selected_path.breaks[:-1]),
             "line_widths": [round(_items_advance(group), 3) for group in groups],
             "selected_lexicographic_key": selected_record.get("lexicographic_key", {}),
+            "canonical_break_quality": selected_record.get(
+                "canonical_break_quality",
+                {},
+            ),
+            "canonical_break_quality_sort_key": list(
+                selected_record.get("canonical_break_quality_sort_key") or []
+            ),
         }
         return BreakPlanResult(
             groups=groups,
@@ -495,8 +721,14 @@ def _best_vertical_path(
                 previous_units=0.0,
                 fit_overflow_count=0,
                 fit_overflow_units=0.0,
-                lexical_penalty=0.0,
+                confirmed_lexical_break_count=0,
+                confirmed_lexical_rank_loss=0,
                 punctuation_penalty=0.0,
+                phrase_boundary_crossing_count=0,
+                segment_quality_penalty=0.0,
+                weak_lexical_break_count=0,
+                weak_lexical_rank_loss=0,
+                lexical_conflict_break_count=0,
                 balance_penalty=0.0,
                 source_layout_error=0.0,
                 frontload_penalty=0.0,
@@ -522,10 +754,17 @@ def _best_vertical_path(
                 if source_distribution:
                     source_error = abs(units - float(source_distribution[column]))
                 boundary = boundary_by_split.get(end) if end < count else None
-                lexical = _boundary_lexical_penalty(boundary)
+                confirmed_count, confirmed_rank, weak_count, weak_rank = (
+                    _boundary_lexical_evidence(boundary)
+                )
+                conflict_count = _boundary_conflict_uncertainty(boundary)
                 punctuation = _segment_punctuation_penalty(items, start, end)
                 if end < count:
                     punctuation += _boundary_punctuation_penalty(items, end)
+                phrase_boundary_crossings = (
+                    _segment_phrase_boundary_crossing_count(items[start:end])
+                )
+                segment_quality = _segment_quality_penalty(items, start, end)
                 balance = abs(units - ideal) + _segment_optical_penalty(
                     items,
                     start,
@@ -540,8 +779,29 @@ def _best_vertical_path(
                         previous_units=units,
                         fit_overflow_count=path.fit_overflow_count + int(overflow > 1e-9),
                         fit_overflow_units=path.fit_overflow_units + overflow,
-                        lexical_penalty=path.lexical_penalty + lexical,
+                        confirmed_lexical_break_count=(
+                            path.confirmed_lexical_break_count + confirmed_count
+                        ),
+                        confirmed_lexical_rank_loss=(
+                            path.confirmed_lexical_rank_loss + confirmed_rank
+                        ),
                         punctuation_penalty=path.punctuation_penalty + punctuation,
+                        phrase_boundary_crossing_count=(
+                            path.phrase_boundary_crossing_count
+                            + phrase_boundary_crossings
+                        ),
+                        segment_quality_penalty=(
+                            path.segment_quality_penalty + segment_quality
+                        ),
+                        weak_lexical_break_count=(
+                            path.weak_lexical_break_count + weak_count
+                        ),
+                        weak_lexical_rank_loss=(
+                            path.weak_lexical_rank_loss + weak_rank
+                        ),
+                        lexical_conflict_break_count=(
+                            path.lexical_conflict_break_count + conflict_count
+                        ),
                         balance_penalty=path.balance_penalty + balance,
                         source_layout_error=path.source_layout_error + source_error,
                         frontload_penalty=frontload,
@@ -576,8 +836,14 @@ def _vertical_path_prefix_key(path: _VerticalPath) -> tuple[Any, ...]:
     return (
         path.fit_overflow_count,
         round(path.fit_overflow_units, 6),
-        round(path.lexical_penalty, 6),
+        path.confirmed_lexical_break_count,
+        path.confirmed_lexical_rank_loss,
         round(path.punctuation_penalty, 6),
+        path.phrase_boundary_crossing_count,
+        round(path.segment_quality_penalty, 6),
+        path.weak_lexical_break_count,
+        path.weak_lexical_rank_loss,
+        path.lexical_conflict_break_count,
         round(path.balance_penalty, 6),
         round(path.source_layout_error, 6),
     )
@@ -598,19 +864,29 @@ def _vertical_candidate_key(
         + structural_penalty
         + abs(columns - desired_columns)
     )
-    return (
-        0,
-        path.fit_overflow_count,
-        round(path.fit_overflow_units, 6),
-        0,
-        round(path.lexical_penalty, 6),
-        round(path.punctuation_penalty, 6),
-        columns,
-        round(path.balance_penalty, 6),
-        round(advisory_source_error, 6),
-        round(path.frontload_penalty, 6),
-        path.breaks,
+    quality = _canonical_quality_record(
+        writing_mode="vertical",
+        fit=(path.fit_overflow_count, path.fit_overflow_units),
+        confirmed=(
+            path.confirmed_lexical_break_count,
+            path.confirmed_lexical_rank_loss,
+        ),
+        punctuation=path.punctuation_penalty,
+        topology=columns,
+        segment_quality=(
+            path.phrase_boundary_crossing_count,
+            path.segment_quality_penalty,
+        ),
+        weak=(
+            path.weak_lexical_break_count,
+            path.weak_lexical_rank_loss,
+            path.lexical_conflict_break_count,
+        ),
+        balance=path.balance_penalty,
+        source=advisory_source_error,
+        frontload=path.frontload_penalty,
     )
+    return (*_canonical_quality_record_key(quality), path.breaks)
 
 
 def _vertical_candidate_audit(
@@ -629,6 +905,28 @@ def _vertical_candidate_audit(
         + structural_penalty
         + abs(columns - desired_columns)
     )
+    quality = _canonical_quality_record(
+        writing_mode="vertical",
+        fit=(path.fit_overflow_count, path.fit_overflow_units),
+        confirmed=(
+            path.confirmed_lexical_break_count,
+            path.confirmed_lexical_rank_loss,
+        ),
+        punctuation=path.punctuation_penalty,
+        topology=columns,
+        segment_quality=(
+            path.phrase_boundary_crossing_count,
+            path.segment_quality_penalty,
+        ),
+        weak=(
+            path.weak_lexical_break_count,
+            path.weak_lexical_rank_loss,
+            path.lexical_conflict_break_count,
+        ),
+        balance=path.balance_penalty,
+        source=advisory_source_error,
+        frontload=path.frontload_penalty,
+    )
     return {
         "columns": columns,
         "desired_columns": desired_columns,
@@ -637,20 +935,11 @@ def _vertical_candidate_audit(
         "column_row_units": [round(_items_row_units(group), 3) for group in groups],
         "legal_candidate_count": legal_candidate_count,
         "selected": False,
-        "lexicographic_key": {
-            "hard_legality": 0,
-            "fit": [path.fit_overflow_count, round(path.fit_overflow_units, 3)],
-            "source_relative_preferred_size": 0,
-            "lexical_span_integrity": round(path.lexical_penalty, 3),
-            "punctuation_attachment": round(path.punctuation_penalty, 3),
-            "target_topology_economy": columns,
-            "optical_balance": round(path.balance_penalty, 3),
-            "advisory_source_footprint_distribution": round(
-                advisory_source_error,
-                3,
-            ),
-            "rtl_frontload_fallback": round(path.frontload_penalty, 3),
-        },
+        "lexicographic_key": quality,
+        "canonical_break_quality": quality,
+        "canonical_break_quality_sort_key": list(
+            _canonical_quality_record_key(quality)
+        ),
         "sort_key": [item if not isinstance(item, tuple) else list(item) for item in key[:-1]],
         "segment_quality_adjustments": _partition_quality_adjustments(groups),
     }
@@ -670,7 +959,20 @@ def _best_horizontal_path(
     for item in items:
         prefix.append(prefix[-1] + max(0.0, float(item.get("advance") or 0.0)))
     states: dict[tuple[int, int], _HorizontalPath] = {
-        (0, 0): _HorizontalPath((), 0, 0.0, 0.0, 0.0, 0.0)
+        (0, 0): _HorizontalPath(
+            breaks=(),
+            width_overflow_count=0,
+            width_overflow_amount=0.0,
+            confirmed_lexical_break_count=0,
+            confirmed_lexical_rank_loss=0,
+            punctuation_penalty=0.0,
+            phrase_boundary_crossing_count=0,
+            segment_quality_penalty=0.0,
+            weak_lexical_break_count=0,
+            weak_lexical_rank_loss=0,
+            lexical_conflict_break_count=0,
+            raggedness=0.0,
+        )
     }
     evaluated = 0
     for line in range(line_count):
@@ -687,17 +989,45 @@ def _best_horizontal_path(
                 width = max(0.0, prefix[end] - prefix[start])
                 overflow = max(0.0, width - max_width)
                 segment = items[start:end]
-                lexical = _boundary_lexical_penalty(boundary)
+                confirmed_count, confirmed_rank, weak_count, weak_rank = (
+                    _boundary_lexical_evidence(boundary)
+                )
+                conflict_count = _boundary_conflict_uncertainty(boundary)
                 punctuation = _horizontal_whitespace_penalty(segment)
                 if end < count:
                     punctuation += _break_strength_penalty(boundary)
+                phrase_boundary_crossings = (
+                    _segment_phrase_boundary_crossing_count(segment)
+                )
+                segment_quality = _segment_quality_penalty(items, start, end)
                 raggedness = max(0.0, max_width - min(max_width, width))
                 candidate = _HorizontalPath(
                     breaks=(*path.breaks, end),
                     width_overflow_count=path.width_overflow_count + int(overflow > 1e-9),
                     width_overflow_amount=path.width_overflow_amount + overflow,
-                    lexical_penalty=path.lexical_penalty + lexical,
+                    confirmed_lexical_break_count=(
+                        path.confirmed_lexical_break_count + confirmed_count
+                    ),
+                    confirmed_lexical_rank_loss=(
+                        path.confirmed_lexical_rank_loss + confirmed_rank
+                    ),
                     punctuation_penalty=path.punctuation_penalty + punctuation,
+                    phrase_boundary_crossing_count=(
+                        path.phrase_boundary_crossing_count
+                        + phrase_boundary_crossings
+                    ),
+                    segment_quality_penalty=(
+                        path.segment_quality_penalty + segment_quality
+                    ),
+                    weak_lexical_break_count=(
+                        path.weak_lexical_break_count + weak_count
+                    ),
+                    weak_lexical_rank_loss=(
+                        path.weak_lexical_rank_loss + weak_rank
+                    ),
+                    lexical_conflict_break_count=(
+                        path.lexical_conflict_break_count + conflict_count
+                    ),
                     raggedness=path.raggedness + raggedness,
                 )
                 key = (line + 1, end)
@@ -714,8 +1044,14 @@ def _horizontal_path_key(path: _HorizontalPath) -> tuple[Any, ...]:
     return (
         path.width_overflow_count,
         round(path.width_overflow_amount, 6),
-        round(path.lexical_penalty, 6),
+        path.confirmed_lexical_break_count,
+        path.confirmed_lexical_rank_loss,
         round(path.punctuation_penalty, 6),
+        path.phrase_boundary_crossing_count,
+        round(path.segment_quality_penalty, 6),
+        path.weak_lexical_break_count,
+        path.weak_lexical_rank_loss,
+        path.lexical_conflict_break_count,
         round(path.raggedness, 6),
         path.breaks,
     )
@@ -747,10 +1083,22 @@ def _segment_punctuation_penalty(
     segment = list(items[start:end])
     if not segment:
         return 1000.0
-    penalty = sum(float(item.get("penalty") or 0.0) for item in _segment_quality_adjustments(segment))
+    penalty = 0.0
     if _segment_is_punctuation_only(segment) and not _segment_is_punctuation_only(items):
         penalty += 45.0
     return penalty
+
+
+def _segment_quality_penalty(
+    items: Sequence[Mapping[str, Any]],
+    start: int,
+    end: int,
+) -> float:
+    segment = list(items[start:end])
+    return sum(
+        float(item.get("penalty") or 0.0)
+        for item in _segment_quality_adjustments(segment, all_items=items)
+    )
 
 
 def _segment_optical_penalty(
@@ -758,18 +1106,79 @@ def _segment_optical_penalty(
     start: int,
     end: int,
 ) -> float:
-    segment = list(items[start:end])
-    if len(segment) == 1 and len(items) > 3:
-        return 9.0
+    del items, start, end
     return 0.0
 
 
-def _boundary_lexical_penalty(boundary: Mapping[str, Any] | None) -> float:
+def _segment_phrase_boundary_crossing_count(
+    segment: Sequence[Mapping[str, Any]],
+) -> int:
+    """Count strong punctuation boundaries crossed inside one line/column.
+
+    This is a same-topology ordering fact, not a reward for creating more
+    columns. Continuous punctuation is treated as one boundary at the end of
+    the sequence, and a terminal mark does not count as crossed.
+    """
+
+    values = [item for item in segment if str(item.get("text") or "")]
+    count = 0
+    for index, item in enumerate(values[:-1]):
+        text = str(item.get("text") or "")
+        if not _is_strong_phrase_end(text):
+            continue
+        following = str(values[index + 1].get("text") or "")
+        if _is_continuation_punctuation(following) or _is_sequence_punctuation(
+            following
+        ):
+            continue
+        if any(
+            not _is_continuation_punctuation(
+                str(later.get("text") or "")
+            )
+            and not _is_sequence_punctuation(str(later.get("text") or ""))
+            for later in values[index + 1 :]
+        ):
+            count += 1
+    return int(count)
+
+
+def _boundary_lexical_evidence(
+    boundary: Mapping[str, Any] | None,
+) -> tuple[int, int, int, int]:
     metadata = dict((boundary or {}).get("opportunity_metadata") or {})
-    try:
-        return max(0.0, float(metadata.get("lexical_integrity_penalty") or 0.0))
-    except (TypeError, ValueError):
-        return 0.0
+    confirmed_rank = max(
+        0,
+        _integer(metadata.get("confirmed_lexical_break_rank")),
+    )
+    weak_rank = max(
+        0,
+        _integer(metadata.get("weak_lexical_break_rank")),
+    )
+    return (
+        int(confirmed_rank > 0),
+        confirmed_rank,
+        int(weak_rank > 0),
+        weak_rank,
+    )
+
+
+def _boundary_conflict_uncertainty(
+    boundary: Mapping[str, Any] | None,
+) -> int:
+    metadata = dict((boundary or {}).get("opportunity_metadata") or {})
+    return int(
+        bool(
+            metadata.get("lexical_evidence_conflict")
+            or metadata.get("lexical_boundary_conflict")
+        )
+    )
+
+
+def _boundary_lexical_penalty(boundary: Mapping[str, Any] | None) -> float:
+    _confirmed_count, confirmed_rank, _weak_count, weak_rank = (
+        _boundary_lexical_evidence(boundary)
+    )
+    return float(confirmed_rank) + float(weak_rank) / 10.0
 
 
 def _boundary_punctuation_penalty(
@@ -780,22 +1189,70 @@ def _boundary_punctuation_penalty(
         return 0.0
     previous = str(items[split - 1].get("text") or "")
     following = str(items[split].get("text") or "")
+    if (
+        _is_sequence_punctuation(following)
+        and not _is_sequence_punctuation(previous)
+        and not _is_open_punctuation(previous)
+    ):
+        return 24.0
     if _is_strong_phrase_end(previous) and not _is_continuation_punctuation(following):
-        return -8.0
+        return 0.0
     return 0.0
 
 
-def _segment_quality_adjustments(segment: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _segment_quality_adjustments(
+    segment: Sequence[Mapping[str, Any]],
+    *,
+    all_items: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    phrase_crossings = _segment_phrase_boundary_crossing_count(segment)
+    if phrase_crossings:
+        records.append(
+            {
+                "reason": "crossed_strong_phrase_boundary",
+                "penalty": 0.0,
+                "count": int(phrase_crossings),
+                "selection_tier": "row_unit_segment_quality",
+            }
+        )
     if _segment_has_terminal_cjk_widow_before_punctuation_tail(segment):
-        return [{"reason": "terminal_cjk_widow_before_punctuation_tail", "penalty": 12.0}]
-    return []
+        records.append(
+            {
+                "reason": "terminal_cjk_widow_before_punctuation_tail",
+                "penalty": 12.0,
+            }
+        )
+    total_context_units = _items_row_units(all_items or segment)
+    segment_units = _items_row_units(segment)
+    visible_content = [
+        item
+        for item in segment
+        if str(item.get("text") or "")
+        and not _is_sequence_punctuation(str(item.get("text") or ""))
+        and not _is_continuation_punctuation(str(item.get("text") or ""))
+        and not _is_open_punctuation(str(item.get("text") or ""))
+    ]
+    if (
+        total_context_units > 3.0
+        and segment_units <= 1.05
+        and len(visible_content) == 1
+    ):
+        records.append(
+            {
+                "reason": "single_row_unit_content_orphan",
+                "penalty": 9.0,
+            }
+        )
+    return records
 
 
 def _partition_quality_adjustments(groups: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     start = 0
     for column, group in enumerate(groups):
-        for item in _segment_quality_adjustments(group):
+        all_items = [value for values in groups for value in values]
+        for item in _segment_quality_adjustments(group, all_items=all_items):
             records.append(
                 {
                     **item,
@@ -871,7 +1328,7 @@ def _reliable_source_distribution(profile: Mapping[str, Any], columns: int) -> l
 
 def _break_strength_penalty(boundary: Mapping[str, Any] | None) -> float:
     metadata = dict((boundary or {}).get("opportunity_metadata") or {})
-    if metadata.get("target_lexical_boundary") in {"intra_span", "between_spans"}:
+    if metadata.get("lexical_boundary_state"):
         return 0.0
     strength = str((boundary or {}).get("strength") or "normal")
     return {"preferred": 0.0, "normal": 1.0, "weak": 2.0}.get(strength, 3.0)
@@ -900,6 +1357,34 @@ def _items_row_units(items: Sequence[Mapping[str, Any]]) -> float:
 
 def _items_advance(items: Sequence[Mapping[str, Any]]) -> float:
     return sum(max(0.0, float(item.get("advance") or 0.0)) for item in items)
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if math.isfinite(result) else float(default)
+
+
+def _integer(value: Any, default: int = 0) -> int:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _numeric_sequence(value: Any, *, length: int) -> list[float]:
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        values = [_number(item) for item in list(value)[:length]]
+    elif value is None:
+        values = []
+    else:
+        values = [_number(value)]
+    return [*values, *([0.0] * max(0, length - len(values)))]
 
 
 def _is_open_punctuation(text: str) -> bool:

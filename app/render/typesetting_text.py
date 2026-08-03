@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 from app.render.typesetting_contracts import PunctuationToken, TextToken
 
 if TYPE_CHECKING:
-    from app.render.target_lexical_segmenter import TargetLexicalSpan
+    from app.render.target_lexical_segmenter import (
+        TargetLexicalBoundary,
+        TargetLexicalSpan,
+    )
 
 try:
     import regex as _regex
@@ -1174,11 +1177,16 @@ def compute_break_opportunities(
     *,
     writing_mode: str,
     target_lexical_spans: Sequence["TargetLexicalSpan"] | None = None,
+    target_lexical_boundaries: Sequence["TargetLexicalBoundary"] | None = None,
     language_hint: str = "zh",
 ) -> list[BreakOpportunity]:
     items = list(runs or [])
     lexical_spans = list(target_lexical_spans or [])
-    lexical_evidence_supplied = target_lexical_spans is not None
+    lexical_boundaries = {
+        int(item.token_boundary): item
+        for item in list(target_lexical_boundaries or [])
+    }
+    lexical_evidence_supplied = target_lexical_boundaries is not None
     opportunities: list[BreakOpportunity] = []
     for index in range(1, len(items)):
         before = items[index - 1]
@@ -1190,14 +1198,24 @@ def compute_break_opportunities(
             if int(span.token_start) < token_boundary < int(span.token_end)
             and int(span.grapheme_end) - int(span.grapheme_start) > 1
         ]
-        boundary_confidence = (
-            _target_lexical_boundary_confidence(
-                lexical_spans,
-                token_boundary,
-            )
-            if lexical_evidence_supplied and not covering_lexical_spans
-            else {}
+        lexical_boundary = lexical_boundaries.get(token_boundary)
+        lexical_state = str(
+            getattr(lexical_boundary, "state", "unknown") or "unknown"
         )
+        confirmed_rank = max(
+            0,
+            int(getattr(lexical_boundary, "confirmed_keep_rank", 0) or 0),
+        )
+        weak_rank = max(
+            0,
+            int(getattr(lexical_boundary, "weak_keep_rank", 0) or 0),
+        )
+        lexical_contributors = [
+            item.to_audit_dict()
+            for item in tuple(
+                getattr(lexical_boundary, "contributors", ()) or ()
+            )
+        ]
         reason = "generic_run_boundary"
         strength = "normal"
         allowed = True
@@ -1213,12 +1231,15 @@ def compute_break_opportunities(
             reason = "space_word_boundary"
             strength = "preferred"
         elif before.script in {"Hani", "Hira", "Kana", "Hang"} and after.script in {"Hani", "Hira", "Kana", "Hang"}:
-            if covering_lexical_spans:
-                reason = "target_lexical_intra_word_boundary"
+            if lexical_state == "confirmed_keep":
+                reason = "target_lexical_confirmed_keep_boundary"
+                strength = "weak"
+            elif lexical_state == "weak_keep":
+                reason = "target_lexical_weak_keep_boundary"
                 strength = "weak"
             elif lexical_evidence_supplied:
-                reason = "target_lexical_word_boundary"
-                strength = "preferred"
+                reason = f"target_lexical_{lexical_state}_boundary"
+                strength = "normal"
             else:
                 reason = "cjk_grapheme_boundary"
                 strength = "normal"
@@ -1239,43 +1260,31 @@ def compute_break_opportunities(
                     "after_text": after.text,
                     "token_boundary": token_boundary,
                     "target_lexical_boundary": (
-                        "intra_span"
-                        if covering_lexical_spans
-                        else "between_spans"
+                        lexical_state
                         if lexical_evidence_supplied
                         else "unavailable"
                     ),
                     "lexical_integrity_penalty": (
-                        1.0 if covering_lexical_spans else 0.0
+                        float(confirmed_rank)
+                        if confirmed_rank
+                        else float(weak_rank) / 10.0
                     ),
+                    "lexical_boundary_state": lexical_state,
+                    "confirmed_lexical_break_rank": int(confirmed_rank),
+                    "weak_lexical_break_rank": int(weak_rank),
+                    "lexical_evidence_conflict": bool(
+                        getattr(lexical_boundary, "conflict", False)
+                    ),
+                    "lexical_boundary_id": str(
+                        getattr(lexical_boundary, "boundary_id", "") or ""
+                    ),
+                    "lexical_evidence_contributors": lexical_contributors,
                     "lexical_span_ids": [
                         span.span_id for span in covering_lexical_spans
                     ],
                     "lexical_span_texts": [
                         span.text for span in covering_lexical_spans
                     ],
-                    "target_lexical_boundary_confidence": str(
-                        boundary_confidence.get("classification")
-                        or "standard"
-                    ),
-                    "target_lexical_boundary_confidence_basis": str(
-                        boundary_confidence.get("basis")
-                        or "primary_partition"
-                    ),
-                    "lexical_preceding_primary_span_ids": list(
-                        boundary_confidence.get("preceding_span_ids")
-                        or []
-                    ),
-                    "lexical_starting_primary_span_ids": list(
-                        boundary_confidence.get("starting_span_ids")
-                        or []
-                    ),
-                    "lexical_following_singleton_span_ids": list(
-                        boundary_confidence.get(
-                            "following_singleton_span_ids"
-                        )
-                        or []
-                    ),
                 },
             )
         )
@@ -1329,11 +1338,14 @@ def compute_break_opportunities(
                         "after_text": after.text,
                         "token_boundary": int(after.token_start),
                         "target_lexical_boundary": (
-                            "between_spans"
-                            if lexical_evidence_supplied
-                            else "unavailable"
+                            "unknown" if lexical_evidence_supplied else "unavailable"
                         ),
                         "lexical_integrity_penalty": 0.0,
+                        "lexical_boundary_state": "unknown",
+                        "confirmed_lexical_break_rank": 0,
+                        "weak_lexical_break_rank": 0,
+                        "lexical_evidence_conflict": False,
+                        "lexical_evidence_contributors": [],
                         "lexical_span_ids": [],
                         "lexical_span_texts": [],
                         "no_ink_space_transport": True,
@@ -1522,61 +1534,6 @@ def _apply_pyicu_strict_line_break_legality(
             )
         )
     return filtered
-
-
-def _target_lexical_boundary_confidence(
-    lexical_spans: Sequence["TargetLexicalSpan"],
-    token_boundary: int,
-) -> dict[str, Any]:
-    """Describe confidence in one primary-segmentation boundary.
-
-    A multi-token primary span followed by two consecutive singleton primary
-    spans is retained as a legal boundary, but its compound-word evidence is
-    weaker than an ordinary primary partition.  The renderer does not infer a
-    word or alter the segmentation; it exposes this deterministic evidence so
-    a same-size layout retry cannot trade worse balance for one marginal
-    column while newly selecting that boundary.
-    """
-
-    primary = [span for span in lexical_spans if bool(span.primary)]
-    preceding = [
-        span
-        for span in primary
-        if int(span.token_end) == int(token_boundary)
-        and int(span.token_end) - int(span.token_start) > 1
-    ]
-    starting = [
-        span
-        for span in primary
-        if int(span.token_start) == int(token_boundary)
-        and int(span.token_end) - int(span.token_start) == 1
-    ]
-    following = [
-        following_span
-        for starting_span in starting
-        for following_span in primary
-        if (
-            int(following_span.token_start)
-            == int(starting_span.token_end)
-            and int(following_span.token_end)
-            - int(following_span.token_start)
-            == 1
-        )
-    ]
-    if not preceding or not starting or not following:
-        return {
-            "classification": "standard",
-            "basis": "primary_partition",
-        }
-    return {
-        "classification": "lower_adjacent_primary_singletons",
-        "basis": "multi_token_span_followed_by_adjacent_singletons",
-        "preceding_span_ids": [span.span_id for span in preceding],
-        "starting_span_ids": [span.span_id for span in starting],
-        "following_singleton_span_ids": [
-            span.span_id for span in following
-        ],
-    }
 
 
 def _symbol_supported(font_manager, face, symbol: str) -> bool:

@@ -54,6 +54,65 @@ function Resolve-VcVars64 {
     throw "Visual Studio 2022 Build Tools with the x64 C++ workload is required."
 }
 
+function Disable-QtConflictingIcuAlias {
+    param(
+        [string]$RuntimeDirectory,
+        [string]$Version
+    )
+
+    $majorVersion = ($Version -split "\.")[0]
+    $unversionedPath = Join-Path $RuntimeDirectory "icuuc.dll"
+    $versionedPath = Join-Path $RuntimeDirectory "icuuc$majorVersion.dll"
+    $quarantinePath = Join-Path $RuntimeDirectory (
+        "icuuc.dll.conda-icu{0}-quarantined" -f $majorVersion
+    )
+
+    if (-not (Test-Path -LiteralPath $unversionedPath)) {
+        return [ordered]@{
+            status = "not_present"
+            source = $unversionedPath
+            quarantine = $quarantinePath
+        }
+    }
+    if (-not (Test-Path -LiteralPath $versionedPath)) {
+        throw "Cannot quarantine $unversionedPath without $versionedPath."
+    }
+
+    $unversionedHash = (
+        Get-FileHash -Algorithm SHA256 -LiteralPath $unversionedPath
+    ).Hash.ToLowerInvariant()
+    $versionedHash = (
+        Get-FileHash -Algorithm SHA256 -LiteralPath $versionedPath
+    ).Hash.ToLowerInvariant()
+    if ($unversionedHash -ne $versionedHash) {
+        throw (
+            "Refusing to quarantine non-alias ICU runtime: {0} does not match {1}." -f `
+                $unversionedPath, $versionedPath
+        )
+    }
+
+    if (Test-Path -LiteralPath $quarantinePath) {
+        $quarantineHash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $quarantinePath
+        ).Hash.ToLowerInvariant()
+        if ($quarantineHash -ne $unversionedHash) {
+            throw "Existing ICU quarantine hash mismatch: $quarantinePath"
+        }
+        Remove-Item -LiteralPath $unversionedPath -Force
+    }
+    else {
+        Move-Item -LiteralPath $unversionedPath -Destination $quarantinePath
+    }
+
+    return [ordered]@{
+        status = "quarantined"
+        source = $unversionedPath
+        versioned_runtime = $versionedPath
+        quarantine = $quarantinePath
+        sha256 = $unversionedHash
+    }
+}
+
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $artifactPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $ArtifactRoot))
 $wheelhouse = Join-Path $artifactPath "wheelhouse"
@@ -72,6 +131,9 @@ $includeDir = Join-Path $prefix "Library\include"
 $libraryDir = Join-Path $prefix "Library\lib"
 $runtimeDir = Join-Path $prefix "Library\bin"
 $vcvars64 = Resolve-VcVars64
+$qtIcuAliasDisposition = Disable-QtConflictingIcuAlias `
+    -RuntimeDirectory $runtimeDir `
+    -Version $IcuVersion
 
 foreach ($requiredPath in @(
     $python,
@@ -167,6 +229,20 @@ if ($LASTEXITCODE -ne 0) {
     throw "Installed PyICU runtime verification failed."
 }
 
+$qtCoexistenceProbe = @"
+import importlib.util
+if importlib.util.find_spec("PySide6") is not None:
+    from PySide6 import QtCore, QtWidgets
+import icu
+assert icu.VERSION == "$PyIcuVersion", icu.VERSION
+assert icu.ICU_VERSION == "$IcuVersion", icu.ICU_VERSION
+print("Qt/PyICU coexistence verified")
+"@
+& $python -c $qtCoexistenceProbe
+if ($LASTEXITCODE -ne 0) {
+    throw "Qt-first PyICU coexistence verification failed."
+}
+
 $wheelHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $wheel.FullName).Hash
 $inventory = [ordered]@{
     schema_version = 1
@@ -185,6 +261,8 @@ $inventory = [ordered]@{
     link_library_dir = $linkLibraryDir
     import_library_aliases = $aliasInventory
     runtime_dir = $runtimeDir
+    qt_icu_alias_disposition = $qtIcuAliasDisposition
+    qt_first_pyicu_coexistence_verified = $true
 }
 $inventoryPath = Join-Path $artifactPath "wheel_inventory.json"
 $inventory | ConvertTo-Json -Depth 4 |

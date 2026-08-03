@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import importlib.util
 import json
 import math
 import os
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +28,6 @@ BUBBLE_DETECTION_VERSION = "phase4b23_bubble_detection_semantic_authority_contra
 BUBBLE_DETECTION_CACHE_VERSION = "phase4b23_bubble_detection_semantic_authority_cache_v6"
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = ROOT / "scripts"
 KITSUMED_MODEL = ROOT / "models" / "yolov8m_seg-speech-bubble" / "model_dynamic.onnx"
 OGKALU_MODEL = ROOT / "models" / "comic-text-and-bubble-detector" / "detector.onnx"
 OGKALU_CONFIG = ROOT / "models" / "comic-text-and-bubble-detector" / "config.json"
@@ -888,7 +885,9 @@ def _get_runtime() -> _BubbleDetectionRuntime:
     if _RUNTIME_CACHE is not None:
         return _RUNTIME_CACHE
 
-    fusion_module = _load_script_module("phase4b3_model_evidence_fusion", SCRIPTS_DIR / "phase4b3_model_evidence_fusion.py")
+    from app.pipeline import bubble_detection_runtime
+
+    fusion_module = bubble_detection_runtime
     available = list(fusion_module.ort.get_available_providers())
     requested = [provider for provider in PROVIDER_PREFERENCE if provider in available]
     if not requested:
@@ -919,19 +918,6 @@ def _get_runtime() -> _BubbleDetectionRuntime:
         ogkalu_model_hash=ogkalu_hash,
     )
     return _RUNTIME_CACHE
-
-
-def _load_script_module(name: str, path: Path) -> Any:
-    if not path.exists():
-        raise FileNotFoundError(path)
-    spec = importlib.util.spec_from_file_location(f"_mt_{name}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
 
 def _parse_input_size(value: Optional[str]) -> int:
     if not value:

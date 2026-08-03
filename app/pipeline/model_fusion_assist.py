@@ -7,12 +7,10 @@ and the requested diagnostic flag are enabled.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
 import shutil
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
@@ -46,7 +44,6 @@ HIGH_ACCURACY_BUBBLE_MODE_FLAG = "MT_HIGH_ACCURACY_BUBBLE_MODE"
 LEGACY_PAGE_SPECIFIC_ASSIST_FLAG = "MT_LEGACY_PAGE_SPECIFIC_ASSIST"
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = ROOT / "scripts"
 
 SAFE_FUTURE_CLASSES = {
     "safe_future_text_container_assist",
@@ -169,9 +166,6 @@ CLASS_TO_ASSIST_TYPE = {
     "missed_useful_evidence": "review_only",
     "ignore_low_value": "review_only",
 }
-
-
-_CALIBRATION_MODULE_CACHE: Optional[Any] = None
 
 
 def model_fusion_assist_enabled() -> bool:
@@ -479,25 +473,9 @@ def _attach_bubble_detection_consumer_metadata(
 
 
 def _get_calibration_module() -> Any:
-    global _CALIBRATION_MODULE_CACHE
-    if _CALIBRATION_MODULE_CACHE is None:
-        _CALIBRATION_MODULE_CACHE = _load_script_module(
-            "phase4b4_fusion_calibration",
-            SCRIPTS_DIR / "phase4b4_fusion_calibration.py",
-        )
-    return _CALIBRATION_MODULE_CACHE
+    from app.pipeline import legacy_model_fusion_calibration
 
-
-def _load_script_module(name: str, path: Path) -> Any:
-    if not path.exists():
-        raise FileNotFoundError(path)
-    spec = importlib.util.spec_from_file_location(f"_mt_{name}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return legacy_model_fusion_calibration
 
 
 def _source_image_path(audit: Mapping[str, Any]) -> Optional[Path]:
