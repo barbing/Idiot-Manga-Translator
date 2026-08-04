@@ -42,6 +42,23 @@ RENDERER_COMPOSITOR_VERSION = "renderer_compositor_stage5_v6"
 PARENT_LAYER_COMPOSITION_VERSION = "isolated_parent_layer_atomic_effects_v4"
 
 
+AlphaSurfaceStats = tuple[tuple[int, int, int, int] | None, int]
+
+
+def _alpha_channel_stats(alpha) -> AlphaSurfaceStats:
+    """Return exact nonzero bounds and sum without scanning zero canvas margins."""
+
+    bounds = alpha.getbbox()
+    if not bounds:
+        return None, 0
+    normalized_bounds = tuple(int(value) for value in bounds)
+    return normalized_bounds, int(sum(alpha.crop(normalized_bounds).getdata()))
+
+
+def _surface_alpha_stats(surface) -> AlphaSurfaceStats:
+    return _alpha_channel_stats(surface.getchannel("A"))
+
+
 class RendererCompositor:
     """Draw and atomically composite one completed typeset parent layer."""
 
@@ -275,15 +292,15 @@ class RendererCompositor:
             str(item.get("status") or "") not in {"drawn", "primitive", "no_ink"}
             for item in raster_placements
         )
-        parent_alpha = parent_surface.getchannel("A")
-        parent_alpha_bounds = parent_alpha.getbbox()
-        parent_alpha_sum = int(sum(parent_alpha.getdata()))
+        parent_alpha_stats = _surface_alpha_stats(parent_surface)
+        parent_alpha_bounds = parent_alpha_stats[0]
         combined_containment = (
             _hard_bound_containment(
                 page,
                 parent_surface,
                 (0, 0),
                 plan.hard_bounds or plan.target_box,
+                alpha_bounds=parent_alpha_bounds or (),
             )
             if parent_alpha_bounds
             else {
@@ -318,6 +335,7 @@ class RendererCompositor:
                 parent_surface,
                 combined_containment,
                 reason=optional_effect_degradation,
+                alpha_stats=parent_alpha_stats,
             )
             issues.extend(effect_application.get("issues") or [])
         else:
@@ -325,7 +343,9 @@ class RendererCompositor:
                 parent_effects,
                 parent_surface,
                 combined_containment,
+                alpha_stats=parent_alpha_stats,
             )
+        commit_alpha_stats = parent_alpha_stats
         if (
             not rejection_reasons
             and expected_visible_count > 0
@@ -338,6 +358,18 @@ class RendererCompositor:
                 plan=plan,
                 layout=layout,
                 effects=parent_effects,
+                base_alpha_stats=parent_alpha_stats,
+            )
+            final_alpha_bounds = list(
+                effect_application.get("final_alpha_bounds") or []
+            )
+            commit_alpha_stats = (
+                (
+                    tuple(int(value) for value in final_alpha_bounds)
+                    if len(final_alpha_bounds) == 4
+                    else None
+                ),
+                int(effect_application.get("final_alpha_sum") or 0),
             )
             final_containment = dict(
                 effect_application.get("final_alpha_containment") or {}
@@ -353,8 +385,10 @@ class RendererCompositor:
                     combined_containment,
                     reason=effect_issue,
                     attempted=effect_application,
+                    alpha_stats=parent_alpha_stats,
                 )
                 commit_surface = parent_surface
+                commit_alpha_stats = parent_alpha_stats
                 final_containment = combined_containment
                 issues.extend(effect_application.get("issues") or [effect_issue])
 
@@ -376,6 +410,7 @@ class RendererCompositor:
             page_composite_count=1 if committed else 0,
             effect_resolution=parent_effects,
             effect_application=effect_application,
+            surface_alpha_stats=commit_alpha_stats,
         )
         return _layer_audit(
             plan,
@@ -1048,10 +1083,12 @@ def _inactive_parent_effect_audit(
     effects: ParentLayerEffectsResolution,
     surface,
     containment: Mapping[str, Any],
+    *,
+    alpha_stats: AlphaSurfaceStats | None = None,
 ) -> dict[str, Any]:
-    alpha = surface.getchannel("A")
-    bounds = list(alpha.getbbox() or [])
-    alpha_sum = int(sum(alpha.getdata()))
+    resolved_stats = alpha_stats or _surface_alpha_stats(surface)
+    bounds = list(resolved_stats[0] or ())
+    alpha_sum = int(resolved_stats[1])
     status = "unavailable" if effects.status == "unavailable" else "no_visible_effect"
     shadow = effects.shadow.to_audit_dict()
     if shadow.get("availability") == "resolved":
@@ -1092,12 +1129,13 @@ def _degraded_parent_effect_audit(
     *,
     reason: str,
     attempted: Mapping[str, Any] | None = None,
+    alpha_stats: AlphaSurfaceStats | None = None,
 ) -> dict[str, Any]:
     """Describe a base-text commit after an optional effect could not be used."""
 
-    alpha = surface.getchannel("A")
-    bounds = list(alpha.getbbox() or [])
-    alpha_sum = int(sum(alpha.getdata()))
+    resolved_stats = alpha_stats or _surface_alpha_stats(surface)
+    bounds = list(resolved_stats[0] or ())
+    alpha_sum = int(resolved_stats[1])
     attempted_audit = dict(attempted or {})
     shadow = effects.shadow.to_audit_dict()
     if shadow.get("availability") == "resolved":
@@ -1151,10 +1189,11 @@ def _apply_parent_layer_effects(
     plan: RenderLayerPlan,
     layout: TypesetLayout,
     effects: ParentLayerEffectsResolution,
+    base_alpha_stats: AlphaSurfaceStats | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    base_alpha = parent_surface.getchannel("A")
-    base_bounds = list(base_alpha.getbbox() or [])
-    base_sum = int(sum(base_alpha.getdata()))
+    resolved_base_stats = base_alpha_stats or _surface_alpha_stats(parent_surface)
+    base_bounds = list(resolved_base_stats[0] or ())
+    base_sum = int(resolved_base_stats[1])
     pivot = _effect_pivot(layout, plan)
     angle = (
         float(effects.rotation.degrees_clockwise)
@@ -1179,8 +1218,13 @@ def _apply_parent_layer_effects(
         )
         rotation_sampling = "premultiplied_rgba_bicubic_expand_false"
     rotated_alpha = rotated.getchannel("A")
-    rotated_bounds = list(rotated_alpha.getbbox() or [])
-    rotated_sum = int(sum(rotated_alpha.getdata()))
+    rotated_stats = (
+        resolved_base_stats
+        if rotated is parent_surface
+        else _alpha_channel_stats(rotated_alpha)
+    )
+    rotated_bounds = list(rotated_stats[0] or ())
+    rotated_sum = int(rotated_stats[1])
 
     shadow_surface = Image.new("RGBA", parent_surface.size, (0, 0, 0, 0))
     shadow_bounds: list[int] = []
@@ -1220,22 +1264,28 @@ def _apply_parent_layer_effects(
             )
         shadow_surface = Image.new("RGBA", parent_surface.size, (red, green, blue, 0))
         shadow_surface.putalpha(shadow_alpha)
-        shadow_bounds = list(shadow_alpha.getbbox() or [])
-        shadow_sum = int(sum(shadow_alpha.getdata()))
+        shadow_stats = _alpha_channel_stats(shadow_alpha)
+        shadow_bounds = list(shadow_stats[0] or ())
+        shadow_sum = int(shadow_stats[1])
 
     final_surface = (
         Image.alpha_composite(shadow_surface, rotated)
         if effects.shadow.visible
         else rotated
     )
-    final_alpha = final_surface.getchannel("A")
-    final_bounds = list(final_alpha.getbbox() or [])
-    final_sum = int(sum(final_alpha.getdata()))
+    final_stats = (
+        rotated_stats
+        if final_surface is rotated
+        else _surface_alpha_stats(final_surface)
+    )
+    final_bounds = list(final_stats[0] or ())
+    final_sum = int(final_stats[1])
     containment = _hard_bound_containment(
         page,
         final_surface,
         (0, 0),
         plan.hard_bounds or plan.target_box,
+        alpha_bounds=final_bounds,
     )
     predicted = _glyph_bounds(layout.measured_bounds)
     predicted_contains_actual = bool(
@@ -1330,6 +1380,7 @@ def _parent_layer_composition_audit(
     page_composite_count: int = 0,
     effect_resolution: ParentLayerEffectsResolution | None = None,
     effect_application: Mapping[str, Any] | None = None,
+    surface_alpha_stats: AlphaSurfaceStats | None = None,
 ) -> dict[str, Any]:
     raster_items = [dict(item) for item in raster_placements]
     expected_visible_count = sum(_glyph_requires_visible_ink(item) for item in glyphs)
@@ -1350,11 +1401,10 @@ def _parent_layer_composition_audit(
     alpha_bounds: list[int] = []
     alpha_sum = 0
     if surface is not None:
-        alpha = surface.getchannel("A")
-        bounds = alpha.getbbox()
-        if bounds:
-            alpha_bounds = [int(item) for item in bounds]
-        alpha_sum = int(sum(alpha.getdata()))
+        resolved_stats = surface_alpha_stats or _surface_alpha_stats(surface)
+        if resolved_stats[0]:
+            alpha_bounds = [int(item) for item in resolved_stats[0]]
+        alpha_sum = int(resolved_stats[1])
     committed = str(status or "") == "committed"
     effects = effect_resolution or ParentLayerEffectsResolution()
     effects_audit = effects.to_audit_dict()
@@ -1744,8 +1794,14 @@ def _hard_bound_containment(
     raster,
     dest: tuple[int, int],
     hard_bounds: Sequence[Any] | None,
+    *,
+    alpha_bounds: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
-    alpha_box = raster.getchannel("A").getbbox() if raster is not None else None
+    if alpha_bounds is None:
+        alpha_box = raster.getchannel("A").getbbox() if raster is not None else None
+    else:
+        values = [int(value) for value in alpha_bounds]
+        alpha_box = tuple(values) if len(values) == 4 else None
     hard_xyxy = _glyph_bounds(hard_bounds)
     page_xyxy = [0, 0, int(page.size[0]), int(page.size[1])]
     if not alpha_box:

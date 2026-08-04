@@ -6,6 +6,7 @@ cleanup, or reinterpret parent execution identity.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -495,7 +496,9 @@ def bbox_from_value(value: Any) -> list[int]:
 
 
 def copy_jsonish(value: Any) -> Any:
-    if isinstance(value, Mapping):
+    if isinstance(value, dict):
+        return {str(key): copy_jsonish(item) for key, item in value.items()}
+    if isinstance(value, MappingABC):
         return {str(key): copy_jsonish(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [copy_jsonish(item) for item in value]

@@ -19,7 +19,11 @@ from app.render.compositor import RENDERER_COMPOSITOR_VERSION, RendererComposito
 from app.render.font_manager import FontManager
 from app.render.glyph_rasterizer import GLYPH_RASTER_AUTHORITY
 from app.render.ink_bound_layout_fitter import InkBoundFitResult, InkBoundLayoutFitter
-from app.render.layout_planner import RENDER_LAYOUT_PLANNER_VERSION, RenderLayoutPlanner
+from app.render.layout_planner import (
+    RENDER_LAYOUT_PLANNER_VERSION,
+    PlannedLayerResult,
+    RenderLayoutPlanner,
+)
 from app.render.parent_layer_effects import (
     PARENT_LAYER_EFFECTS_VERSION,
     resolve_parent_layer_effects,
@@ -184,15 +188,41 @@ class PageRenderExecutor:
         occupied_bounds: list[dict[str, Any]] = []
         failed_layer_ids: list[str] = []
         for plan in page_slotted_plans:
-            adjusted_plan = self.layout_planner.plan_layer(
-                immutable_cleaned_page,
-                plan,
-                occupied_bounds=occupied_bounds,
+            precomputed_typeset: tuple[TypesetLayout, FitReport] | None = None
+            plan_layer_with_typeset = getattr(
+                self.layout_planner,
+                "plan_layer_with_typeset",
+                None,
             )
+            if callable(plan_layer_with_typeset):
+                planned_result = plan_layer_with_typeset(
+                    immutable_cleaned_page,
+                    plan,
+                    occupied_bounds=occupied_bounds,
+                )
+            else:
+                planned_result = None
+            if isinstance(planned_result, PlannedLayerResult):
+                adjusted_plan = planned_result.plan
+                if (
+                    isinstance(planned_result.layout, TypesetLayout)
+                    and isinstance(planned_result.fit_report, FitReport)
+                ):
+                    precomputed_typeset = (
+                        planned_result.layout,
+                        planned_result.fit_report,
+                    )
+            else:
+                adjusted_plan = self.layout_planner.plan_layer(
+                    immutable_cleaned_page,
+                    plan,
+                    occupied_bounds=occupied_bounds,
+                )
             adjusted_plans.append(adjusted_plan)
             layout, report, effect_degradation = _typeset_with_optional_effect_fallback(
                 self.typesetting_engine,
                 adjusted_plan,
+                precomputed_typeset=precomputed_typeset,
             )
             parent_effects = resolve_parent_layer_effects(adjusted_plan.resolved_render_style)
             if parent_effects.active and not effect_degradation:
@@ -454,6 +484,8 @@ def _layout_fit_evidence(
 def _typeset_with_optional_effect_fallback(
     typesetting_engine: TypesettingEngine,
     plan: RenderLayerPlan,
+    *,
+    precomputed_typeset: tuple[TypesetLayout, FitReport] | None = None,
 ) -> tuple[TypesetLayout, FitReport, dict[str, Any]]:
     effects = resolve_parent_layer_effects(plan.resolved_render_style)
     if effects.status == "invalid":
@@ -470,7 +502,10 @@ def _typeset_with_optional_effect_fallback(
         _annotate_optional_effect_fallback(layout, report, degradation)
         return layout, report, degradation
 
-    layout, report = typesetting_engine.typeset_layer(plan)
+    if precomputed_typeset is not None:
+        layout, report = precomputed_typeset
+    else:
+        layout, report = typesetting_engine.typeset_layer(plan)
     if effects.active and _effect_envelope_blocked_base_layout(report):
         base_plan = _plan_without_optional_effects(plan)
         base_layout, base_report = typesetting_engine.typeset_layer(base_plan)

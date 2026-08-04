@@ -7,6 +7,7 @@ import os
 import statistics
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
 from app.models import resolution as model_resolution
@@ -1648,6 +1649,7 @@ def _unique_chars(text: str) -> list[str]:
     return chars
 
 
+@lru_cache(maxsize=512)
 def _canonical_font_path(path: str) -> str:
     return os.path.normcase(
         os.path.realpath(os.path.abspath(str(path or "")))

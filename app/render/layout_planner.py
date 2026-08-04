@@ -9,7 +9,7 @@ parent identity, translation, or style resolution.
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from app.render.typesetting_contracts import (
@@ -42,6 +42,21 @@ _SHAPE_PULL_FRACTION = 0.35
 _SHAPE_PULL_MAX_EM = 0.40
 
 
+@dataclass(frozen=True)
+class PlannedLayerResult:
+    """Final renderer-local plan and an optional already-measured layout.
+
+    Visual slot scoring must typeset every candidate to compare it.  Carrying
+    the selected candidate's immutable result forward prevents the page
+    executor from repeating that exact work without moving layout ownership
+    out of TypesettingEngine.
+    """
+
+    plan: RenderLayerPlan
+    layout: TypesetLayout | None = None
+    fit_report: FitReport | None = None
+
+
 class RenderLayoutPlanner:
     """Resolve a final renderer-owned slot before compositor drawing."""
 
@@ -65,8 +80,21 @@ class RenderLayoutPlanner:
         *,
         occupied_bounds: Sequence[Mapping[str, Any]],
     ) -> RenderLayerPlan:
+        return self.plan_layer_with_typeset(
+            page,
+            plan,
+            occupied_bounds=occupied_bounds,
+        ).plan
+
+    def plan_layer_with_typeset(
+        self,
+        page,
+        plan: RenderLayerPlan,
+        *,
+        occupied_bounds: Sequence[Mapping[str, Any]],
+    ) -> PlannedLayerResult:
         shape_plan = _shape_aware_plan(page, plan)
-        return _visual_slot_scored_plan(
+        return _visual_slot_scored_result(
             page,
             plan,
             shape_plan,
@@ -303,25 +331,74 @@ def _visual_slot_scored_plan(
     typesetting_engine: TypesettingEngine,
     occupied_bounds: Sequence[Mapping[str, Any]],
 ) -> RenderLayerPlan:
+    return _visual_slot_scored_result(
+        page,
+        original_plan,
+        shape_plan,
+        typesetting_engine,
+        occupied_bounds,
+    ).plan
+
+
+def _visual_slot_scored_result(
+    page,
+    original_plan: RenderLayerPlan,
+    shape_plan: RenderLayerPlan,
+    typesetting_engine: TypesettingEngine,
+    occupied_bounds: Sequence[Mapping[str, Any]],
+) -> PlannedLayerResult:
     if not _is_shape_aware_speech_layer(original_plan):
-        return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "not_speech_bubble_layer"})
+        return PlannedLayerResult(
+            plan=_plan_with_visual_slot_audit(
+                shape_plan,
+                {"applied": False, "reason": "not_speech_bubble_layer"},
+            )
+        )
     if np is None:
-        return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "numpy_unavailable"})
+        return PlannedLayerResult(
+            plan=_plan_with_visual_slot_audit(
+                shape_plan,
+                {"applied": False, "reason": "numpy_unavailable"},
+            )
+        )
     page_box = [0, 0, int(page.size[0]), int(page.size[1])]
     candidate = _shape_candidate_box(original_plan, page_box)
     if not candidate:
-        return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "missing_candidate_box"})
+        return PlannedLayerResult(
+            plan=_plan_with_visual_slot_audit(
+                shape_plan,
+                {"applied": False, "reason": "missing_candidate_box"},
+            )
+        )
     geometry = _speech_bubble_geometry_from_page(page, original_plan, candidate)
     audit = geometry.get("audit") if isinstance(geometry.get("audit"), Mapping) else {}
     if not audit.get("applied"):
-        return _plan_with_visual_slot_audit(shape_plan, audit or {"applied": False, "reason": "speech_geometry_unavailable"})
+        return PlannedLayerResult(
+            plan=_plan_with_visual_slot_audit(
+                shape_plan,
+                audit
+                or {"applied": False, "reason": "speech_geometry_unavailable"},
+            )
+        )
 
     candidates = _visual_slot_candidates(original_plan, shape_plan, geometry, page_box)
     if not candidates:
-        return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "no_visual_slot_candidates"})
+        return PlannedLayerResult(
+            plan=_plan_with_visual_slot_audit(
+                shape_plan,
+                {"applied": False, "reason": "no_visual_slot_candidates"},
+            )
+        )
 
     scored: list[
-        tuple[tuple[Any, ...], float, RenderLayerPlan, dict[str, Any]]
+        tuple[
+            tuple[Any, ...],
+            float,
+            RenderLayerPlan,
+            TypesetLayout,
+            FitReport,
+            dict[str, Any],
+        ]
     ] = []
     original_metadata = (
         original_plan.metadata
@@ -384,6 +461,8 @@ def _visual_slot_scored_plan(
                     tuple(typesetting_quality.get("sort_key") or ()),
                     float(score),
                     candidate_plan,
+                    layout,
+                    report,
                     {
                         "source": str(candidate_record.get("source") or "candidate"),
                         "box": list(box),
@@ -404,7 +483,15 @@ def _visual_slot_scored_plan(
             )
 
     if not scored:
-        return _plan_with_visual_slot_audit(shape_plan, {"applied": False, "reason": "no_scoreable_visual_slot_candidates"})
+        return PlannedLayerResult(
+            plan=_plan_with_visual_slot_audit(
+                shape_plan,
+                {
+                    "applied": False,
+                    "reason": "no_scoreable_visual_slot_candidates",
+                },
+            )
+        )
     scored.sort(
         key=lambda item: _visual_slot_sort_key(
             item[0],
@@ -412,12 +499,19 @@ def _visual_slot_scored_plan(
             item[2].target_box,
         )
     )
-    _typography_key, _score, selected_plan, selected_meta = scored[0]
-    rejected = [item[3] for item in scored[1:12]]
+    (
+        _typography_key,
+        _score,
+        selected_plan,
+        selected_layout,
+        selected_report,
+        selected_meta,
+    ) = scored[0]
+    rejected = [item[5] for item in scored[1:12]]
     anchor_aligned = [
-        item[3]
+        item[5]
         for item in scored
-        if str(item[3].get("alignment_policy") or "")
+        if str(item[5].get("alignment_policy") or "")
         in {
             "source_text_footprint_union_center",
             "source_contract_bbox_center",
@@ -443,7 +537,11 @@ def _visual_slot_scored_plan(
         "selected": selected_meta,
         "rejected_candidates": rejected,
     }
-    return _plan_with_visual_slot_audit(selected_plan, final_audit)
+    return PlannedLayerResult(
+        plan=_plan_with_visual_slot_audit(selected_plan, final_audit),
+        layout=selected_layout,
+        fit_report=selected_report,
+    )
 
 
 def _visual_slot_sort_key(

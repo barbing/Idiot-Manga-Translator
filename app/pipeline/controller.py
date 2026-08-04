@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
-from app.io.project import default_project_dict, load_project, save_project
+from app.io.project import default_project_dict, load_project
+from app.io.project_checkpoint import ProjectCheckpointSession
 from app.io.style_guide import default_style_guide, load_style_guide
 from app.pipeline.text_block_root_graph import (
     annotate_parent_candidate_visual_group,
@@ -202,56 +203,35 @@ _STYLE_CONTEXT_CACHE_UNSET = object()
 
 def _commit_page_project_checkpoint(
     *,
-    json_path: str,
+    checkpoint_session: ProjectCheckpointSession,
     project: dict[str, Any],
     committed_pages: list[dict[str, Any]],
     page_record: dict[str, Any],
+    style_context_delta: Mapping[str, Any] | None = None,
     style_context_cache: Any = _STYLE_CONTEXT_CACHE_UNSET,
-) -> None:
+) -> Any:
     """Persist the next page prefix before publishing it to the GUI."""
 
-    previous_project_pages = project.get("pages")
-    previous_cache_present = "style_context_cache" in project
-    previous_style_context_cache = project.get("style_context_cache")
-    candidate_pages = [*committed_pages, page_record]
-    project["pages"] = candidate_pages
-    if style_context_cache is not _STYLE_CONTEXT_CACHE_UNSET:
-        project["style_context_cache"] = style_context_cache
-    absolute_json_path = os.path.abspath(json_path)
-    json_dir = os.path.dirname(absolute_json_path) or os.getcwd()
-    temp_handle = -1
-    temp_path = ""
-    try:
-        temp_handle, temp_path = tempfile.mkstemp(
-            prefix=f".{os.path.basename(absolute_json_path)}.",
-            suffix=".tmp",
-            dir=json_dir,
-        )
-        os.close(temp_handle)
-        temp_handle = -1
-        save_project(temp_path, project)
-        with open(temp_path, "r+b") as staged_project:
-            os.fsync(staged_project.fileno())
-        os.replace(temp_path, absolute_json_path)
-        temp_path = ""
-    except Exception:
-        project["pages"] = previous_project_pages
-        if style_context_cache is not _STYLE_CONTEXT_CACHE_UNSET:
-            if previous_cache_present:
-                project["style_context_cache"] = previous_style_context_cache
-            else:
-                project.pop("style_context_cache", None)
-        raise
-    finally:
-        if temp_handle >= 0:
-            os.close(temp_handle)
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+    style_context_cache_supplied = (
+        style_context_cache is not _STYLE_CONTEXT_CACHE_UNSET
+    )
+    if not style_context_cache_supplied:
+        style_context_cache = project.get("style_context_cache")
+    journal_id = (
+        str(style_context_cache.get("journal_id") or "")
+        if isinstance(style_context_cache, Mapping)
+        else ""
+    )
+    receipt = checkpoint_session.commit_page(
+        page_record=page_record,
+        style_delta=style_context_delta,
+        style_cache_journal_id=journal_id,
+    )
     committed_pages.append(page_record)
     project["pages"] = list(committed_pages)
+    if style_context_cache_supplied:
+        project["style_context_cache"] = style_context_cache
+    return receipt
 
 
 def _page014_timeout_diag_enabled() -> bool:
@@ -884,6 +864,7 @@ class PipelineWorker(QtCore.QThread):
         ollama = None
         auto_glossary_state = None
         pages = []
+        checkpoint_session: ProjectCheckpointSession | None = None
         debug_artifacts_enabled = debug_enabled(self._settings)
         perf_telemetry_is_enabled = perf_telemetry_enabled(self._settings)
         debug_page_filter = debug_pages(self._settings) if debug_artifacts_enabled else set()
@@ -1024,6 +1005,9 @@ class PipelineWorker(QtCore.QThread):
             from app.pipeline.parent_font_detection import (
                 PARENT_STYLE_DECISION_LEDGER_VERSION,
                 YUZUMARKER_PROVIDER_MODEL,
+                YuzuMarkerOnnxFontDetector,
+                resolve_yuzumarker_font_labels_file,
+                resolve_yuzumarker_font_onnx_file,
             )
             from app.pipeline.parent_style_evidence import (
                 AUTHORIZED_SOURCE_STYLE_VIEW_VERSION,
@@ -1034,6 +1018,8 @@ class PipelineWorker(QtCore.QThread):
             font_detection_mode = str(
                 self._settings.font_detection or "off"
             ).strip().lower()
+            parent_style_detector = None
+            parent_style_detector_initialization_attempted = False
             style_context_policy_identity = build_style_context_policy_identity(
                 {
                     "observer_version": AUTHORIZED_SOURCE_STYLE_VIEW_VERSION,
@@ -1164,6 +1150,17 @@ class PipelineWorker(QtCore.QThread):
             if perf_telemetry_is_enabled:
                 worker_initialization["pre_page_setup_time"] = time.time() - start_time
                 worker_initialization["cleanup_model_warmup_time"] = cleanup_model_warmup_elapsed
+            try:
+                checkpoint_session = ProjectCheckpointSession(
+                    json_path=json_path,
+                    base_project=project,
+                )
+            except Exception as exc:
+                self.message.emit(
+                    "Failed to initialize incremental project persistence: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return
             style_font_manager = None
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
@@ -1897,6 +1894,24 @@ class PipelineWorker(QtCore.QThread):
                                 mode=parent_font_mode,
                                 parent_execution_bundle_count=len(parent_execution_bundles),
                             )
+                            if (
+                                font_detection_mode == "yuzumarker"
+                                and parent_style_detector is None
+                                and not parent_style_detector_initialization_attempted
+                            ):
+                                parent_style_detector_initialization_attempted = True
+                                try:
+                                    models_dir = os.path.join(os.getcwd(), "models")
+                                    parent_style_detector = YuzuMarkerOnnxFontDetector(
+                                        model_path=resolve_yuzumarker_font_onnx_file(models_dir),
+                                        labels_path=resolve_yuzumarker_font_labels_file(models_dir),
+                                        use_gpu=self._settings.use_gpu,
+                                    )
+                                except Exception:
+                                    # Preserve the existing observer-owned
+                                    # unavailable/fallback and page-local retry
+                                    # contract after one worker-owned attempt.
+                                    parent_style_detector = None
                             style_view_result, parent_style_observation = (
                                 _observe_parent_style_after_cleanup(
                                     page_id=page_id,
@@ -1907,6 +1922,7 @@ class PipelineWorker(QtCore.QThread):
                                     mode=parent_font_mode,
                                     use_gpu=self._settings.use_gpu,
                                     models_dir=os.path.join(os.getcwd(), "models"),
+                                    detector=parent_style_detector,
                                 )
                             )
                             _page014_timeout_checkpoint(
@@ -2419,11 +2435,16 @@ class PipelineWorker(QtCore.QThread):
                         bundle.to_audit_dict() for bundle in parent_execution_bundles
                     ]
                 try:
-                    _commit_page_project_checkpoint(
-                        json_path=json_path,
+                    checkpoint_receipt = _commit_page_project_checkpoint(
+                        checkpoint_session=checkpoint_session,
                         project=project,
                         committed_pages=pages,
                         page_record=page_record,
+                        style_context_delta=(
+                            style_context_delta.to_project_dict()
+                            if style_context_delta is not None
+                            else None
+                        ),
                         style_context_cache=(
                             style_context_candidate_journal.to_project_dict()
                         ),
@@ -2439,6 +2460,37 @@ class PipelineWorker(QtCore.QThread):
                         f"{type(exc).__name__}: {exc}"
                     )
                     return
+                if isinstance(debug_context, dict):
+                    set_timing(
+                        debug_context,
+                        "project_checkpoint_encode_time",
+                        checkpoint_receipt.encode_seconds,
+                    )
+                    set_timing(
+                        debug_context,
+                        "project_checkpoint_transaction_time",
+                        checkpoint_receipt.transaction_seconds,
+                    )
+                    set_timing(
+                        debug_context,
+                        "project_checkpoint_descriptor_time",
+                        checkpoint_receipt.descriptor_seconds,
+                    )
+                    set_timing(
+                        debug_context,
+                        "project_checkpoint_total_time",
+                        checkpoint_receipt.total_seconds,
+                    )
+                    set_count(
+                        debug_context,
+                        "project_checkpoint_page_bytes",
+                        checkpoint_receipt.page_bytes,
+                    )
+                    set_count(
+                        debug_context,
+                        "project_checkpoint_style_delta_bytes",
+                        checkpoint_receipt.style_delta_bytes,
+                    )
                 style_context_journal = style_context_candidate_journal
                 self.page_ready.emit(index - 1, page_record)
 
@@ -2548,6 +2600,47 @@ class PipelineWorker(QtCore.QThread):
                     except Exception as exc:
                         self.message.emit(f"Failed to write performance telemetry for {name}: {exc}")
 
+            project["pages"] = list(pages)
+            project["style_context_cache"] = (
+                style_context_journal.to_project_dict()
+            )
+            try:
+                checkpoint_finalize_receipt = checkpoint_session.finalize(
+                    expected_project=project,
+                )
+            except Exception as exc:
+                self.message.emit(
+                    "Failed to finalize project JSON from the durable page "
+                    f"checkpoint: {type(exc).__name__}: {exc}"
+                )
+                return
+            if perf_telemetry_is_enabled and perf_telemetry_output_root:
+                try:
+                    os.makedirs(perf_telemetry_output_root, exist_ok=True)
+                    checkpoint_summary = checkpoint_session.summary()
+                    checkpoint_summary["finalize"] = (
+                        checkpoint_finalize_receipt.to_dict()
+                    )
+                    with open(
+                        os.path.join(
+                            perf_telemetry_output_root,
+                            "project_checkpoint_summary.json",
+                        ),
+                        "w",
+                        encoding="utf-8",
+                    ) as handle:
+                        json.dump(
+                            checkpoint_summary,
+                            handle,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                except Exception as exc:
+                    self.message.emit(
+                        "Failed to write project checkpoint telemetry: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
             # --- MEMORY CLEANUP START ---
             # Flush Python Garbage Collector
             import gc
@@ -2567,6 +2660,11 @@ class PipelineWorker(QtCore.QThread):
             self.total_time_changed.emit(f"Total: {_format_seconds(total_elapsed)}")
             self.message.emit("Completed")
         finally:
+            if checkpoint_session is not None:
+                try:
+                    checkpoint_session.close()
+                except Exception:
+                    pass
             should_finalize_auto_glossary = (
                 auto_glossary_state
                 and self._settings.style_guide_path
@@ -2795,12 +2893,10 @@ class DeepScanWorker(QtCore.QThread):
             if not os.path.exists(self.settings.json_path):
                 return
 
-            import json
             from app.translate.ollama_client import OllamaClient
             from app.models.ollama import list_models
 
-            with open(self.settings.json_path, 'r', encoding='utf-8') as f:
-                project = json.load(f)
+            project = load_project(self.settings.json_path)
 
             pages = project.get("pages", [])
             accumulated = []
@@ -11036,7 +11132,12 @@ def _process_page(
         )
         prompt_has_glossary = bool((prompt_style_guide.get("glossary") or []) or (prompt_style_guide.get("characters") or []))
         batch_items = []
+        short_batch_items_by_context: dict[bool, list[dict[str, str]]] = {
+            False: [],
+            True: [],
+        }
         id_to_assignment_id: dict[str, str] = {}
+        id_to_context_lines: dict[str, list[str]] = {}
         assignment_to_translation: dict[str, str] = {}
         single_assignment_ids: list[str] = []
         for idx, (assignment_id, assignment) in enumerate(translation_assignments.items()):
@@ -11059,23 +11160,63 @@ def _process_page(
                     prompt_glossary_section_included=prompt_has_glossary,
                 )
             if _should_single_translate_text(text, region_ids, execution_regions):
-                single_assignment_ids.append(assignment_id)
+                short_batch_context_lane = _deepseek_short_batch_context_lane(
+                    text,
+                    region_ids,
+                    execution_regions,
+                    target_lang=target_lang,
+                    settings=settings,
+                )
+                if short_batch_context_lane is None:
+                    single_assignment_ids.append(assignment_id)
+                    continue
+                item_id = f"t{idx:03d}"
+                short_batch_items_by_context[short_batch_context_lane].append(
+                    {"id": item_id, "text": text}
+                )
+                id_to_assignment_id[item_id] = assignment_id
+                id_to_context_lines[item_id] = (
+                    list(context_lines or []) if short_batch_context_lane else []
+                )
                 continue
             item_id = f"t{idx:03d}"
             batch_items.append({"id": item_id, "text": text})
             id_to_assignment_id[item_id] = assignment_id
+            id_to_context_lines[item_id] = list(context_lines or [])
         translations = {}
         if batch_items:
-            translations = _batch_translate(
-                ollama,
-                model,
-                source_lang,
-                target_lang,
-                prompt_style_guide,
-                batch_items,
-                context_lines=context_lines,
-                settings=settings,
-                debug_records_by_text=translation_perf_records,
+            translations.update(
+                _batch_translate(
+                    ollama,
+                    model,
+                    source_lang,
+                    target_lang,
+                    prompt_style_guide,
+                    batch_items,
+                    context_lines=context_lines,
+                    settings=settings,
+                    debug_records_by_text=translation_perf_records,
+                )
+            )
+        for use_context, short_batch_items in short_batch_items_by_context.items():
+            if len(short_batch_items) < 2:
+                for item in short_batch_items:
+                    assignment_id = id_to_assignment_id.get(str(item.get("id") or ""))
+                    if assignment_id:
+                        single_assignment_ids.append(assignment_id)
+                continue
+            translations.update(
+                _batch_translate(
+                    ollama,
+                    model,
+                    source_lang,
+                    target_lang,
+                    prompt_style_guide,
+                    short_batch_items,
+                    context_lines=context_lines if use_context else [],
+                    settings=settings,
+                    debug_records_by_text=translation_perf_records,
+                )
             )
         if translations:
             for item_id, translation in translations.items():
@@ -11104,7 +11245,15 @@ def _process_page(
                             )
                         if protected:
                             enforced = _enforce_glossary(protected, text, active_style_guide)
-                    if not _translation_reuses_recent_context(enforced, text, context_lines):
+                    item_context_lines = id_to_context_lines.get(
+                        item_id,
+                        list(context_lines or []),
+                    )
+                    if not _translation_reuses_recent_context(
+                        enforced,
+                        text,
+                        item_context_lines,
+                    ):
                         assignment_to_translation[assignment.assignment_id] = enforced
         missing_assignment_ids = list(single_assignment_ids)
         for assignment_id in translation_assignments.keys():
@@ -18904,6 +19053,45 @@ def _should_single_translate_text(
         return True
 
     return False
+
+
+def _deepseek_short_batch_context_lane(
+    text: str,
+    region_ids: list[str],
+    regions: list[dict],
+    *,
+    target_lang: str,
+    settings: PipelineSettings | None,
+) -> bool | None:
+    """Select a safe DeepSeek batch lane for an existing short single unit.
+
+    The function does not rewrite, mask, split, or normalize source text.  It
+    only consolidates LLM requests when the existing single-unit policy would
+    otherwise call DeepSeek and when all units in the request share the same
+    existing context policy.  Punctuation, deterministic reactions, and
+    decorative/SFX material retain their established individual path.
+    """
+
+    if not _is_deepseek_translation_backend(settings):
+        return None
+    if not _should_single_translate_text(text, region_ids, regions):
+        return None
+    cleaned = str(text or "").strip()
+    if not cleaned or _is_punct_only(cleaned) or _is_ellipsis_like(cleaned):
+        return None
+    if len(_non_punct_chars(cleaned)) < 3 or _is_short_reaction_source(cleaned):
+        return None
+    if _translate_short_reaction_fallback(cleaned, target_lang):
+        return None
+    matched = [region for region in regions if region.get("region_id") in region_ids]
+    if not matched or any(
+        str(region.get("type") or "").strip().lower()
+        in {"decorative_text", "sfx", "sign"}
+        or _region_is_sfx_or_decorative_preserve(region)
+        for region in matched
+    ):
+        return None
+    return bool(_should_use_context_for_text(cleaned, region_ids, regions))
 
 
 def _classify_semantic_region(
