@@ -94,6 +94,7 @@ SOURCE_TEXT_FOOTPRINT_PROFILE_SELECTION_AUTHORITY = (
     "parent_style_arbitrator_resolved_writing_direction"
 )
 SOURCE_STYLE_AXIS_EVIDENCE_VERSION = "source_style_axis_evidence_v1"
+SOURCE_ADVANCE_GRID_VERSION = "source_advance_grid_v1"
 SOURCE_STYLE_AXES = (
     "family",
     "weight",
@@ -294,6 +295,64 @@ class SourceStyleAxisEvidence:
 
 
 @dataclass(frozen=True)
+class SourceAdvanceGridEvidence:
+    """Non-executable source cadence bound to one authorized source view.
+
+    The grid describes a relation between source parents.  It is deliberately
+    separate from ``SourceStyleAxisEvidence(scale)`` and never supplies an
+    executable source size by itself.
+    """
+
+    contract_version: str
+    status: str
+    source_identity: Mapping[str, Any] = field(default_factory=dict)
+    directions: Mapping[str, Any] = field(default_factory=dict)
+    reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "contract_version",
+            str(self.contract_version or SOURCE_ADVANCE_GRID_VERSION),
+        )
+        object.__setattr__(
+            self,
+            "status",
+            str(self.status or "unavailable").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "source_identity",
+            _freeze_axis_value(self.source_identity or {}),
+        )
+        object.__setattr__(
+            self,
+            "directions",
+            _freeze_axis_value(self.directions or {}),
+        )
+        object.__setattr__(
+            self,
+            "reason_codes",
+            tuple(_unique([str(value) for value in self.reason_codes if value])),
+        )
+
+    def direction_record(self, direction: str) -> Mapping[str, Any] | None:
+        record = self.directions.get(str(direction or "").strip().lower())
+        return record if isinstance(record, Mapping) else None
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": self.contract_version,
+            "status": self.status,
+            "source_identity": _json_safe_mapping(self.source_identity),
+            "directions": _json_safe_mapping(self.directions),
+            "reason_codes": list(self.reason_codes),
+            "executable_source_scale": False,
+            "relation_owner": "ParentStyleArbitrator",
+        }
+
+
+@dataclass(frozen=True)
 class SourceTextAxisProfile:
     """Direction-specific layout geometry without choosing writing mode."""
 
@@ -488,6 +547,7 @@ class AuthorizedStyleObservationInputs:
     )
     perceptual_axis_evidence: Mapping[str, Any] = field(default_factory=dict)
     axis_evidence: tuple[SourceStyleAxisEvidence, ...] = ()
+    source_advance_grid: SourceAdvanceGridEvidence | None = None
     source_text_footprint: SourceTextFootprint | None = None
     reason_codes: tuple[str, ...] = ()
     metrics: Mapping[str, Any] = field(default_factory=dict)
@@ -653,6 +713,10 @@ class AuthorizedStyleObservationInputs:
             )
             result["perceptual_axis_evidence"] = _json_safe_mapping(
                 self.perceptual_axis_evidence
+            )
+        if self.source_advance_grid is not None:
+            result["source_advance_grid"] = (
+                self.source_advance_grid.to_audit_dict()
             )
         return result
 
@@ -1935,6 +1999,299 @@ def _native_component_boxes_overlap(
     return bool(
         min(first_x1, second_x1) >= max(first_x0, second_x0)
         and min(first_y1, second_y1) >= max(first_y0, second_y0)
+    )
+
+
+def _source_advance_grid_direct_gaps(
+    gaps_px: Sequence[float],
+) -> tuple[tuple[float, ...], tuple[float, ...], bool]:
+    """Select directly observed cadence without promoting an arbitrary harmonic."""
+
+    ordered = tuple(sorted(float(value) for value in gaps_px if value > 0.0))
+    if len(ordered) < 2:
+        return (), (), False
+
+    valid_splits: list[tuple[int, tuple[float, ...], tuple[float, ...]]] = []
+    for split_index in range(2, len(ordered)):
+        lower = ordered[:split_index]
+        upper = ordered[split_index:]
+        if ordered[split_index] / max(1e-8, ordered[split_index - 1]) < 1.45:
+            continue
+        pitch = float(np.median(np.asarray(lower, dtype=np.float32)))
+        if pitch <= 0.0:
+            continue
+        if (max(lower) - min(lower)) / pitch > 0.25:
+            continue
+        harmonic_supported = True
+        for gap in upper:
+            multiple = int(round(gap / pitch))
+            residual = abs(gap - float(multiple) * pitch)
+            if (
+                multiple < 2
+                or multiple > 4
+                or residual > max(1.0, pitch * 0.12)
+            ):
+                harmonic_supported = False
+                break
+        if harmonic_supported:
+            valid_splits.append((split_index, lower, upper))
+
+    if len(valid_splits) == 1:
+        _, direct, skipped = valid_splits[0]
+        return direct, skipped, False
+    if valid_splits:
+        return (), ordered, True
+
+    median = float(np.median(np.asarray(ordered, dtype=np.float32)))
+    relative_spread = (max(ordered) - min(ordered)) / max(1.0, median)
+    if relative_spread <= 0.25:
+        return ordered, (), False
+    return (), ordered, True
+
+
+def _source_advance_grid_direction_record(
+    geometry: _NativeAuthorizedGlyphGeometry,
+    *,
+    direction: str,
+    visible_ink_spans_px: Sequence[float] = (),
+) -> dict[str, Any]:
+    """Observe adjacent body cadence without changing executable source scale."""
+
+    normalized_direction = str(direction or "").strip().lower()
+    base: dict[str, Any] = {
+        "status": "unavailable_insufficient_body_landmarks",
+        "writing_direction": normalized_direction,
+        "advance_p20_px": 0.0,
+        "advance_median_px": 0.0,
+        "advance_p80_px": 0.0,
+        "confidence": 0.0,
+        "body_landmark_count": 0,
+        "punctuation_landmark_count": int(
+            sum(
+                bool(fact.get("punctuation_fragment"))
+                for fact in geometry.component_facts
+            )
+        ),
+        "track_count": 0,
+        "qualified_track_count": 0,
+        "adjacent_gap_count": 0,
+        "qualified_adjacent_gap_count": 0,
+        "skipped_harmonic_gap_count": 0,
+        "harmonic_ambiguous": False,
+        "visible_ink_spans_px": [
+            round(float(value), 6)
+            for value in visible_ink_spans_px
+            if float(value) > 0.0
+        ],
+        "track_records": [],
+        "reason_codes": ["source_advance_grid_insufficient_body_landmarks"],
+        "executable_source_scale": False,
+    }
+    if normalized_direction not in {"ttb", "ltr"}:
+        base["status"] = "unavailable_invalid_writing_direction"
+        base["reason_codes"] = ["source_advance_grid_direction_invalid"]
+        return base
+
+    inline_dimension = (
+        "height_px" if normalized_direction == "ttb" else "width_px"
+    )
+    cross_dimension = (
+        "width_px" if normalized_direction == "ttb" else "height_px"
+    )
+    cross_index = 0 if normalized_direction == "ttb" else 1
+    body_facts = [
+        fact
+        for fact in geometry.component_facts
+        if not bool(fact.get("punctuation_fragment"))
+        and _native_component_center(fact) is not None
+        and _native_component_bbox(fact) is not None
+        and float(fact.get("long_span_px") or 0.0) > 0.0
+    ]
+    if len(body_facts) < 3:
+        return base
+
+    reference_long_span = float(
+        np.percentile(
+            np.asarray(
+                [float(fact.get("long_span_px") or 0.0) for fact in body_facts],
+                dtype=np.float32,
+            ),
+            75,
+        )
+    )
+    primary_minimum = max(2.0, reference_long_span * 0.60)
+    primary_facts = [
+        fact
+        for fact in body_facts
+        if float(fact.get("long_span_px") or 0.0) >= primary_minimum
+    ]
+    base["body_landmark_count"] = len(primary_facts)
+    if len(primary_facts) < 3:
+        base["reason_codes"] = [
+            "source_advance_grid_primary_body_landmarks_insufficient"
+        ]
+        return base
+
+    cross_spans = np.asarray(
+        [float(fact.get(cross_dimension) or 0.0) for fact in primary_facts],
+        dtype=np.float32,
+    )
+    track_cross_limit = max(2.0, float(np.median(cross_spans)) * 0.75)
+    tracks: list[list[tuple[float, Mapping[str, Any]]]] = []
+    for fact in sorted(
+        primary_facts,
+        key=lambda item: float(_native_component_center(item)[cross_index]),
+    ):
+        cross_center = float(_native_component_center(fact)[cross_index])
+        compatible = [
+            track
+            for track in tracks
+            if max(
+                [item[0] for item in track] + [cross_center]
+            )
+            - min([item[0] for item in track] + [cross_center])
+            <= track_cross_limit
+        ]
+        if compatible:
+            selected = min(
+                compatible,
+                key=lambda track: abs(
+                    float(np.median([item[0] for item in track]))
+                    - cross_center
+                ),
+            )
+            selected.append((cross_center, fact))
+        else:
+            tracks.append([(cross_center, fact)])
+
+    track_records: list[dict[str, Any]] = []
+    adjacent_gaps: list[float] = []
+    for track_index, track in enumerate(tracks):
+        inline_centers: list[tuple[float, int]] = []
+        for _, fact in track:
+            bbox = _native_component_bbox(fact)
+            if bbox is None:
+                continue
+            x0, y0, _, _ = bbox
+            inline_center = (
+                y0 + float(fact.get(inline_dimension) or 0.0) * 0.5
+                if normalized_direction == "ttb"
+                else x0 + float(fact.get(inline_dimension) or 0.0) * 0.5
+            )
+            inline_centers.append(
+                (inline_center, int(fact.get("component_index") or 0))
+            )
+        inline_centers.sort()
+        gaps = [
+            float(second[0] - first[0])
+            for first, second in zip(inline_centers, inline_centers[1:])
+            if second[0] - first[0] >= 1.0
+        ]
+        adjacent_gaps.extend(gaps)
+        track_records.append(
+            {
+                "track_index": track_index,
+                "component_indices": [item[1] for item in inline_centers],
+                "body_landmark_count": len(inline_centers),
+                "adjacent_gaps_px": [round(value, 6) for value in gaps],
+            }
+        )
+
+    base["track_count"] = len(track_records)
+    base["qualified_track_count"] = sum(
+        int(record["body_landmark_count"]) >= 2 for record in track_records
+    )
+    base["adjacent_gap_count"] = len(adjacent_gaps)
+    base["track_records"] = track_records
+    direct_gaps, skipped_gaps, ambiguous = _source_advance_grid_direct_gaps(
+        adjacent_gaps
+    )
+    base["qualified_adjacent_gap_count"] = len(direct_gaps)
+    base["skipped_harmonic_gap_count"] = len(skipped_gaps)
+    base["harmonic_ambiguous"] = bool(ambiguous)
+    if ambiguous:
+        base["status"] = "unavailable_harmonic_ambiguity"
+        base["reason_codes"] = ["source_advance_grid_harmonic_ambiguity"]
+        return base
+    if len(direct_gaps) < 2:
+        base["status"] = "unavailable_insufficient_adjacent_gap_support"
+        base["reason_codes"] = [
+            "source_advance_grid_adjacent_gap_support_insufficient"
+        ]
+        return base
+
+    direct = np.asarray(direct_gaps, dtype=np.float32)
+    median = float(np.median(direct))
+    low = max(1.0, float(np.min(direct)) - 0.5)
+    high = max(median, float(np.max(direct)) + 0.5)
+    relative_spread = (float(np.max(direct)) - float(np.min(direct))) / max(
+        1.0, median
+    )
+    sample_reliability = max(0.0, 1.0 - 1.0 / math.sqrt(len(direct) + 1.0))
+    confidence = min(sample_reliability, max(0.0, 1.0 - relative_spread))
+    base.update(
+        {
+            "status": "supported",
+            "advance_p20_px": round(low, 6),
+            "advance_median_px": round(median, 6),
+            "advance_p80_px": round(high, 6),
+            "confidence": round(confidence, 8),
+            "qualified_adjacent_gaps_px": [
+                round(float(value), 6) for value in direct_gaps
+            ],
+            "skipped_harmonic_gaps_px": [
+                round(float(value), 6) for value in skipped_gaps
+            ],
+            "relative_direct_gap_spread": round(relative_spread, 8),
+            "primary_body_minimum_long_span_px": round(primary_minimum, 6),
+            "track_cross_center_limit_px": round(track_cross_limit, 6),
+            "reason_codes": [
+                "source_advance_grid_adjacent_body_cadence_supported"
+            ],
+        }
+    )
+    return base
+
+
+def _measure_source_advance_grid(
+    geometry: _NativeAuthorizedGlyphGeometry,
+    *,
+    scale_measurement: _IndependentScaleMeasurement,
+    support_identity: Mapping[str, Any],
+) -> SourceAdvanceGridEvidence:
+    vertical = _source_advance_grid_direction_record(
+        geometry,
+        direction="ttb",
+        visible_ink_spans_px=scale_measurement.vertical_qualification.get(
+            "qualified_component_spans_px", ()
+        ),
+    )
+    horizontal = _source_advance_grid_direction_record(
+        geometry,
+        direction="ltr",
+        visible_ink_spans_px=scale_measurement.horizontal_qualification.get(
+            "qualified_component_spans_px", ()
+        ),
+    )
+    supported = any(
+        record.get("status") == "supported"
+        for record in (vertical, horizontal)
+    )
+    return SourceAdvanceGridEvidence(
+        contract_version=SOURCE_ADVANCE_GRID_VERSION,
+        status="observed" if supported else "unavailable",
+        source_identity=support_identity,
+        directions={"ttb": vertical, "ltr": horizontal},
+        reason_codes=tuple(
+            _unique(
+                [
+                    "source_advance_grid_source_pixels_only",
+                    "source_advance_grid_non_executable_relation",
+                    *vertical.get("reason_codes", ()),
+                    *horizontal.get("reason_codes", ()),
+                ]
+            )
+        ),
     )
 
 
@@ -4812,6 +5169,11 @@ def build_authorized_style_observation_inputs(
         support_identity=support_identity,
         geometry=native_geometry,
     )
+    source_advance_grid = _measure_source_advance_grid(
+        native_geometry,
+        scale_measurement=scale_measurement,
+        support_identity=support_identity,
+    )
     source_cell_median_px = _source_cell_reference(scale_measurement)
     grayscale_geometry = _grayscale_paint_geometry(
         source_crop,
@@ -5027,6 +5389,7 @@ def build_authorized_style_observation_inputs(
         authorized_perceptual_source_identity={},
         perceptual_axis_evidence={},
         axis_evidence=axis_evidence,
+        source_advance_grid=source_advance_grid,
         source_text_footprint=source_text_footprint,
         reason_codes=tuple(metrics.get("reason_codes") or ()),
         metrics=metrics,

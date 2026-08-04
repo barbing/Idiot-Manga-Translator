@@ -42,6 +42,8 @@ from app.pipeline.parent_style_evidence import (
     AuthorizedSourceStyleView,
     EXTERNAL_SOURCE_SURFACE_RING_VERSION,
     SOURCE_STYLE_AXES,
+    SOURCE_ADVANCE_GRID_VERSION,
+    SourceAdvanceGridEvidence,
     SourceTextFootprint,
     SourceStyleAxisEvidence,
     build_authorized_style_observation_inputs,
@@ -456,6 +458,7 @@ class StyleEvidence:
     analysis_bbox: tuple[int, int, int, int] = ()
     detector_input_sha256: str = ""
     source_text_footprint: SourceTextFootprint | None = None
+    source_advance_grid: SourceAdvanceGridEvidence | None = None
     source_font_observation: SourceFontObservationV3 | None = None
     source_font_style_evidence: SourceStyleAxisEvidence | None = None
     authorized_perceptual_source_identity: Mapping[str, Any] = field(
@@ -535,6 +538,13 @@ class StyleEvidence:
         ):
             raise TypeError(
                 "source_font_observation must be SourceFontObservationV3"
+            )
+        if self.source_advance_grid is not None and not isinstance(
+            self.source_advance_grid,
+            SourceAdvanceGridEvidence,
+        ):
+            raise TypeError(
+                "source_advance_grid must be SourceAdvanceGridEvidence"
             )
         if self.source_font_style_evidence is not None and not isinstance(
             self.source_font_style_evidence,
@@ -829,6 +839,10 @@ class StyleEvidence:
         if self.source_text_footprint is not None:
             result["source_text_footprint"] = (
                 self.source_text_footprint.to_audit_dict()
+            )
+        if self.source_advance_grid is not None:
+            result["source_advance_grid"] = (
+                self.source_advance_grid.to_audit_dict()
             )
         if self.source_font_observation is not None:
             result["source_font_observation"] = (
@@ -2304,6 +2318,10 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
     scale_fact = _v3_source_scale_fact(
         records.get("scale"), direction=direction_key
     )
+    source_advance_grid_fact = _v3_source_advance_grid_fact(
+        evidence_item,
+        direction=direction_key,
+    )
     source_optical_fact = _v3_source_optical_fact(
         records.get("weight"),
         direction=direction_key,
@@ -2398,6 +2416,7 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
             weight_interval_ambiguous_heavy_candidate
         ),
         "source_scale_fact": scale_fact,
+        "source_advance_grid_fact": source_advance_grid_fact,
         "source_optical_fact": source_optical_fact,
         "scale_interval": (
             tuple(scale_fact["interval"])
@@ -2704,6 +2723,108 @@ def _v3_source_scale_fact(
         "confidence": float(confidence),
         "provenance": record.provenance,
         "reason_codes": tuple(record.reason_codes),
+    }
+
+
+def _v3_source_advance_grid_fact(
+    evidence: StyleEvidence | None,
+    *,
+    direction: str,
+) -> dict[str, Any] | None:
+    """Validate one non-executable cadence fact at the arbitration boundary."""
+
+    if (
+        evidence is None
+        or evidence.status != "observed"
+        or not evidence.vote_eligible
+        or not isinstance(evidence.source_advance_grid, SourceAdvanceGridEvidence)
+    ):
+        return None
+    carrier = evidence.source_advance_grid
+    if (
+        carrier.contract_version != SOURCE_ADVANCE_GRID_VERSION
+        or carrier.status != "observed"
+    ):
+        return None
+    identity = carrier.source_identity
+    if not isinstance(identity, Mapping):
+        return None
+    expected = {
+        "page_id": evidence.page_id,
+        "view_id": evidence.view_id,
+        "bundle_id": evidence.bundle_id,
+        "parent_id": evidence.parent_id,
+        "root_id": evidence.root_id,
+        "detector_input_sha256": evidence.detector_input_sha256,
+    }
+    if any(
+        not expected_value
+        or str(identity.get(key) or "") != str(expected_value)
+        for key, expected_value in expected.items()
+    ):
+        return None
+    if not str(identity.get("authorized_mask_sha256") or ""):
+        return None
+    cleanup_mask_ids = identity.get("cleanup_mask_ids")
+    if cleanup_mask_ids is not None and tuple(cleanup_mask_ids) != tuple(
+        evidence.cleanup_mask_ids
+    ):
+        return None
+
+    record = carrier.direction_record(direction)
+    if (
+        not isinstance(record, Mapping)
+        or str(record.get("status") or "") != "supported"
+        or bool(record.get("harmonic_ambiguous"))
+        or str(record.get("writing_direction") or "") != direction
+        or bool(record.get("executable_source_scale"))
+    ):
+        return None
+    interval = _v3_numeric_interval(
+        record,
+        keys=("advance_p20_px", "advance_median_px", "advance_p80_px"),
+        minimum=1e-8,
+        maximum=None,
+    )
+    confidence = _unit_interval(record.get("confidence"))
+    try:
+        body_landmark_count = int(record.get("body_landmark_count") or 0)
+        qualified_gap_count = int(
+            record.get("qualified_adjacent_gap_count") or 0
+        )
+    except (TypeError, ValueError):
+        return None
+    spans_raw = record.get("visible_ink_spans_px")
+    if not _is_plain_sequence(spans_raw):
+        return None
+    try:
+        spans = tuple(
+            float(value)
+            for value in spans_raw
+            if math.isfinite(float(value)) and float(value) > 0.0
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        interval is None
+        or confidence is None
+        or body_landmark_count < 3
+        or qualified_gap_count < 2
+        or not spans
+    ):
+        return None
+    return {
+        "direction": direction,
+        "interval": interval,
+        "confidence": float(confidence),
+        "visible_ink_spans_px": spans,
+        "body_landmark_count": body_landmark_count,
+        "qualified_adjacent_gap_count": qualified_gap_count,
+        "harmonic_ambiguous": False,
+        "provenance": (
+            "authorized_source_style_view:source_advance_grid_relation"
+        ),
+        "reason_codes": tuple(carrier.reason_codes),
     }
 
 
@@ -5064,11 +5185,278 @@ def _v3_family_posteriors_are_compatible(first: Any, second: Any) -> bool:
     )
 
 
+def _v3_source_advance_complete_link_components(
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+) -> tuple[tuple[str, ...], ...]:
+    """Return disjoint interval cliques; transitive overlap is insufficient."""
+
+    grouped: dict[tuple[str, str], list[tuple[str, tuple[float, float, float]]]] = {}
+    for bundle_id in sorted(facts_by_bundle):
+        facts = facts_by_bundle[bundle_id]
+        relation = facts.get("source_advance_grid_fact")
+        if (
+            not isinstance(relation, Mapping)
+            or bool(relation.get("harmonic_ambiguous"))
+            or int(relation.get("body_landmark_count") or 0) < 3
+            or int(relation.get("qualified_adjacent_gap_count") or 0) < 2
+            or not bool(facts.get("writing_mode_reliable"))
+            or str(facts.get("source_evidence_status") or "") != "observed"
+        ):
+            continue
+        interval = relation.get("interval")
+        if not _is_plain_sequence(interval) or len(interval) != 3:
+            continue
+        try:
+            low, median, high = [float(value) for value in interval]
+        except (TypeError, ValueError):
+            continue
+        if (
+            not all(math.isfinite(value) for value in (low, median, high))
+            or low <= 0.0
+            or low > median
+            or median > high
+        ):
+            continue
+        key = (
+            str(facts.get("page_id") or ""),
+            str(facts.get("writing_mode") or ""),
+        )
+        if not all(key):
+            continue
+        grouped.setdefault(key, []).append(
+            (bundle_id, (low, median, high))
+        )
+
+    components: list[tuple[str, ...]] = []
+    for key in sorted(grouped):
+        candidates = grouped[key]
+        endpoints = sorted(
+            {
+                value
+                for _, interval in candidates
+                for value in (interval[0], interval[2])
+            }
+        )
+        cliques = {
+            tuple(
+                sorted(
+                    bundle_id
+                    for bundle_id, interval in candidates
+                    if interval[0] <= point <= interval[2]
+                )
+            )
+            for point in endpoints
+        }
+        cliques = {clique for clique in cliques if len(clique) >= 3}
+        maximal = {
+            clique
+            for clique in cliques
+            if not any(set(clique) < set(other) for other in cliques)
+        }
+        for clique in sorted(maximal):
+            if any(
+                clique != other and set(clique).intersection(other)
+                for other in maximal
+            ):
+                continue
+            components.append(clique)
+    return tuple(components)
+
+
+def _v3_pooled_visible_ink_interval(
+    *,
+    member_ids: Sequence[str],
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve the supported upper/full-cell tier in the existing ink basis."""
+
+    members = tuple(sorted(str(value) for value in member_ids if value))
+    if len(members) < 3:
+        return None
+    relation_intervals = [
+        facts_by_bundle[bundle_id]["source_advance_grid_fact"]["interval"]
+        for bundle_id in members
+    ]
+    grid_upper = max(float(interval[2]) for interval in relation_intervals)
+    samples: list[tuple[float, str]] = []
+    for bundle_id in members:
+        relation = facts_by_bundle[bundle_id].get("source_advance_grid_fact")
+        if not isinstance(relation, Mapping):
+            return None
+        spans = relation.get("visible_ink_spans_px")
+        if not _is_plain_sequence(spans):
+            return None
+        for raw in spans:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and 0.0 < value <= grid_upper * 1.10:
+                samples.append((value, bundle_id))
+    if len(samples) < 3:
+        return None
+
+    values = np.asarray([value for value, _ in samples], dtype=np.float32)
+    upper_threshold = float(np.percentile(values, 75))
+    upper = [
+        (value, bundle_id)
+        for value, bundle_id in samples
+        if value >= upper_threshold
+    ]
+    if len({bundle_id for _, bundle_id in upper}) < 2:
+        return None
+    upper_values = np.asarray([value for value, _ in upper], dtype=np.float32)
+    p20, median, p80 = [
+        float(value) for value in np.percentile(upper_values, [20, 50, 80])
+    ]
+    if not (0.0 < p20 <= median <= p80):
+        return None
+    return {
+        "interval": (p20, median, p80),
+        "raw_visible_ink_sample_count": len(samples),
+        "upper_tier_sample_count": len(upper),
+        "upper_tier_parent_count": len(
+            {bundle_id for _, bundle_id in upper}
+        ),
+        "upper_tier_threshold_px": upper_threshold,
+        "grid_upper_bound_px": grid_upper,
+    }
+
+
+def _v3_source_advance_relation_updates(
+    *,
+    facts_by_bundle: Mapping[str, Mapping[str, Any]],
+    decisions_by_bundle: Mapping[
+        str, Mapping[str, ParentStyleAxisDecisionV3]
+    ],
+) -> dict[str, ParentStyleAxisDecisionV3]:
+    """Use source cadence only to authorize pooled visible-ink reconciliation."""
+
+    updates: dict[str, ParentStyleAxisDecisionV3] = {}
+    for component in _v3_source_advance_complete_link_components(
+        facts_by_bundle
+    ):
+        pooled = _v3_pooled_visible_ink_interval(
+            member_ids=component,
+            facts_by_bundle=facts_by_bundle,
+        )
+        if pooled is None:
+            continue
+        pooled_interval = tuple(float(value) for value in pooled["interval"])
+        direct_intervals: list[tuple[float, float, float]] = []
+        direct_conflict = False
+        for bundle_id in component:
+            decision = decisions_by_bundle.get(bundle_id, {}).get(
+                "source_scale"
+            )
+            if decision is None or decision.status != "direct":
+                continue
+            value = decision.value if isinstance(decision.value, Mapping) else {}
+            interval = _v3_numeric_interval(
+                value,
+                keys=("p20_px", "median_px", "p80_px"),
+                minimum=1e-8,
+                maximum=None,
+            )
+            if interval is None or not _v3_intervals_are_compatible(
+                interval,
+                pooled_interval,
+            ):
+                direct_conflict = True
+                break
+            direct_intervals.append(interval)
+        if direct_conflict or any(
+            not _v3_intervals_are_compatible(first, second)
+            for index, first in enumerate(direct_intervals)
+            for second in direct_intervals[index + 1 :]
+        ):
+            continue
+
+        confidences = [
+            float(
+                facts_by_bundle[bundle_id]["source_advance_grid_fact"].get(
+                    "confidence"
+                )
+                or 0.0
+            )
+            for bundle_id in component
+        ]
+        confidence = max(0.0, min(1.0, float(np.mean(confidences))))
+        group_fingerprint = hashlib.sha256(
+            "\n".join(component).encode("utf-8")
+        ).hexdigest()[:16]
+        p20, median, p80 = pooled_interval
+        for bundle_id in component:
+            if decisions_by_bundle.get(bundle_id, {}).get("source_scale") is not None:
+                continue
+            local = facts_by_bundle[bundle_id].get("source_scale_fact")
+            local_interval = (
+                local.get("interval") if isinstance(local, Mapping) else None
+            )
+            if _is_plain_sequence(local_interval) and len(local_interval) == 3:
+                try:
+                    local_median = float(local_interval[1])
+                    local_confidence = float(local.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if local_confidence >= V3_DIRECT_SCALE_MIN_CONFIDENCE:
+                    continue
+                # This contract repairs underestimation only. A low-confidence
+                # larger observation may be a real scale distinction and is
+                # therefore preserved rather than normalized downward.
+                if local_median >= p20:
+                    continue
+            updates[bundle_id] = _v3_axis_decision(
+                axis="source_scale",
+                value={
+                    "p20_px": p20,
+                    "median_px": median,
+                    "p80_px": p80,
+                },
+                status="peer",
+                confidence=confidence,
+                provenance=(
+                    "parent_style_arbitrator_v3:"
+                    "source_advance_relation_pooled_visible_ink"
+                ),
+                reason_codes=(
+                    "source_advance_grid_complete_link_relation",
+                    "pooled_visible_ink_full_cell_tier",
+                    "low_confidence_source_scale_underestimate_reconciled",
+                ),
+                peer_support={
+                    "group_id": (
+                        "current-page:source-scale:advance-relation:"
+                        f"{group_fingerprint}"
+                    ),
+                    "member_bundle_ids": component,
+                    "member_count": len(component),
+                    "relation_evidence": "source_advance_grid",
+                    "executable_measurement_basis": (
+                        "pooled_visible_ink_span"
+                    ),
+                    **{
+                        key: value
+                        for key, value in pooled.items()
+                        if key != "interval"
+                    },
+                },
+            )
+    return updates
+
+
 def _v3_apply_source_scale_peer_axis(
     *,
     facts_by_bundle: Mapping[str, Mapping[str, Any]],
     decisions_by_bundle: dict[str, dict[str, ParentStyleAxisDecisionV3]],
 ) -> None:
+    relation_updates = _v3_source_advance_relation_updates(
+        facts_by_bundle=facts_by_bundle,
+        decisions_by_bundle=decisions_by_bundle,
+    )
+    for bundle_id, decision in relation_updates.items():
+        decisions_by_bundle[bundle_id]["source_scale"] = decision
+
     updates: dict[str, ParentStyleAxisDecisionV3] = {}
     for target_id in sorted(facts_by_bundle):
         if "source_scale" in decisions_by_bundle[target_id]:
@@ -6801,6 +7189,7 @@ def _direct_only_style_evidence(
             or ""
         ),
         source_text_footprint=getattr(observation, "source_text_footprint", None),
+        source_advance_grid=getattr(observation, "source_advance_grid", None),
         evidence_provider="AuthorizedSourceStyleObserver",
         evidence_source="authorized_source_style_view_independent_axes",
         confidence=max(record.confidence for record in supported),
@@ -7443,6 +7832,7 @@ def observe_parent_style_evidence(
                 analysis_bbox=tuple(view.analysis_bbox),
                 detector_input_sha256=actual_detector_input_sha256,
                 source_text_footprint=source_text_footprint,
+                source_advance_grid=observation_inputs.source_advance_grid,
                 source_font_observation=source_font_observation,
                 source_font_style_evidence=source_font_style_evidence,
                 authorized_perceptual_source_identity={},
