@@ -22,6 +22,23 @@ _DEEPSEEK_JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 _DEEPSEEK_DISABLED_THINKING = {"type": "disabled"}
 
 
+class _RedactedRuntimeSecret:
+    """Keep an injected secret out of ordinary object and container reprs."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "<redacted runtime secret>"
+
+    __str__ = __repr__
+
+
 class _ThreadLocalSessionPool:
     """Own one persistent requests session per caller thread."""
 
@@ -207,11 +224,23 @@ class DeepSeekClient:
         base_url: str = "https://api.deepseek.com",
         api_key_path: str = "api/API_KEY",
         model_name: str = "deepseek-v4-flash",
+        api_key: str | None = None,
     ) -> None:
+        if api_key is not None and not isinstance(api_key, str):
+            raise TypeError("api_key must be a string or None")
         self._base_url = base_url.rstrip("/")
         self._api_key_path = api_key_path
+        self._runtime_api_key = (
+            _RedactedRuntimeSecret(api_key.strip()) if api_key is not None else None
+        )
         self.model_name = model_name
         self._http_sessions = _ThreadLocalSessionPool()
+
+    def __repr__(self) -> str:
+        source = "runtime-redacted" if self._runtime_api_key is not None else "legacy"
+        return f"DeepSeekClient(credential_source={source!r})"
+
+    __str__ = __repr__
 
     @staticmethod
     def has_configured_key(api_key_path: str = "api/API_KEY") -> bool:
@@ -221,7 +250,12 @@ class DeepSeekClient:
             return False
 
     def _headers(self) -> dict[str, str]:
-        api_key = _load_deepseek_api_key(self._api_key_path)
+        if self._runtime_api_key is None:
+            api_key = _load_deepseek_api_key(self._api_key_path)
+        else:
+            api_key = self._runtime_api_key.reveal()
+            if not api_key:
+                raise DeepSeekApiKeyError("Explicit DeepSeek runtime credential is empty.")
         return {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -246,7 +280,7 @@ class DeepSeekClient:
             )
             return response.status_code == 200
         except (DeepSeekApiKeyError, requests.RequestException) as exc:
-            logger.debug(f"DeepSeek unavailable: {exc}")
+            logger.debug("DeepSeek unavailable (%s).", type(exc).__name__)
             return False
 
     def generate(self, model: str, prompt: str, timeout: int = 600, options: Optional[dict] = None) -> str:
@@ -335,8 +369,11 @@ class DeepSeekClient:
                     results.update(chunk_map)
                 else:
                     logger.warning(f"Failed to parse glossary JSON (DeepSeek): {str(response)[:50]}...")
-            except Exception as e:
-                logger.error(f"Error translating glossary chunk (DeepSeek): {e}")
+            except Exception as exc:
+                logger.error(
+                    "Error translating glossary chunk (DeepSeek): %s",
+                    type(exc).__name__,
+                )
 
         final_map = {}
         for term in terms:
@@ -358,19 +395,28 @@ class DeepSeekClient:
 class OllamaClient:
     owns_http_sessions = True
 
-    def __init__(self, base_url: str = "http://localhost:11434") -> None:
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        *,
+        context_tokens: int = 4096,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
+        if type(context_tokens) is not int or context_tokens <= 0:
+            raise ValueError("context_tokens must be a positive integer")
+        self._context_tokens = context_tokens
         self._http_sessions = _ThreadLocalSessionPool()
 
-    _availability_cache = {"timestamp": 0.0, "status": False}
+    _availability_cache: dict[str, dict[str, object]] = {}
 
     def is_available(self, timeout: int = 5) -> bool:
         import time
         now = time.time()
         
         # Check cache (limit checks to once every 3 seconds globally)
-        if now - OllamaClient._availability_cache["timestamp"] < 3.0:
-            return OllamaClient._availability_cache["status"]
+        cached = OllamaClient._availability_cache.get(self._base_url)
+        if cached is not None and now - float(cached["timestamp"]) < 3.0:
+            return bool(cached["status"])
 
         url = f"{self._base_url}/api/tags"
         available = False
@@ -385,7 +431,10 @@ class OllamaClient:
             available = False
             
         # Update cache
-        OllamaClient._availability_cache = {"timestamp": now, "status": available}
+        OllamaClient._availability_cache[self._base_url] = {
+            "timestamp": now,
+            "status": available,
+        }
         return available
 
     def generate(self, model: str, prompt: str, timeout: int = 600, options: Optional[dict] = None) -> str:
@@ -393,6 +442,9 @@ class OllamaClient:
         default_options = {"temperature": 0.2}
         if options:
             default_options.update(options)
+        # Context is provider-profile authority and is resource-budgeted before
+        # Start; individual call sites cannot silently expand it.
+        default_options["num_ctx"] = self._context_tokens
         payload = {"model": model, "prompt": prompt, "stream": False, "options": default_options}
         response = self._http_sessions.get().post(url, json=payload, timeout=timeout)
         response.raise_for_status()

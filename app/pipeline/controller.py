@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 import sys
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
 from app.io.project import default_project_dict, load_project
@@ -42,6 +42,17 @@ from app.pipeline.style_context_cache import (
     load_style_context_journal,
     prepare_style_context_delta,
     style_context_snapshot_before,
+)
+from app.pipeline.status_contracts import (
+    PipelineErrorReceipt,
+    PipelineLifecycleEvent,
+    PipelineProgressSnapshot,
+    PipelineRetryAction,
+    PipelineRunState,
+    PipelineStage,
+    PipelineStageEvent,
+    new_error_id,
+    new_run_id,
 )
 from app.pipeline.steps import build_output_path, build_page_record
 from app.models.ollama import list_models
@@ -650,6 +661,12 @@ def _page014_timeout_checkpoint(stage: str, event: str, **fields: Any) -> None:
         return
 
 class PipelineStatus(QtCore.QObject):
+    # GUI-5 typed status seam.  Historical signals below remain intact for the
+    # compatibility shell during migration.
+    lifecycle_changed = QtCore.Signal(object)
+    stage_changed = QtCore.Signal(object)
+    progress_snapshot = QtCore.Signal(object)
+    structured_error = QtCore.Signal(object)
     progress_changed = QtCore.Signal(int)
     eta_changed = QtCore.Signal(str)
     page_changed = QtCore.Signal(int, int)
@@ -675,6 +692,7 @@ class PipelineSettings:
     source_lang: str
     target_lang: str
     ollama_model: str
+    ollama_base_url: str
     style_guide_path: str
     font_name: str
     use_gpu: bool
@@ -708,6 +726,8 @@ class PipelineSettings:
     files_whitelist: List[str] | None = None
     discovery_model: str | None = None # Model to use for discovery (None=Auto)
     discovery_backend: str = "Ollama" # "Ollama" or "GGUF"
+    discovery_base_url: str = "http://localhost:11434"
+    discovery_context: int = 4096
     prescan_enabled: bool = False  # Run pre-scan to build glossary before translation
     prescan_use_ner: bool = False  # Optional heavy NER enhancement for pre-scan
     debug_ocr: bool = False  # Save OCR crop images for debugging
@@ -719,6 +739,84 @@ class PipelineSettings:
     debug_disabled_stages: str = ""
     debug_dir: str = ""
     private_cleanup_validation_stop_after_cleanup: bool = False
+
+
+class PipelineRuntimeBinding:
+    """One-run provider credential carrier that is never serialized.
+
+    Typed GUI runs resolve an opaque credential reference immediately before
+    Start and place the resolved value only in this redacted, memory-only
+    carrier.  Legacy callers may omit the binding and keep the historical
+    provider lookup behavior.
+    """
+
+    __slots__ = ("_provider_kind", "_resolved_credential")
+
+    def __init__(
+        self,
+        *,
+        provider_kind: object,
+        resolved_credential: str | None,
+    ) -> None:
+        raw_kind = getattr(provider_kind, "value", provider_kind)
+        normalized_kind = str(raw_kind or "").strip().casefold().replace("_", "-")
+        if not normalized_kind:
+            raise ValueError("provider_kind must not be empty")
+        if resolved_credential is not None and not isinstance(resolved_credential, str):
+            raise TypeError("resolved_credential must be a string or None")
+        self._provider_kind = normalized_kind
+        self._resolved_credential = (
+            resolved_credential.strip() if resolved_credential is not None else None
+        )
+
+    @property
+    def provider_kind(self) -> str:
+        return self._provider_kind
+
+    @property
+    def has_resolved_credential(self) -> bool:
+        return bool(self._resolved_credential)
+
+    def credential_for_backend(self, backend: str) -> str:
+        normalized_backend = str(backend or "").strip().casefold().replace("_", "-")
+        if normalized_backend != self._provider_kind:
+            raise ValueError(
+                "runtime provider binding does not match the selected translator backend"
+            )
+        if not self._resolved_credential:
+            raise ValueError("resolved runtime credential is unavailable")
+        return self._resolved_credential
+
+    def __repr__(self) -> str:
+        state = "<redacted>" if self._resolved_credential else "<unavailable>"
+        return (
+            "PipelineRuntimeBinding("
+            f"provider_kind={self._provider_kind!r}, resolved_credential={state})"
+        )
+
+    __str__ = __repr__
+
+
+def _missing_required_gguf_model_path(settings: object) -> bool:
+    """Return whether the selected translation backend lacks its GGUF path."""
+
+    backend = str(getattr(settings, "translator_backend", "") or "").strip()
+    model_path = str(getattr(settings, "gguf_model_path", "") or "").strip()
+    return backend == "GGUF" and not model_path
+
+
+def _deepseek_unavailable_message(
+    runtime_binding: PipelineRuntimeBinding | None,
+) -> str:
+    if runtime_binding is not None:
+        return (
+            "DeepSeek API is not available. Verify the selected provider "
+            "credential and network access."
+        )
+    return (
+        "DeepSeek API is not available. Set DEEPSEEK_API_KEY or api/API_KEY "
+        "and verify network access."
+    )
 
 
 OCR_ENGINE_PADDLE_VL = "PaddleOCR-VL"
@@ -775,6 +873,10 @@ def _create_selected_ocr_engine(settings: PipelineSettings, message_callback=Non
 
 
 class PipelineWorker(QtCore.QThread):
+    lifecycle_changed = QtCore.Signal(object)
+    stage_changed = QtCore.Signal(object)
+    progress_snapshot = QtCore.Signal(object)
+    structured_error = QtCore.Signal(object)
     progress_changed = QtCore.Signal(int)
     eta_changed = QtCore.Signal(str)
     page_changed = QtCore.Signal(int, int)
@@ -790,15 +892,172 @@ class PipelineWorker(QtCore.QThread):
     prescan_progress = QtCore.Signal(int)
     prescan_finished = QtCore.Signal()
 
-    def __init__(self, settings: PipelineSettings, parent=None) -> None:
+    def __init__(
+        self,
+        settings: PipelineSettings,
+        parent=None,
+        *,
+        runtime_binding: PipelineRuntimeBinding | None = None,
+        run_id: str | None = None,
+    ) -> None:
         super().__init__(parent)
+        if runtime_binding is not None and not isinstance(
+            runtime_binding, PipelineRuntimeBinding
+        ):
+            raise TypeError("runtime_binding must be PipelineRuntimeBinding or None")
         self._settings = settings
+        self._runtime_binding = runtime_binding
+        self._run_id = str(run_id or new_run_id())
+        self._current_stage = PipelineStage.IDLE
+        self._terminal_lifecycle_emitted = False
+        self._terminal_error_emitted = False
+        self._pending_terminal_state: PipelineRunState | None = None
+        self._pending_terminal_message = ""
         self._stop_requested = False
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    def _emit_lifecycle(self, state: PipelineRunState, message: str = "") -> None:
+        event = PipelineLifecycleEvent(
+            run_id=self._run_id,
+            state=state,
+            message=message,
+        )
+        self.lifecycle_changed.emit(event)
+        if state in {
+            PipelineRunState.STOPPED,
+            PipelineRunState.COMPLETED,
+            PipelineRunState.FAILED,
+        }:
+            self._terminal_lifecycle_emitted = True
+
+    def _queue_terminal_lifecycle(
+        self,
+        state: PipelineRunState,
+        message: str = "",
+    ) -> None:
+        if state not in {
+            PipelineRunState.STOPPED,
+            PipelineRunState.COMPLETED,
+            PipelineRunState.FAILED,
+        }:
+            raise ValueError("only terminal lifecycle states may be queued")
+        self._pending_terminal_state = state
+        self._pending_terminal_message = message
+
+    def _flush_terminal_lifecycle(self) -> None:
+        if self._terminal_lifecycle_emitted:
+            return
+        if self._pending_terminal_state is not None:
+            self._emit_lifecycle(
+                self._pending_terminal_state,
+                self._pending_terminal_message,
+            )
+            return
+        self._emit_failed_terminal_if_needed()
+
+    def _emit_stage(
+        self,
+        stage: PipelineStage,
+        detail: str = "",
+        *,
+        page_id: str = "",
+        parent_id: str = "",
+    ) -> None:
+        self._current_stage = stage
+        self.stage_changed.emit(
+            PipelineStageEvent(
+                run_id=self._run_id,
+                stage=stage,
+                page_id=page_id,
+                parent_id=parent_id,
+                detail=detail,
+            )
+        )
+
+    def _emit_progress_snapshot(
+        self,
+        *,
+        completed_pages: int,
+        total_pages: int,
+        percent: int,
+        eta_seconds: float | None,
+        current_page_id: str = "",
+        current_parent_id: str = "",
+    ) -> None:
+        self.progress_snapshot.emit(
+            PipelineProgressSnapshot(
+                run_id=self._run_id,
+                completed_pages=completed_pages,
+                total_pages=total_pages,
+                percent=percent,
+                stage=self._current_stage,
+                eta_seconds=eta_seconds,
+                current_page_id=current_page_id,
+                current_parent_id=current_parent_id,
+            )
+        )
+
+    def _emit_structured_error(
+        self,
+        *,
+        code: str,
+        owner_stage: PipelineStage,
+        message: str,
+        detail: str = "",
+        page_id: str = "",
+        parent_id: str = "",
+        recoverable: bool,
+        retry_action: PipelineRetryAction,
+        operation: str = "",
+        prior_state_safe: bool = True,
+        terminal: bool = False,
+    ) -> PipelineErrorReceipt:
+        receipt = PipelineErrorReceipt(
+            error_id=new_error_id(),
+            run_id=self._run_id,
+            code=code,
+            owner_stage=owner_stage,
+            message=message,
+            detail=detail,
+            page_id=page_id,
+            parent_id=parent_id,
+            recoverable=recoverable,
+            retry_action=retry_action,
+            operation=operation,
+            prior_state_safe=prior_state_safe,
+        )
+        if terminal:
+            self._terminal_error_emitted = True
+        self.structured_error.emit(receipt)
+        return receipt
+
+    def _emit_failed_terminal_if_needed(self) -> None:
+        if self._terminal_lifecycle_emitted:
+            return
+        if not self._terminal_error_emitted:
+            self._emit_structured_error(
+                code="pipeline_terminated",
+                owner_stage=self._current_stage,
+                message="The pipeline ended before completion.",
+                detail="No typed terminal receipt was produced by the owning stage.",
+                recoverable=True,
+                retry_action=PipelineRetryAction.RETRY_RUN,
+                operation="run",
+                terminal=True,
+            )
+        self._emit_lifecycle(
+            PipelineRunState.FAILED,
+            "The pipeline ended before completion.",
+        )
 
     def request_stop(self) -> None:
         self._stop_requested = True
 
     def run(self) -> None:
+        self._emit_stage(PipelineStage.VALIDATION, "Validating run inputs")
         images = _list_images(self._settings.import_dir)
 
         # Filter by whitelist if provided (for re-translation)
@@ -810,7 +1069,18 @@ class PipelineWorker(QtCore.QThread):
         total = len(images)
         self.queue_reset.emit(images)
         if total == 0:
-            self.message.emit("No images found in import folder.")
+            message = "No images found in import folder."
+            self._emit_structured_error(
+                code="no_input_pages",
+                owner_stage=PipelineStage.VALIDATION,
+                message=message,
+                recoverable=True,
+                retry_action=PipelineRetryAction.RELINK,
+                operation="enumerate_inputs",
+                terminal=True,
+            )
+            self.message.emit(message)
+            self._emit_lifecycle(PipelineRunState.FAILED, message)
             return
         if self._settings.fast_mode:
             self._settings.detector_engine = "ComicTextDetector"
@@ -821,10 +1091,23 @@ class PipelineWorker(QtCore.QThread):
         if not os.path.isdir(self._settings.export_dir):
             try:
                 os.makedirs(self._settings.export_dir, exist_ok=True)
-            except OSError:
-                self.message.emit("Failed to create export folder.")
+            except OSError as exc:
+                message = "Failed to create export folder."
+                self._emit_structured_error(
+                    code="export_directory_unavailable",
+                    owner_stage=PipelineStage.VALIDATION,
+                    message=message,
+                    detail=f"{type(exc).__name__}: {exc}",
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RELINK,
+                    operation="create_export_directory",
+                    terminal=True,
+                )
+                self.message.emit(message)
+                self._emit_lifecycle(PipelineRunState.FAILED, message)
                 return
 
+        self._emit_stage(PipelineStage.INITIALIZATION, "Initializing selected runtime")
         start_time = time.time()
         from app.translate.ollama_client import DeepSeekClient, OllamaClient
         from app.render.renderer import render_parent_execution_bundles
@@ -885,7 +1168,18 @@ class PipelineWorker(QtCore.QThread):
                         time.perf_counter() - ocr_initialization_start
                     )
             except Exception as inner_exc:
-                self.message.emit(_friendly_model_error(inner_exc))
+                message = _friendly_model_error(inner_exc)
+                self._emit_structured_error(
+                    code="ocr_initialization_failed",
+                    owner_stage=PipelineStage.INITIALIZATION,
+                    message=message,
+                    detail=f"{type(inner_exc).__name__}: {inner_exc}",
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RETRY_RUN,
+                    operation="initialize_ocr",
+                    terminal=True,
+                )
+                self.message.emit(message)
                 return
 
             try:
@@ -902,7 +1196,18 @@ class PipelineWorker(QtCore.QThread):
                         time.perf_counter() - detector_initialization_start
                     )
             except Exception as exc:
-                self.message.emit(_friendly_model_error(exc))
+                message = _friendly_model_error(exc)
+                self._emit_structured_error(
+                    code="detector_initialization_failed",
+                    owner_stage=PipelineStage.INITIALIZATION,
+                    message=message,
+                    detail=f"{type(exc).__name__}: {exc}",
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RETRY_RUN,
+                    operation="initialize_detector",
+                    terminal=True,
+                )
+                self.message.emit(message)
                 return
             background_detector = detector if not self._settings.filter_background else None
 
@@ -930,24 +1235,64 @@ class PipelineWorker(QtCore.QThread):
                             "build or switch to Ollama."
                         )
                 elif self._settings.translator_backend == "DeepSeek":
+                    runtime_api_key = (
+                        self._runtime_binding.credential_for_backend("DeepSeek")
+                        if self._runtime_binding is not None
+                        else None
+                    )
                     ollama = DeepSeekClient(
                         base_url=self._settings.deepseek_base_url,
                         model_name=self._settings.deepseek_model,
+                        api_key=runtime_api_key,
                     )
                     if not ollama.is_available():
-                        self.message.emit("DeepSeek API is not available. Set DEEPSEEK_API_KEY or api/API_KEY and verify network access.")
+                        message = _deepseek_unavailable_message(self._runtime_binding)
+                        self._emit_structured_error(
+                            code="translation_provider_unavailable",
+                            owner_stage=PipelineStage.INITIALIZATION,
+                            message=message,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RETRY_RUN,
+                            operation="initialize_translation_provider",
+                            terminal=True,
+                        )
+                        self.message.emit(message)
                         return
                 else:
-                    ollama = OllamaClient()
+                    ollama = OllamaClient(
+                        base_url=self._settings.ollama_base_url,
+                        context_tokens=self._settings.ollama_context,
+                    )
                     if not ollama.is_available():
-                        self.message.emit("Ollama server is not running. Start it with: ollama serve")
+                        message = "Ollama server is not running. Start it with: ollama serve"
+                        self._emit_structured_error(
+                            code="translation_provider_unavailable",
+                            owner_stage=PipelineStage.INITIALIZATION,
+                            message=message,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RETRY_RUN,
+                            operation="initialize_translation_provider",
+                            terminal=True,
+                        )
+                        self.message.emit(message)
                         return
                 if perf_telemetry_is_enabled:
                     worker_initialization["translator_initialization_time"] = (
                         time.perf_counter() - translator_initialization_start
                     )
             except Exception as exc:
-                self.message.emit(_friendly_model_error(exc))
+                message = _friendly_model_error(exc)
+                self._emit_structured_error(
+                    code="translator_initialization_failed",
+                    owner_stage=PipelineStage.INITIALIZATION,
+                    message=message,
+                    detail=f"{type(exc).__name__}: {exc}",
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RETRY_RUN,
+                    operation="initialize_translator",
+                    terminal=True,
+                )
+                self.message.emit(message)
                 return
             if self._settings.translator_backend == "GGUF":
                 model_name = self._settings.gguf_model_path
@@ -962,10 +1307,30 @@ class PipelineWorker(QtCore.QThread):
                 if resolved_model and self._settings.ollama_model != "auto-detect":
                     available = list_models()
                     if available and resolved_model not in available:
-                        self.message.emit(f"Ollama model not found: {resolved_model}")
+                        message = f"Ollama model not found: {resolved_model}"
+                        self._emit_structured_error(
+                            code="translation_model_missing",
+                            owner_stage=PipelineStage.INITIALIZATION,
+                            message=message,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RELINK,
+                            operation="resolve_translation_model",
+                            terminal=True,
+                        )
+                        self.message.emit(message)
                         return
-            elif not self._settings.gguf_model_path:
-                self.message.emit("GGUF model path is required for GGUF backend.")
+            elif _missing_required_gguf_model_path(self._settings):
+                message = "GGUF model path is required for GGUF backend."
+                self._emit_structured_error(
+                    code="translation_model_missing",
+                    owner_stage=PipelineStage.INITIALIZATION,
+                    message=message,
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RELINK,
+                    operation="resolve_translation_model",
+                    terminal=True,
+                )
+                self.message.emit(message)
                 return
 
             # Ensure model name is set on the client for glossary translation
@@ -1068,6 +1433,7 @@ class PipelineWorker(QtCore.QThread):
 
             # Pre-Scan Mode: Build complete glossary before translation
             if self._settings.prescan_enabled and self._settings.auto_glossary:
+                self._emit_stage(PipelineStage.PRESCAN, "Building the run glossary")
                 self.prescan_started.emit()
                 self.message.emit("Pre-Scan Mode: Building glossary before translation...")
                 try:
@@ -1090,13 +1456,27 @@ class PipelineWorker(QtCore.QThread):
                         save_style_guide(self._settings.style_guide_path, style_guide)
                     self.message.emit(f"Pre-Scan complete: {len(style_guide.get('glossary', []))} glossary entries.")
                 except Exception as e:
-                    self.message.emit(f"Pre-Scan failed: {e}. Continuing with normal translation.")
+                    message = f"Pre-Scan failed: {e}. Continuing with normal translation."
+                    self._emit_structured_error(
+                        code="prescan_failed",
+                        owner_stage=PipelineStage.PRESCAN,
+                        message=message,
+                        detail=f"{type(e).__name__}: {e}",
+                        recoverable=False,
+                        retry_action=PipelineRetryAction.NONE,
+                        operation="prescan",
+                    )
+                    self.message.emit(message)
                     import logging
                     logging.getLogger(__name__).exception("Pre-scan error")
                 finally:
                     self.prescan_finished.emit()
             if self._settings.prescan_only:
                 self.message.emit("Pre-Scan only mode complete.")
+                self._queue_terminal_lifecycle(
+                    PipelineRunState.COMPLETED,
+                    "Pre-Scan only mode complete.",
+                )
                 return
             cleanup_model_prewarmed = False
             cleanup_model_warmup_record: dict[str, Any] = {}
@@ -1156,15 +1536,30 @@ class PipelineWorker(QtCore.QThread):
                     base_project=project,
                 )
             except Exception as exc:
-                self.message.emit(
+                message = (
                     "Failed to initialize incremental project persistence: "
                     f"{type(exc).__name__}: {exc}"
                 )
+                self._emit_structured_error(
+                    code="checkpoint_initialization_failed",
+                    owner_stage=PipelineStage.PERSISTENCE,
+                    message=message,
+                    detail=f"{type(exc).__name__}: {exc}",
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RETRY_RUN,
+                    operation="initialize_checkpoint",
+                    terminal=True,
+                )
+                self.message.emit(message)
                 return
             style_font_manager = None
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
                     self.message.emit("Stopped")
+                    self._queue_terminal_lifecycle(
+                        PipelineRunState.STOPPED,
+                        "Stopped at the next safe page boundary.",
+                    )
                     return
 
                 page_start = time.time()
@@ -1174,6 +1569,19 @@ class PipelineWorker(QtCore.QThread):
 
                 source_path = os.path.join(self._settings.import_dir, name)
                 output_path = build_output_path(self._settings.export_dir, name, self._settings.output_suffix)
+                page_id = os.path.splitext(name)[0]
+                self._emit_stage(
+                    PipelineStage.DETECTION,
+                    "Preparing page analysis",
+                    page_id=page_id,
+                )
+                self._emit_progress_snapshot(
+                    completed_pages=index - 1,
+                    total_pages=total,
+                    percent=int((index - 1) / total * 100),
+                    eta_seconds=None,
+                    current_page_id=page_id,
+                )
                 style_context_snapshot = style_context_snapshot_before(
                     style_context_journal,
                     page_index=index - 1,
@@ -1233,6 +1641,11 @@ class PipelineWorker(QtCore.QThread):
                         discovery_model=self._settings.discovery_model,
                         settings=self._settings,
                         debug_context=debug_context,
+                        stage_callback=lambda stage, detail: self._emit_stage(
+                            stage,
+                            detail,
+                            page_id=page_id,
+                        ),
                     )
                     regions = page_result.regions
                     execution_regions = page_result.execution_regions
@@ -1273,11 +1686,26 @@ class PipelineWorker(QtCore.QThread):
                     )
                     page_elapsed = time.time() - page_start
                     self.queue_item.emit(index - 1, f"error ({_format_seconds(page_elapsed)}): {exc}")
-                    self.message.emit(f"Failed to process {name}: {exc}")
+                    message = f"Failed to process {name}: {exc}"
+                    self._emit_structured_error(
+                        code="page_processing_failed",
+                        owner_stage=self._current_stage,
+                        message=message,
+                        detail=f"{type(exc).__name__}: {exc}",
+                        page_id=page_id,
+                        recoverable=True,
+                        retry_action=PipelineRetryAction.RETRY_PAGE,
+                        operation="process_page",
+                    )
+                    self.message.emit(message)
                     continue
 
-                page_id = os.path.splitext(name)[0]
                 source_glyph_mask_result = None
+                self._emit_stage(
+                    PipelineStage.SOURCE_GLYPH,
+                    "Building source-glyph evidence",
+                    page_id=page_id,
+                )
                 try:
                     source_glyph_start = time.time()
                     _page014_timeout_checkpoint("sourceglyph_generation", "start", page_id=page_id)
@@ -1318,6 +1746,16 @@ class PipelineWorker(QtCore.QThread):
                             "source_glyph_mask_errors": [f"{type(exc).__name__}: {exc}"],
                             "source_glyph_masks": [],
                         }
+                    self._emit_structured_error(
+                        code="source_glyph_failed",
+                        owner_stage=PipelineStage.SOURCE_GLYPH,
+                        message=f"Source-glyph evidence failed for {name}.",
+                        detail=f"{type(exc).__name__}: {exc}",
+                        page_id=page_id,
+                        recoverable=True,
+                        retry_action=PipelineRetryAction.RETRY_PAGE,
+                        operation="build_source_glyph_evidence",
+                    )
 
                 cleanup_job_contract_result = None
                 cleanup_mask_contract_result = None
@@ -1329,6 +1767,11 @@ class PipelineWorker(QtCore.QThread):
                 cleaned_page_base_record = {}
                 cleanup_upstream_temp_path = ""
                 source_image_size = None
+                self._emit_stage(
+                    PipelineStage.CLEANUP,
+                    "Building and applying cleanup contracts",
+                    page_id=page_id,
+                )
                 try:
                     cleanup_contract_start = time.time()
                     _page014_timeout_checkpoint("cleanup_contract_chain", "start", page_id=page_id)
@@ -1842,6 +2285,16 @@ class PipelineWorker(QtCore.QThread):
                                 "renderer_consumed": False,
                                 },
                             }
+                    self._emit_structured_error(
+                        code="cleanup_failed",
+                        owner_stage=PipelineStage.CLEANUP,
+                        message=f"Cleanup processing failed for {name}.",
+                        detail=f"{type(exc).__name__}: {exc}",
+                        page_id=page_id,
+                        recoverable=True,
+                        retry_action=PipelineRetryAction.RETRY_PAGE,
+                        operation="run_cleanup",
+                    )
 
                 _sync_parent_execution_downstream_contracts(
                     parent_execution_bundles,
@@ -1877,9 +2330,25 @@ class PipelineWorker(QtCore.QThread):
                         )
                         page_elapsed = time.time() - page_start
                         self.queue_item.emit(index - 1, f"error ({_format_seconds(page_elapsed)}): {exc}")
-                        self.message.emit(f"Failed to write cleanup validation output for {name}: {exc}")
+                        message = f"Failed to write cleanup validation output for {name}: {exc}"
+                        self._emit_structured_error(
+                            code="cleanup_validation_output_failed",
+                            owner_stage=PipelineStage.CLEANUP,
+                            message=message,
+                            detail=f"{type(exc).__name__}: {exc}",
+                            page_id=page_id,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RETRY_PAGE,
+                            operation="write_cleanup_validation_output",
+                        )
+                        self.message.emit(message)
                         continue
                 else:
+                    self._emit_stage(
+                        PipelineStage.STYLE,
+                        "Resolving current-page source style",
+                        page_id=page_id,
+                    )
                     parent_font_mode = str(self._settings.font_detection or "off").strip()
                     parent_style_observation = None
                     style_view_result = None
@@ -2032,20 +2501,42 @@ class PipelineWorker(QtCore.QThread):
                                         f"authorized_style_stage_failed:{type(exc).__name__}:{exc}",
                                     ),
                                 )
-                                self.message.emit(
+                                message = (
                                     f"Parent style evidence failed for {name}; "
                                     "current-page arbitration will use explicit unavailable evidence."
                                 )
+                                self._emit_structured_error(
+                                    code="style_evidence_unavailable",
+                                    owner_stage=PipelineStage.STYLE,
+                                    message=message,
+                                    detail=f"{type(exc).__name__}: {exc}",
+                                    page_id=page_id,
+                                    recoverable=False,
+                                    retry_action=PipelineRetryAction.NONE,
+                                    operation="observe_parent_style",
+                                )
+                                self.message.emit(message)
                             except Exception as fallback_exc:
                                 page_elapsed = time.time() - page_start
                                 self.queue_item.emit(
                                     index - 1,
                                     f"error ({_format_seconds(page_elapsed)}): {fallback_exc}",
                                 )
-                                self.message.emit(
+                                message = (
                                     f"Failed to record unavailable parent style evidence for "
                                     f"{name}: {fallback_exc}"
                                 )
+                                self._emit_structured_error(
+                                    code="style_evidence_fallback_failed",
+                                    owner_stage=PipelineStage.STYLE,
+                                    message=message,
+                                    detail=f"{type(fallback_exc).__name__}: {fallback_exc}",
+                                    page_id=page_id,
+                                    recoverable=True,
+                                    retry_action=PipelineRetryAction.RETRY_PAGE,
+                                    operation="record_unavailable_style_evidence",
+                                )
+                                self.message.emit(message)
                                 continue
                             if debug_context is not None and not debug_context.get(
                                 "perf_telemetry_only"
@@ -2175,10 +2666,22 @@ class PipelineWorker(QtCore.QThread):
                             index - 1,
                             f"error ({_format_seconds(page_elapsed)}): {exc}",
                         )
-                        self.message.emit(
+                        message = (
                             "Failed to resolve current-page parent styles for "
                             f"{name}: {type(exc).__name__}: {exc}"
                         )
+                        self._emit_structured_error(
+                            code="style_resolution_failed",
+                            owner_stage=PipelineStage.STYLE,
+                            message=message,
+                            detail=f"{type(exc).__name__}: {exc}",
+                            page_id=page_id,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RETRY_PAGE,
+                            operation="resolve_parent_styles",
+                            terminal=True,
+                        )
+                        self.message.emit(message)
                         return
 
                     observation_audit = parent_style_observation.to_audit_dict()
@@ -2314,6 +2817,11 @@ class PipelineWorker(QtCore.QThread):
                                     parent_font_detection=record,
                                 )
 
+                    self._emit_stage(
+                        PipelineStage.RENDERING,
+                        "Rendering the committed page output",
+                        page_id=page_id,
+                    )
                     render_start = time.time()
                     _page014_timeout_checkpoint(
                         "renderer_entry",
@@ -2388,7 +2896,19 @@ class PipelineWorker(QtCore.QThread):
                             except OSError:
                                 pass
                         self.queue_item.emit(index - 1, f"error: {exc}")
-                        self.message.emit(f"Failed to render {name}: {exc}")
+                        message = f"Failed to render {name}: {exc}"
+                        self._emit_structured_error(
+                            code="render_failed",
+                            owner_stage=PipelineStage.RENDERING,
+                            message=message,
+                            detail=f"{type(exc).__name__}: {exc}",
+                            page_id=page_id,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RETRY_PAGE,
+                            operation="render_page",
+                            terminal=True,
+                        )
+                        self.message.emit(message)
                         return
                     if style_context_delta is not None:
                         try:
@@ -2420,6 +2940,11 @@ class PipelineWorker(QtCore.QThread):
                     except OSError:
                         pass
 
+                self._emit_stage(
+                    PipelineStage.PERSISTENCE,
+                    "Committing the page checkpoint",
+                    page_id=page_id,
+                )
                 page_record = build_page_record(
                     source_path,
                     page_id,
@@ -2455,10 +2980,22 @@ class PipelineWorker(QtCore.QThread):
                         index - 1,
                         f"error ({_format_seconds(page_elapsed)}): {exc}",
                     )
-                    self.message.emit(
+                    message = (
                         f"Failed to checkpoint project after {name}: "
                         f"{type(exc).__name__}: {exc}"
                     )
+                    self._emit_structured_error(
+                        code="checkpoint_commit_failed",
+                        owner_stage=PipelineStage.PERSISTENCE,
+                        message=message,
+                        detail=f"{type(exc).__name__}: {exc}",
+                        page_id=page_id,
+                        recoverable=True,
+                        retry_action=PipelineRetryAction.RETRY_PAGE,
+                        operation="commit_page_checkpoint",
+                        terminal=True,
+                    )
+                    self.message.emit(message)
                     return
                 if isinstance(debug_context, dict):
                     set_timing(
@@ -2538,6 +3075,13 @@ class PipelineWorker(QtCore.QThread):
                 avg = elapsed / index
                 remaining = avg * (total - index)
                 self.eta_changed.emit(_format_eta(remaining))
+                self._emit_progress_snapshot(
+                    completed_pages=index,
+                    total_pages=total,
+                    percent=progress,
+                    eta_seconds=remaining,
+                    current_page_id=page_id,
+                )
 
                 # --- PER-PAGE MEMORY CLEANUP ---
                 # Prevent memory accumulation over long chapters (fixes 2GB+ leak)
@@ -2600,6 +3144,10 @@ class PipelineWorker(QtCore.QThread):
                     except Exception as exc:
                         self.message.emit(f"Failed to write performance telemetry for {name}: {exc}")
 
+            self._emit_stage(
+                PipelineStage.FINALIZING,
+                "Finalizing the durable project",
+            )
             project["pages"] = list(pages)
             project["style_context_cache"] = (
                 style_context_journal.to_project_dict()
@@ -2609,10 +3157,21 @@ class PipelineWorker(QtCore.QThread):
                     expected_project=project,
                 )
             except Exception as exc:
-                self.message.emit(
+                message = (
                     "Failed to finalize project JSON from the durable page "
                     f"checkpoint: {type(exc).__name__}: {exc}"
                 )
+                self._emit_structured_error(
+                    code="checkpoint_finalize_failed",
+                    owner_stage=PipelineStage.FINALIZING,
+                    message=message,
+                    detail=f"{type(exc).__name__}: {exc}",
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RETRY_RUN,
+                    operation="finalize_checkpoint",
+                    terminal=True,
+                )
+                self.message.emit(message)
                 return
             if perf_telemetry_is_enabled and perf_telemetry_output_root:
                 try:
@@ -2659,6 +3218,7 @@ class PipelineWorker(QtCore.QThread):
             total_elapsed = time.time() - start_time
             self.total_time_changed.emit(f"Total: {_format_seconds(total_elapsed)}")
             self.message.emit("Completed")
+            self._queue_terminal_lifecycle(PipelineRunState.COMPLETED, "Completed")
         finally:
             if checkpoint_session is not None:
                 try:
@@ -2713,7 +3273,10 @@ class PipelineWorker(QtCore.QThread):
                                 elif self._settings.use_ollama_discovery:
                                     try:
                                         from app.translate.ollama_client import OllamaClient
-                                        new_client = OllamaClient()
+                                        new_client = OllamaClient(
+                                            base_url=self._settings.discovery_base_url,
+                                            context_tokens=self._settings.discovery_context,
+                                        )
                                         if new_client.is_available():
                                             discovery_client = new_client
                                             created_client = new_client
@@ -2813,6 +3376,7 @@ class PipelineWorker(QtCore.QThread):
                     ollama.close()
                 except Exception:
                     pass
+            self._flush_terminal_lifecycle()
 
 
 class PipelineController(QtCore.QObject):
@@ -2821,18 +3385,95 @@ class PipelineController(QtCore.QObject):
         self.status = PipelineStatus()
         self._running = False
         self._worker: PipelineWorker | None = None
+        self._current_run_id = ""
 
-    def start(self, settings: PipelineSettings) -> None:
+    def start(
+        self,
+        settings: PipelineSettings,
+        *,
+        runtime_binding: PipelineRuntimeBinding | None = None,
+    ) -> bool:
         if self._running:
-            return
+            return False
+        if runtime_binding is not None and not isinstance(
+            runtime_binding, PipelineRuntimeBinding
+        ):
+            raise TypeError("runtime_binding must be PipelineRuntimeBinding or None")
+        run_id = new_run_id()
+        self._current_run_id = run_id
+        self.status.lifecycle_changed.emit(
+            PipelineLifecycleEvent(
+                run_id=run_id,
+                state=PipelineRunState.VALIDATING,
+                message="Validating run settings",
+            )
+        )
+        self.status.stage_changed.emit(
+            PipelineStageEvent(
+                run_id=run_id,
+                stage=PipelineStage.VALIDATION,
+                detail="Validating run settings",
+            )
+        )
         if not settings.import_dir:
-            self.status.message.emit("Import folder is required.")
-            return
+            message = "Import folder is required."
+            self.status.structured_error.emit(
+                PipelineErrorReceipt(
+                    error_id=new_error_id(),
+                    run_id=run_id,
+                    code="import_directory_required",
+                    owner_stage=PipelineStage.VALIDATION,
+                    message=message,
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RELINK,
+                    operation="validate_run_settings",
+                )
+            )
+            self.status.message.emit(message)
+            self.status.lifecycle_changed.emit(
+                PipelineLifecycleEvent(
+                    run_id=run_id,
+                    state=PipelineRunState.FAILED,
+                    message=message,
+                )
+            )
+            self._current_run_id = ""
+            return False
         if not settings.export_dir:
-            self.status.message.emit("Export folder is required.")
-            return
+            message = "Export folder is required."
+            self.status.structured_error.emit(
+                PipelineErrorReceipt(
+                    error_id=new_error_id(),
+                    run_id=run_id,
+                    code="export_directory_required",
+                    owner_stage=PipelineStage.VALIDATION,
+                    message=message,
+                    recoverable=True,
+                    retry_action=PipelineRetryAction.RELINK,
+                    operation="validate_run_settings",
+                )
+            )
+            self.status.message.emit(message)
+            self.status.lifecycle_changed.emit(
+                PipelineLifecycleEvent(
+                    run_id=run_id,
+                    state=PipelineRunState.FAILED,
+                    message=message,
+                )
+            )
+            self._current_run_id = ""
+            return False
         self._running = True
-        self._worker = PipelineWorker(settings, self)
+        self._worker = PipelineWorker(
+            settings,
+            self,
+            runtime_binding=runtime_binding,
+            run_id=run_id,
+        )
+        self._worker.lifecycle_changed.connect(self.status.lifecycle_changed.emit)
+        self._worker.stage_changed.connect(self.status.stage_changed.emit)
+        self._worker.progress_snapshot.connect(self.status.progress_snapshot.emit)
+        self._worker.structured_error.connect(self.status.structured_error.emit)
         self._worker.progress_changed.connect(self.status.progress_changed.emit)
         self._worker.eta_changed.connect(self.status.eta_changed.emit)
         self._worker.page_changed.connect(self.status.page_changed.emit)
@@ -2850,6 +3491,14 @@ class PipelineController(QtCore.QObject):
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
         self.status.message.emit("Started")
+        self.status.lifecycle_changed.emit(
+            PipelineLifecycleEvent(
+                run_id=run_id,
+                state=PipelineRunState.RUNNING,
+                message="Started",
+            )
+        )
+        return True
 
     def stop(self) -> None:
         if not self._running:
@@ -2857,10 +3506,19 @@ class PipelineController(QtCore.QObject):
         if self._worker:
             self._worker.request_stop()
         self.status.message.emit("Stopping...")
+        if self._current_run_id:
+            self.status.lifecycle_changed.emit(
+                PipelineLifecycleEvent(
+                    run_id=self._current_run_id,
+                    state=PipelineRunState.STOP_REQUESTED,
+                    message="Stop requested; waiting for the next safe page boundary.",
+                )
+            )
 
     def _on_finished(self):
         self._running = False
         self._worker = None
+        self._current_run_id = ""
 
     def start_deep_scan(self, settings: PipelineSettings):
         """Start deep scan worker."""
@@ -2947,7 +3605,10 @@ class DeepScanWorker(QtCore.QThread):
                     print("DeepScan: GGUF backend selected but model path is invalid")
                     return
             else:
-                ollama = OllamaClient()
+                ollama = OllamaClient(
+                    base_url=self.settings.discovery_base_url,
+                    context_tokens=self.settings.discovery_context,
+                )
                 if not ollama.is_available():
                     print("DeepScan: Ollama server is not running")
                     return
@@ -9977,6 +10638,7 @@ def _process_page(
     discovery_model: str | None = None,
     settings: PipelineSettings | None = None,
     debug_context: dict | None = None,
+    stage_callback: Callable[[PipelineStage, str], None] | None = None,
 ) -> PageProcessingResult:
     from app.pipeline.debug_artifacts import add_count, add_timing, mark_render_region, mark_translation_plan, set_count
     from app.pipeline.bubble_detection import BubbleDetectionInput, run_bubble_detection
@@ -9998,6 +10660,15 @@ def _process_page(
         enrich_text_area_plan_with_region_records,
     )
 
+    def notify_stage(stage: PipelineStage, detail: str) -> None:
+        if stage_callback is None:
+            return
+        try:
+            stage_callback(stage, detail)
+        except Exception:
+            # Presentation status must never become a pipeline dependency.
+            logger.debug("Pipeline stage callback failed", exc_info=True)
+
     # Initialize Filter
     text_filter = TextFilter(settings)
 
@@ -10010,6 +10681,7 @@ def _process_page(
     page_id = os.path.splitext(os.path.basename(image_path))[0]
     text_area_plan = None
     text_area_plan_start = time.time()
+    notify_stage(PipelineStage.DETECTION, "Detecting page text areas")
     try:
         bubble_detection_start = time.perf_counter()
         bubble_detection_result = run_bubble_detection(
@@ -10191,6 +10863,7 @@ def _process_page(
             )
     add_timing(debug_context, "grouping_time", time.time() - grouping_start)
     set_count(debug_context, "detected_regions", len(groups))
+    notify_stage(PipelineStage.OCR, "Recognizing source text")
     regions = []
     pending_texts: dict[str, list[str]] = {}
     glossary_texts: list[str] = []
@@ -10905,6 +11578,7 @@ def _process_page(
         set_count(debug_context, "logical_text_block_skipped_containers", logical_block_result.skipped_container_count)
     hierarchy_start = time.time()
     initial_hierarchy_start = time.perf_counter()
+    notify_stage(PipelineStage.HIERARCHY, "Building the effective text hierarchy")
     initial_text_block_hierarchy = build_text_block_hierarchy(
         page_id=page_id,
         regions=regions,
@@ -11110,6 +11784,7 @@ def _process_page(
                 int(post_plan_logical_repairs.get("logical_text_render_eligibility_repair_count") or 0),
             )
     translation_start = time.time()
+    notify_stage(PipelineStage.TRANSLATION, "Translating parent assignments")
     translation_assignments = (
         _translation_assignments_from_parent_execution_bundles(parent_execution_bundles)
         if parent_execution_bundles
@@ -16642,7 +17317,14 @@ def _trigger_discovery_if_needed(
             else:
                 try:
                     from app.translate.ollama_client import OllamaClient
-                    new_client = OllamaClient()
+                    new_client = OllamaClient(
+                        base_url=settings.discovery_base_url
+                        if settings is not None
+                        else "http://localhost:11434",
+                        context_tokens=settings.discovery_context
+                        if settings is not None
+                        else 4096,
+                    )
                     if new_client.is_available():
                         discovery_client = new_client
                         use_deep_scan = True

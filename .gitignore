@@ -44,11 +44,30 @@ app/tests/*
 # Local validation workflow
 validation/
 
+# Repository-local test/runtime scratch
+# Durable validation evidence belongs under output/, which is already ignored.
+/.t/
+/tmp*/
+
+# Ad-hoc QA harnesses and their outputs are local validation material.
+/qa/
+/*.yomiframe.json
+/.*.checkpoint.sqlite3*
+/.*.publish.lock
+/*_translated.jpg
+/cleaned_page_base/
+/style_guide.json
+
 # Local test data
 tests/
 
 # Local debug artifacts
 debug_artifacts/
+
+# Prototypes
+prototypes/
+
+
 
 # Documentation
 *.md

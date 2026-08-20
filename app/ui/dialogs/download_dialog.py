@@ -1,47 +1,93 @@
 # -*- coding: utf-8 -*-
-"""Download progress dialog."""
-from PySide6 import QtWidgets, QtCore
+"""Hybrid Pro runtime-download progress dialog."""
+from __future__ import annotations
 
-class DownloadDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, title="Downloading Models"):
+from PySide6 import QtCore, QtWidgets
+
+from app.ui.design_system.dialogs import HybridDialog
+
+
+class DownloadDialog(HybridDialog):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        title: str = "Downloading Models",
+    ) -> None:
         super().__init__(parent)
+        self.setObjectName("downloadDialog")
         self.setWindowTitle(title)
-        self.setFixedWidth(400)
-        self.setWindowModality(QtCore.Qt.ApplicationModal)
-        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowCloseButtonHint) # Disable close button to enforce wait or cancel
+        self.setMinimumWidth(460)
+        self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        self.setAccessibleName(title)
+        self.setAccessibleDescription(
+            "Managed runtime download progress with an explicit cancellation action."
+        )
 
         layout = QtWidgets.QVBoxLayout(self)
-        
-        self.status_label = QtWidgets.QLabel("Initializing...")
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(16)
+        layout.addWidget(
+            self.create_dialog_header(
+                title=title,
+                subtitle=(
+                    "YomiFrame keeps this asset in its managed runtime folder. "
+                    "Cancel leaves the current installed state unchanged."
+                ),
+                icon_name="runtime",
+                close_accessible_name="Cancel download",
+            )
+        )
+
+        self.status_label = QtWidgets.QLabel("Preparing download…")
+        self.status_label.setObjectName("downloadStatus")
+        self.status_label.setProperty("role", "secondary")
         self.status_label.setWordWrap(True)
+        self.status_label.setAccessibleName("Download status")
         layout.addWidget(self.status_label)
 
         self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setObjectName("downloadProgress")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setAccessibleName("Runtime asset download progress")
         layout.addWidget(self.progress_bar)
 
-        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        footer = QtWidgets.QHBoxLayout()
+        footer.addStretch(1)
+        self.cancel_btn = QtWidgets.QPushButton("Cancel download")
+        self.cancel_btn.setProperty("role", "command")
+        self.cancel_btn.setProperty("variant", "quiet")
+        self.cancel_btn.setAccessibleName("Cancel runtime asset download")
         self.cancel_btn.clicked.connect(self.reject)
-        layout.addWidget(self.cancel_btn)
-        
+        footer.addWidget(self.cancel_btn)
+        layout.addLayout(footer)
+
+        if self.dialog_header is not None:
+            QtWidgets.QWidget.setTabOrder(
+                self.cancel_btn,
+                self.dialog_header.close_button,
+            )
         self._downloader = None
 
-    def set_downloader(self, downloader):
-        """Connect downloader signals."""
+    def set_downloader(self, downloader: QtCore.QObject) -> None:
+        """Connect the owned downloader without changing worker semantics."""
+
         self._downloader = downloader
         self._downloader.progress_changed.connect(self.progress_bar.setValue)
         self._downloader.status_changed.connect(self.status_label.setText)
-        self._downloader.finished.connect(self._on_finished)
-        # Connect cancel
-        self.rejected.connect(self._downloader.request_cancel)
+        terminal = getattr(self._downloader, "completed", self._downloader.finished)
+        terminal.connect(self._on_finished)
+        self.rejected.connect(
+            self._downloader.request_cancel,
+            QtCore.Qt.ConnectionType.DirectConnection,
+        )
 
-    def _on_finished(self, success: bool, message: str):
+    def _on_finished(self, success: bool, message: str) -> None:
+        self.status_label.setText(str(message or "Download finished."))
         if success:
             self.accept()
         else:
-            if message == "Cancelled":
-                pass # Already rejected
-            else:
-                QtWidgets.QMessageBox.critical(self, "Download Error", message)
-                self.reject()
+            self.reject()
+
+
+__all__ = ["DownloadDialog"]

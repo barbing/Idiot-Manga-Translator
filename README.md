@@ -74,15 +74,23 @@ Packaged YomiFrame builds validate their bundled private ICU runtime and never
 download a replacement at startup. Other required assets can be downloaded by
 the same prompt or placed under the local `models` folder.
 
-### Translation Model Setup
+### Translation Provider Setup
 
-YomiFrame supports local translation backends.
+YomiFrame preserves the existing GGUF and Ollama translation paths and also
+supports authenticated DeepSeek profiles. Configure them in **Settings >
+Providers**. The workflow is explicit: create or select a profile, enter its
+public configuration, choose **Test provider**, then choose **Use for
+translation** after validation succeeds. Workspace **Start** remains disabled
+until the selected profile is validated.
 
 For GGUF models:
 
 1. Create a `models` folder if it does not already exist.
 2. Put one or more `.gguf` model files anywhere under that folder.
-3. Start the app and select the model from the GGUF model list.
+3. In **Settings > Providers**, create a GGUF local profile, browse to the file,
+   and test it. Validation checks that the `.gguf` file is readable without
+   loading the model.
+4. Choose **Use for translation**, then apply the settings.
 
 Example layout:
 
@@ -98,7 +106,14 @@ For Ollama:
 
 1. Install and start Ollama separately.
 2. Pull a translation-capable model.
-3. Start YomiFrame and select the Ollama backend/model in the UI.
+3. In **Settings > Providers**, enter the Ollama endpoint and installed model.
+4. Test the profile, choose **Use for translation**, and apply the settings.
+
+For DeepSeek, create a DeepSeek API profile, keep the official API endpoint,
+select a currently available model, and choose **Test and link credential**.
+The API key is held transiently for the connection test and is saved to Windows
+Credential Manager only after a successful result and explicit confirmation;
+portable settings contain only an opaque credential reference.
 
 ### Build A Windows App Folder
 
@@ -162,15 +177,28 @@ This separation is important because manga pages contain many things that look l
 
 ### Desktop Workflow
 
-The desktop app provides the normal user workflow:
+The production desktop app uses one project-centered GUI-7 shell with four
+surfaces: Project Hub, Translation Workspace, Page Editor, and Settings and
+Providers. It provides the normal user workflow:
 
 - choose input and output folders
 - choose source and target languages
-- choose local translation settings
+- see imported pages immediately in the Workspace queue and selected source
+  image in the Page Editor
+- configure, test, and activate a translation provider
 - run translation jobs
 - monitor progress
-- review pages and regions
-- edit glossary/style-guide information when needed
+- review pages and evidence-backed parents
+- apply reversible parent, text, cleanup, style, layout, glossary, and History
+  edits, then invoke Preview explicitly
+
+User editing never changes detector, OCR, translation, cleanup, style,
+eligibility, or renderer algorithms. A custom scope starts as pending workflow
+intent and obtains source text only from an explicit OCR revision. Merge and
+Split retain exact immutable detected-parent identities, bboxes, OCR text,
+reading order, and already admitted render evidence. Typed source or target text
+can override only an existing mapped/selected-revision parent; entering text
+cannot create or render a parent by itself.
 
 ### Model and Asset Management
 
@@ -234,6 +262,13 @@ This helps prevent:
 
 After the hierarchy is finalized, `ParentExecutionBundle` records carry the parent id, root id, source text, execution region, cleanup target, render allowed area, represented children, source-glyph ids, cleanup ids, render ids, OCR provenance, and style hints. Source regions remain evidence; the parent execution bundle is the normal downstream execution unit.
 
+The GUI edit ledger does not rewrite those bundles. Evidence-backed user
+topology stores references to the exact automatic parents/bundles and their OCR
+and geometry facts. A mapped Merge can present several immutable source parents
+as one user parent, and a mapped Split can partition those source members
+without cutting, duplicating, or inventing evidence. History simply changes
+which typed mapping/edit is active.
+
 ### Translation
 
 YomiFrame is built around local translation. The current recommended path is a local GGUF backend, with Ollama available as an alternate local backend.
@@ -277,12 +312,23 @@ For normal use:
 
 1. Prepare input pages in a folder.
 2. Start YomiFrame.
-3. Choose input and output folders.
+3. Choose input and output folders. Supported source images immediately appear
+   as naturally ordered queued pages with thumbnails; selecting a page opens its
+   source image in the Page Editor before the pipeline runs.
 4. Select source and target languages.
-5. Use the local translation backend and OCR settings appropriate for the machine.
-6. Enable glossary/name memory for chapter or volume work.
-7. Run translation.
-8. Review output pages, especially dialogue completeness, source-text cleanup, and rendered text fit.
+5. In **Settings > Providers**, test the desired GGUF, Ollama, or DeepSeek
+   profile and choose **Use for translation**. A profile whose current
+   configuration has not passed validation cannot enable Start.
+6. Set OCR options and, if needed, glossary/name memory for chapter or volume
+   work.
+7. Treat **Output Defaults** as fallback output presentation only. Detected
+   per-parent style and explicit user style/layout edits remain authoritative.
+8. Run translation.
+9. Review output pages and parent evidence in the Page Editor.
+10. Use custom-scope OCR, Merge, or Split when topology needs correction; use
+   text fields only as overrides on the resulting evidence-backed parent.
+11. Preview explicitly and review dialogue completeness, source-text cleanup,
+    and rendered text fit before relying on edited output.
 
 For development validation, use a real page set rather than only checking logs or metadata. Visual correctness must be judged from the actual images.
 

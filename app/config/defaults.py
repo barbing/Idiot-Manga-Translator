@@ -72,6 +72,8 @@ class AppDefaults:
     gguf_model_path: str = ""
     gguf_prompt_style: str = "sakura"
     gguf_n_ctx: int = 4096
+    # -1 is the GUI's Automatic policy. Resource admission resolves it to one
+    # exact per-run layer count before controller materialization.
     gguf_n_gpu_layers: int = -1
     gguf_n_threads: int = 8
     gguf_n_batch: int = 256
@@ -83,6 +85,7 @@ class AppDefaults:
     ollama_temperature: float = 0.2
     ollama_top_p: float = 0.9
     ollama_context: int = 4096
+    ollama_base_url: str = "http://localhost:11434"
     gguf_temperature: float = 0.2
     gguf_top_p: float = 0.95
 

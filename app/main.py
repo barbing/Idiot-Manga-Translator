@@ -34,10 +34,32 @@ def _configure_paddle_env() -> None:
 
 
 def _preload_torch() -> None:
+    """Compatibility helper for explicit headless/full-run workers.
+
+    The interactive GUI bootstrap deliberately does not call this helper;
+    runtime readiness is handed to the shell only after it has been shown.
+    """
+
     try:
         import torch  # noqa: F401
     except Exception:
         return
+
+
+def _schedule_runtime_readiness(window: object) -> bool:
+    """Hand deferred readiness ownership to a shell that implements it.
+
+    The shell hook must schedule non-modal work after its first paint.  Calling
+    the hook does not itself import a model runtime, touch the network, or run a
+    readiness scan.  Legacy windows without the hook retain their own migration
+    behavior until the GUI-7 cutover.
+    """
+
+    schedule = getattr(window, "schedule_runtime_readiness", None)
+    if not callable(schedule):
+        return False
+    schedule()
+    return True
 
 
 def main() -> int:
@@ -53,9 +75,8 @@ def main() -> int:
             pass
     _configure_dll_paths()
     _configure_paddle_env()
-    _preload_torch()
     from PySide6 import QtWidgets, QtGui
-    from app.ui.main_window import MainWindow
+    from app.ui.application_coordinator import create_gui_application_window
     app = QtWidgets.QApplication(sys.argv)
     
     # Set global default font to prevent "Point size <= 0" errors
@@ -63,8 +84,9 @@ def main() -> int:
     font.setStyleStrategy(QtGui.QFont.PreferAntialias)
     app.setFont(font)
     
-    window = MainWindow()
+    window = create_gui_application_window()
     window.show()
+    _schedule_runtime_readiness(window)
     return app.exec()
 
 

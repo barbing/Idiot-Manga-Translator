@@ -730,7 +730,6 @@ class ModelDownloader(QtCore.QObject):
         """Queue YuzuMarker font detection and local CJK fallback font assets."""
         onnx_dir = os.path.join(models_dir, "YuzuMarker", "onnx")
         labels_dir = os.path.join(models_dir, "YuzuMarker", "safetensors")
-        font_dir = noto_cjk_sc_font_dir(models_dir)
         onnx_url = f"https://huggingface.co/{YUZUMARKER_FONT_ONNX_REPO_ID}/resolve/main"
         labels_url = f"https://huggingface.co/{YUZUMARKER_FONT_LABELS_REPO_ID}/resolve/main"
         targets = [
@@ -751,6 +750,14 @@ class ModelDownloader(QtCore.QObject):
                 label="Downloading YuzuMarker fallback font labels...",
             ),
         ]
+        self.queue_targets(targets)
+        self.prepare_noto_cjk_sc_font_pack(models_dir)
+
+    def prepare_noto_cjk_sc_font_pack(self, models_dir: str):
+        """Queue only the local CJK fallback fonts shown by Runtime Assets."""
+
+        font_dir = noto_cjk_sc_font_dir(models_dir)
+        targets = []
         for relative_path in NOTO_CJK_SC_FONT_FILES:
             targets.append(
                 DownloadTarget(

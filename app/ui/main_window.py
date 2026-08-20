@@ -2,26 +2,79 @@
 """Main window UI."""
 import importlib.util
 import os
+from dataclasses import replace
+from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 from app.config.defaults import get_defaults
+from app.config.credential_store import (
+    CompositeCredentialResolver,
+    EnvironmentCredentialResolver,
+    WindowsCredentialStore,
+)
+from app.config.module_registry import DEFAULT_MODULE_REGISTRY
+from app.config.provider_profiles import (
+    GGUFProviderOptions,
+    GenerationSettings,
+    ModelGenerationOverride,
+    OllamaProviderOptions,
+    ProviderKind,
+    ProviderProfileStore,
+)
+from app.config.run_settings_compiler import (
+    CompilationResult,
+    RunInvocation,
+    materialize_pipeline_settings,
+)
+from app.config.settings_contracts import (
+    ApplicationPreferences,
+    ModuleConfig,
+    ProjectConfig,
+    RunSettingsSnapshot,
+    SettingsScope,
+    canonical_fingerprint,
+)
+from app.config.settings_migration import (
+    LegacyRunInvocationDefaults,
+    LegacySettingsMigrationResult,
+    legacy_project_settings_seed_required,
+    migrate_legacy_qsettings_once,
+    publish_legacy_migration_marker_last,
+)
+from app.config.settings_store import (
+    ApplicationSettingsDocument,
+    ApplicationSettingsStore,
+    InactiveLegacyMigrationEvidence,
+    LegacyMigrationIssueEvidence,
+)
 from app.pipeline.controller import (
-    OCR_ENGINE_CHOICES,
     PipelineController,
+    PipelineRuntimeBinding,
     PipelineSettings,
     _normalize_ocr_engine_name,
 )
 from app.models.ollama import list_models
 from app.ui.theme import apply_dark_palette, apply_light_palette
-from app.io.project import load_project
-from app.pipeline.parent_execution_bundle import parent_execution_bundles_from_audit_records
-from app.render.renderer import render_parent_execution_bundles
+from app.io.project import (
+    load_project,
+    load_project_for_editing,
+    migrate_project_schema_v2,
+    project_storage_is_checkpoint_descriptor,
+    read_project_settings,
+    save_project_schema_v2_atomic,
+    with_project_settings,
+)
 from app.ui.style_guide_editor import StyleGuideEditor
 from app.ui.region_review import RegionReviewDialog
 from app.models.downloader import ModelDownloader
 from app.ui.dialogs.download_dialog import DownloadDialog
+from app.ui.viewmodels.settings_model import (
+    LegacyShellSettingsProjection,
+    SettingsDraft,
+    SettingsViewModel,
+    rebind_run_snapshot_project,
+)
 
 import glob
-import json
 import logging
 import re
 
@@ -56,6 +109,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._download_thread: QtCore.QThread | None = None
         self._download_dialog: DownloadDialog | None = None
         self._download_worker: ModelDownloader | None = None
+        self._settings_model: SettingsViewModel | None = None
+        self._application_settings_store: ApplicationSettingsStore | None = None
+        self._provider_profile_store: ProviderProfileStore | None = None
+        self._application_settings_document = ApplicationSettingsDocument()
+        self._last_run_snapshot: RunSettingsSnapshot | None = None
+        self._active_project_id: str | None = None
+        self._active_run_json_path: str | None = None
+        self._pending_run_snapshot: RunSettingsSnapshot | None = None
+        self._pending_project_id: str | None = None
+        self._pending_run_json_path: str | None = None
+        self._settings_projection_guard = False
         self._setup_ui()
         self._connect_signals()
         self.start_btn.setEnabled(False)
@@ -682,6 +746,42 @@ class MainWindow(QtWidgets.QMainWindow):
         vbox = QtWidgets.QVBoxLayout(panel)
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(10)
+
+        summary_group = QtWidgets.QGroupBox("Effective Run")
+        summary_layout = QtWidgets.QFormLayout(summary_group)
+        self.settings_effective_status = QtWidgets.QLabel("Not evaluated")
+        self.settings_effective_status.setWordWrap(True)
+        self.settings_effective_language = QtWidgets.QLabel("--")
+        self.settings_effective_language.setWordWrap(True)
+        self.settings_effective_provider = QtWidgets.QLabel("--")
+        self.settings_effective_provider.setWordWrap(True)
+        self.settings_effective_model = QtWidgets.QLabel("--")
+        self.settings_effective_model.setWordWrap(True)
+        self.settings_effective_detection = QtWidgets.QLabel("--")
+        self.settings_effective_detection.setWordWrap(True)
+        self.settings_effective_cleanup = QtWidgets.QLabel("--")
+        self.settings_effective_cleanup.setWordWrap(True)
+        self.settings_effective_runtime = QtWidgets.QLabel("--")
+        self.settings_effective_runtime.setWordWrap(True)
+        self.settings_effective_snapshot = QtWidgets.QLabel("--")
+        self.settings_effective_snapshot.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.settings_effective_validation = QtWidgets.QLabel(
+            "Validation has not run."
+        )
+        self.settings_effective_validation.setWordWrap(True)
+        summary_layout.addRow("Status", self.settings_effective_status)
+        summary_layout.addRow("Language", self.settings_effective_language)
+        summary_layout.addRow("Provider", self.settings_effective_provider)
+        summary_layout.addRow("Model", self.settings_effective_model)
+        summary_layout.addRow("Detection / OCR", self.settings_effective_detection)
+        summary_layout.addRow("Cleanup / Style", self.settings_effective_cleanup)
+        summary_layout.addRow("Runtime", self.settings_effective_runtime)
+        summary_layout.addRow("Snapshot", self.settings_effective_snapshot)
+        summary_layout.addRow("Validation", self.settings_effective_validation)
+        vbox.addWidget(summary_group)
+
         group = QtWidgets.QGroupBox("Save Options")
         layout = QtWidgets.QFormLayout(group)
         self.settings_save_folder = QtWidgets.QLineEdit()
@@ -817,11 +917,15 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         self.detector_engine = QtWidgets.QComboBox()
-        self.detector_engine.addItems(["ComicTextDetector"])
+        self.detector_engine.addItems(
+            self._supported_setting_texts("detection.engine")
+        )
         self.detector_engine.setCurrentText(self._defaults.detector_engine)
         
         self.detector_input_size = QtWidgets.QComboBox()
-        self.detector_input_size.addItems(["640", "1024", "1280"])
+        self.detector_input_size.addItems(
+            self._supported_setting_texts("detection.input_size")
+        )
         self.detector_input_size.setCurrentText("640")
         
         det_layout = self._hbox(self.detector_engine, self.detector_input_size)
@@ -829,7 +933,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("Text Detector"), 0, 0)
         layout.addWidget(det_layout, 1, 0)
         self.ocr_engine = QtWidgets.QComboBox()
-        self.ocr_engine.addItems(list(OCR_ENGINE_CHOICES))
+        self.ocr_engine.addItems(self._supported_setting_texts("ocr.engine"))
         self.ocr_engine.setCurrentText(self._defaults.ocr_engine)
         layout.addWidget(QtWidgets.QLabel("OCR Engine"), 0, 1)
         layout.addWidget(self.ocr_engine, 1, 1)
@@ -890,15 +994,21 @@ class MainWindow(QtWidgets.QMainWindow):
         l_core = QtWidgets.QGridLayout(grp_core)
         
         self.settings_detector_engine = QtWidgets.QComboBox()
-        self.settings_detector_engine.addItems(["ComicTextDetector"])
+        self.settings_detector_engine.addItems(
+            self._supported_setting_texts("detection.engine")
+        )
         self.settings_detector_engine.setCurrentText(self._defaults.detector_engine)
         
         self.settings_detector_input_size = QtWidgets.QComboBox()
-        self.settings_detector_input_size.addItems(["640", "1024", "1280"])
+        self.settings_detector_input_size.addItems(
+            self._supported_setting_texts("detection.input_size")
+        )
         self.settings_detector_input_size.setCurrentText("640")
         
         self.settings_ocr_engine = QtWidgets.QComboBox()
-        self.settings_ocr_engine.addItems(list(OCR_ENGINE_CHOICES))
+        self.settings_ocr_engine.addItems(
+            self._supported_setting_texts("ocr.engine")
+        )
         self.settings_ocr_engine.setCurrentText(self._defaults.ocr_engine)
         
         l_core.addWidget(QtWidgets.QLabel("Text Detector"), 0, 0)
@@ -971,7 +1081,7 @@ class MainWindow(QtWidgets.QMainWindow):
         l_trans.addWidget(self.settings_trans_ollama_warning, 7, 1)
 
         self.settings_trans_deepseek_warning = QtWidgets.QLabel(
-            "⚠️ DeepSeek backend selected, but DEEPSEEK_API_KEY or api/API_KEY is missing."
+            "⚠️ DeepSeek backend selected, but its credential reference is not linked."
         )
         self.settings_trans_deepseek_warning.setStyleSheet("color: #ef4444; font-size: 10px; font-weight: 600;")
         self.settings_trans_deepseek_warning.setVisible(False)
@@ -994,7 +1104,9 @@ class MainWindow(QtWidgets.QMainWindow):
         l_scan.addWidget(self.settings_scan_note, 0, 0, 1, 2)
         
         self.settings_discovery_backend = QtWidgets.QComboBox()
-        self.settings_discovery_backend.addItems(["Ollama", "GGUF"])
+        self.settings_discovery_backend.addItems(
+            self._supported_setting_texts("translation.discovery_backend")
+        )
         
         self.settings_discovery_ollama_model = QtWidgets.QComboBox()
         self.settings_discovery_ollama_model.addItems(["auto-detect"])
@@ -1226,18 +1338,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.font_name.setCurrentText(self._defaults.font_name)
         layout.addRow("Font", self.font_name)
         self.font_detection = QtWidgets.QComboBox()
-        self.font_detection.addItems(["off", "heuristic", "yuzumarker"])
+        self.font_detection.addItems(
+            self._supported_setting_texts("source_style.font_detection")
+        )
         self.font_detection.setCurrentText(self._defaults.font_detection)
         layout.addRow("Font Detection", self.font_detection)
-        self.filter_background = QtWidgets.QCheckBox("Ignore background/onoma text")
-        self.filter_background.setChecked(True)
-        self.filter_strength = QtWidgets.QComboBox()
-        self.filter_strength.addItems(["normal", "aggressive"])
-        self.filter_strength.setCurrentText(self._defaults.filter_strength)
-        layout.addRow("", self.filter_background)
-        layout.addRow("Filter Strength", self.filter_strength)
         self.inpaint_mode = QtWidgets.QComboBox()
-        self.inpaint_mode.addItems(["fast", "ai", "off"])
+        self.inpaint_mode.addItems(
+            self._supported_setting_texts("cleanup.inpaint_mode")
+        )
         self.inpaint_mode.setCurrentText(self._defaults.inpaint_mode)
         layout.addRow("Inpainting", self.inpaint_mode)
         
@@ -1254,10 +1363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QFormLayout(group)
         self.use_gpu = QtWidgets.QCheckBox("Enable GPU when available")
         self.use_gpu.setChecked(True)
-        self.fast_mode = QtWidgets.QCheckBox("Fast Mode (detector/inpaint only)")
-        self.fast_mode.setChecked(self._defaults.fast_mode)
         layout.addRow("", self.use_gpu)
-        layout.addRow("", self.fast_mode)
         return group
 
     def _group_theme(self) -> QtWidgets.QGroupBox:
@@ -1327,16 +1433,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return icons
 
     def _switch_page(self, index: int) -> None:
-        prev = self._active_page_index
-        if prev == 3:
-            self._sync_settings_to_models()
-            self._sync_paths_from_settings()
-        if index == 3:
-            self._sync_models_to_settings()
-            self._sync_paths_to_settings()
         self._active_page_index = index
         self.center_stack.setCurrentIndex(index)
         self.right_stack.setCurrentIndex(index)
+        if index == 3:
+            self._refresh_effective_run_summary()
+
+    @staticmethod
+    def _supported_setting_texts(qualified_id: str) -> list[str]:
+        """Project the editable combo vocabulary from the module registry."""
+
+        return [
+            str(value)
+            for value in DEFAULT_MODULE_REGISTRY.supported_values(qualified_id)
+        ]
 
     def _sync_models_to_settings(self) -> None:
         self.settings_detector_engine.setCurrentText(self.detector_engine.currentText())
@@ -1700,7 +1810,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.settings_trans_deepseek_warning.setVisible(True)
             elif not self._deepseek_key_configured():
                 self.settings_trans_deepseek_warning.setText(
-                    "⚠️ DeepSeek backend selected, but DEEPSEEK_API_KEY or api/API_KEY is missing."
+                    "⚠️ DeepSeek backend selected, but its credential reference is not linked."
                 )
                 self.settings_trans_deepseek_warning.setVisible(True)
 
@@ -1737,11 +1847,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _deepseek_key_configured(self) -> bool:
-        try:
-            from app.translate.ollama_client import DeepSeekClient
-            return DeepSeekClient.has_configured_key()
-        except Exception:
+        if self._settings_model is None:
             return False
+        profile = self._settings_model.draft.translation_profile
+        return bool(
+            profile is not None
+            and profile.kind is ProviderKind.DEEPSEEK
+            and profile.credential_ref is not None
+        )
 
     def _gguf_runtime_available(self) -> bool:
         try:
@@ -1749,29 +1862,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         except Exception:
             return False
-
-    def _validate_translation_backend(self, settings: PipelineSettings) -> str:
-        if settings.translator_backend == "DeepSeek":
-            if not (settings.deepseek_model or "").strip():
-                return "DeepSeek backend selected, but the model name is empty."
-            if not (settings.deepseek_base_url or "").strip():
-                return "DeepSeek backend selected, but the base URL is empty."
-            if not self._deepseek_key_configured():
-                return "DeepSeek backend selected, but DEEPSEEK_API_KEY or api/API_KEY is missing."
-            return ""
-        if settings.translator_backend != "GGUF":
-            return ""
-        gguf_path = (settings.gguf_model_path or "").strip()
-        if not gguf_path:
-            return "GGUF backend selected, but no GGUF model path is set."
-        if not os.path.isfile(gguf_path):
-            return f"GGUF backend selected, but model file was not found: {gguf_path}"
-        if not self._gguf_runtime_available():
-            return (
-                "GGUF backend selected, but llama-cpp-python is not available in this environment. "
-                "Install it with 'pip install llama-cpp-python' or switch Translator backend to Ollama."
-            )
-        return ""
 
     def _settings_selected_gguf(self) -> str:
         data = self.settings_gguf_model_path.currentData()
@@ -1790,6 +1880,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.import_browse.clicked.connect(self._choose_import_dir)
         self.export_browse.clicked.connect(self._choose_export_dir)
         self.json_browse.clicked.connect(self._choose_json_path)
+        self.json_path.editingFinished.connect(self._on_project_path_edited)
         self.style_browse.clicked.connect(self._choose_style_path)
         self.style_edit.clicked.connect(self._open_style_editor)
         self.gguf_browse.clicked.connect(self._choose_gguf_model)
@@ -1870,13 +1961,205 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_import_preview()
         self._sync_models_to_settings()
         self._sync_paths_to_settings()
-        self._load_saved_settings()
+        self._initialize_settings_authority()
+        self._connect_live_settings_authority()
 
-    def closeEvent(self, event):
-        logger.info("Application closing via closeEvent")
-        self._stop_pipeline()
-        super().closeEvent(event)
-        
+    def _connect_live_settings_authority(self) -> None:
+        """Route every editable workflow control into one typed draft.
+
+        The visible Settings controls and the shared Home controls are inputs
+        only.  Hidden legacy model controls are updated solely as projections
+        so neither Start nor page navigation has to choose a mirror direction.
+        """
+
+        home_combo_inputs = (
+            self.detector_engine,
+            self.detector_input_size,
+            self.ocr_engine,
+            self.translator_backend,
+            self.ollama_model,
+            self.gguf_model_path,
+            self.gguf_prompt_style,
+        )
+        for widget in home_combo_inputs:
+            widget.currentTextChanged.connect(self._dispatch_home_settings_edit)
+        for widget in (
+            self.gguf_n_ctx,
+            self.gguf_n_gpu_layers,
+            self.gguf_n_threads,
+            self.gguf_n_batch,
+        ):
+            widget.valueChanged.connect(self._dispatch_home_settings_edit)
+
+        combo_inputs = (
+            self.source_lang,
+            self.target_lang,
+            self.inpaint_mode,
+            self.font_detection,
+            self.font_name,
+            self.theme_combo,
+            self.settings_detector_engine,
+            self.settings_detector_input_size,
+            self.settings_ocr_engine,
+            self.settings_translator_backend,
+            self.settings_ollama_model,
+            self.settings_gguf_model_path,
+            self.settings_gguf_prompt_style,
+            self.settings_discovery_backend,
+            self.settings_discovery_ollama_model,
+            self.settings_discovery_gguf_path,
+            self.settings_gen_preset,
+        )
+        for widget in combo_inputs:
+            widget.currentTextChanged.connect(self._dispatch_settings_edit)
+
+        numeric_inputs = (
+            self.settings_ollama_temp,
+            self.settings_ollama_top_p,
+            self.settings_ollama_ctx,
+            self.settings_gguf_temp,
+            self.settings_gguf_top_p,
+            self.settings_gguf_n_ctx,
+            self.settings_gguf_n_gpu_layers,
+            self.settings_gguf_n_threads,
+            self.settings_gguf_n_batch,
+            self.override_ollama_temp,
+            self.override_ollama_top_p,
+            self.override_ollama_ctx,
+            self.override_gguf_temp,
+            self.override_gguf_top_p,
+            self.override_gguf_n_ctx,
+            self.override_gguf_n_gpu_layers,
+            self.override_gguf_n_threads,
+            self.override_gguf_n_batch,
+        )
+        for widget in numeric_inputs:
+            widget.valueChanged.connect(self._dispatch_settings_edit)
+
+        boolean_inputs = (
+            self.use_gpu,
+            self.auto_glossary,
+            self.prescan_enabled,
+            self.use_ollama_discovery,
+            self.override_enabled,
+        )
+        for widget in boolean_inputs:
+            widget.toggled.connect(self._dispatch_settings_edit)
+        self.override_copy_btn.clicked.connect(self._dispatch_settings_edit)
+        self.override_reset_btn.clicked.connect(self._dispatch_settings_edit)
+
+        text_inputs = (
+            self.output_suffix,
+            self.style_path,
+            self.inpaint_model_id,
+            self.settings_deepseek_model,
+            self.settings_deepseek_base_url,
+        )
+        for widget in text_inputs:
+            widget.editingFinished.connect(self._dispatch_settings_edit)
+
+        for widget in (self.import_dir, self.export_dir, self.json_path):
+            widget.textChanged.connect(self._dispatch_project_path_edit)
+        self.output_suffix.textChanged.connect(self._dispatch_project_path_edit)
+
+    def _dispatch_home_settings_edit(self, *_args) -> None:
+        if self._settings_projection_guard or self._settings_model is None:
+            return
+        self._settings_projection_guard = True
+        try:
+            self._sync_models_to_settings()
+        finally:
+            self._settings_projection_guard = False
+        self._dispatch_settings_edit()
+
+    def _dispatch_project_path_edit(self, *_args) -> None:
+        if self._settings_projection_guard:
+            return
+        self._settings_projection_guard = True
+        try:
+            self._sync_paths_to_settings()
+        finally:
+            self._settings_projection_guard = False
+        self._refresh_effective_run_summary()
+
+    def _dispatch_settings_edit(self, *_args) -> None:
+        if self._settings_projection_guard or self._settings_model is None:
+            return
+        previous = self._settings_model.draft
+        try:
+            self._settings_model.replace_application(
+                replace(
+                    previous.application,
+                    theme=self.theme_combo.currentText(),
+                )
+            )
+            draft = self._settings_model.replace_from_legacy_shell(
+                self._settings_projection()
+            )
+        except (TypeError, ValueError) as exc:
+            self._settings_model.replace_draft(previous)
+            self._apply_settings_draft_to_shell(previous)
+            self.status_bar.showMessage(f"Settings edit was not applied: {exc}", 5000)
+            return
+        self._apply_settings_draft_to_shell(draft)
+        self._refresh_effective_run_summary()
+
+    def _effective_run_preview_project_id(self) -> str:
+        json_path = self.json_path.text().strip()
+        normalized = os.path.normcase(os.path.abspath(json_path or "project.json"))
+        if (
+            self._active_project_id
+            and self._active_run_json_path == normalized
+        ):
+            return self._active_project_id
+        return f"project:gui-preview:{canonical_fingerprint({'json_path': normalized})[:32]}"
+
+    def _refresh_effective_run_summary(self) -> None:
+        """Refresh the read-only candidate shown before a run can start."""
+
+        if self._settings_model is None or not hasattr(
+            self, "settings_effective_status"
+        ):
+            return
+        try:
+            summary = self._settings_model.preview_effective_run_summary(
+                project_id=self._effective_run_preview_project_id(),
+                invocation=RunInvocation(
+                    import_dir=self.import_dir.text().strip(),
+                    export_dir=self.export_dir.text().strip(),
+                    json_path=self.json_path.text().strip(),
+                ),
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self.settings_effective_status.setText("Unavailable")
+            self.settings_effective_validation.setText(str(exc))
+            return
+
+        status = (
+            "Configuration ready"
+            if summary.ready
+            else "Configuration needs attention"
+        )
+        if summary.pending_changes:
+            status += " · Pending changes"
+        self.settings_effective_status.setText(status)
+        self.settings_effective_language.setText(summary.language_pair)
+        self.settings_effective_provider.setText(summary.provider)
+        self.settings_effective_model.setText(summary.model)
+        self.settings_effective_detection.setText(summary.detection_and_ocr)
+        self.settings_effective_cleanup.setText(summary.cleanup_and_style)
+        self.settings_effective_runtime.setText(summary.runtime)
+        snapshot_hash = summary.snapshot_id.rsplit(":", 1)[-1]
+        self.settings_effective_snapshot.setText(snapshot_hash[:12])
+        if summary.issues:
+            visible = [issue.message for issue in summary.issues[:2]]
+            remaining = len(summary.issues) - len(visible)
+            if remaining:
+                visible.append(f"+{remaining} more")
+            self.settings_effective_validation.setText("; ".join(visible))
+        else:
+            self.settings_effective_validation.setText("No blocking issues.")
+
     def _apply_theme(self, theme: str) -> None:
         app = QtWidgets.QApplication.instance()
         if not app:
@@ -1907,11 +2190,56 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.json_path.setText(path)
             self.settings_json_path.setText(path)
+            self._hydrate_typed_project_path(path)
+
+    def _on_project_path_edited(self) -> None:
+        self._hydrate_typed_project_path(self.json_path.text().strip())
+
+    def _hydrate_typed_project_path(self, path: str) -> None:
+        if self._running or self._settings_model is None or not os.path.isfile(path):
+            return
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        if normalized_path == self._active_run_json_path:
+            return
+        try:
+            stored_project = load_project_for_editing(path)
+            stored_settings = read_project_settings(stored_project)
+            application_modules = self._module_configs_for_scope(
+                self._settings_model.draft.module_configs,
+                SettingsScope.APPLICATION,
+            )
+            modules = {
+                config.module_id: config for config in application_modules
+            }
+            modules.update(
+                {
+                    config.module_id: config
+                    for config in stored_settings.module_configs
+                }
+            )
+            self._settings_model.replace_project(stored_settings.project_config)
+            self._settings_model.replace_modules(
+                tuple(modules[key] for key in sorted(modules))
+            )
+            self._settings_model.apply()
+            self._last_run_snapshot = stored_settings.last_run_snapshot
+            self._active_project_id = str(
+                (stored_project.get("project") or {}).get("project_id") or ""
+            ) or None
+            self._active_run_json_path = normalized_path
+            self._apply_settings_draft_to_shell(self._settings_model.draft)
+            self._refresh_effective_run_summary()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.status_bar.showMessage(
+                f"Project settings could not be loaded: {exc}",
+                8000,
+            )
 
     def _choose_style_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Style Guide", filter="JSON Files (*.json)")
         if path:
             self.style_path.setText(path)
+            self._dispatch_settings_edit()
 
     def _choose_gguf_model(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select GGUF Model", filter="GGUF Files (*.gguf)")
@@ -2580,96 +2908,192 @@ class MainWindow(QtWidgets.QMainWindow):
         if not page:
             return
         from app.ui.page_review import PageReviewDialog
+        pipeline_idle = not self._running
+        pipeline_block_reason = (
+            ""
+            if pipeline_idle
+            else "Manual cleanup is unavailable while the forward pipeline is running."
+        )
         dialog = PageReviewDialog(
             self,
             page_record=page,
             json_path=self.json_path.text().strip(),
-            output_suffix=self.output_suffix.text().strip(),
-            font_name=self.font_name.currentText().strip(),
-            inpaint_mode=self.inpaint_mode.currentText(),
             use_gpu=self.use_gpu.isChecked(),
+            pipeline_idle=pipeline_idle,
+            pipeline_block_reason=pipeline_block_reason,
         )
         dialog.exec()
 
-    def _get_pipeline_settings(self, whitelist: list[str] = None) -> PipelineSettings:
-        if not self.json_path.text().strip() and self.export_dir.text().strip():
-            self.json_path.setText(f"{self.export_dir.text().strip()}\\project.json")
-        ollama_temperature = float(self.settings_ollama_temp.value())
-        ollama_top_p = float(self.settings_ollama_top_p.value())
-        ollama_context = int(self.settings_ollama_ctx.value())
-        gguf_temperature = float(self.settings_gguf_temp.value())
-        gguf_top_p = float(self.settings_gguf_top_p.value())
-        gguf_n_ctx = int(self.gguf_n_ctx.value())
-        gguf_n_gpu_layers = int(self.gguf_n_gpu_layers.value())
-        gguf_n_threads = int(self.gguf_n_threads.value())
-        gguf_n_batch = int(self.gguf_n_batch.value())
+    def _typed_model_overrides(self, backend: str) -> tuple[ModelGenerationOverride, ...]:
+        prefix = f"{backend.lower()}::"
+        overrides: list[ModelGenerationOverride] = []
+        for key in sorted(self._model_overrides):
+            if not key.lower().startswith(prefix):
+                continue
+            record = self._model_overrides.get(key) or {}
+            if not isinstance(record, dict) or not bool(record.get("enabled")):
+                continue
+            values = record.get("values") or {}
+            if not isinstance(values, dict):
+                continue
+            model_id = key[len(prefix):].strip()
+            if not model_id:
+                continue
+            if backend == "Ollama":
+                fields = {
+                    "temperature": values.get("ollama_temp"),
+                    "top_p": values.get("ollama_top_p"),
+                    "ollama_context_tokens": values.get("ollama_ctx"),
+                }
+            else:
+                fields = {
+                    "temperature": values.get("gguf_temp"),
+                    "top_p": values.get("gguf_top_p"),
+                    "gguf_n_ctx": values.get("gguf_n_ctx"),
+                    "gguf_n_gpu_layers": values.get("gguf_n_gpu_layers"),
+                    "gguf_n_threads": values.get("gguf_n_threads"),
+                    "gguf_n_batch": values.get("gguf_n_batch"),
+                }
+            if any(value is not None for value in fields.values()):
+                overrides.append(
+                    ModelGenerationOverride(model_id=model_id, **fields)
+                )
+                continue
+            profile = (
+                self._settings_model.draft.translation_profile
+                if self._settings_model is not None
+                else None
+            )
+            if profile is not None:
+                previous = next(
+                    (
+                        item
+                        for item in profile.model_overrides
+                        if item.model_id == model_id
+                    ),
+                    None,
+                )
+                if previous is not None:
+                    overrides.append(previous)
+        return tuple(overrides)
 
-        backend = self.translator_backend.currentText()
-        if backend == "Ollama":
-            model_id = self.ollama_model.currentText().strip()
-            override = self._get_override_values("Ollama", model_id)
-            if override:
-                ollama_temperature = float(override.get("ollama_temp", ollama_temperature))
-                ollama_top_p = float(override.get("ollama_top_p", ollama_top_p))
-                ollama_context = int(override.get("ollama_ctx", ollama_context))
-        elif backend == "GGUF":
-            model_id = self._selected_gguf_model_path()
-            override = self._get_override_values("GGUF", model_id)
-            if override:
-                gguf_temperature = float(override.get("gguf_temp", gguf_temperature))
-                gguf_top_p = float(override.get("gguf_top_p", gguf_top_p))
-                gguf_n_ctx = int(override.get("gguf_n_ctx", gguf_n_ctx))
-                gguf_n_gpu_layers = int(override.get("gguf_n_gpu_layers", gguf_n_gpu_layers))
-                gguf_n_threads = int(override.get("gguf_n_threads", gguf_n_threads))
-                gguf_n_batch = int(override.get("gguf_n_batch", gguf_n_batch))
-
-        return PipelineSettings(
-            import_dir=self.import_dir.text().strip(),
-            export_dir=self.export_dir.text().strip(),
-            json_path=self.json_path.text().strip(),
-            output_suffix=self.output_suffix.text().strip(),
-            source_lang=self.source_lang.currentText(),
-            target_lang=self.target_lang.currentText(),
-            ollama_model=self.ollama_model.currentText(),
-            style_guide_path=self.style_path.text().strip(),
+    def _settings_projection(self) -> LegacyShellSettingsProjection:
+        backend = self.settings_translator_backend.currentText()
+        return LegacyShellSettingsProjection(
+            source_language=self.source_lang.currentText(),
+            target_language=self.target_lang.currentText(),
+            output_suffix=self.output_suffix.text().strip() or self._defaults.output_suffix,
+            glossary_reference=self.style_path.text().strip() or None,
+            detector_engine=self.settings_detector_engine.currentText(),
+            detector_input_size=int(
+                self.settings_detector_input_size.currentText()
+            ),
+            ocr_engine=_normalize_ocr_engine_name(
+                self.settings_ocr_engine.currentText()
+            ),
+            inpaint_mode=self.inpaint_mode.currentText(),
+            inpaint_model_id=self.inpaint_model_id.text().strip(),
+            font_detection=self.font_detection.currentText(),
             font_name=self.font_name.currentText().strip(),
             use_gpu=self.use_gpu.isChecked(),
-            filter_background=self.filter_background.isChecked(),
-            filter_strength=self.filter_strength.currentText(),
-            detector_engine=self.detector_engine.currentText(),
-            ocr_engine=_normalize_ocr_engine_name(self.ocr_engine.currentText()),
-            inpaint_mode=self.inpaint_mode.currentText(),
-            font_detection=self.font_detection.currentText(),
-            translator_backend=self.translator_backend.currentText(),
-            deepseek_model=self.settings_deepseek_model.text().strip() or self._defaults.deepseek_model,
-            deepseek_base_url=self.settings_deepseek_base_url.text().strip() or self._defaults.deepseek_base_url,
-            gguf_model_path=self._selected_gguf_model_path(),
-            gguf_prompt_style=self.gguf_prompt_style.currentText(),
-            gguf_n_ctx=gguf_n_ctx,
-            gguf_n_gpu_layers=gguf_n_gpu_layers,
-            gguf_n_threads=gguf_n_threads,
-            gguf_n_batch=gguf_n_batch,
-            fast_mode=self.fast_mode.isChecked(),
             auto_glossary=self.auto_glossary.isChecked(),
-            detector_input_size=int(self.detector_input_size.currentText()),
-            inpaint_model_id=self.inpaint_model_id.text().strip(),
-            use_ollama_discovery=self.use_ollama_discovery.isChecked(),
-            files_whitelist=whitelist,
-            discovery_backend=self.settings_discovery_backend.currentText(),
-            discovery_model=(
-                self.settings_discovery_ollama_model.currentText()
-                if self.settings_discovery_backend.currentText() == "Ollama"
-                else (self.settings_discovery_gguf_path.currentData() or self.settings_discovery_gguf_path.currentText().strip())
-            ),
-            
-            # Generation specific (Reading from Settings tab directly)
-            ollama_temperature=ollama_temperature,
-            ollama_top_p=ollama_top_p,
-            ollama_context=ollama_context,
-            gguf_temperature=gguf_temperature,
-            gguf_top_p=gguf_top_p,
             prescan_enabled=self.prescan_enabled.isChecked(),
+            use_ollama_discovery=self.use_ollama_discovery.isChecked(),
+            discovery_backend=self.settings_discovery_backend.currentText(),
+            translation_backend=backend,
+            ollama_model=self.settings_ollama_model.currentText().strip(),
+            ollama_endpoint="http://127.0.0.1:11434",
+            ollama_generation=GenerationSettings(
+                temperature=float(self.settings_ollama_temp.value()),
+                top_p=float(self.settings_ollama_top_p.value()),
+            ),
+            ollama_options=OllamaProviderOptions(
+                context_tokens=int(self.settings_ollama_ctx.value()),
+            ),
+            gguf_model_path=self._settings_selected_gguf(),
+            gguf_generation=GenerationSettings(
+                temperature=float(self.settings_gguf_temp.value()),
+                top_p=float(self.settings_gguf_top_p.value()),
+            ),
+            gguf_options=GGUFProviderOptions(
+                prompt_style=self.settings_gguf_prompt_style.currentText(),
+                n_ctx=int(self.settings_gguf_n_ctx.value()),
+                n_gpu_layers=int(self.settings_gguf_n_gpu_layers.value()),
+                n_threads=int(self.settings_gguf_n_threads.value()),
+                n_batch=int(self.settings_gguf_n_batch.value()),
+            ),
+            deepseek_model=(
+                self.settings_deepseek_model.text().strip()
+                or self._defaults.deepseek_model
+            ),
+            deepseek_endpoint=(
+                self.settings_deepseek_base_url.text().strip()
+                or self._defaults.deepseek_base_url
+            ),
+            translation_overrides=(
+                self._typed_model_overrides(backend)
+                if backend in {"Ollama", "GGUF"}
+                else ()
+            ),
+            discovery_ollama_model=self.settings_discovery_ollama_model.currentText().strip(),
+            discovery_gguf_model_path=(
+                self.settings_discovery_gguf_path.currentData()
+                or self.settings_discovery_gguf_path.currentText().strip()
+            ),
         )
+
+    def _capture_settings_draft(self) -> SettingsDraft:
+        if self._settings_model is None:
+            raise RuntimeError("typed settings authority is unavailable")
+        draft = self._settings_model.apply()
+        self._persist_public_settings()
+        return draft
+
+    def _project_id_for_run(self, json_path: str) -> str:
+        if json_path and os.path.isfile(json_path):
+            try:
+                project = load_project_for_editing(json_path)
+                project_id = str((project.get("project") or {}).get("project_id") or "")
+                if project_id:
+                    return project_id
+            except Exception as exc:
+                logger.warning("Could not read typed project identity: %s", exc)
+        normalized = os.path.normcase(os.path.abspath(json_path or "project.json"))
+        return f"project:gui:{canonical_fingerprint({'json_path': normalized})[:32]}"
+
+    def _compile_pipeline_settings(
+        self,
+        whitelist: list[str] | None = None,
+    ) -> tuple[PipelineSettings, CompilationResult]:
+        if not self.json_path.text().strip() and self.export_dir.text().strip():
+            self.json_path.setText(
+                os.path.join(self.export_dir.text().strip(), "project.json")
+            )
+        self._capture_settings_draft()
+        if self._settings_model is None:
+            raise RuntimeError("typed settings authority is unavailable")
+        json_path = self.json_path.text().strip()
+        project_id = self._project_id_for_run(json_path)
+        result = self._settings_model.preview_run(
+            project_id=project_id,
+            invocation=RunInvocation(
+                import_dir=self.import_dir.text().strip(),
+                export_dir=self.export_dir.text().strip(),
+                json_path=json_path,
+                files_whitelist=tuple(whitelist or ()),
+            ),
+        )
+        settings = materialize_pipeline_settings(result)
+        return settings, result
+
+    def _get_pipeline_settings(
+        self,
+        whitelist: list[str] | None = None,
+    ) -> PipelineSettings:
+        """Compatibility accessor backed exclusively by the typed compiler."""
+
+        settings, _ = self._compile_pipeline_settings(whitelist)
+        return settings
 
     def _start_pipeline(self, whitelist: list[str] = None) -> bool:
         logger.info(f"Attempting to start pipeline. Whitelist: {whitelist}")
@@ -2686,24 +3110,69 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return False
         self._set_pyicu_runtime_ready(True)
-        self._sync_settings_to_models()
-        self._sync_paths_from_settings()
         if not self.import_dir.text().strip():
             path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Manga Folder")
             if not path:
                 return False
             self.import_dir.setText(path)
         
-        settings = self._get_pipeline_settings(whitelist)
-        backend_error = self._validate_translation_backend(settings)
-        if backend_error:
-            self.status_bar.showMessage(backend_error, 8000)
+        try:
+            settings, compilation = self._compile_pipeline_settings(whitelist)
+            runtime_binding = self._resolve_pipeline_runtime_binding(compilation)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            message = str(exc)
+            self.status_bar.showMessage(message, 8000)
             if self.log_view:
-                self.log_view.appendPlainText(backend_error)
-            QtWidgets.QMessageBox.warning(self, "Translator Backend Error", backend_error)
+                self.log_view.appendPlainText(message)
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Run Settings Error",
+                message,
+            )
             return False
-        self._pipeline.start(settings)
+        started = self._pipeline.start(
+            settings,
+            runtime_binding=runtime_binding,
+        )
+        if not started:
+            self._clear_pending_run_settings()
+            return False
+        self._pending_run_snapshot = compilation.snapshot
+        self._pending_project_id = compilation.snapshot.project_id
+        self._pending_run_json_path = os.path.normcase(
+            os.path.abspath(settings.json_path)
+        )
         return True
+
+    def _resolve_pipeline_runtime_binding(
+        self,
+        compilation: CompilationResult,
+    ) -> PipelineRuntimeBinding:
+        """Resolve an opaque credential reference only for this Start call."""
+
+        binding = compilation.runtime_binding
+        reference = binding.credential_reference
+        resolved_credential: str | None = None
+        if reference is not None:
+            resolver = CompositeCredentialResolver(
+                environment=EnvironmentCredentialResolver(),
+                windows=WindowsCredentialStore(),
+            )
+            resolved_credential = resolver.resolve(reference)
+            if not resolved_credential:
+                raise RuntimeError(
+                    "The selected provider credential is unavailable. Relink it in "
+                    "Settings; DeepSeek migration uses the DEEPSEEK_API_KEY "
+                    "environment reference and does not read legacy key files."
+                )
+        if binding.provider_kind is ProviderKind.DEEPSEEK and not resolved_credential:
+            raise RuntimeError(
+                "DeepSeek requires a resolved credential reference before Start."
+            )
+        return PipelineRuntimeBinding(
+            provider_kind=binding.provider_kind,
+            resolved_credential=resolved_credential,
+        )
 
     def _on_consistency_issue(self, pages: list[int]) -> None:
         """Handle end-of-run consistency notification."""
@@ -2774,83 +3243,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 
-    def _reapply_from_json(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Project JSON", filter="JSON Files (*.json)")
-        if not path:
-            return
-        try:
-            data = load_project(path)
-        except Exception as exc:
-            self.status_bar.showMessage(f"Failed to load JSON: {exc}")
-            return
-        pages = data.get("pages", [])
-        if not pages:
-            self.status_bar.showMessage("No pages in project JSON.")
-            return
-        export_dir = self.export_dir.text().strip()
-        if not export_dir:
-            export_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Export Folder")
-            if not export_dir:
-                return
-            self.export_dir.setText(export_dir)
-        suffix = self.output_suffix.text().strip() or "_translated"
-        total = len(pages)
-        self.queue_list.clear()
-        self.queue_table.setRowCount(0)
-        for page in pages:
-            name = os.path.basename(page.get("image_path", ""))
-            self.queue_list.addItem(f"{name} - pending")
-            table_row = self.queue_table.rowCount()
-            self.queue_table.insertRow(table_row)
-            self.queue_table.setItem(table_row, 0, QtWidgets.QTableWidgetItem(name))
-            self.queue_table.setItem(table_row, 1, QtWidgets.QTableWidgetItem("pending"))
-            action_btn = QtWidgets.QPushButton("Remove")
-            action_btn.setProperty("tableAction", True)
-            action_btn.setMinimumWidth(120)
-            action_btn.setMinimumHeight(28)
-            action_btn.setSizePolicy(QtWidgets.QSizePolicy.MinimumExpanding, QtWidgets.QSizePolicy.Fixed)
-            action_btn.clicked.connect(self._on_queue_remove_clicked)
-            action_cell = QtWidgets.QWidget()
-            action_layout = QtWidgets.QHBoxLayout(action_cell)
-            action_layout.setContentsMargins(6, 2, 6, 2)
-            action_layout.addStretch(1)
-            action_layout.addWidget(action_btn)
-            action_layout.addStretch(1)
-            self.queue_table.setCellWidget(table_row, 2, action_cell)
-        self._update_queue_placeholder()
-        self._update_queue_table_placeholder()
-        for idx, page in enumerate(pages, start=1):
-            image_path = page.get("image_path", "")
-            if not image_path:
-                continue
-            filename = os.path.basename(image_path)
-            output_path = os.path.join(export_dir, f"{os.path.splitext(filename)[0]}{suffix}{os.path.splitext(filename)[1]}")
-            parent_execution_bundles = parent_execution_bundles_from_audit_records(
-                page.get("parent_execution_bundles") or []
-            )
-            try:
-                if parent_execution_bundles:
-                    render_parent_execution_bundles(
-                        image_path,
-                        output_path,
-                        parent_execution_bundles,
-                        self.font_name.currentText().strip(),
-                        inpaint_mode=self.inpaint_mode.currentText(),
-                        use_gpu=self.use_gpu.isChecked(),
-                        model_id=self.inpaint_model_id.text().strip(),
-                    )
-                else:
-                    raise RuntimeError(
-                        "reapply_parent_execution_bundle_contract_error:"
-                        "missing_current_parent_execution_bundles"
-                    )
-                self._update_queue_item(idx - 1, "done")
-            except Exception as exc:
-                self._update_queue_item(idx - 1, "error")
-                self.status_bar.showMessage(f"Re-apply failed: {exc}")
-            self.overall_bar.setValue(int(idx / total * 100))
-            self.processing_label.setText(f"Processing Page {idx} of {total}...")
-
     def _open_region_review(self) -> None:
         if not self._review_dialog:
             self._review_dialog = RegionReviewDialog(self)
@@ -2865,6 +3257,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_view.appendPlainText(message)
         if message in {"Completed", "Stopped"}:
             self._set_running(False)
+            if message == "Completed":
+                self._last_run_snapshot = self._pending_run_snapshot
+                self._active_project_id = self._pending_project_id
+                self._active_run_json_path = self._pending_run_json_path
+                try:
+                    self._persist_project_settings_if_idle(completed_run=True)
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    logger.warning("Typed project settings were not published: %s", exc)
+            self._clear_pending_run_settings()
         if message.startswith("Failed") or "required" in message:
             self._set_running(False)
         if (
@@ -2876,141 +3277,533 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             QtWidgets.QMessageBox.critical(self, "Dependency Error", message)
 
+    def _clear_pending_run_settings(self) -> None:
+        self._pending_run_snapshot = None
+        self._pending_project_id = None
+        self._pending_run_json_path = None
+
     def closeEvent(self, event) -> None:
         self._save_settings()
         super().closeEvent(event)
 
     def _save_settings(self) -> None:
+        # Window geometry remains application-shell state.  Workflow settings
+        # are persisted only through the typed stores below.
         settings = QtCore.QSettings("MangaTranslator", "Pro")
         settings.setValue("geometry", self.saveGeometry())
         settings.setValue("windowState", self.saveState())
-        
-        # Paths
-        settings.setValue("import_dir", self.import_dir.text())
-        settings.setValue("export_dir", self.export_dir.text())
-        settings.setValue("json_path", self.json_path.text())
-        
-        # Models & Params
-        settings.setValue("source_lang", self.source_lang.currentText())
-        settings.setValue("target_lang", self.target_lang.currentText())
-        settings.setValue("detector_engine", self.detector_engine.currentText())
-        settings.setValue("detector_input_size", self.detector_input_size.currentText())
-        settings.setValue("ocr_engine", _normalize_ocr_engine_name(self.ocr_engine.currentText()))
-        settings.setValue("translator_backend", self.translator_backend.currentText())
-        settings.setValue("inpaint_mode", self.inpaint_mode.currentText())
-        settings.setValue("filter_strength", self.filter_strength.currentText())
-        settings.setValue("use_gpu", self.use_gpu.isChecked())
-        settings.setValue("fast_mode", self.fast_mode.isChecked())
-        settings.setValue("auto_glossary", self.auto_glossary.isChecked())
-        settings.setValue("use_ollama_discovery", self.use_ollama_discovery.isChecked())
-        settings.setValue("prescan_enabled", self.prescan_enabled.isChecked())
-        settings.setValue("font_name", self.font_name.currentText())
-        
-        # GGUF
-        settings.setValue("gguf_model_path", self._selected_gguf_model_path())
-        settings.setValue("gguf_n_gpu_layers", self.gguf_n_gpu_layers.value())
-        
-        # Generation Settings (Settings Tab Widgets)
-        settings.setValue("gen_preset", self.settings_gen_preset.currentText())
-        settings.setValue("ollama_temp", self.settings_ollama_temp.value())
-        settings.setValue("ollama_top_p", self.settings_ollama_top_p.value())
-        settings.setValue("ollama_ctx", self.settings_ollama_ctx.value())
-        settings.setValue("deepseek_model", self.settings_deepseek_model.text().strip())
-        settings.setValue("deepseek_base_url", self.settings_deepseek_base_url.text().strip())
-        settings.setValue("gguf_temp", self.settings_gguf_temp.value())
-        settings.setValue("gguf_top_p", self.settings_gguf_top_p.value())
-        
-        # Discovery
-        settings.setValue("discovery_backend", self.settings_discovery_backend.currentText())
-        settings.setValue("discovery_ollama_model", self.settings_discovery_ollama_model.currentText())
-        settings.setValue("discovery_gguf_path", self.settings_discovery_gguf_path.currentText())
-        settings.setValue("model_overrides", json.dumps(self._model_overrides))
-
-    def _load_saved_settings(self) -> None:
-        settings = QtCore.QSettings("MangaTranslator", "Pro")
-        # geo = settings.value("geometry")
-        # if geo:
-        #     self.restoreGeometry(geo)
-        # state = settings.value("windowState")
-        # if state:
-        #     self.restoreState(state)
-
-        raw_overrides = settings.value("model_overrides")
-        if raw_overrides:
+        if self._settings_model is not None:
             try:
-                loaded = json.loads(str(raw_overrides))
-                if isinstance(loaded, dict):
-                    self._model_overrides = loaded
+                self._capture_settings_draft()
+                self._persist_project_settings_if_idle()
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                logger.warning("Typed settings were not saved: %s", exc)
+
+    @staticmethod
+    def _module_configs_for_scope(
+        configs: tuple[ModuleConfig, ...],
+        scope: SettingsScope,
+    ) -> tuple[ModuleConfig, ...]:
+        selected: list[ModuleConfig] = []
+        for config in configs:
+            module = DEFAULT_MODULE_REGISTRY.get_module(config.module_id)
+            values = {
+                key: value
+                for key, value in config.values.items()
+                if module.definitions[key].scope is scope
+            }
+            legacy_values = {
+                key: value
+                for key, value in config.legacy_values.items()
+                if key in module.definitions
+                and module.definitions[key].scope is scope
+            }
+            if values or legacy_values:
+                selected.append(
+                    ModuleConfig(
+                        module_id=config.module_id,
+                        module_schema_version=config.module_schema_version,
+                        values=values,
+                        legacy_values=legacy_values,
+                    )
+                )
+        return tuple(sorted(selected, key=lambda item: item.module_id))
+
+    def _settings_storage_directory(self) -> Path:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "YomiFrame" / "config"
+        fallback = QtCore.QStandardPaths.writableLocation(
+            QtCore.QStandardPaths.AppConfigLocation
+        )
+        return Path(fallback or os.getcwd()) / "YomiFrame"
+
+    def _initialize_settings_authority(self) -> None:
+        root = self._settings_storage_directory()
+        self._application_settings_store = ApplicationSettingsStore(
+            root / "settings.json"
+        )
+        self._provider_profile_store = ProviderProfileStore(
+            root / "provider_profiles.json"
+        )
+        application_document = self._application_settings_store.load()
+        profiles = self._provider_profile_store.load()
+
+        legacy_settings = QtCore.QSettings("MangaTranslator", "Pro")
+        migration = migrate_legacy_qsettings_once(
+            legacy_settings,
+            application_document.migration_markers,
+        )
+        invocation_defaults = LegacyRunInvocationDefaults()
+        project = ProjectConfig()
+        project_modules: tuple[ModuleConfig, ...] = ()
+        last_snapshot: RunSettingsSnapshot | None = None
+        marker_document: ApplicationSettingsDocument | None = None
+        migration_has_project_payload = False
+
+        if migration is not None:
+            invocation_defaults = migration.run_invocation_defaults
+            recent_projects = application_document.application_preferences.recent_projects
+            if invocation_defaults.json_path:
+                recent_projects = tuple(
+                    dict.fromkeys(
+                        (*recent_projects, invocation_defaults.json_path)
+                    )
+                )
+            workspace_layout = dict(
+                migration.application_preferences.workspace_layout
+            )
+            workspace_layout.update(
+                application_document.application_preferences.workspace_layout
+            )
+            migrated_application_modules = {
+                config.module_id: config
+                for config in self._module_configs_for_scope(
+                    migration.module_configs,
+                    SettingsScope.APPLICATION,
+                )
+            }
+            migrated_application_modules.update(
+                {
+                    config.module_id: config
+                    for config in application_document.application_module_configs
+                }
+            )
+            evidence_by_source = {
+                item.source_fingerprint: item
+                for item in application_document.legacy_migration_evidence
+            }
+            evidence = self._inactive_migration_evidence(migration)
+            evidence_by_source[evidence.source_fingerprint] = evidence
+            application_document = ApplicationSettingsDocument(
+                application_preferences=replace(
+                    application_document.application_preferences,
+                    recent_projects=recent_projects,
+                    workspace_layout=workspace_layout,
+                ),
+                application_module_configs=tuple(
+                    migrated_application_modules[key]
+                    for key in sorted(migrated_application_modules)
+                ),
+                migration_markers=application_document.migration_markers,
+                legacy_migration_evidence=tuple(
+                    evidence_by_source[key] for key in sorted(evidence_by_source)
+                ),
+            )
+            marker_document = replace(
+                application_document,
+                migration_markers=(
+                    *application_document.migration_markers,
+                    migration.migration_marker,
+                ),
+            )
+            project = migration.project_config
+            project_modules = self._module_configs_for_scope(
+                migration.module_configs,
+                SettingsScope.PROJECT,
+            )
+            by_id = {profile.profile_id: profile for profile in profiles}
+            for profile in migration.provider_profiles:
+                by_id.setdefault(profile.profile_id, profile)
+            profiles = tuple(by_id[key] for key in sorted(by_id))
+            migration_has_project_payload = bool(
+                project != ProjectConfig()
+                or project_modules
+                or migration.provider_profiles
+            )
+
+        candidate_path = invocation_defaults.json_path
+        if not candidate_path:
+            for recent in reversed(
+                application_document.application_preferences.recent_projects
+            ):
+                if os.path.isfile(recent):
+                    candidate_path = recent
+                    break
+        candidate_loaded = False
+        project_publication = None
+        project_publication_deferred = False
+        if candidate_path and os.path.isfile(candidate_path):
+            try:
+                checkpoint_descriptor_active = project_storage_is_checkpoint_descriptor(
+                    candidate_path
+                )
+                raw_project = load_project(candidate_path)
+                stored_project = load_project_for_editing(candidate_path)
+                stored_settings = read_project_settings(stored_project)
+                migration_seed_required = bool(
+                    migration is not None
+                    and legacy_project_settings_seed_required(raw_project)
+                )
+                if migration_seed_required and checkpoint_descriptor_active:
+                    # The checkpoint descriptor remains controller-owned.  Keep
+                    # the migrated project settings in the current draft, but
+                    # publish neither project/profile state nor the one-time
+                    # marker until a later startup sees a finalized project.
+                    project_publication_deferred = True
+                    logger.info(
+                        "Deferred legacy project settings migration while a "
+                        "forward checkpoint descriptor is active."
+                    )
+                elif migration_seed_required:
+                    migrated_project = with_project_settings(
+                        stored_project,
+                        project_config=migration.project_config,
+                        module_configs=self._module_configs_for_scope(
+                            migration.module_configs,
+                            SettingsScope.PROJECT,
+                        ),
+                        last_run_snapshot=stored_settings.last_run_snapshot,
+                    )
+                    project_publication = lambda: save_project_schema_v2_atomic(
+                        candidate_path,
+                        migrated_project,
+                        defer_if_checkpoint=True,
+                    )
                 else:
-                    self._model_overrides = {}
-            except Exception:
-                self._model_overrides = {}
+                    project = stored_settings.project_config
+                    project_modules = stored_settings.module_configs
+                last_snapshot = stored_settings.last_run_snapshot
+                self._active_project_id = str(
+                    (stored_project.get("project") or {}).get("project_id") or ""
+                ) or None
+                self._active_run_json_path = os.path.normcase(
+                    os.path.abspath(candidate_path)
+                )
+                self.json_path.setText(candidate_path)
+                self.export_dir.setText(os.path.dirname(candidate_path))
+                pages = stored_project.get("pages") or []
+                if isinstance(pages, list) and pages:
+                    image_path = str((pages[0] or {}).get("image_path") or "")
+                    if image_path:
+                        self.import_dir.setText(os.path.dirname(image_path))
+                candidate_loaded = True
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                logger.warning("Could not hydrate typed project settings: %s", exc)
+        elif not invocation_defaults.is_empty:
+            self.import_dir.setText(invocation_defaults.import_dir)
+            self.export_dir.setText(invocation_defaults.export_dir)
+            self.json_path.setText(invocation_defaults.json_path)
 
-        def _restore(widget, key, type_func=str):
-            val = settings.value(key)
-            if val is not None:
-                val = type_func(val)
-                if isinstance(widget, QtWidgets.QComboBox):
-                    widget.setCurrentText(val)
-                elif isinstance(widget, QtWidgets.QLineEdit):
-                    widget.setText(val)
-                elif isinstance(widget, QtWidgets.QCheckBox):
-                    widget.setChecked(val == "true" if isinstance(val, str) else bool(val))
-                elif isinstance(widget, QtWidgets.QSpinBox):
-                    widget.setValue(int(val))
-                elif isinstance(widget, QtWidgets.QDoubleSpinBox):
-                    widget.setValue(float(val))
+        if migration is not None and marker_document is not None:
+            migration_can_commit = (
+                not migration_has_project_payload
+                or (candidate_loaded and not project_publication_deferred)
+            )
+            if migration_can_commit:
+                migration_published = publish_legacy_migration_marker_last(
+                    publish_project=project_publication,
+                    publish_provider_profiles=lambda: self._provider_profile_store.save(
+                        profiles
+                    ),
+                    publish_application_marker=lambda: self._application_settings_store.save(
+                        marker_document
+                    ),
+                )
+                if migration_published:
+                    application_document = marker_document
+                else:
+                    project_publication_deferred = True
+                    logger.info(
+                        "Deferred legacy project settings migration because a "
+                        "forward checkpoint became active before publication."
+                    )
 
-        _restore(self.import_dir, "import_dir")
-        _restore(self.export_dir, "export_dir")
-        _restore(self.json_path, "json_path")
-        _restore(self.source_lang, "source_lang")
-        _restore(self.target_lang, "target_lang")
-        
-        _restore(self.detector_engine, "detector_engine")
-        _restore(self.detector_input_size, "detector_input_size")
-        _restore(self.ocr_engine, "ocr_engine")
-        _restore(self.translator_backend, "translator_backend")
-        _restore(self.inpaint_mode, "inpaint_mode")
-        _restore(self.filter_strength, "filter_strength")
-        _restore(self.use_gpu, "use_gpu", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
-        _restore(self.fast_mode, "fast_mode", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
-        _restore(self.auto_glossary, "auto_glossary", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
-        _restore(self.use_ollama_discovery, "use_ollama_discovery", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
-        _restore(self.prescan_enabled, "prescan_enabled", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
-        _restore(self.font_name, "font_name")
-        _restore(self.gguf_n_gpu_layers, "gguf_n_gpu_layers", type_func=int)
-        
-        # Restore Generation Settings (Direct to Settings Widgets)
-        _restore(self.settings_gen_preset, "gen_preset")
-        _restore(self.settings_ollama_temp, "ollama_temp", type_func=float)
-        _restore(self.settings_ollama_top_p, "ollama_top_p", type_func=float)
-        _restore(self.settings_ollama_ctx, "ollama_ctx", type_func=int)
-        _restore(self.settings_deepseek_model, "deepseek_model")
-        _restore(self.settings_deepseek_base_url, "deepseek_base_url")
-        _restore(self.settings_gguf_temp, "gguf_temp", type_func=float)
-        _restore(self.settings_gguf_top_p, "gguf_top_p", type_func=float)
-        
-        _restore(self.settings_discovery_backend, "discovery_backend")
-        _restore(self.settings_discovery_ollama_model, "discovery_ollama_model")
-        
-        gguf_path = settings.value("gguf_model_path")
-        if gguf_path:
-            self._add_gguf_model(str(gguf_path))
-            
-        ds_gguf_path = settings.value("discovery_gguf_path")
-        if ds_gguf_path:
-             path = str(ds_gguf_path).strip()
-             if path:
-                 models = self._iter_gguf_models()
-                 resolved = self._resolve_gguf_selection(path, models)
-                 if resolved:
-                     self._set_gguf_combo(self.settings_discovery_gguf_path, resolved)
-            
+        module_by_id = {
+            config.module_id: config
+            for config in application_document.application_module_configs
+        }
+        module_by_id.update({config.module_id: config for config in project_modules})
+        initial = SettingsDraft(
+            application=application_document.application_preferences,
+            project=project,
+            module_configs=tuple(
+                module_by_id[key] for key in sorted(module_by_id)
+            ),
+            provider_profiles=profiles,
+        )
+        self._application_settings_document = application_document
+        self._last_run_snapshot = last_snapshot
+        self._settings_model = SettingsViewModel(initial)
+        self._apply_settings_draft_to_shell(initial)
+        self._refresh_effective_run_summary()
+
+        geometry = legacy_settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        window_state = legacy_settings.value("windowState")
+        if window_state is not None:
+            self.restoreState(window_state)
+
+    @staticmethod
+    def _inactive_migration_evidence(
+        migration: LegacySettingsMigrationResult,
+    ) -> InactiveLegacyMigrationEvidence:
+        return InactiveLegacyMigrationEvidence(
+            migration_version=migration.migration_version,
+            source_fingerprint=migration.source_fingerprint,
+            legacy_values=migration.legacy_values,
+            issues=tuple(
+                LegacyMigrationIssueEvidence(
+                    key=issue.key,
+                    reason=issue.reason,
+                )
+                for issue in migration.issues
+            ),
+            unresolved_provider_profile_references=(
+                migration.unresolved_provider_profile_references
+            ),
+        )
+
+    def _apply_settings_draft_to_shell(self, draft: SettingsDraft) -> None:
+        previous_guard = self._settings_projection_guard
+        self._settings_projection_guard = True
+        try:
+            self._apply_settings_draft_to_widgets(draft)
+        finally:
+            self._settings_projection_guard = previous_guard
+
+    def _apply_settings_draft_to_widgets(self, draft: SettingsDraft) -> None:
+        self.theme_combo.setCurrentText(draft.application.theme)
+        self.source_lang.setCurrentText(draft.project.source_language)
+        self.target_lang.setCurrentText(draft.project.target_language)
+        self.output_suffix.setText(draft.project.output_suffix)
+        self.style_path.setText(draft.project.glossary_reference or "")
+        module_values = {
+            config.module_id: dict(config.values)
+            for config in draft.module_configs
+        }
+        detection = module_values.get("detection", {})
+        self.detector_engine.setCurrentText(
+            str(detection.get("engine", self._defaults.detector_engine))
+        )
+        self.detector_input_size.setCurrentText(
+            str(detection.get("input_size", 640))
+        )
+        self.ocr_engine.setCurrentText(
+            str(module_values.get("ocr", {}).get("engine", self._defaults.ocr_engine))
+        )
+        cleanup = module_values.get("cleanup", {})
+        self.inpaint_mode.setCurrentText(
+            str(cleanup.get("inpaint_mode", self._defaults.inpaint_mode))
+        )
+        self.font_detection.setCurrentText(
+            str(
+                module_values.get("source_style", {}).get(
+                    "font_detection", self._defaults.font_detection
+                )
+            )
+        )
+        self._set_combo_text(
+            self.font_name,
+            str(
+                module_values.get("renderer", {}).get(
+                    "font_name", self._defaults.font_name
+                )
+            ),
+        )
+        self.use_gpu.setChecked(
+            bool(module_values.get("runtime", {}).get("use_gpu", True))
+        )
+        translation = module_values.get("translation", {})
+        self.auto_glossary.setChecked(
+            bool(translation.get("auto_glossary", self._defaults.auto_glossary))
+        )
+        self.prescan_enabled.setChecked(
+            bool(translation.get("prescan_enabled", False))
+        )
+        self.use_ollama_discovery.setChecked(
+            bool(translation.get("use_ollama_discovery", False))
+        )
+        self.settings_discovery_backend.setCurrentText(
+            str(translation.get("discovery_backend", "Ollama"))
+        )
+        profile = draft.translation_profile
+        if profile is not None:
+            backend = {
+                ProviderKind.OLLAMA: "Ollama",
+                ProviderKind.GGUF: "GGUF",
+                ProviderKind.DEEPSEEK: "DeepSeek",
+                ProviderKind.OPENAI_COMPATIBLE: "OpenAI-compatible",
+            }[profile.kind]
+            if backend != "OpenAI-compatible":
+                self.translator_backend.setCurrentText(backend)
+            generation = profile.generation_defaults
+            if profile.kind is ProviderKind.OLLAMA:
+                self._set_combo_text(self.ollama_model, profile.model_id or "auto-detect")
+                self.settings_ollama_temp.setValue(generation.temperature)
+                self.settings_ollama_top_p.setValue(generation.top_p)
+                if profile.ollama_options is not None:
+                    self.settings_ollama_ctx.setValue(
+                        profile.ollama_options.context_tokens
+                    )
+            elif profile.kind is ProviderKind.GGUF:
+                if profile.local_model_path:
+                    self._add_gguf_model(profile.local_model_path)
+                self.settings_gguf_temp.setValue(generation.temperature)
+                self.settings_gguf_top_p.setValue(generation.top_p)
+                if profile.gguf_options is not None:
+                    self.gguf_prompt_style.setCurrentText(
+                        profile.gguf_options.prompt_style
+                    )
+                    self.gguf_n_ctx.setValue(profile.gguf_options.n_ctx)
+                    self.gguf_n_gpu_layers.setValue(
+                        profile.gguf_options.n_gpu_layers
+                    )
+                    self.gguf_n_threads.setValue(profile.gguf_options.n_threads)
+                    self.gguf_n_batch.setValue(profile.gguf_options.n_batch)
+            elif profile.kind is ProviderKind.DEEPSEEK:
+                self.settings_deepseek_model.setText(profile.model_id or "")
+                self.settings_deepseek_base_url.setText(profile.endpoint or "")
+            self._model_overrides = {}
+            for override in profile.model_overrides:
+                values: dict[str, object] = {}
+                if profile.kind is ProviderKind.OLLAMA:
+                    values = {
+                        key: value
+                        for key, value in {
+                            "ollama_temp": override.temperature,
+                            "ollama_top_p": override.top_p,
+                            "ollama_ctx": override.ollama_context_tokens,
+                        }.items()
+                        if value is not None
+                    }
+                    key = f"ollama::{override.model_id}"
+                elif profile.kind is ProviderKind.GGUF:
+                    values = {
+                        key: value
+                        for key, value in {
+                            "gguf_temp": override.temperature,
+                            "gguf_top_p": override.top_p,
+                            "gguf_n_ctx": override.gguf_n_ctx,
+                            "gguf_n_gpu_layers": override.gguf_n_gpu_layers,
+                            "gguf_n_threads": override.gguf_n_threads,
+                            "gguf_n_batch": override.gguf_n_batch,
+                        }.items()
+                        if value is not None
+                    }
+                    key = f"gguf::{override.model_id}"
+                else:
+                    continue
+                self._model_overrides[key] = {"enabled": True, "values": values}
+        discovery_profile = draft.discovery_profile
+        if discovery_profile is not None:
+            if discovery_profile.kind is ProviderKind.OLLAMA:
+                self._set_combo_text(
+                    self.settings_discovery_ollama_model,
+                    discovery_profile.model_id or "auto-detect",
+                )
+            elif (
+                discovery_profile.kind is ProviderKind.GGUF
+                and discovery_profile.local_model_path
+            ):
+                self._set_gguf_combo(
+                    self.settings_discovery_gguf_path,
+                    discovery_profile.local_model_path,
+                )
         self._sync_models_to_settings()
         self._sync_paths_to_settings()
         self._update_glossary_controls()
         self._update_discovery_ui()
+        self._refresh_override_model_list()
         self._update_translation_warning()
         self._update_scan_warnings()
-        self._refresh_override_model_list()
+
+    def _persist_public_settings(self) -> None:
+        if (
+            self._settings_model is None
+            or self._application_settings_store is None
+            or self._provider_profile_store is None
+        ):
+            return
+        draft = self._settings_model.draft
+        recent_projects = list(draft.application.recent_projects)
+        project_path = self.json_path.text().strip()
+        if project_path:
+            recent_projects = [
+                item for item in recent_projects if item != project_path
+            ] + [project_path]
+        application = replace(
+            draft.application,
+            recent_projects=tuple(recent_projects[-20:]),
+        )
+        self._settings_model.replace_application(application)
+        self._settings_model.apply()
+        document = ApplicationSettingsDocument(
+            application_preferences=application,
+            application_module_configs=self._module_configs_for_scope(
+                self._settings_model.draft.module_configs,
+                SettingsScope.APPLICATION,
+            ),
+            migration_markers=self._application_settings_document.migration_markers,
+            legacy_migration_evidence=(
+                self._application_settings_document.legacy_migration_evidence
+            ),
+        )
+        self._application_settings_store.save(document)
+        self._provider_profile_store.save(
+            self._settings_model.draft.provider_profiles
+        )
+        self._application_settings_document = document
+
+    def _persist_project_settings_if_idle(
+        self,
+        *,
+        completed_run: bool = False,
+    ) -> None:
+        if self._running or self._settings_model is None:
+            return
+        path = self.json_path.text().strip()
+        if not path or not os.path.isfile(path):
+            return
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        raw = load_project(path)
+        if str(raw.get("schema_version") or "1") == "1":
+            project = migrate_project_schema_v2(
+                raw,
+                project_id=self._active_project_id,
+            )
+        else:
+            project = load_project_for_editing(path)
+        project_id = str((project.get("project") or {}).get("project_id") or "")
+        snapshot = self._last_run_snapshot
+        if snapshot is not None:
+            if normalized_path != self._active_run_json_path:
+                snapshot = None
+            elif snapshot.project_id != project_id:
+                if completed_run:
+                    snapshot = rebind_run_snapshot_project(snapshot, project_id)
+                    self._last_run_snapshot = snapshot
+                    self._active_project_id = project_id
+                else:
+                    snapshot = None
+        updated = with_project_settings(
+            project,
+            project_config=self._settings_model.draft.project,
+            module_configs=self._module_configs_for_scope(
+                self._settings_model.draft.module_configs,
+                SettingsScope.PROJECT,
+            ),
+            last_run_snapshot=snapshot,
+        )
+        save_project_schema_v2_atomic(path, updated)

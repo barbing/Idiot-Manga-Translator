@@ -102,6 +102,13 @@ PROJECTION_OUTSIDE_AUTHORIZED_AREA_STATE = "projection_outside_authorized_area"
 MASK_NOT_READY_STATE = "mask_not_ready"
 COMPONENT_PROJECTION_AUDIT_ONLY_REJECTION_REASONS = {
     "effective_mask_not_ready",
+    "effective_mask_incomplete_under_coverage",
+    "effective_mask_fragment_only",
+    "effective_mask_protected_overlap_removed",
+    "upstream_container_mismatch",
+    "segmentation_mask_wrong_owner_broad_background_capture",
+    "segmentation_mask_wrong_owner_rectangular_background_capture",
+    "effective_mask_failed_unsafe_background_capture",
 }
 COMPONENT_PROJECTION_AUDIT_ONLY_REJECTED_COMPONENT_REASONS = {
     "effective_mask_not_ready",
@@ -7120,27 +7127,9 @@ def _component_projection_outside_warning_is_audit_only(
 
 
 def _is_component_projection_ready_audit_rejection(cleanup_mask: CleanupMask, rejection_reason: str) -> bool:
-    if str(rejection_reason or "") not in {
-        "effective_mask_not_ready",
-        "effective_mask_incomplete_under_coverage",
-        "effective_mask_fragment_only",
-        "effective_mask_protected_overlap_removed",
-        "upstream_container_mismatch",
-    }:
+    if str(rejection_reason or "") not in COMPONENT_PROJECTION_AUDIT_ONLY_REJECTION_REASONS:
         return False
-    if not _is_component_projected_cleanup_mask(cleanup_mask):
-        return False
-    if _component_projection_outside_warning_is_audit_only(cleanup_mask, rejection_reason):
-        return True
-    if str(getattr(cleanup_mask, "projection_quality_state", "") or "") != "projection_ready":
-        return False
-    if str(getattr(cleanup_mask, "mask_readiness_state", "") or "") != "mask_ready":
-        return False
-    if int(getattr(cleanup_mask, "foreground_mask_pixels", 0) or 0) <= 0:
-        return False
-    if int(getattr(cleanup_mask, "erase_mask_pixels", 0) or 0) <= 0:
-        return False
-    return True
+    return _component_projection_outside_warning_is_audit_only(cleanup_mask, rejection_reason)
 
 
 def _should_run_backend_noop_fallback(result: CleanupResult, proof: CleanupProof | None) -> bool:

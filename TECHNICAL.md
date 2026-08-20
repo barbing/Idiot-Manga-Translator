@@ -41,11 +41,51 @@ BubbleDetection typed evidence
 
 ### UI and Controller
 
-The desktop UI gathers user selections and calls the pipeline controller. The controller orchestrates module execution and preserves the TextAreaPlan contract when regions are serialized, rehydrated, filtered, or routed.
+`app/main.py` is a thin production bootstrap. It calls
+`app.ui.application_coordinator.create_gui_application_window`, which constructs
+the single `app.ui.shell.main_window.YomiFrameMainWindow` and connects typed
+project, settings, run, Preview, failure, recovery, cancellation, and close
+signals exactly once. The legacy monolithic window and Page/Region Review owners
+remain compatibility modules, not production authorities.
+
+New-folder preparation has an application-owned pre-run projection: supported
+source images become naturally ordered queued page rows with thumbnails,
+selection, activity context, and a source canvas before pipeline artifacts
+exist. These rows are workflow presentation only and do not fabricate detection,
+OCR, parent, cleanup, style, eligibility, or render evidence.
+
+Provider activation is likewise application-owned. The coordinator validates a
+GGUF file, an Ollama endpoint/model, or an authenticated DeepSeek model catalog
+through a settled worker and marks the exact public profile configuration ready.
+The shell enables Start only for the selected ready profile. API credentials are
+transient during testing and portable settings retain only an opaque Windows
+credential reference. Output Defaults supplies fallback presentation; it is not
+a renderer command and cannot override effective per-parent style evidence or
+user edits.
+
+The desktop UI gathers user selections and calls typed application or edit
+interfaces. The controller orchestrates functional module execution and
+preserves the TextAreaPlan contract when regions are serialized, rehydrated,
+filtered, or routed; the GUI never mutates controller or pipeline internals.
 
 The controller should not turn route intent into translation authority. A region is translatable only when TextAreaPlan has explicitly marked OCR, translation, cleanup, and render eligibility as appropriate for a cleanup-translatable semantic state. Review-only OCR conservation does not create translation or cleanup authority.
 
 In the current root-parent-child architecture, the controller must promote finalized parent obligations into `ParentExecutionBundle` records before downstream execution. Translation input rebuilding, cleanup job creation, render eligibility, and renderer entry all use the parent bundle path when bundles are present. Legacy region records remain compatibility and audit records; source child regions are evidence for a parent, not independent downstream execution owners.
+
+GUI user topology is an application projection over those immutable records.
+`ParentSourceEvidenceMappingV1` binds exact parent/root/bundle identities,
+automatic fingerprints, integer bboxes, OCR and target text/fingerprints,
+reading order, roles, and page identity. Merge replaces compatible mapped source
+slots; Split assigns every mapped source member to exactly one child and fails
+if a boundary cuts evidence. Mechanical effective render-plan projection may
+reuse only the bound automatic layers and substitute effective identity/text/
+geometry. It cannot create a bundle, source-style fact, cleanup proof, or render-
+eligibility decision.
+
+Add Custom Scope is different: it first records only pending geometry/workflow
+intent. An explicit OCR revision may establish source text for that exact scope,
+but neither Add nor typed text makes it executable. Free-form source/target text
+is accepted only as an override on retained mapped or selected-revision evidence.
 
 ### BubbleDetection
 
@@ -313,6 +353,9 @@ Performance-sensitive work should report:
 - Do not route SFX/decorative/art areas through normal OCR, translation, cleanup, or render paths unless explicitly required.
 - Keep compatibility paths visible and temporary; do not let them become hidden alternate authority.
 - Prefer deterministic contracts and explicit fallback states over ad hoc heuristics.
+- Do not create user topology or render authority from typed text. Require an
+  exact OCR/detection mapping or selected owner revision and preserve it through
+  projection, History, and reload.
 
 ## Recommended Lightweight Checks
 

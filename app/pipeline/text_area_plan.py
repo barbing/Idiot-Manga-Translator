@@ -1874,6 +1874,8 @@ def _text_area_graph_parent_boundary_entries(
             image_size=image_size,
             luma_image=luma_image,
         )
+    if not entries:
+        entries = _linked_text_free_speech_parent_boundary_entries(container)
     output: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for entry in entries:
@@ -7859,6 +7861,66 @@ def _semantic_unit_evidence_bboxes_for_container(container: TextAreaContainer) -
     return bboxes
 
 
+def _linked_text_free_speech_parent_boundary_entries(
+    container: TextAreaContainer | Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    auth = str(
+        _container_value(container, "cleanup_authorization", "")
+        or _container_value(container, "semantic_authorization_state", "")
+        or ""
+    )
+    if auth != AUTH_CLEANUP_TRANSLATE_SPEECH:
+        return []
+    role_evidence = _container_semantic_role_evidence(container)
+    entries = role_evidence.get("text_unit_evidence_bboxes") or []
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        return []
+    output: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or str(entry.get("class_name") or "") != "text_free":
+            continue
+        if not _text_free_parent_boundary_has_typed_speech_mask_support(entry, role_evidence):
+            continue
+        bbox = _semantic_unit_bbox_from_evidence(entry)
+        if not bbox:
+            continue
+        output.append(
+            {
+                "bbox": bbox,
+                "evidence_id": str(entry.get("evidence_id") or ""),
+                "class_name": "text_free",
+                "container_overlap_ratio": round(
+                    _inside_ratio_xywh(bbox, _text_area_graph_container_bbox(container)),
+                    6,
+                ),
+                "boundary_source": TEXT_AREA_GRAPH_PARENT_SOURCE_TEXT_UNIT,
+                "is_explicit_parent_boundary_evidence": True,
+            }
+        )
+    return output
+
+
+def _text_free_parent_boundary_has_typed_speech_mask_support(
+    entry: Mapping[str, Any],
+    role_evidence: Mapping[str, Any],
+) -> bool:
+    entry_bbox = _semantic_unit_bbox_from_evidence(entry)
+    if not entry_bbox:
+        return False
+    mask_entries = role_evidence.get("speech_mask_polygons") or []
+    if not isinstance(mask_entries, Sequence) or isinstance(mask_entries, (str, bytes)):
+        return False
+    for mask_entry in mask_entries:
+        if not isinstance(mask_entry, Mapping):
+            continue
+        mask_bbox = _semantic_unit_bbox_from_evidence(mask_entry)
+        if not mask_bbox:
+            continue
+        if _inside_ratio_xywh(entry_bbox, mask_bbox) >= 0.50:
+            return True
+    return False
+
+
 def _semantic_unit_from_container(
     container: TextAreaContainer,
     *,
@@ -8099,6 +8161,65 @@ def _sync_scopes_to_authorized_containers(plan: TextAreaPlan) -> None:
         _copy_container_authorization_to_scope(scope, container)
         plan.scopes.append(scope)
         scopes_by_container_id[container_id] = scope
+
+
+def _typed_multicolumn_unlinked_text_free_background_authority(
+    fused: Mapping[str, Any],
+    semantic_role_evidence: Mapping[str, Any],
+    *,
+    bbox: Sequence[int],
+    image_size: Tuple[int, int],
+    luma_image: Any,
+    clipped: bool,
+) -> bool:
+    if str(fused.get("fused_container_type") or "") != "free_text":
+        return False
+    if clipped or fused.get("conflict_flags"):
+        return False
+    if fused.get("linked_kitsumed_mask_ids") or not fused.get("linked_ogkalu_detection_ids"):
+        return False
+    confidence = _semantic_role_model_confidence(semantic_role_evidence)
+    if confidence is None or confidence < OGKALU_SINGLE_MODEL_AUTHORITY_CONFIDENCE:
+        return False
+    if SEMANTIC_KIND_BACKGROUND_NARRATION not in set(
+        _semantic_role_values(semantic_role_evidence, "candidate_roles")
+    ):
+        return False
+    if AUTH_CLEANUP_TRANSLATE_BACKGROUND not in set(
+        _semantic_role_values(semantic_role_evidence, "cleanup_candidate_states")
+    ):
+        return False
+    if "no_speech_bubble_mask_link" not in set(
+        _semantic_role_values(semantic_role_evidence, "role_signals")
+    ):
+        return False
+    protected_states = set(
+        _semantic_role_values(semantic_role_evidence, "protected_authority_states")
+    )
+    protected_states.update(
+        _semantic_role_values(semantic_role_evidence, "protected_candidate_states")
+    )
+    for record in _semantic_evidence_records(semantic_role_evidence):
+        state = str(record.get("authority_state") or "")
+        if _component_auth_family(state) in {"protected", "outside"}:
+            protected_states.add(state)
+    if protected_states:
+        return False
+    text_entries = semantic_role_evidence.get("text_unit_evidence_bboxes") or []
+    if not isinstance(text_entries, Sequence) or isinstance(text_entries, (str, bytes)):
+        return False
+    if not any(
+        isinstance(entry, Mapping)
+        and str(entry.get("class_name") or "") == "text_free"
+        and bool(_semantic_unit_bbox_from_evidence(entry))
+        for entry in text_entries
+    ):
+        return False
+    return _luma_bbox_has_multicolumn_vertical_text_components(
+        luma_image,
+        bbox,
+        image_size,
+    )
 
 
 def _container_from_fused(
@@ -8638,6 +8759,47 @@ def _container_from_fused(
             conflict_flags=conflicts,
             human_review_required=True,
             ocr_eligibility_reason="blocked_dark_unlinked_ogkalu_sfx_decorative",
+        )
+
+    if _typed_multicolumn_unlinked_text_free_background_authority(
+        fused,
+        semantic_role_evidence,
+        bbox=bbox,
+        image_size=image_size,
+        luma_image=luma_image,
+        clipped=clipped,
+    ):
+        semantic_role_evidence = _semantic_role_evidence_with_state(
+            semantic_role_evidence,
+            "cleanup_authority_states",
+            AUTH_CLEANUP_TRANSLATE_BACKGROUND,
+            evidence_kind="typed_multicolumn_text_free_background_authority",
+        )
+        return TextAreaContainer(
+            container_id=container_id,
+            page_id=page_id,
+            container_type=CONTAINER_CAPTION,
+            bbox=bbox,
+            source_model_ids=source_ids,
+            semantic_role_evidence=semantic_role_evidence,
+            confidence=confidence,
+            confidence_tier="typed_multicolumn_text_free_background_authority",
+            route_intent=ROUTE_TRANSLATE_CAPTION,
+            ocr_eligible=True,
+            comic_text_detector_scope_eligible=True,
+            fallback_reason=None,
+            evidence_reason_codes=reasons
+            + ["text_area_plan:typed_multicolumn_text_free_background_authority"],
+            conflict_flags=conflicts,
+            human_review_required=False,
+            ocr_eligibility_reason="typed_multicolumn_text_free_background_authority",
+            cleanup_authorization=AUTH_CLEANUP_TRANSLATE_BACKGROUND,
+            semantic_kind=SEMANTIC_KIND_BACKGROUND_NARRATION,
+            semantic_authorization_state=AUTH_CLEANUP_TRANSLATE_BACKGROUND,
+            authorization_source_stage="text_area_plan",
+            authorization_basis="typed_multicolumn_text_free_background_authority",
+            authorization_explicit=True,
+            authorization_field_origin=FRESH_AUTHORIZATION_FIELD_ORIGIN,
         )
 
     safe_unknown = _safe_unknown_ocr_fallback(fused_type, reasons, bbox, visual, image_size)
@@ -9441,10 +9603,6 @@ def _append_deterministic_vertical_side_caption_containers(
             continue
         side = _side_caption_side_for_bbox(seed_bbox, image_size)
         search_bbox = _side_caption_search_bbox(seed_bbox, image_size)
-        trimmed = _trim_side_caption_search_bbox_against_protected(search_bbox, plan.containers, image_size)
-        if trimmed is None:
-            continue
-        search_bbox = trimmed
         paired_text_boxes = _side_caption_paired_text_boundary_bboxes(result, item, search_bbox, image_size)
         if not paired_text_boxes:
             # Visual localization can support search and review, but only an

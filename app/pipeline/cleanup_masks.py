@@ -562,7 +562,7 @@ def build_cleanup_masks(
                 allow_growth_exception=bool(exception_reason),
             )
             component_projected = _effective_uses_component_projection(effective)
-            if broad_rejection and not (component_projected and effective.rejected):
+            if broad_rejection and not component_projected:
                 rejected_records.append(
                     {
                         **base,
@@ -579,6 +579,10 @@ def build_cleanup_masks(
                     }
                 )
                 continue
+
+            projection_quality_reasons = list(effective.audit.get("projection_quality_reasons", []) or [])
+            if broad_rejection and broad_rejection not in projection_quality_reasons:
+                projection_quality_reasons.append(broad_rejection)
 
             completion_method = str(effective.audit.get("mask_completion_method") or "")
             clean_authority = str(effective.audit.get("clean_mask_authority") or "")
@@ -721,7 +725,7 @@ def build_cleanup_masks(
                 authorization_source_stage=effective.audit.get("authorization_source_stage", ""),
                 semantic_authorization_state=effective.audit.get("semantic_authorization_state", ""),
                 projection_quality_state=effective.audit.get("projection_quality_state", ""),
-                projection_quality_reasons=effective.audit.get("projection_quality_reasons", []),
+                projection_quality_reasons=projection_quality_reasons,
                 mask_readiness_state=effective.audit.get("mask_readiness_state", ""),
                 mask_readiness_failure_reason=effective.audit.get("mask_readiness_failure_reason", ""),
                 semantic_authority_owner=effective.audit.get("semantic_authority_owner", ""),
@@ -1186,6 +1190,7 @@ def _build_component_projected_text_mask(
     status = "cleanup_mask_ready_from_owned_segmentation_components"
     failure_reason = ""
     rejected = False
+    quality_warning_reasons: list[str] = []
     owned_ratio_quality_warning = ""
     parent_surface_clipping_accounts_for_loss = False
     if not owned_ids or foreground is None or foreground_pixels <= 0:
@@ -1225,15 +1230,13 @@ def _build_component_projected_text_mask(
         if parent_surface_clipping_accounts_for_loss:
             owned_ratio_reason = ""
         unsafe_reason = _segmentation_foreground_unsafe_reason(foreground, execution_allowed, job)
-        hard_failure_reason = coverage_reason or owned_ratio_reason or unsafe_reason
-        if hard_failure_reason:
-            status = "cleanup_mask_partial_owned_components"
-            failure_reason = hard_failure_reason
-            rejected = True
-        elif ambiguous_ids or unowned_ids:
+        quality_warning_reasons = [
+            reason
+            for reason in (coverage_reason, owned_ratio_reason, unsafe_reason)
+            if reason
+        ]
+        if ambiguous_ids or unowned_ids:
             status = "cleanup_mask_ready_with_component_exclusions"
-            failure_reason = ""
-            rejected = False
 
     seed_pixels = int(np.count_nonzero(seed_foreground > 0)) if seed_foreground is not None else 0
     erase = None
@@ -1258,6 +1261,9 @@ def _build_component_projected_text_mask(
         )
     )
     projection_quality_reasons = list(projection.get("projection_quality_reasons", []) or [])
+    for reason in quality_warning_reasons:
+        if reason not in projection_quality_reasons:
+            projection_quality_reasons.append(reason)
     if (
         ambiguous_ids
         and status == "cleanup_mask_ready_with_component_exclusions"
