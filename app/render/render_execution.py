@@ -290,7 +290,7 @@ class PageRenderExecutor:
             )
             if transaction_failures:
                 audit["page_transaction"] = {
-                    "status": "parent_rejected_page_continues",
+                    "status": "parent_rejected_page_fails",
                     "required_parent": True,
                     "reasons": list(transaction_failures),
                     "output_committed": False,
@@ -299,13 +299,39 @@ class PageRenderExecutor:
                     [
                         *(audit.get("issues") or []),
                         *transaction_failures,
-                        "parent_render_rejected_page_continues",
+                        "parent_render_rejected_page_fails",
                     ]
                 )
                 issues.extend(transaction_failures)
-                issues.append("parent_render_rejected_page_continues")
+                issues.append("parent_render_rejected_page_fails")
                 failed_layer_ids.append(str(adjusted_plan.layer_id or adjusted_plan.parent_id))
-                continue
+                _finalize_page_transaction_audits(
+                    layer_audits,
+                    committed=False,
+                    failure_reason="required_parent_render_failed",
+                )
+                audit["page_transaction"]["status"] = "parent_rejected_page_fails"
+                return PageRenderResult(
+                    cleaned_page_base_path=cleaned_page_base_path,
+                    output_path=output_path,
+                    plans=adjusted_plans,
+                    layouts=layouts,
+                    fit_reports=reports,
+                    layer_audits=layer_audits,
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                    status="failed",
+                    issues=_unique_strings(issues),
+                    canvas_size=canvas_size,
+                    page_slot_owner=type(self.layout_planner).__name__,
+                    render_layout_planner_version=str(
+                        getattr(self.layout_planner, "version", "")
+                        or "unversioned"
+                    ),
+                    output_committed=False,
+                    requested_layer_count=len(ordered_plans),
+                    failed_layer_ids=failed_layer_ids,
+                    failure_reason="required_parent_render_failed",
+                )
             if audit.get("drawn"):
                 audit["page_transaction"] = {
                     "status": "staged",

@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
@@ -1766,6 +1767,7 @@ class PipelineWorker(QtCore.QThread):
                 render_input_path = source_path
                 cleaned_page_base_record = {}
                 cleanup_upstream_temp_path = ""
+                cleanup_stage_errors: list[str] = []
                 source_image_size = None
                 self._emit_stage(
                     PipelineStage.CLEANUP,
@@ -2155,6 +2157,7 @@ class PipelineWorker(QtCore.QThread):
                                 len(cleanup_upstream_commit_result.commit_records),
                             )
                     except Exception as exc:
+                        cleanup_stage_errors.append(f"{type(exc).__name__}: {exc}")
                         _page014_timeout_checkpoint(
                             "cleanup_runtime_or_commit",
                             "error",
@@ -2235,6 +2238,7 @@ class PipelineWorker(QtCore.QThread):
                         elapsed_ms=round((time.time() - cleanup_contract_start) * 1000.0, 3),
                     )
                 except Exception as exc:
+                    cleanup_stage_errors.append(f"{type(exc).__name__}: {exc}")
                     _page014_timeout_checkpoint(
                         "cleanup_contract_chain",
                         "error",
@@ -2295,6 +2299,68 @@ class PipelineWorker(QtCore.QThread):
                         retry_action=PipelineRetryAction.RETRY_PAGE,
                         operation="run_cleanup",
                     )
+
+                if not cleaned_page_base_record and parent_execution_bundles:
+                    from PIL import Image
+
+                    with Image.open(source_path) as fallback_source:
+                        fallback_cleaned_image = fallback_source.convert("RGB")
+                    failure_reason = (
+                        cleanup_stage_errors[-1]
+                        if cleanup_stage_errors
+                        else "cleanup_stage_did_not_publish_cleaned_page_base"
+                    )
+                    cleanup_required_bundles = [
+                        bundle
+                        for bundle in parent_execution_bundles
+                        if bool(getattr(bundle, "cleanup_required", False))
+                    ]
+                    cleanup_upstream_commit_result = SimpleNamespace(
+                        version="cleanup_upstream_commit_top_down_failure_snapshot_v1",
+                        cleaned_image=fallback_cleaned_image,
+                        commit_records=[],
+                        blocked_records=[
+                            {
+                                "page_id": page_id,
+                                "region_id": str(bundle.bundle_id or bundle.parent_id or ""),
+                                "parent_execution_bundle_id": str(
+                                    bundle.bundle_id or bundle.parent_id or ""
+                                ),
+                                "parent_logical_text_unit_id": str(
+                                    bundle.parent_id or bundle.bundle_id or ""
+                                ),
+                                "text_block_root_id": str(bundle.root_id or ""),
+                                "cleanup_committed_to_working_image": False,
+                                "failure_reason": failure_reason,
+                            }
+                            for bundle in cleanup_required_bundles
+                        ],
+                        errors=list(cleanup_stage_errors or [failure_reason]),
+                    )
+                    cleaned_page_base_record = persist_cleaned_page_base(
+                        page_id=page_id,
+                        source_path=source_path,
+                        export_dir=self._settings.export_dir,
+                        cleanup_upstream_commit_result=cleanup_upstream_commit_result,
+                        parent_execution_bundles=parent_execution_bundles,
+                        cleanup_required=bool(cleanup_required_bundles),
+                    )
+                    fallback_base_path = str(
+                        cleaned_page_base_record.get("image_path") or ""
+                    )
+                    if fallback_base_path and os.path.isfile(fallback_base_path):
+                        render_input_path = fallback_base_path
+                    if debug_context is not None:
+                        debug_context["cleaned_page_base"] = dict(
+                            cleaned_page_base_record
+                        )
+                        debug_context["cleanup_top_down_failure_snapshot"] = {
+                            "failure_reason": failure_reason,
+                            "parent_ids": [
+                                str(bundle.bundle_id or bundle.parent_id or "")
+                                for bundle in cleanup_required_bundles
+                            ],
+                        }
 
                 _sync_parent_execution_downstream_contracts(
                     parent_execution_bundles,
@@ -3823,13 +3889,6 @@ def _apply_cleanup_runtime_render_blocks(
     if not warning_records:
         return render_eligibility_result
 
-    _suppress_render_eligibility_for_cleanup_blocks(
-        render_eligibility_result,
-        warning_records,
-        reason="cleanup_runtime_required_source_erasure_not_proven",
-        contradiction="cleanup_runtime_required_source_erasure_not_proven",
-    )
-
     for record in warning_records:
         region_id = str(record.get("region_id") or "")
         warning_reason = str(record.get("phase5_cleanup_warning_reason") or "cleanup_runtime_warning_before_renderer")
@@ -3845,9 +3904,9 @@ def _apply_cleanup_runtime_render_blocks(
                     cleanup_runtime_failure_reason=record.get("failure_reason"),
                     cleanup_result_id=record.get("cleanup_result_id"),
                     cleanup_proof_id=record.get("cleanup_proof_id"),
-                    cleanup_render_permission_gate_released=False,
-                    cleanup_render_permission_gate_release_reason="cleanup_required_source_erasure_not_proven",
-                    renderer_policy_changed=True,
+                    cleanup_render_permission_gate_released=True,
+                    cleanup_render_permission_gate_release_reason="diagnostic_only_renderer_unaffected",
+                    renderer_policy_changed=False,
                 )
             except Exception:
                 pass
@@ -3879,13 +3938,6 @@ def _apply_cleanup_upstream_commit_render_blocks(
     if not blocked_records:
         return render_eligibility_result
 
-    _suppress_render_eligibility_for_cleanup_blocks(
-        render_eligibility_result,
-        blocked_records,
-        reason="cleanup_commit_required_source_erasure_not_committed",
-        contradiction="cleanup_commit_required_source_erasure_not_committed",
-    )
-
     for record in blocked_records:
         region_id = str(record.get("region_id") or "")
         if debug_context is not None:
@@ -3900,9 +3952,9 @@ def _apply_cleanup_upstream_commit_render_blocks(
                     cleanup_upstream_commit_warning_reason="cleanup_upstream_commit_blocked_warning_before_renderer",
                     cleanup_result_id=record.get("cleanup_result_id"),
                     cleanup_proof_id=record.get("cleanup_proof_id"),
-                    cleanup_render_permission_gate_released=False,
-                    cleanup_render_permission_gate_release_reason="cleanup_commit_required_source_erasure_not_committed",
-                    renderer_policy_changed=True,
+                    cleanup_render_permission_gate_released=True,
+                    cleanup_render_permission_gate_release_reason="diagnostic_only_renderer_unaffected",
+                    renderer_policy_changed=False,
                 )
             except Exception:
                 pass
@@ -12183,6 +12235,17 @@ def _process_page(
     _summarize_translation_requests(debug_context)
 
     sync_bundles_from_region_records(parent_execution_bundles, execution_regions)
+    missing_translation_parent_ids = [
+        str(bundle.parent_id or bundle.bundle_id or "")
+        for bundle in parent_execution_bundles
+        if bool(bundle.translation_required)
+        and not str(bundle.translated_text or "").strip()
+    ]
+    if missing_translation_parent_ids:
+        raise RuntimeError(
+            "parent_translation_contract_error:missing_translation_output:"
+            + ",".join(missing_translation_parent_ids)
+        )
     if debug_context is not None and parent_execution_bundles:
         debug_context["parent_execution_bundles"] = parent_execution_bundle_result.to_audit_dict()
 
@@ -14760,6 +14823,8 @@ def _route_low_conf_dark_short_art_sfx_regions(
 
 
 def _looks_like_recoverable_speech_region(region: dict, page_class: str = "normal") -> bool:
+    if _is_authoritative_parent_execution_region(region):
+        return False
     if str(page_class or "").strip().lower() in {"cover", "contents", "chapter_title"}:
         return False
     region_type = str(region.get("type", "") or "").strip().lower()
@@ -16250,6 +16315,8 @@ def _should_preserve_decorative_fragment_translation(
     region: dict,
     style_guide: dict,
 ) -> bool:
+    if _is_authoritative_parent_execution_region(region):
+        return False
     source = str(source_text or "").strip()
     if _looks_like_mukimuki_fragment(source):
         return True
@@ -16291,6 +16358,20 @@ def _should_preserve_decorative_fragment_translation(
     if body == "むきむき" or re.fullmatch(r"(?:むき){2,}", body):
         return True
     return False
+
+
+def _is_authoritative_parent_execution_region(region: dict | None) -> bool:
+    if not isinstance(region, dict):
+        return False
+    render = region.get("render") if isinstance(region.get("render"), dict) else {}
+    return bool(
+        region.get("parent_execution_authoritative")
+        or render.get("parent_execution_authoritative")
+        or str(region.get("execution_region_authority") or "")
+        == "parent_execution_bundle"
+        or str(render.get("execution_region_authority") or "")
+        == "parent_execution_bundle"
+    )
 
 
 def _strip_name_suffixes(text: str) -> str:

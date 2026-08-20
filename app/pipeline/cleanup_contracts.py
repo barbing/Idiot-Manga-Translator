@@ -486,6 +486,7 @@ def build_cleanup_job_candidates(
 
     started = time.time()
     source_records_by_region = _source_records_by_region(source_glyph_masks)
+    finalized_parent_ids_by_region = _finalized_parent_ids_by_region(regions)
     _cleanup_perf_contract_checkpoint(
         "cleanup_job_build",
         "module_start",
@@ -506,17 +507,70 @@ def build_cleanup_job_candidates(
 
         region_id = str(_first_present(region, "region_id", "id", default=f"region_{index}"))
         render = _mapping_or_empty(region.get("render"))
-        direct_source_records = source_records_by_region.get(region_id, [])
+        expected_parent_id = _optional_str(
+            _first_present(
+                region,
+                "parent_execution_bundle_id",
+                "parent_logical_text_unit_id",
+                "parent_execution_parent_id",
+                default=_first_present(
+                    render,
+                    "parent_execution_bundle_id",
+                    "parent_logical_text_unit_id",
+                    "parent_execution_parent_id",
+                    default=None,
+                ),
+            )
+        )
+        direct_source_records = _source_records_for_finalized_parent(
+            source_records_by_region.get(region_id, []),
+            region_id=region_id,
+            expected_parent_id=expected_parent_id,
+        )
         expanded_source_records = _expand_cleanup_unit_source_records(
             region_id=region_id,
             source_records=direct_source_records,
             source_records_by_region=source_records_by_region,
+            expected_parent_id=expected_parent_id,
         )
         cleanup_unit = _cleanup_unit_for_region(
             page_id=page_id,
             region_id=region_id,
             source_records=expanded_source_records,
+            expected_parent_id=expected_parent_id,
+            finalized_parent_ids_by_region=finalized_parent_ids_by_region,
         )
+        parent_execution_authoritative = bool(
+            region.get("parent_execution_authoritative")
+            or render.get("parent_execution_authoritative")
+            or str(region.get("execution_region_authority") or "")
+            == "parent_execution_bundle"
+            or str(render.get("execution_region_authority") or "")
+            == "parent_execution_bundle"
+        )
+        parent_cleanup_required = bool(
+            region.get("cleanup_required")
+            or render.get("cleanup_required")
+        )
+        parent_execution_id = str(
+            region.get("parent_execution_bundle_id")
+            or region.get("parent_logical_text_unit_id")
+            or region_id
+        )
+        if parent_execution_authoritative and parent_execution_id:
+            cleanup_unit = _CleanupUnit(
+                unit_id=f"cu_{_safe_id(page_id)}_{_safe_id(parent_execution_id)}",
+                level="parent",
+                anchor_region_id=parent_execution_id,
+                child_region_ids=[parent_execution_id],
+                source_records=cleanup_unit.source_records,
+                required_source_glyph_mask_ids=cleanup_unit.required_source_glyph_mask_ids,
+                missing_source_glyph_mask_ids=cleanup_unit.missing_source_glyph_mask_ids,
+                text_block_root_id=str(region.get("text_block_root_id") or "") or None,
+                parent_logical_text_unit_id=parent_execution_id,
+                text_area_container_id=str(region.get("text_area_container_id") or "") or None,
+                ambiguous_reason="",
+            )
         source_records = cleanup_unit.source_records
         route_intent = _string_from_first(
             render,
@@ -724,7 +778,9 @@ def build_cleanup_job_candidates(
             skipped_records.append({**base_record, "reason": "region_marked_not_translated"})
             continue
 
-        if not source_records:
+        if not source_records and not (
+            parent_execution_authoritative and parent_cleanup_required
+        ):
             if accepted_cleanup_obligation:
                 obligation_records.append(
                     _obligation_record(
@@ -844,7 +900,11 @@ def build_cleanup_job_candidates(
                         "logical_text_unit_id",
                         "logical_block_id",
                         "logical_text_unit_ids",
-                        default=[],
+                        default=(
+                            [parent_logical_text_unit_id]
+                            if parent_logical_text_unit_id
+                            else []
+                        ),
                     )
                 ),
                 cleanup_class=cleanup_class,
@@ -1183,9 +1243,19 @@ def _cleanup_unit_for_region(
     page_id: str,
     region_id: str,
     source_records: list[dict[str, Any]],
+    expected_parent_id: str | None = None,
+    finalized_parent_ids_by_region: Mapping[str, str] | None = None,
 ) -> _CleanupUnit:
     records = [record for record in source_records or [] if isinstance(record, Mapping)]
     child_region_ids = _region_ids_from_source_records(records) or [region_id]
+    if expected_parent_id:
+        owner_by_region = finalized_parent_ids_by_region or {}
+        child_region_ids = [
+            child_region_id
+            for child_region_id in child_region_ids
+            if not owner_by_region.get(child_region_id)
+            or owner_by_region.get(child_region_id) == expected_parent_id
+        ]
     if region_id not in child_region_ids:
         child_region_ids.append(region_id)
         child_region_ids = sorted(set(child_region_ids))
@@ -1249,6 +1319,35 @@ def _cleanup_unit_for_region(
     )
 
 
+def _finalized_parent_ids_by_region(
+    regions: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for region in regions or []:
+        if not isinstance(region, Mapping):
+            continue
+        render = _mapping_or_empty(region.get("render"))
+        region_id = str(_first_present(region, "region_id", "id", default="") or "")
+        parent_id = _optional_str(
+            _first_present(
+                region,
+                "parent_execution_bundle_id",
+                "parent_logical_text_unit_id",
+                "parent_execution_parent_id",
+                default=_first_present(
+                    render,
+                    "parent_execution_bundle_id",
+                    "parent_logical_text_unit_id",
+                    "parent_execution_parent_id",
+                    default=None,
+                ),
+            )
+        )
+        if region_id and parent_id:
+            output[region_id] = parent_id
+    return output
+
+
 def _parent_first_target_region_ids(parent_id: str | None, region_ids: Sequence[Any]) -> list[str]:
     output: list[str] = []
     parent = str(parent_id or "").strip()
@@ -1266,6 +1365,7 @@ def _expand_cleanup_unit_source_records(
     region_id: str,
     source_records: list[dict[str, Any]],
     source_records_by_region: Mapping[str, list[dict[str, Any]]],
+    expected_parent_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Expand anchor evidence to its represented child SourceGlyph records.
 
@@ -1300,12 +1400,61 @@ def _expand_cleanup_unit_source_records(
         for record in source_records_by_region.get(current, []) or []:
             if not isinstance(record, Mapping):
                 continue
+            if expected_parent_id and not _source_record_matches_finalized_parent(
+                record,
+                region_id=current,
+                expected_parent_id=expected_parent_id,
+            ):
+                continue
             added = add_record(record)
             if added:
                 for related_id in _region_ids_from_source_record(record):
                     if related_id not in visited:
                         pending.add(related_id)
     return records
+
+
+def _source_records_for_finalized_parent(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    region_id: str,
+    expected_parent_id: str | None,
+) -> list[dict[str, Any]]:
+    if not expected_parent_id:
+        return [dict(record) for record in records if isinstance(record, Mapping)]
+    return [
+        dict(record)
+        for record in records
+        if isinstance(record, Mapping)
+        and _source_record_matches_finalized_parent(
+            record,
+            region_id=region_id,
+            expected_parent_id=expected_parent_id,
+        )
+    ]
+
+
+def _source_record_matches_finalized_parent(
+    record: Mapping[str, Any],
+    *,
+    region_id: str,
+    expected_parent_id: str,
+) -> bool:
+    parent_ids = _source_record_unit_ids(
+        [record],
+        keys=(
+            "parent_execution_bundle_id",
+            "parent_logical_text_unit_id",
+            "parent_id",
+            "logical_text_unit_id",
+        ),
+    )
+    if parent_ids:
+        return expected_parent_id in parent_ids
+    direct_region_id = _optional_str(
+        _first_present(record, "region_id", "target_region_id", default=None)
+    )
+    return direct_region_id == region_id
 
 
 def _source_record_unit_ids(records: Sequence[Mapping[str, Any]], *, keys: Sequence[str]) -> list[str]:
@@ -1476,16 +1625,16 @@ def _classify_cleanup_class(
             f"source_glyph_class_contract_soft_risk_{contract_class.value}_strategy",
             "",
         )
-    if len(source_records or []) <= 1 and any(_truthy(record.get("cleanup_visual_artifact_risk")) for record in source_records):
-        return (
-            CleanupClass.CAPTION_DARK_OR_SCREENTONE,
-            "cleanup_visual_artifact_risk_soft_strategy_metadata",
-            "",
-        )
     if contract_class is not None:
         return (
             contract_class,
             f"source_glyph_class_contract_{contract_class.value}",
+            "",
+        )
+    if len(source_records or []) <= 1 and any(_truthy(record.get("cleanup_visual_artifact_risk")) for record in source_records):
+        return (
+            CleanupClass.CAPTION_DARK_OR_SCREENTONE,
+            "cleanup_visual_artifact_risk_soft_strategy_metadata",
             "",
         )
 
@@ -1609,10 +1758,7 @@ def _iter_source_records(source_glyph_masks: Any) -> list[Any]:
         if isinstance(masks_by_region, Mapping):
             for region_id, value in masks_by_region.items():
                 for item in _sequence_or_single(value):
-                    if isinstance(item, Mapping):
-                        records.append({"region_id": region_id, **dict(item)})
-                    else:
-                        records.append({"region_id": region_id, "mask": item})
+                    records.append(_source_record_for_region(region_id, item))
         return records
 
     records = []
@@ -1624,11 +1770,18 @@ def _iter_source_records(source_glyph_masks: Any) -> list[Any]:
     if isinstance(masks_by_region, Mapping):
         for region_id, value in masks_by_region.items():
             for item in _sequence_or_single(value):
-                if isinstance(item, Mapping):
-                    records.append({"region_id": region_id, **dict(item)})
-                else:
-                    records.append({"region_id": region_id, "mask": item})
+                records.append(_source_record_for_region(region_id, item))
     return records
+
+
+def _source_record_for_region(region_id: Any, record: Any) -> dict[str, Any]:
+    if hasattr(record, "to_audit_dict"):
+        audit_record = record.to_audit_dict()
+        if isinstance(audit_record, Mapping):
+            return {"region_id": region_id, **dict(audit_record)}
+    if isinstance(record, Mapping):
+        return {"region_id": region_id, **dict(record)}
+    return {"region_id": region_id, "mask": record}
 
 
 def _normalize_source_record(record: Any) -> dict[str, Any]:

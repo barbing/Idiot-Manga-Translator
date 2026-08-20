@@ -896,6 +896,19 @@ def _evaluate_root_source_coherence(
             parent.source_contract_quality_action = parent.source_contract_quality_action or "identity_punctuation"
         else:
             status, reasons, action = _parent_source_coherence(parent.source_text, role=parent.role)
+        if (
+            _parent_has_explicit_text_area_graph_boundary(parent)
+            and str(parent.source_text or "").strip()
+            and (status == "malformed" or action in {"repair_required", "block_review_only"})
+        ):
+            status = "weak"
+            action = "translate_with_review"
+            reasons = sorted(
+                set(
+                    list(reasons or [])
+                    + ["explicit_parent_source_quality_diagnostic_only"]
+                )
+            )
         if _parent_owned_ocr_source_should_translate_with_review(parent, action):
             status = "weak"
             action = "translate_with_review"
@@ -941,7 +954,15 @@ def _evaluate_root_source_coherence(
             for parent in root_parents
             if parent.source_coherence_action in {"repair_required", "block_review_only"}
         ]
-        duplicate_pairs = _duplicate_partial_parent_pairs(root_parents)
+        parent_by_id = {parent.parent_id: parent for parent in root_parents}
+        duplicate_pairs = [
+            (left_id, right_id)
+            for left_id, right_id in _duplicate_partial_parent_pairs(root_parents)
+            if not (
+                _parent_has_explicit_text_area_graph_boundary(parent_by_id[left_id])
+                and _parent_has_explicit_text_area_graph_boundary(parent_by_id[right_id])
+            )
+        ]
         duplicate_parent_ids = _duplicate_partial_rejected_parent_ids(root_parents, duplicate_pairs)
         for parent in root_parents:
             duplicate_with = {
@@ -985,7 +1006,14 @@ def _evaluate_root_source_coherence(
             and root.ctd_scope_eligible
         ):
             failure_reasons.append("speech_root_empty_source")
-        if root.root_type == ROOT_SPEECH and root.root_parent_count >= 3:
+        if (
+            root.root_type == ROOT_SPEECH
+            and root.root_parent_count >= 3
+            and any(
+                not _parent_has_explicit_text_area_graph_boundary(parent)
+                for parent in root_parents
+            )
+        ):
             failure_reasons.append("speech_root_many_parent_units")
         if root.root_type == ROOT_CAPTION and _caption_root_looks_incomplete(root_parents, root_children):
             failure_reasons.append("caption_background_root_incomplete_source")
@@ -1636,6 +1664,8 @@ def _caption_parent_looks_incomplete(parent: ParentLogicalTextUnit) -> bool:
     body = _source_body(parent.source_text)
     if not body:
         return True
+    if _parent_has_explicit_text_area_graph_boundary(parent):
+        return False
     if len(body) <= 2 and not _valid_short_reaction_or_laugh(parent.source_text):
         return True
     return parent.source_coherence_action in {"repair_required", "block_review_only"}

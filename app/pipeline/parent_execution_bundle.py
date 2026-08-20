@@ -325,6 +325,9 @@ class ParentExecutionBundle:
             "source_text": self.source_text,
             "translation": self.translated_text,
             "translated_text": self.translated_text,
+            "translation_required": bool(self.translation_required),
+            "cleanup_required": bool(self.cleanup_required),
+            "render_required": bool(self.render_required),
             "bbox": list(bbox),
             "polygon": _polygon_from_bbox(bbox),
             "order_index": int(self.reading_order_index),
@@ -392,6 +395,9 @@ class ParentExecutionBundle:
                 "source_text": self.source_text,
                 "translation": self.translated_text,
                 "translated_text": self.translated_text,
+                "translation_required": bool(self.translation_required),
+                "cleanup_required": bool(self.cleanup_required),
+                "render_required": bool(self.render_required),
                 "child_final_state": "parent_anchor",
                 "cleanup_mode": cleanup_mode,
                 "semantic_class": semantic_class,
@@ -1088,6 +1094,9 @@ def _sync_execution_region_from_bundle(
     record["source_quality_reason_codes"] = list(bundle.source_quality_reason_codes)
     record["translation"] = bundle.translated_text
     record["translated_text"] = bundle.translated_text
+    record["translation_required"] = bool(bundle.translation_required)
+    record["cleanup_required"] = bool(bundle.cleanup_required)
+    record["render_required"] = bool(bundle.render_required)
     record["order_index"] = int(bundle.reading_order_index)
     record["reading_order_index"] = int(bundle.reading_order_index)
     record["source_region_ids"] = list(bundle.source_region_ids)
@@ -1138,6 +1147,9 @@ def _sync_execution_region_from_bundle(
     render["source_quality_reason_codes"] = list(bundle.source_quality_reason_codes)
     render["translation"] = bundle.translated_text
     render["translated_text"] = bundle.translated_text
+    render["translation_required"] = bool(bundle.translation_required)
+    render["cleanup_required"] = bool(bundle.cleanup_required)
+    render["render_required"] = bool(bundle.render_required)
     render["order_index"] = int(bundle.reading_order_index)
     render["reading_order_index"] = int(bundle.reading_order_index)
     render["source_region_ids"] = list(bundle.source_region_ids)

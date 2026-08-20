@@ -149,8 +149,8 @@ def _renderer_stage5_renderable_parent_bundles(
                 legacy_region_rendering_used=False,
                 renderer_cleanup_mutation_applied=False,
                 cleanup_applied=False,
+                render_eligibility_diagnostic_only=True,
             )
-            continue
         output.append(bundle)
     return output
 

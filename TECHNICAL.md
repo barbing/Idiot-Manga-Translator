@@ -13,7 +13,7 @@ YomiFrame separates semantic authority from pixel evidence and from downstream e
 - TextBlockHierarchy normalizes physical roots, parent text obligations, and child source evidence into a finalized graph view.
 - ParentExecutionBundle converts finalized parent obligations into the downstream execution contract.
 - CleanupMask consumes upstream authorization and foreground projection; it does not infer speech, background, SFX, art, or review semantics from local component geometry.
-- OCR, translation, cleanup, and rendering require explicit TextAreaPlan fields instead of accepting route intent alone. OCR may be allowed for review/conservation while translation, cleanup, and rendering remain blocked.
+- Before parent finalization, OCR may remain review/conservation evidence without creating downstream work. Once a parent is finalized as executable, OCR, translation, cleanup, and rendering form a mandatory top-down chain and no later diagnostic can cancel that parent.
 
 The target default chain is:
 
@@ -125,7 +125,7 @@ TextAreaPlan must distinguish a candidate or review state from executable semant
 
 ComicTextDetector/TextForegroundSegmentation provides text-pixel evidence within TextAreaPlan scopes. It may refine component boundaries and foreground pixels, but it must not become the semantic owner of speech, background, SFX, or review classifications.
 
-The projection output feeds component authorization and cleanup masks. Projection quality may affect executability, but projection readiness should not recolor semantic state.
+The projection output feeds component authorization and cleanup masks. Projection quality is diagnostic after parent finalization; it cannot recolor semantic state or cancel the parent cleanup task.
 
 ### Root / Parent / Child Hierarchy
 
@@ -190,6 +190,12 @@ ParentExecutionBundle
 Rendering composes translated text after cleanup. The primary entry point for current production output is `render_parent_execution_bundles()`, which converts bundles to parent-owned execution regions and stamps renderer audit identity. It must preserve the full translated text or produce explicit evidence when text cannot fit. It should not silently drop characters, overflow unreadably, or reinterpret semantic scope.
 
 The renderer consumes cleanup results and render-eligibility decisions. It must not generate cleanup masks, choose cleanup classes, select cleanup backends, or mutate source cleanup locally in normal operation.
+
+The renderer does not validate cleanup completeness. It consumes the supplied
+`CleanedPageBase` and every render-required parent. Cleanup/proof and
+render-eligibility records remain diagnostics; they cannot suppress parent
+execution. A required layer failure fails the page transaction instead of
+committing a successful partial page.
 
 ## Semantic Authorization Contract
 

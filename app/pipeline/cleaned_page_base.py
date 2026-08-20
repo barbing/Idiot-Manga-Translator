@@ -96,7 +96,11 @@ def persist_cleaned_page_base(
             return record
         record.update(
             {
-                "state": "committed",
+                "state": (
+                    "committed_with_cleanup_failures"
+                    if blocked_records or errors
+                    else "committed"
+                ),
                 "valid": True,
                 "image_path": cache_path,
                 "cache_path": cache_path,
@@ -128,16 +132,33 @@ def persist_cleaned_page_base(
     reason = "cleanup_blocked" if blocked_records else "cleanup_required_but_not_committed"
     if errors:
         reason = "cleanup_commit_errors"
+    cache_path = cleaned_page_base_cache_path(export_dir, page_id_text, source_path)
+    save_error = _save_cleaned_image(cleanup_upstream_commit_result, cache_path)
+    if not save_error:
+        record.update(
+            {
+                "state": "committed_with_cleanup_failures",
+                "valid": True,
+                "image_path": cache_path,
+                "cache_path": cache_path,
+                "cleaned_page_base_sha256": file_sha256(cache_path),
+                "invalidation": {
+                    "valid": True,
+                    "reason": reason,
+                },
+            }
+        )
+        return record
     record.update(
         {
-            "state": "blocked_or_partial",
+            "state": "cache_write_failed",
             "valid": False,
             "image_path": str(source_path or ""),
-            "cache_path": "",
+            "cache_path": cache_path,
             "cleaned_page_base_sha256": source_hash,
             "invalidation": {
                 "valid": False,
-                "reason": reason,
+                "reason": save_error or reason,
             },
         }
     )

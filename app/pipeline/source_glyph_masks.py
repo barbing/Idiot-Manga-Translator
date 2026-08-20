@@ -156,6 +156,8 @@ class SourceGlyphMask:
             "compatibility_source_fields": dict(self.compatibility_source_fields),
             "source_glyph_mask_anchor_block_id": self.logical_block_id,
             "parent_execution_bundle_id": self.parent_execution_bundle_id,
+            "parent_logical_text_unit_id": self.parent_logical_text_unit_id,
+            "text_block_root_id": self.text_block_root_id,
             "source_glyph_mask_parent_logical_text_unit_id": self.parent_logical_text_unit_id,
             "source_glyph_mask_text_block_root_id": self.text_block_root_id,
             "source_glyph_mask_anchor_child_id": self.anchor_child_id,

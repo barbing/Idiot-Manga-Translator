@@ -1645,6 +1645,55 @@ def run_cleanup_runtime_contract(
             }
         )
 
+    accounted_job_ids = {
+        str(job.cleanup_job_id)
+        for job, _cleanup_mask, _plan in runtime_obligations
+    }
+    accounted_job_ids.update(
+        str(record.get("cleanup_job_id") or "")
+        for record in status_records
+        if isinstance(record, Mapping) and str(record.get("cleanup_job_id") or "")
+    )
+    for job in jobs:
+        job_id = str(job.cleanup_job_id or "")
+        if not job_id or job_id in accounted_job_ids:
+            continue
+        job_masks = list(masks_by_job_id.get(job_id, []) or [])
+        if not job_masks:
+            reason = "cleanup_mask_missing_for_parent"
+        elif not any(_accepted_executable_cleanup_mask(mask) for mask in job_masks):
+            reason = "cleanup_mask_non_executable_for_parent"
+        else:
+            reason = "cleanup_plan_missing_for_parent"
+        base_record = _runtime_base_record(
+            page_id,
+            job,
+            runtime_class=job.cleanup_class,
+        )
+        status_records.append(
+            {
+                **base_record,
+                "runtime_status": "failed",
+                "cleanup_mask_id": str(
+                    getattr(job_masks[0], "cleanup_mask_id", "")
+                    if job_masks
+                    else ""
+                ),
+                "cleanup_obligation_id": str(
+                    getattr(job_masks[0], "cleanup_mask_id", "")
+                    if job_masks
+                    else job_id
+                ),
+                "failure_reason": reason,
+                "cleanup_outcome_state": reason,
+                "render_consumption_decision_if_consumed": (
+                    "diagnostic_only_renderer_unaffected"
+                ),
+                "renderer_consumed": False,
+            }
+        )
+        errors.append(f"{job_id}:{reason}")
+
     backend_contexts_by_mask_id = _backend_contexts_by_cleanup_mask_id(
         runtime_obligations,
         image,
@@ -2215,11 +2264,24 @@ def commit_cleanup_runtime_results_to_working_image(
 
     entries_by_root: dict[str, list[dict[str, Any]]] = {}
     for entry in commit_entries:
-        entries_by_root.setdefault(str(entry.get("text_block_root_id") or "root_unknown"), []).append(entry)
+        base = entry.get("base") if isinstance(entry.get("base"), Mapping) else {}
+        parent_id = str(
+            base.get("parent_execution_bundle_id")
+            or base.get("parent_logical_text_unit_id")
+            or base.get("region_id")
+            or entry.get("cleanup_obligation_id")
+            or "parent_unknown"
+        )
+        entries_by_root.setdefault(parent_id, []).append(entry)
 
-    for root_id in sorted(entries_by_root):
+    for parent_id in sorted(entries_by_root):
         root_started = time.time()
-        root_entries = entries_by_root[root_id]
+        root_entries = entries_by_root[parent_id]
+        root_id = str(
+            (root_entries[0].get("base") or {}).get("text_block_root_id")
+            or root_entries[0].get("text_block_root_id")
+            or "root_unknown"
+        )
         root_obligation_ids = sorted(
             {
                 str(entry.get("cleanup_obligation_id") or entry.get("cleanup_mask_id") or "")
@@ -2380,6 +2442,8 @@ def commit_cleanup_runtime_results_to_working_image(
         root_transaction_records.append(
             {
                 "page_id": page_id,
+                "parent_execution_bundle_id": parent_id,
+                "parent_logical_text_unit_id": parent_id,
                 "text_block_root_id": root_id,
                 "root_id": root_id,
                 "accepted_cleanup_mask_ids": root_obligation_ids,
