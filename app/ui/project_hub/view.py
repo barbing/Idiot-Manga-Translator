@@ -62,6 +62,7 @@ class _ProjectFilterProxy(QtCore.QSortFilterProxyModel):
         super().__init__(parent)
         self._query = ""
         self._attention_only = False
+        self._excluded_path = ""
         self.setDynamicSortFilter(True)
 
     def set_query(self, value: str) -> None:
@@ -80,6 +81,16 @@ class _ProjectFilterProxy(QtCore.QSortFilterProxyModel):
         self._attention_only = active
         self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
 
+    def set_excluded_path(self, value: str) -> None:
+        """Hide the featured project from the secondary recent-project grid."""
+
+        path = str(value or "").strip().casefold()
+        if path == self._excluded_path:
+            return
+        self.beginFilterChange()
+        self._excluded_path = path
+        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
+
     def filterAcceptsRow(self, source_row: int, source_parent: QtCore.QModelIndex) -> bool:
         model = self.sourceModel()
         if model is None:
@@ -88,6 +99,9 @@ class _ProjectFilterProxy(QtCore.QSortFilterProxyModel):
         name = str(index.data(int(ProjectRole.NAME)) or "").casefold()
         pair = str(index.data(int(ProjectRole.LANGUAGE_PAIR)) or "").casefold()
         status = str(index.data(int(ProjectRole.STATUS_LABEL)) or "").strip().casefold()
+        path = str(index.data(int(ProjectRole.PATH)) or "").strip().casefold()
+        if self._excluded_path and path == self._excluded_path:
+            return False
         if self._query and self._query not in name and self._query not in pair:
             return False
         if self._attention_only and status in {"ready", "complete", "completed"}:
@@ -434,12 +448,20 @@ class ProjectHubView(QtWidgets.QWidget):
             label.setAccessibleName(text)
 
     def _update_empty_state(self, *_args: object) -> None:
-        model = self.recent_projects.model()
-        empty = model is None or model.rowCount() == 0
-        self.empty_label.setVisible(empty)
-        self.recent_projects.setVisible(not empty)
-        self.hero.setVisible(not empty)
         self._sync_current_project()
+        source = self._recent_proxy.sourceModel()
+        source_empty = source is None or source.rowCount() == 0
+        recent_empty = self._recent_proxy.rowCount() == 0
+        self.hero.setVisible(not source_empty)
+        self.recent_projects.setVisible(not recent_empty)
+        self.empty_label.setVisible(source_empty or recent_empty)
+        self.empty_label.setText(
+            "No recent projects yet. Start a translation or open an existing project."
+            if source_empty
+            else "No projects need attention."
+            if self._attention_only
+            else "No other recent projects."
+        )
         self._schedule_recent_projects_resize()
 
     def _schedule_recent_projects_resize(self) -> None:
@@ -488,9 +510,14 @@ class ProjectHubView(QtWidgets.QWidget):
         return super().eventFilter(watched, event)
 
     def _sync_current_project(self) -> None:
-        model = self.recent_projects.model()
-        index = model.index(0, 0) if model is not None and model.rowCount() else QtCore.QModelIndex()
+        model = self._recent_proxy.sourceModel()
+        index = (
+            model.index(0, 0)
+            if model is not None and model.rowCount()
+            else QtCore.QModelIndex()
+        )
         if not index.isValid():
+            self._recent_proxy.set_excluded_path("")
             self._hero_project_path = ""
             self._hero_recoverable = False
             self.resume_button.setEnabled(False)
@@ -498,6 +525,7 @@ class ProjectHubView(QtWidgets.QWidget):
             return
         name = str(index.data(int(ProjectRole.NAME)) or index.data() or "Project")
         path = str(index.data(int(ProjectRole.PATH)) or "").strip()
+        self._recent_proxy.set_excluded_path(path)
         pair = str(index.data(int(ProjectRole.LANGUAGE_PAIR)) or "Languages unavailable")
         total = int(index.data(int(ProjectRole.PAGE_COUNT)) or 0)
         complete = int(index.data(int(ProjectRole.COMPLETED_COUNT)) or 0)
@@ -575,7 +603,11 @@ class ProjectHubView(QtWidgets.QWidget):
                 if ready_text:
                     label.setText(ready_text)
                     label.setAccessibleName(f"{ready_text} status")
-        self.recent_projects.setCurrentIndex(index)
+        self.recent_projects.setCurrentIndex(
+            self._recent_proxy.index(0, 0)
+            if self._recent_proxy.rowCount()
+            else QtCore.QModelIndex()
+        )
 
     def _toggle_attention_filter(self, checked: bool) -> None:
         self._attention_only = bool(checked)

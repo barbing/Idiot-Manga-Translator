@@ -23,6 +23,7 @@ from app.ui.editor.canvas import (
 )
 from app.ui.design_system.delegates import PageRailDelegate
 from app.ui.design_system.icons import hybrid_icon
+from app.ui.presentation import editor_preview_action
 from app.ui.ui_contract import (
     CANVAS_VIEW_IDS,
     INSPECTOR_TAB_IDS,
@@ -883,11 +884,14 @@ class PageEditorView(QtWidgets.QWidget):
             self._toggle_inspector_visibility
         )
         toolbar_layout.addWidget(self.inspector_toggle_button)
-        self.rerender_button = QtWidgets.QPushButton("Preview this page")
+        self.rerender_button = QtWidgets.QPushButton("Preview final page")
         self.rerender_button.setObjectName("primaryCommand")
         self.rerender_button.setProperty("role", "command")
         self.rerender_button.setProperty("variant", "primary")
-        self.rerender_button.setAccessibleName("Preview this page")
+        self.rerender_button.setAccessibleName("Preview final page")
+        self.rerender_button.setAccessibleDescription(
+            "Preview the current saved text, style, and layout as final page pixels."
+        )
         self.rerender_button.clicked.connect(
             lambda: self.rerender_requested.emit(self._current_page_id)
             if self._current_page_id
@@ -1065,18 +1069,31 @@ class PageEditorView(QtWidgets.QWidget):
             "text",
         )
         self.inspector_footer.setVisible(tab not in {"cleanup", "history"})
-        label = {
-            "style": "Preview style",
-            "layout": "Preview layout",
-        }.get(tab, "Preview this page")
+        label, description = editor_preview_action(tab)
         self.rerender_button.setText(label)
         self.rerender_button.setAccessibleName(label)
+        self.rerender_button.setAccessibleDescription(description)
+        self.rerender_button.setToolTip(description)
         self.target_restore_button.setVisible(tab == "text")
         self.inspector_more_button.setAccessibleName(
             f"More {tab} actions"
         )
         self.inspector_toggle_details_action.setEnabled(
             tab in {"style", "layout"}
+        )
+        details_visible = False
+        if tab == "style":
+            details_visible = any(
+                not card.isHidden() for card in self._style_detail_cards
+            )
+        elif tab == "layout":
+            details_visible = any(
+                not card.isHidden() for card in self._layout_detail_cards
+            )
+        self.inspector_toggle_details_action.setText(
+            "Hide explicit override controls"
+            if details_visible
+            else "Show explicit override controls"
         )
         self._sync_cleanup_overlay_visibility()
 
@@ -3404,13 +3421,17 @@ class PageEditorView(QtWidgets.QWidget):
         self.style_more_button.setObjectName("styleAdvancedOverridesButton")
         self.style_more_button.setCheckable(True)
         self.style_more_button.setIcon(hybrid_icon("more"))
+        self.style_more_button.setText("Edit style")
+        self.style_more_button.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
         self.style_more_button.setToolTip("Show explicit style override controls")
         self.style_more_button.setAccessibleName("Show explicit style override controls")
         self.style_more_button.toggled.connect(self._set_style_details_visible)
         style_actions.addWidget(self.style_more_button)
         style_resolved_layout.addLayout(style_actions)
         self.style_preview_button.setVisible(False)
-        self.style_more_button.setVisible(False)
+        self.style_more_button.setVisible(True)
         layout.insertWidget(0, self.style_resolved_card)
 
         self.style_legacy_values = QtWidgets.QWidget()
@@ -3428,11 +3449,10 @@ class PageEditorView(QtWidgets.QWidget):
         self.style_authority.setProperty("role", "secondary")
         style_legacy_layout.addWidget(self.style_authority)
         layout.addWidget(self.style_legacy_values)
-        # The prototype keeps the actual override controls in the same scroll
-        # surface.  Leave them expanded so every existing command remains
-        # discoverable and keyboard reachable; the More action may still
-        # collapse them when the user wants the compact evidence-only view.
-        self._set_style_details_visible(True)
+        # Lead with resolved evidence and one Preview action.  The More menu
+        # keeps every explicit override keyboard reachable without presenting
+        # all low-frequency controls at equal visual weight.
+        self._set_style_details_visible(False)
         layout.addStretch(1)
         return scroll
 
@@ -3450,6 +3470,24 @@ class PageEditorView(QtWidgets.QWidget):
                 "Hide explicit style override controls"
                 if show
                 else "Show explicit style override controls"
+            )
+            self.style_more_button.setText(
+                "Hide controls" if show else "Edit style"
+            )
+            self.style_more_button.setAccessibleName(
+                "Hide explicit style override controls"
+                if show
+                else "Show explicit style override controls"
+            )
+        if (
+            hasattr(self, "inspector_toggle_details_action")
+            and self.inspector_tabs.currentIndex()
+            == self._inspector_index.get("style")
+        ):
+            self.inspector_toggle_details_action.setText(
+                "Hide explicit override controls"
+                if show
+                else "Show explicit override controls"
             )
 
     def _update_style_facade(
@@ -4442,6 +4480,10 @@ class PageEditorView(QtWidgets.QWidget):
         self.layout_more_button.setObjectName("layoutAdvancedOverridesButton")
         self.layout_more_button.setCheckable(True)
         self.layout_more_button.setIcon(hybrid_icon("more"))
+        self.layout_more_button.setText("Edit layout")
+        self.layout_more_button.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
         self.layout_more_button.setToolTip("Show explicit layout and topology controls")
         self.layout_more_button.setAccessibleName(
             "Show explicit layout and topology controls"
@@ -4450,7 +4492,7 @@ class PageEditorView(QtWidgets.QWidget):
         layout_actions.addWidget(self.layout_more_button)
         layout_resolved_layout.addLayout(layout_actions)
         self.layout_preview_button.setVisible(False)
-        self.layout_more_button.setVisible(False)
+        self.layout_more_button.setVisible(True)
         layout.insertWidget(0, self.layout_resolved_card)
 
         self.layout_legacy_values = QtWidgets.QWidget()
@@ -4466,10 +4508,9 @@ class PageEditorView(QtWidgets.QWidget):
         self.layout_diagnostic.setProperty("role", "secondary")
         layout_legacy_layout.addWidget(self.layout_diagnostic)
         layout.addWidget(self.layout_legacy_values)
-        # Structural/edit commands must not disappear behind a presentation
-        # facade.  Start expanded, matching the prototype's functional
-        # inspector, while preserving the explicit collapse action.
-        self._set_layout_details_visible(True)
+        # Keep the resolved layout summary primary.  Structural and field-level
+        # edits stay explicitly available through the More menu.
+        self._set_layout_details_visible(False)
         layout.addStretch(1)
         return scroll
 
@@ -4487,6 +4528,24 @@ class PageEditorView(QtWidgets.QWidget):
                 "Hide explicit layout and topology controls"
                 if show
                 else "Show explicit layout and topology controls"
+            )
+            self.layout_more_button.setText(
+                "Hide controls" if show else "Edit layout"
+            )
+            self.layout_more_button.setAccessibleName(
+                "Hide explicit layout and topology controls"
+                if show
+                else "Show explicit layout and topology controls"
+            )
+        if (
+            hasattr(self, "inspector_toggle_details_action")
+            and self.inspector_tabs.currentIndex()
+            == self._inspector_index.get("layout")
+        ):
+            self.inspector_toggle_details_action.setText(
+                "Hide explicit override controls"
+                if show
+                else "Show explicit override controls"
             )
 
     def _update_layout_facade(

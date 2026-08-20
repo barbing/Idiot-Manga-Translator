@@ -10,6 +10,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from app.ui.design_system.components import HybridComboBox
 from app.ui.design_system.delegates import WorkspacePageQueueDelegate
 from app.ui.design_system.icons import hybrid_icon
+from app.ui.presentation import NextActionPresentation
 from app.ui.ui_contract import LayoutMode
 from app.ui.viewmodels.project_model import PageRole
 
@@ -404,6 +405,7 @@ class TranslationWorkspaceView(QtWidgets.QWidget):
         monitor_panel = QtWidgets.QFrame()
         monitor_panel.setObjectName("workspaceRunCard")
         monitor_panel.setProperty("role", "panel")
+        monitor_panel.setProperty("importance", "primary")
         monitor = QtWidgets.QVBoxLayout(monitor_panel)
         monitor.setContentsMargins(16, 14, 16, 14)
         monitor.setSpacing(12)
@@ -538,6 +540,7 @@ class TranslationWorkspaceView(QtWidgets.QWidget):
         current_panel = QtWidgets.QFrame()
         current_panel.setObjectName("workspaceCurrentCard")
         current_panel.setProperty("role", "panel")
+        current_panel.setProperty("importance", "secondary")
         current_layout = QtWidgets.QVBoxLayout(current_panel)
         current_layout.setContentsMargins(16, 14, 16, 14)
         current_layout.setSpacing(9)
@@ -586,6 +589,7 @@ class TranslationWorkspaceView(QtWidgets.QWidget):
         runtime_panel = QtWidgets.QFrame()
         runtime_panel.setObjectName("workspaceRuntimeCard")
         runtime_panel.setProperty("role", "panel")
+        runtime_panel.setProperty("importance", "secondary")
         runtime_layout = QtWidgets.QVBoxLayout(runtime_panel)
         runtime_layout.setContentsMargins(16, 14, 16, 14)
         runtime_layout.setSpacing(8)
@@ -660,6 +664,32 @@ class TranslationWorkspaceView(QtWidgets.QWidget):
         self.summary_row_widget.setMinimumHeight(156)
         self.summary_row_widget.setMaximumHeight(156)
         root.addWidget(self.summary_row_widget)
+        root.addSpacing(12)
+
+        self.next_action_frame = QtWidgets.QFrame()
+        self.next_action_frame.setObjectName("workspaceNextAction")
+        self.next_action_frame.setProperty("role", "state-callout")
+        self.next_action_frame.setProperty("tone", "muted")
+        next_action_layout = QtWidgets.QHBoxLayout(self.next_action_frame)
+        next_action_layout.setContentsMargins(12, 8, 12, 8)
+        next_action_layout.setSpacing(12)
+        next_action_eyebrow = QtWidgets.QLabel("NEXT ACTION")
+        next_action_eyebrow.setProperty("role", "eyebrow")
+        next_action_layout.addWidget(next_action_eyebrow)
+        self.next_action_title = QtWidgets.QLabel("Open or create a project")
+        self.next_action_title.setProperty("role", "section")
+        next_action_layout.addWidget(self.next_action_title)
+        self.next_action_detail = QtWidgets.QLabel(
+            "Choose source pages from Project Hub before starting translation."
+        )
+        self.next_action_detail.setProperty("role", "secondary")
+        self.next_action_detail.setWordWrap(True)
+        next_action_layout.addWidget(self.next_action_detail, 1)
+        self.next_action_frame.setAccessibleName("Next action")
+        self.next_action_frame.setAccessibleDescription(
+            self.next_action_detail.text()
+        )
+        root.addWidget(self.next_action_frame)
         root.addSpacing(12)
 
         primary_column = QtWidgets.QWidget()
@@ -1206,6 +1236,20 @@ class TranslationWorkspaceView(QtWidgets.QWidget):
             raise ValueError(f"unknown workspace stage detail keys: {unknown!r}")
         for key, detail in details.items():
             self.stage_labels[key].set_detail(detail)
+
+    def set_next_action(self, value: NextActionPresentation) -> None:
+        """Present one safe next action without changing command eligibility."""
+
+        if not isinstance(value, NextActionPresentation):
+            raise TypeError("value must be NextActionPresentation")
+        self.next_action_title.setText(value.label)
+        self.next_action_detail.setText(value.detail)
+        self.next_action_frame.setProperty("tone", value.tone)
+        self.next_action_frame.setAccessibleDescription(
+            f"{value.label}. {value.detail}"
+        )
+        self.next_action_frame.style().unpolish(self.next_action_frame)
+        self.next_action_frame.style().polish(self.next_action_frame)
 
     def _open_selected_page(self, index: QtCore.QModelIndex) -> None:
         if self._page_id_role is None:

@@ -40,6 +40,7 @@ from app.pipeline.status_contracts import (
 from app.ui.design_system.components import HybridComboBox
 from app.ui.design_system.dialogs import HybridConfirmDialog, HybridDialog
 from app.ui.design_system.icons import hybrid_icon
+from app.ui.presentation import provider_lifecycle_summary
 from app.ui.viewmodels.settings_model import (
     EffectiveRunSummary,
     SettingsViewModel,
@@ -2403,16 +2404,22 @@ class SettingsView(QtWidgets.QWidget):
                 ProviderKind.DEEPSEEK: "DeepSeek API",
                 ProviderKind.OPENAI_COMPATIBLE: "OpenAI-compatible API",
             }[profile.kind]
-            if active:
-                self.profile_kind.setText(
-                    (
-                        f"Used by {self._project_scope_name} · public profile data"
-                        if self._project_scope_name != "No project open"
-                        else "Used for translation · public profile data"
-                    )
+            configured = not bool(issues)
+            tested = profile.last_test_status is not ProviderTestStatus.NOT_TESTED
+            self.profile_kind.setText(
+                provider_lifecycle_summary(
+                    configured=configured,
+                    tested=tested,
+                    active=active,
                 )
-            else:
-                self.profile_kind.setText(profile_detail)
+            )
+            self.profile_kind.setAccessibleDescription(
+                (
+                    f"{profile_detail}. Used by {self._project_scope_name}."
+                    if active and self._project_scope_name != "No project open"
+                    else f"{profile_detail}. Public profile data."
+                )
+            )
             if profile.runtime_ready:
                 connection_text = "Connected"
                 connection_tone = "ready"

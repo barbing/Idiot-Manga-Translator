@@ -145,6 +145,7 @@ QMainWindow, QDialog {{ background: {c('surface-app')}; color: {c('content-prima
 QWidget[role="shell"] {{ background: {c('surface-shell')}; color: {c('content-primary')}; }}
 QWidget[role="header"] {{ background: {c('surface-header')}; border-bottom: 1px solid {c('border-subtle')}; }}
 QWidget[role="panel"] {{ background: {c('surface-panel')}; border: 1px solid {c('border-default')}; border-radius: {radius}px; }}
+QWidget[role="panel"][importance="secondary"] {{ background: {c('surface-panel-raised')}; border-color: {c('border-subtle')}; }}
 QWidget[role="panel-raised"] {{ background: {c('surface-panel-raised')}; border: 1px solid {c('border-default')}; border-radius: {radius}px; }}
 QFrame#authorityCard[authority="user"] {{ background: {c('status-edit-surface')}; border-color: {c('status-edit-border')}; }}
 QFrame#authorityCard[authority="effective"] {{ background: {c('status-effective-surface')}; border-color: {c('status-effective-border')}; }}

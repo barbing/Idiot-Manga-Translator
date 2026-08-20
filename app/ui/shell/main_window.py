@@ -81,6 +81,7 @@ from app.pipeline.hierarchy_revision_contracts import (
 )
 from app.ui.design_system.icons import hybrid_icon
 from app.ui.design_system.theme import ThemeOptions, apply_application_theme
+from app.ui.presentation import workspace_next_action
 from app.ui.project_hub.new_project_dialog import named_project_display_name
 from app.ui.editor.canvas import (
     CanvasArtifactSet,
@@ -23346,95 +23347,88 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             and not current_admission.safe_to_start
             else ""
         )
-        self.workspace.set_command_state(
-            can_start=bool(
-                (
-                    self._pending_run_invocation is not None
-                    and pending_start_ready
-                    and not busy
-                    and not self._manual_cleanup_modal_active()
-                    and not self._page_preview_active
-                    and not self._provider_test_active
-                    and self._resource_admission_thread is None
-                    and self._project_thread is None
-                    and self._post_run_project_load_failure is None
-                )
-                or (
-                    self._projection is not None
-                    and has_pages
-                    and not busy
-                    and not self._manual_cleanup_modal_active()
-                    and not self._page_preview_active
-                    and not self._provider_test_active
-                    and self._resource_admission_thread is None
-                    and self._active_project_matches_projection()
-                    and self._project_thread is None
-                    and self._source_text_thread is None
-                    and self._target_text_thread is None
-                    and self._parent_membership_thread is None
-                    and self._parent_geometry_thread is None
-                    and self._reading_order_thread is None
-                    and self._merge_parent_thread is None
-                    and self._split_parent_thread is None
-                    and self._writing_mode_thread is None
-                    and self._line_height_thread is None
-                    and self._rotation_thread is None
-                    and self._render_box_command_settled()
-                    and self._font_role_thread is None
-                    and self._font_weight_tier_command_settled()
-                    and self._fill_color_thread is None
-                    and self._outline_color_thread is None
-                    and self._outline_width_thread is None
-                    and self._preferred_size_thread is None
-                    and self._shadow_color_thread is None
-                    and self._shadow_blur_thread is None
-                    and self._shadow_offset_thread is None
-                    and self._shadow_visibility_thread is None
-                    and self._add_user_parent_thread is None
-                    and self._translation_revision_thread is None
-                    and self._edit_history_thread is None
-                    and self._glossary_thread is None
-                    and source_ready_for_run
-                    and target_ready_for_run
-                    and membership_ready_for_run
-                    and geometry_ready_for_run
-                    and reading_order_ready_for_run
-                    and writing_mode_ready_for_run
-                    and line_height_ready_for_run
-                    and rotation_ready_for_run
-                    and render_box_ready_for_run
-                    and font_role_ready_for_run
-                    and fill_color_ready_for_run
-                    and outline_color_ready_for_run
-                    and outline_width_ready_for_run
-                    and preferred_size_ready_for_run
-                    and shadow_color_ready_for_run
-                    and shadow_blur_ready_for_run
-                    and shadow_offset_ready_for_run
-                    and shadow_visibility_ready_for_run
-                    and add_parent_ready_for_run
-                    and merge_parent_ready_for_run
-                    and split_parent_ready_for_run
-                    and history_ready_for_run
-                    and glossary_ready_for_run
-                    and not self._projection_has_stale_targets()
-                    and self._projection_execution_ready()
-                )
-            ),
-            can_stop=busy,
-            # The frozen controller exposes safe-boundary stop only. Keep the
-            # typed future-facing signal, but never present immediate Cancel as
-            # available when no application capability can honor it.
-            can_cancel=False,
-            can_open_page=bool(
-                (
-                    self._pending_run_invocation is not None
-                    and self._selected_page_id in self._prepared_source_pages
-                    and not self._manual_cleanup_modal_active()
-                    and self._project_thread is None
-                    and self._post_run_project_load_failure is None
-                )
-                or (
+        pending_candidate_start = bool(
+            self._pending_run_invocation is not None
+            and pending_start_ready
+            and not busy
+            and not self._manual_cleanup_modal_active()
+            and not self._page_preview_active
+            and not self._provider_test_active
+            and self._resource_admission_thread is None
+            and self._project_thread is None
+            and self._post_run_project_load_failure is None
+        )
+        project_start = bool(
+            self._projection is not None
+            and has_pages
+            and not busy
+            and not self._manual_cleanup_modal_active()
+            and not self._page_preview_active
+            and not self._provider_test_active
+            and self._resource_admission_thread is None
+            and self._active_project_matches_projection()
+            and self._project_thread is None
+            and self._source_text_thread is None
+            and self._target_text_thread is None
+            and self._parent_membership_thread is None
+            and self._parent_geometry_thread is None
+            and self._reading_order_thread is None
+            and self._merge_parent_thread is None
+            and self._split_parent_thread is None
+            and self._writing_mode_thread is None
+            and self._line_height_thread is None
+            and self._rotation_thread is None
+            and self._render_box_command_settled()
+            and self._font_role_thread is None
+            and self._font_weight_tier_command_settled()
+            and self._fill_color_thread is None
+            and self._outline_color_thread is None
+            and self._outline_width_thread is None
+            and self._preferred_size_thread is None
+            and self._shadow_color_thread is None
+            and self._shadow_blur_thread is None
+            and self._shadow_offset_thread is None
+            and self._shadow_visibility_thread is None
+            and self._add_user_parent_thread is None
+            and self._translation_revision_thread is None
+            and self._edit_history_thread is None
+            and self._glossary_thread is None
+            and source_ready_for_run
+            and target_ready_for_run
+            and membership_ready_for_run
+            and geometry_ready_for_run
+            and reading_order_ready_for_run
+            and writing_mode_ready_for_run
+            and line_height_ready_for_run
+            and rotation_ready_for_run
+            and render_box_ready_for_run
+            and font_role_ready_for_run
+            and fill_color_ready_for_run
+            and outline_color_ready_for_run
+            and outline_width_ready_for_run
+            and preferred_size_ready_for_run
+            and shadow_color_ready_for_run
+            and shadow_blur_ready_for_run
+            and shadow_offset_ready_for_run
+            and shadow_visibility_ready_for_run
+            and add_parent_ready_for_run
+            and merge_parent_ready_for_run
+            and split_parent_ready_for_run
+            and history_ready_for_run
+            and glossary_ready_for_run
+            and not self._projection_has_stale_targets()
+            and self._projection_execution_ready()
+        )
+        can_start = bool(pending_candidate_start or project_start)
+        can_open_page = bool(
+            (
+                self._pending_run_invocation is not None
+                and self._selected_page_id in self._prepared_source_pages
+                and not self._manual_cleanup_modal_active()
+                and self._project_thread is None
+                and self._post_run_project_load_failure is None
+            )
+            or (
                 self._projection is not None
                 and has_pages
                 and self._selected_page_id
@@ -23487,13 +23481,36 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 and merge_parent_ready_for_navigation
                 and split_parent_ready_for_navigation
                 and history_ready_for_run
-                )
-            ),
-            start_reason=(
-                "Checking the current memory budget before Start."
-                if self._resource_admission_thread is not None
-                else admission_start_reason or pending_start_reason
-            ),
+            )
+        )
+        start_reason = (
+            "Checking the current memory budget before Start."
+            if self._resource_admission_thread is not None
+            else admission_start_reason or pending_start_reason
+        )
+        self.workspace.set_command_state(
+            can_start=can_start,
+            can_stop=busy,
+            # The frozen controller exposes safe-boundary stop only. Keep the
+            # typed future-facing signal, but never present immediate Cancel as
+            # available when no application capability can honor it.
+            can_cancel=False,
+            can_open_page=can_open_page,
+            start_reason=start_reason,
+        )
+        self.workspace.set_next_action(
+            workspace_next_action(
+                run_detail=detail,
+                busy=busy,
+                can_start=can_start,
+                start_reason=start_reason,
+                has_project=bool(
+                    self._projection is not None
+                    or self._pending_run_invocation is not None
+                ),
+                has_pages=has_pages,
+                recovery_required=self._post_run_project_load_failure is not None,
+            )
         )
         self.workspace.set_start_memory_check_state(
             check_required=bool(
