@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import difflib
 import math
 import re
 from typing import Any, Mapping
@@ -109,7 +108,7 @@ class LogicalTextBlock:
     reconstruction_rejected_for_visual_overmerge: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        translation_unit = self.source_quality_action not in _BLOCKING_SOURCE_QUALITY_ACTIONS
+        translation_unit = bool(str(self.source_text or "").strip())
         return {
             "logical_text_block_id": self.block_id,
             "page_id": self.page_id,
@@ -1538,20 +1537,10 @@ def _component_should_assemble(
 ) -> bool:
     if len(members) < 2:
         return False
-    if any(
-        _source_fragments_overlap(
-            _source_body(str(a.get("ocr_text") or "")),
-            _source_body(str(b.get("ocr_text") or "")),
-        )
-        for idx, a in enumerate(meaningful)
-        for b in meaningful[idx + 1 :]
-    ):
-        return True
     if not any(_is_anchor_worthy(region) for region in meaningful):
         return False
     relation_reasons = set(_component_relation_reasons(members, container_bbox))
     safe_reasons = {
-        "source_overlap_or_duplicate",
         "bbox_overlap_or_containment",
         "dependent_fragment_near_anchor",
         "punctuation_child_near_anchor",
@@ -1594,38 +1583,10 @@ def _source_quality_assessment(
         if speech_members and _is_ellipsis_like_source(cleaned):
             return "fragmented", ["punctuation_only_speech_source"], "translate"
         return "empty", ["empty_logical_text_source"], "unresolved_review"
-    known_bad_patterns = (
-        "それまで女救出",
-        "といいハ風の吹き回しだ果長自ら課長自",
-        "折角だー無こも",
-        "折角だ無こも",
-        "ただキャ涼んで",
-        "単に視界が悪いって悪かだけで",
-        "嵐最初は遭難したと思",
-    )
-    if any(pattern in compact for pattern in known_bad_patterns):
-        reasons.append("known_malformed_ocr_anchor_pattern")
-    if (
-        "果長" in cleaned
-        or "無、こも" in cleaned
-        or "それまで女" in cleaned
-        or "悪かだけ" in cleaned
-        or "ただキャ、" in cleaned
-        or "ただキャ," in cleaned
-        or "さるけど" in cleaned
-        or "やんし" in cleaned
-    ):
-        reasons.append("malformed_ocr_anchor_surface")
     if cleaned.count("「") != cleaned.count("」") or cleaned.count("『") != cleaned.count("』"):
         reasons.append("unbalanced_quote_in_logical_source")
-    if compact.endswith(("と思", "だと思", "悪かだけで")):
+    if len(compact) <= 4 and compact.endswith(("で", "と", "を", "に", "の", "は", "が")):
         reasons.append("incomplete_trailing_grammar")
-    elif len(compact) <= 4 and compact.endswith(("で", "と", "を", "に", "の", "は", "が")):
-        reasons.append("incomplete_trailing_grammar")
-    if reasons:
-        if speech_members and _speech_source_quality_reasons_allow_translation(cleaned, reasons):
-            return "fragmented", sorted(set(reasons + ["speech_short_source_requires_root_proof"])), "translate"
-        return "contaminated", sorted(set(reasons)), "source_quality_blocked"
 
     fragments = [
         part.strip()
@@ -1635,24 +1596,22 @@ def _source_quality_assessment(
     short_fragments = [part for part in fragments if 0 < len(_source_body(part)) <= 2]
     member_body_count = sum(1 for region in members if _source_body(str(region.get("ocr_text") or "")))
     separator_count = cleaned.count("、") + cleaned.count("，") + cleaned.count(",")
-    unusual_kanji = any(token in cleaned for token in ("牢", "返を", "果長", "女、救出", "救出来"))
     orphan_particles = {"と", "で", "に", "を", "が", "は", "の", "も", "し"}
     if (
         (separator_count >= 4 and len(short_fragments) >= 3 and len(compact) >= 8)
-        or (unusual_kanji and member_body_count >= 3)
         or (separator_count >= 2 and any(_source_body(fragment) in orphan_particles for fragment in fragments))
     ):
         reasons.append("fragmented_physical_bubble_source")
         if short_fragments:
             reasons.append("many_short_ocr_fragments")
-        if unusual_kanji:
-            reasons.append("suspect_ocr_substitution_surface")
         if any(_source_body(fragment) in orphan_particles for fragment in fragments):
             reasons.append("orphan_particle_fragment")
         if speech_members and _speech_source_quality_reasons_allow_translation(cleaned, reasons):
             reasons.append("speech_short_source_requires_root_proof")
         return "fragmented", sorted(set(reasons)), "translate"
 
+    if reasons:
+        return "fragmented", sorted(set(reasons)), "translate"
     return "clean", [], "translate"
 
 
@@ -1677,8 +1636,6 @@ def _valid_short_speech_utterance(text: str) -> bool:
     if not body or len(body) > 10:
         return False
     if not any(_is_kana_char(ch) or "\u3400" <= ch <= "\u9fff" for ch in body):
-        return False
-    if any(token in cleaned for token in ("果長", "救出来", "悪かだけ", "無、こも", "それまで女", "返を")):
         return False
     if len(body) <= 2 and all(_is_kana_char(ch) for ch in body):
         return True
@@ -1732,11 +1689,6 @@ def _regions_related_for_block(
     b: dict[str, Any],
     container_bbox: list[int],
 ) -> tuple[bool, str]:
-    a_text = _source_body(str(a.get("ocr_text") or ""))
-    b_text = _source_body(str(b.get("ocr_text") or ""))
-    if _source_fragments_overlap(a_text, b_text):
-        return True, "source_overlap_or_duplicate"
-
     a_box = _bbox(a.get("bbox"))
     b_box = _bbox(b.get("bbox"))
     if _overlap_ratio(a_box, b_box) >= 0.05:
@@ -1778,7 +1730,7 @@ def _regions_related_for_block(
     if (
         horizontal_gap <= max(32, min(128, int(0.45 * c_w)))
         and center_dy <= max(72, int(0.50 * c_h))
-        and (_is_anchor_worthy(a) or _is_anchor_worthy(b) or (len(a_text) >= 2 and len(b_text) >= 2))
+        and (_is_anchor_worthy(a) or _is_anchor_worthy(b))
     ):
         return True, "staggered_bubble_columns"
     return False, ""
@@ -1790,7 +1742,7 @@ def _relation_allows_component_edge(
     b: dict[str, Any],
     container_bbox: list[int],
 ) -> bool:
-    if reason in {"source_overlap_or_duplicate", "bbox_overlap_or_containment"}:
+    if reason == "bbox_overlap_or_containment":
         return True
     if reason == "punctuation_child_near_anchor":
         return True
@@ -1826,8 +1778,11 @@ def _apply_block_to_regions(block: LogicalTextBlock, member_by_id: dict[str, dic
     if anchor is None:
         return
     if block.source_quality_action in _BLOCKING_SOURCE_QUALITY_ACTIONS:
-        _mark_source_quality_block_review_only(block, member_by_id)
-        return
+        if _source_body(block.source_text):
+            block.source_quality_action = "translate_with_review"
+        else:
+            _mark_source_quality_block_review_only(block, member_by_id)
+            return
     _stamp_region_fields(anchor, block, block.ownership_status_by_region.get(block.anchor_region_id, _OWNERSHIP_BLOCK_ANCHOR))
     _activate_block_anchor_region(anchor, block)
     if not block.would_change_behavior:
@@ -2231,7 +2186,10 @@ def _stamp_record_only(region: dict[str, Any] | None, record: LogicalTextOwnersh
 
 def _stamp_v3_region_fields(region: dict[str, Any], block: LogicalTextBlock, ownership_status: str) -> None:
     final_state = _v3_ownership_state(ownership_status, region)
-    is_translation_unit = ownership_status in _ACTIVE_OWNERSHIP_STATUSES and block.source_quality_action not in _BLOCKING_SOURCE_QUALITY_ACTIONS
+    is_translation_unit = (
+        ownership_status in _ACTIVE_OWNERSHIP_STATUSES
+        and bool(str(block.source_text or "").strip())
+    )
     region["physical_bubble_graph_id"] = block.physical_bubble_id
     region["logical_text_block_v3_status"] = final_state
     region["logical_text_block_translation_unit"] = is_translation_unit
@@ -2551,49 +2509,10 @@ def _merge_source_fragment(current: str, new: str) -> tuple[str, str]:
         return current, "duplicate"
     if not current:
         return new, "append"
-    current_body = _source_body(current)
-    new_body = _source_body(new)
-    if new_body and new_body in current_body:
+    if current == new:
         return current, "duplicate"
-    if current_body and current_body in new_body:
-        return new, "overlap"
-    max_overlap = min(len(current), len(new))
-    for length in range(max_overlap, 1, -1):
-        if current[-length:] == new[:length]:
-            return current + new[length:], "overlap"
-    best = 0
-    for length in range(max_overlap, 1, -1):
-        left = current[-length:]
-        right = new[:length]
-        if difflib.SequenceMatcher(None, _source_body(left), _source_body(right)).ratio() >= 0.86:
-            best = length
-            break
-    if best:
-        return current + new[best:], "overlap"
     separator = "" if current.endswith(("、", "。", "…", "...")) or new.startswith(("、", "。", "…", "...")) else "、"
     return current + separator + new, "append"
-
-
-def _source_fragments_overlap(a_text: str, b_text: str) -> bool:
-    if not a_text or not b_text:
-        return False
-    if a_text in b_text or b_text in a_text:
-        return True
-    if difflib.SequenceMatcher(None, a_text, b_text).ratio() >= 0.84:
-        return True
-    max_overlap = min(len(a_text), len(b_text))
-    for length in range(max_overlap, 1, -1):
-        if a_text[-length:] == b_text[:length] or b_text[-length:] == a_text[:length]:
-            return True
-        left = a_text[-length:]
-        right = b_text[:length]
-        if difflib.SequenceMatcher(None, left, right).ratio() >= 0.88:
-            return True
-        left = b_text[-length:]
-        right = a_text[:length]
-        if difflib.SequenceMatcher(None, left, right).ratio() >= 0.88:
-            return True
-    return False
 
 
 def _block_confidence(

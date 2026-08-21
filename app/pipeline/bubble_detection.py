@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from app.pipeline.status_contracts import PipelineStage, PipelineStageTechnicalError
+
 
 BUBBLE_DETECTION_VERSION = "phase4b23_bubble_detection_semantic_authority_contract_v6"
 BUBBLE_DETECTION_CACHE_VERSION = "phase4b23_bubble_detection_semantic_authority_cache_v6"
@@ -424,13 +426,17 @@ def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> B
         )
         _write_cached_result(cache_state, result)
         return result
-    except Exception as exc:  # pragma: no cover - exercised through pipeline fallback validation
-        fallback_result.error = f"{type(exc).__name__}: {exc}"
-        fallback_result.runtime_sec = round(time.perf_counter() - started, 6)
-        fallback_result.fallback_used = True
-        fallback_result.provider_fallback_used = True
-        fallback_result.runtime["error"] = fallback_result.error
-        return fallback_result
+    except PipelineStageTechnicalError:
+        raise
+    except Exception as exc:  # pragma: no cover - exercised through pipeline failure validation
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.DETECTION,
+            code="bubble_detection_failed",
+            message="Bubble detection could not produce a valid evidence artifact.",
+            detail=f"{type(exc).__name__}: {exc}",
+            page_id=page_id,
+            operation="run_bubble_detection",
+        ) from exc
 
 
 def draw_bubble_detection_overlay(result: BubbleDetectionResult, output_path: Path | str, title: str | None = None) -> None:

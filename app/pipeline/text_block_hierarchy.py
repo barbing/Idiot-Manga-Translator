@@ -8,7 +8,6 @@ model inference, OCR, translation, cleanup, or rendering.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import difflib
 import json
 import os
 import re
@@ -837,7 +836,11 @@ def _route_owned_ocr_blocker_can_be_represented_by_parent(
     if not parent.translation_unit:
         return False
     parent_status, _parent_reasons, parent_action = _parent_source_coherence(parent.source_text, role=parent.role)
-    if parent_status not in {"coherent", "weak"} or parent_action not in {"translate", "translate_with_root_proof"}:
+    if parent_status not in {"coherent", "weak"} or parent_action not in {
+        "translate",
+        "translate_with_review",
+        "translate_with_root_proof",
+    }:
         return False
     if not _source_body_requires_root_blocker(parent.source_text):
         return False
@@ -1104,7 +1107,14 @@ def _evaluate_root_source_coherence(
             if root.root_type == ROOT_CAPTION and _caption_parent_looks_incomplete(parent):
                 reject_reasons.append("caption_background_parent_incomplete_source")
             if reject_reasons:
-                _reject_parent_translation_unit(parent, child_by_parent.get(parent.parent_id, []), reject_reasons)
+                if _source_body(parent.source_text) or _parent_is_punctuation_identity(parent):
+                    _retain_parent_with_source_diagnostics(parent, reject_reasons)
+                else:
+                    _reject_parent_translation_unit(
+                        parent,
+                        child_by_parent.get(parent.parent_id, []),
+                        reject_reasons,
+                    )
     for root in roots_list:
         root_parents = sorted(parent_by_root.get(root.root_id, []), key=lambda parent: (parent.render_allowed_area[:2], parent.parent_id))
         root_children = child_by_root.get(root.root_id, [])
@@ -1225,10 +1235,6 @@ def _assign_root_final_state(
 
 def _parent_is_active_translation_unit(parent: ParentLogicalTextUnit) -> bool:
     if not bool(parent.translation_unit):
-        return False
-    if parent.source_coherence_status == "rejected":
-        return False
-    if parent.source_coherence_action in {"source_quality_blocked", "block_auto_translation", "split_required", "unresolved_review", "block_review_only", "repair_required"}:
         return False
     return bool(_source_body(parent.source_text) or _valid_short_reaction_or_laugh(parent.source_text))
 
@@ -1386,6 +1392,31 @@ def _reject_parent_translation_unit(
             _append_unique(child.reason_codes, reason)
 
 
+def _retain_parent_with_source_diagnostics(
+    parent: ParentLogicalTextUnit,
+    reasons: list[str],
+) -> None:
+    """Keep a generated parent executable when its nonempty OCR is imperfect."""
+
+    diagnostic_reasons = sorted(
+        set(
+            ["source_quality_diagnostic_only"]
+            + [str(reason) for reason in reasons if str(reason)]
+        )
+    )
+    parent.translation_unit = True
+    parent.cleanup_unit = True
+    parent.render_unit = True
+    parent.source_conservation_status = "complete"
+    parent.unresolved_reason = None
+    parent.source_coherence_status = "weak"
+    parent.source_coherence_action = "translate_with_review"
+    parent.standalone_parent_rejected = False
+    for reason in diagnostic_reasons:
+        _append_unique(parent.reason_codes, reason)
+        _append_unique(parent.source_coherence_reason_codes, reason)
+
+
 def _root_reconstruction_record(
     root_id: str,
     status: dict[str, Any] | None,
@@ -1529,38 +1560,21 @@ def _parent_source_coherence(source_text: str, *, role: str | None = None) -> tu
         reasons.append("excessive_fragment_join_separators")
     if _ends_with_incomplete_grammar(body):
         reasons.append("incomplete_trailing_grammar")
-    if _has_suspect_ocr_substitution(text, body):
-        reasons.append("suspect_ocr_substitution_surface")
     if _has_orphan_particle_fragment(fragments):
         reasons.append("orphan_particle_fragment")
     if _short_isolated_kanji_fragment(body):
         reasons.append("short_isolated_kanji_fragment")
-    if _duplicate_partial_inside_source(fragments):
-        reasons.append("duplicate_partial_phrase_inside_parent_source")
     if reasons:
-        if speech_role and _speech_source_quality_reasons_allow_root_proof(text, reasons):
-            return "weak", sorted(set(["weak_parent_source_requires_root_proof"] + reasons)), "translate_with_root_proof"
-        return "malformed", sorted(set(reasons)), "repair_required"
+        return "weak", sorted(set(["imperfect_parent_source_diagnostic"] + reasons)), "translate_with_review"
     if _weak_but_translatable_source(body, text):
         return "weak", ["weak_parent_source_requires_root_proof"], "translate_with_root_proof"
     return "coherent", [], "translate"
 
 
 def _duplicate_partial_parent_pairs(parents: list[ParentLogicalTextUnit]) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    normalized = [(parent.parent_id, _source_body(parent.source_text)) for parent in parents]
-    for idx, (left_id, left) in enumerate(normalized):
-        if len(left) < 3:
-            continue
-        for right_id, right in normalized[idx + 1 :]:
-            if len(right) < 3:
-                continue
-            if left in right or right in left:
-                pairs.append((left_id, right_id))
-                continue
-            if difflib.SequenceMatcher(None, left, right).ratio() >= 0.82:
-                pairs.append((left_id, right_id))
-    return pairs
+    # Parent identity is graph/geometry-owned. Source text cannot merge or
+    # suppress two separately generated parents.
+    return []
 
 
 def _duplicate_partial_rejected_parent_ids(
@@ -1783,8 +1797,6 @@ def _valid_short_speech_utterance(text: str) -> bool:
         return False
     if not any(_is_kana_char(ch) or "\u3400" <= ch <= "\u9fff" for ch in body):
         return False
-    if any(token in cleaned for token in ("果長", "救出来", "悪かだけ", "無、こも", "それまで女", "返を")):
-        return False
     return any(ch in cleaned for ch in ".．…‥・･〜～ー-—―－")
 
 
@@ -1815,27 +1827,7 @@ def _unbalanced_quote_text(text: str) -> bool:
 def _ends_with_incomplete_grammar(body: str) -> bool:
     if not body:
         return True
-    if body.endswith(("と思", "だと思", "悪かだけで")):
-        return True
     if len(body) <= 4 and body.endswith(("と", "で", "に", "を", "が", "は")):
-        return True
-    return False
-
-
-def _has_suspect_ocr_substitution(text: str, body: str) -> bool:
-    suspect_tokens = (
-        "果長",
-        "救出来",
-        "悪かだけ",
-        "無、こも",
-        "それまで女",
-        "返を",
-        "さるけど",
-        "やんし",
-    )
-    if any(token in text or token in body for token in suspect_tokens):
-        return True
-    if "ただキャ、" in text or "ただキャ," in text or "キャ、" in text or "キャ," in text:
         return True
     return False
 
@@ -1849,20 +1841,6 @@ def _short_isolated_kanji_fragment(body: str) -> bool:
     if len(body) > 2:
         return False
     return any("\u4e00" <= ch <= "\u9fff" for ch in body)
-
-
-def _duplicate_partial_inside_source(fragments: list[str]) -> bool:
-    for idx, left in enumerate(fragments):
-        if len(left) < 3:
-            continue
-        for right in fragments[idx + 1 :]:
-            if len(right) < 3:
-                continue
-            if left in right or right in left:
-                return True
-            if difflib.SequenceMatcher(None, left, right).ratio() >= 0.84:
-                return True
-    return False
 
 
 def _weak_but_translatable_source(body: str, text: str) -> bool:
@@ -2856,16 +2834,6 @@ def _render_warning_action_metadata(warning_reasons: list[str]) -> tuple[str, st
 
 def _dict_parent_is_active_translation_unit(parent: dict[str, Any]) -> bool:
     if not bool(parent.get("translation_unit")):
-        return False
-    if str(parent.get("source_coherence_status") or "") == "rejected":
-        return False
-    if str(parent.get("source_coherence_action") or "") in {
-        "source_quality_blocked",
-        "block_auto_translation",
-        "split_required",
-        "unresolved_review",
-        "block_review_only",
-    }:
         return False
     return bool(_source_body(parent.get("source_text")) or _valid_short_reaction_or_laugh(str(parent.get("source_text") or "")))
 

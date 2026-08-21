@@ -154,6 +154,16 @@ def _initialize_connection(connection: sqlite3.Connection) -> None:
             commit_sha256 TEXT NOT NULL UNIQUE,
             committed_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS page_stage_outcomes (
+            outcome_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            page_index INTEGER NOT NULL,
+            outcome_payload BLOB NOT NULL,
+            outcome_sha256 TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(page_id, stage)
+        );
         """
     )
 
@@ -272,10 +282,125 @@ def _recover_project(connection: sqlite3.Connection) -> dict[str, Any]:
         )
         pages.append(dict(page))
         previous_commit_sha256 = str(commit_sha256)
+    stage_outcomes = _recover_stage_outcomes(connection)
+    completed_page_ids = {
+        str(page.get("page_id") or "")
+        for page in pages
+        if str(page.get("page_id") or "")
+    }
+    outcomes_by_page: dict[str, list[dict[str, Any]]] = {}
+    for outcome in stage_outcomes:
+        page_id = str(outcome.get("page_id") or "")
+        if page_id:
+            outcomes_by_page.setdefault(page_id, []).append(outcome)
+    for page_id, outcomes in sorted(
+        outcomes_by_page.items(),
+        key=lambda item: min(int(value.get("page_index") or 0) for value in item[1]),
+    ):
+        if page_id in completed_page_ids:
+            continue
+        failure = next(
+            (
+                outcome
+                for outcome in reversed(outcomes)
+                if str(outcome.get("state") or "") == "technical_failure"
+            ),
+            None,
+        )
+        latest = failure or outcomes[-1]
+        source_path = str(latest.get("source_path") or "")
+        page_name = str(latest.get("page_name") or os.path.basename(source_path) or page_id)
+        artifact_summary = _merge_valid_stage_artifacts(outcomes)
+        pages.append(
+            {
+                "page_id": page_id,
+                "file_name": page_name,
+                "image_path": source_path,
+                "output_path": str(artifact_summary.get("output_path") or ""),
+                "width": int(artifact_summary.get("width") or 0),
+                "height": int(artifact_summary.get("height") or 0),
+                "page_class": str(artifact_summary.get("page_class") or "unknown"),
+                "regions": list(artifact_summary.get("regions") or []),
+                "parent_execution_bundles": list(
+                    artifact_summary.get("parent_execution_bundles") or []
+                ),
+                "text_area_plan": artifact_summary.get("text_area_plan"),
+                "cleaned_page_base": dict(
+                    artifact_summary.get("cleaned_page_base") or {}
+                ),
+                "processing_state": "failed" if failure is not None else "in_progress",
+                "failed_stage": str((failure or {}).get("stage") or ""),
+                "pipeline_error": dict(failure or {}),
+            }
+        )
+    pages.sort(
+        key=lambda page: min(
+            [
+                int(value.get("page_index") or 0)
+                for value in outcomes_by_page.get(str(page.get("page_id") or ""), [])
+            ]
+            or [len(pages)]
+        )
+    )
     project["pages"] = pages
+    if stage_outcomes:
+        project["stage_outcomes"] = stage_outcomes
     if style_context_cache is not None:
         project["style_context_cache"] = style_context_cache
     return project
+
+
+def _merge_valid_stage_artifacts(
+    outcomes: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Recover the latest durable artifact from every successful stage."""
+
+    merged: dict[str, Any] = {}
+    for outcome in outcomes:
+        if str(outcome.get("state") or "") not in {
+            "valid",
+            "valid_with_diagnostics",
+        }:
+            continue
+        summary = outcome.get("artifact_summary")
+        if not isinstance(summary, Mapping):
+            continue
+        for key in (
+            "width",
+            "height",
+            "page_class",
+            "text_area_plan",
+            "cleaned_page_base",
+            "output_path",
+        ):
+            value = summary.get(key)
+            if value not in (None, "", [], {}):
+                merged[key] = value
+        for key in ("regions", "parent_execution_bundles"):
+            value = summary.get(key)
+            if isinstance(value, list) and value:
+                merged[key] = value
+    return merged
+
+
+def _recover_stage_outcomes(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    try:
+        rows = connection.execute(
+            "SELECT outcome_payload, outcome_sha256 FROM page_stage_outcomes "
+            "ORDER BY page_index, outcome_sequence"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    outcomes: list[dict[str, Any]] = []
+    for index, (payload, expected_sha256) in enumerate(rows):
+        payload_bytes = bytes(payload)
+        if _sha256(payload_bytes) != str(expected_sha256):
+            raise ValueError(f"stage outcome hash mismatch at {index}")
+        value = _decode_json(payload_bytes, field_name=f"page_stage_outcomes[{index}]")
+        if not isinstance(value, Mapping):
+            raise ValueError(f"stage outcome {index} is not a mapping")
+        outcomes.append(dict(value))
+    return outcomes
 
 
 def recover_project_from_descriptor(
@@ -358,6 +483,7 @@ class ProjectCheckpointSession:
             self._connection.execute("ROLLBACK")
             self._connection.close()
             raise
+        self._publish_descriptor()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -491,6 +617,58 @@ class ProjectCheckpointSession:
         self._receipts.append(receipt)
         return receipt
 
+    def record_stage_outcome(
+        self,
+        outcome: Mapping[str, Any],
+    ) -> None:
+        """Durably publish one latest owner-stage outcome before page commit."""
+
+        self._require_open()
+        if not isinstance(outcome, Mapping):
+            raise TypeError("stage outcome must be mapping-like")
+        page_id = str(outcome.get("page_id") or "")
+        stage = str(outcome.get("stage") or "")
+        state = str(outcome.get("state") or "")
+        if not page_id or not stage:
+            raise ValueError("stage outcome requires page_id and stage")
+        if state not in {"valid", "valid_with_diagnostics", "technical_failure"}:
+            raise ValueError("stage outcome state is invalid")
+        page_index = int(outcome.get("page_index") or 0)
+        payload = _compact_json_bytes(dict(outcome))
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO page_stage_outcomes(
+                    page_id, stage, page_index, outcome_payload,
+                    outcome_sha256, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(page_id, stage) DO UPDATE SET
+                    page_index=excluded.page_index,
+                    outcome_payload=excluded.outcome_payload,
+                    outcome_sha256=excluded.outcome_sha256,
+                    recorded_at=excluded.recorded_at
+                """,
+                (
+                    page_id,
+                    stage,
+                    page_index,
+                    payload,
+                    _sha256(payload),
+                    _utc_now(),
+                ),
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        if not self._descriptor_is_current():
+            self._publish_descriptor()
+
+    def stage_outcomes(self) -> list[dict[str, Any]]:
+        self._require_open()
+        return _recover_stage_outcomes(self._connection)
+
     def recover_project(self) -> dict[str, Any]:
         self._require_open()
         return _recover_project(self._connection)
@@ -516,7 +694,10 @@ class ProjectCheckpointSession:
         recovery_seconds = time.perf_counter() - recovery_started
         verification_started = time.perf_counter()
         recovered_payload = _compact_json_bytes(recovered)
-        if expected_project is not None and recovered != dict(expected_project):
+        expected = dict(expected_project) if expected_project is not None else None
+        if expected is not None and "stage_outcomes" in recovered:
+            expected["stage_outcomes"] = list(recovered.get("stage_outcomes") or [])
+        if expected is not None and recovered != expected:
             raise ValueError(
                 "incremental checkpoint does not match the expected project"
             )
@@ -555,6 +736,7 @@ class ProjectCheckpointSession:
             ),
             "total_seconds": sum(item.total_seconds for item in receipts),
             "commits": [item.to_dict() for item in receipts],
+            "stage_outcome_count": len(_recover_stage_outcomes(self._connection)),
         }
 
     def close(self) -> None:

@@ -44,6 +44,7 @@ from app.pipeline.status_contracts import (
     PipelineProgressSnapshot,
     PipelineRunState,
     PipelineStageEvent,
+    PipelineStageOutcome,
 )
 from app.project_edits.commands import (
     EditHistoryCommandReceipt,
@@ -1972,6 +1973,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._controller = controller
         status.lifecycle_changed.connect(self.accept_lifecycle)
         status.stage_changed.connect(self.accept_stage)
+        status.stage_outcome.connect(self.accept_stage_outcome)
         status.progress_snapshot.connect(self.accept_progress)
         status.structured_error.connect(self.accept_error)
 
@@ -22627,6 +22629,14 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             self._run_model.state.lifecycle,
             self._run_model.state.stage,
         )
+        self._refresh_run_presentation()
+        self._refresh_activity()
+
+    @QtCore.Slot(object)
+    def accept_stage_outcome(self, outcome: object) -> None:
+        if not isinstance(outcome, PipelineStageOutcome):
+            raise TypeError("stage outcome signal must carry PipelineStageOutcome")
+        self._run_model.apply_stage_outcome(outcome)
         self._refresh_run_presentation()
         self._refresh_activity()
 

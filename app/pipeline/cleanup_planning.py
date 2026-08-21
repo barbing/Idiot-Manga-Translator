@@ -32,6 +32,7 @@ from app.pipeline import cleanup_execution
 from app.pipeline import cleanup_backend_runner
 from app.pipeline.debug_artifacts import mask_stats, write_debug_image_file
 from app.pipeline.debug_runtime import diagnostic_enabled, write_diagnostic_checkpoint
+from app.pipeline.status_contracts import PipelineStage, PipelineStageTechnicalError
 
 try:
     import numpy as np
@@ -1670,29 +1671,21 @@ def run_cleanup_runtime_contract(
             job,
             runtime_class=job.cleanup_class,
         )
-        status_records.append(
-            {
-                **base_record,
-                "runtime_status": "failed",
-                "cleanup_mask_id": str(
-                    getattr(job_masks[0], "cleanup_mask_id", "")
-                    if job_masks
-                    else ""
-                ),
-                "cleanup_obligation_id": str(
-                    getattr(job_masks[0], "cleanup_mask_id", "")
-                    if job_masks
-                    else job_id
-                ),
-                "failure_reason": reason,
-                "cleanup_outcome_state": reason,
-                "render_consumption_decision_if_consumed": (
-                    "diagnostic_only_renderer_unaffected"
-                ),
-                "renderer_consumed": False,
-            }
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.CLEANUP,
+            code=reason,
+            message="Cleanup could not construct the required parent execution artifact.",
+            detail=f"{job_id}:{reason}",
+            page_id=str(page_id or ""),
+            parent_id=str(
+                getattr(job, "parent_execution_bundle_id", "")
+                or getattr(job, "parent_logical_text_unit_id", "")
+                or (job.target_region_ids or [""])[0]
+                or ""
+            ),
+            operation="run_cleanup_runtime_contract",
+            artifact_summary={"cleanup_job": base_record},
         )
-        errors.append(f"{job_id}:{reason}")
 
     backend_contexts_by_mask_id = _backend_contexts_by_cleanup_mask_id(
         runtime_obligations,
@@ -2020,15 +2013,39 @@ def run_cleanup_runtime_contract(
             if cleanup_result is None:
                 cleanup_result, cleanup_proof = _best_failed_attempt(job_results, job_proofs)
             proof_passed = bool(cleanup_proof and cleanup_proof.proof_status == ProofStatus.PASSED)
+            degraded_commit_allowed = _proof_allows_degraded_commit(
+                cleanup_proof,
+                cleanup_result,
+            )
+            if cleanup_result is None or cleanup_proof is None or not (
+                proof_passed or degraded_commit_allowed
+            ):
+                technical_reason = (
+                    (cleanup_proof.failure_reason if cleanup_proof else "")
+                    or (cleanup_result.failure_reason if cleanup_result else "")
+                    or "cleanup_runtime_valid_result_unavailable"
+                )
+                raise PipelineStageTechnicalError(
+                    stage=PipelineStage.CLEANUP,
+                    code="cleanup_runtime_valid_result_unavailable",
+                    message="Cleanup could not produce a valid parent result.",
+                    detail=str(technical_reason),
+                    page_id=str(page_id or ""),
+                    parent_id=str(
+                        getattr(job, "parent_execution_bundle_id", "")
+                        or getattr(job, "parent_logical_text_unit_id", "")
+                        or (target_region_ids or [""])[0]
+                        or ""
+                    ),
+                    operation="run_cleanup_runtime_contract",
+                )
             degraded_cleanup_diagnostic = bool(
                 cleanup_proof
                 and isinstance(cleanup_proof.metrics, Mapping)
                 and cleanup_proof.metrics.get("degraded_cleanup_diagnostic", False)
             )
             runtime_status = (
-                "passed"
-                if proof_passed and cleanup_result and cleanup_result.pixel_changed
-                else "failed"
+                "passed" if proof_passed else "warning"
             )
             failure_reason = (
                 "passed"
@@ -2062,7 +2079,7 @@ def run_cleanup_runtime_contract(
                     "mask_ref": cleanup_result.mask_ref if cleanup_result else None,
                     "proof_metrics": selected_proof_metrics,
                     "proof_quality_state": selected_proof_metrics.get("proof_quality_state", ""),
-                    "degraded_commit_allowed": False,
+                    "degraded_commit_allowed": bool(degraded_commit_allowed),
                     "degraded_cleanup_diagnostic": bool(degraded_cleanup_diagnostic),
                     "source_residual_delta_dark_pixels": selected_proof_metrics.get(
                         "source_residual_delta_dark_pixels",
@@ -2093,7 +2110,7 @@ def run_cleanup_runtime_contract(
                     "render_consumption_decision_if_consumed": (
                         cleanup_proof.render_consumption_decision_if_consumed
                         if cleanup_proof
-                        else "block_future_renderer_consumption"
+                        else "diagnostic_only_renderer_unaffected"
                     ),
                     "renderer_consumed": False,
                 }
@@ -2109,6 +2126,8 @@ def run_cleanup_runtime_contract(
                 attempt_count=len(attempt_records),
                 elapsed_ms=round((time.time() - job_started) * 1000.0, 3),
             )
+        except PipelineStageTechnicalError:
+            raise
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             _page014_timeout_checkpoint(
@@ -2120,17 +2139,20 @@ def run_cleanup_runtime_contract(
                 error=message,
                 elapsed_ms=round((time.time() - job_started) * 1000.0, 3),
             )
-            errors.append(message)
-            status_records.append(
-                {
-                    **base_record,
-                    "runtime_status": "inconclusive",
-                    "failure_reason": message,
-                    "cleanup_outcome_state": "cleanup_partially_completed_with_warnings",
-                    "render_consumption_decision_if_consumed": "block_future_renderer_consumption",
-                    "renderer_consumed": False,
-                }
-            )
+            raise PipelineStageTechnicalError(
+                stage=PipelineStage.CLEANUP,
+                code="cleanup_runtime_exception",
+                message="Cleanup runtime failed before producing a valid parent result.",
+                detail=message,
+                page_id=str(page_id or ""),
+                parent_id=str(
+                    getattr(job, "parent_execution_bundle_id", "")
+                    or getattr(job, "parent_logical_text_unit_id", "")
+                    or (target_region_ids or [""])[0]
+                    or ""
+                ),
+                operation="run_cleanup_runtime_contract",
+            ) from exc
 
     if perf_contract is not None:
         perf_contract["job_loop_and_selection_ms"] = _perf_elapsed_ms(perf_job_loop_started)
@@ -2168,7 +2190,7 @@ def commit_cleanup_runtime_results_to_working_image(
     artifact_dir: str | None = None,
     excluded_region_ids: set[str] | None = None,
 ) -> CleanupUpstreamCommitResult:
-    """Commit proof-passed runtime cleanup results to a pre-render working image."""
+    """Commit valid cleanup results, retaining quality warnings as diagnostics."""
 
     commit_started = time.time()
     errors: list[str] = []
@@ -2765,10 +2787,9 @@ def _upstream_commit_block_reason(
         return "runtime_result_already_renderer_consumed"
     if proof is None:
         return "missing_cleanup_proof"
-    if proof.proof_status != ProofStatus.PASSED:
+    degraded_commit_allowed = _proof_allows_degraded_commit(proof, cleanup_result, status)
+    if proof.proof_status != ProofStatus.PASSED and not degraded_commit_allowed:
         return proof.failure_reason or "cleanup_proof_not_passed"
-    if isinstance(proof.metrics, Mapping) and bool(proof.metrics.get("broad_white_patch_risk", False)):
-        return "broad_white_patch_risk"
     if (
         bool(status.get("partitioned_cleanup", False))
         and status.get("parent_cleanup_unit_aggregate_complete") is False
@@ -2779,8 +2800,6 @@ def _upstream_commit_block_reason(
         return str(status.get("failure_reason") or "cleanup_runtime_status_not_passed")
     if not cleanup_result.pixel_changed or int(cleanup_result.changed_pixel_count or 0) <= 0:
         return "cleanup_result_not_pixel_changing"
-    if proof.source_glyph_removal_passed is False:
-        return "source_glyph_removal_proof_failed"
     if proof.mask_containment_passed is False:
         return "mask_containment_proof_failed"
     changed_outside = None
@@ -2799,11 +2818,6 @@ def _upstream_commit_block_reason(
             changed_outside_ratio = _float_or_none(proof.metrics.get("changed_outside_allowed_ratio"))
     if changed_outside_ratio is not None and changed_outside_ratio > PROOF_CHANGED_OUTSIDE_ALLOWED_RATIO:
         return "changed_outside_accepted_mask_ratio"
-    decision = str(proof.render_consumption_decision_if_consumed or "")
-    if decision and decision not in {
-        "allow_stage6_consumption_candidate",
-    }:
-        return decision
     return ""
 
 
@@ -7065,13 +7079,45 @@ def _proof_allows_degraded_commit(
     result: CleanupResult | None = None,
     status: Mapping[str, Any] | None = None,
 ) -> bool:
-    # Degraded/warning cleanup is diagnostic-only unless a future contract
-    # explicitly authorizes non-passed proof commits.
-    return False
+    if proof is None or result is None:
+        return False
+    if proof.proof_status == ProofStatus.PASSED:
+        return bool(result.pixel_changed and int(result.changed_pixel_count or 0) > 0)
+    if not result.pixel_changed or int(result.changed_pixel_count or 0) <= 0:
+        return False
+    reason = str(proof.failure_reason or result.failure_reason or "").lower()
+    hard_failures = {
+        "changed_outside_accepted_mask",
+        "changed_outside_allowed_area",
+        "changed_outside_accepted_mask_ratio",
+        "collateral_change_too_broad",
+        "mask_containment_proof_failed",
+        "cleanup_result_not_pixel_changing",
+        "missing_cleanup_proof",
+    }
+    if reason in hard_failures:
+        return False
+    if proof.mask_containment_passed is False:
+        return False
+    metrics = proof.metrics if isinstance(proof.metrics, Mapping) else {}
+    changed_outside = _int_or_none(metrics.get("changed_outside_accepted_mask_pixels"))
+    if changed_outside is None:
+        changed_outside = _int_or_none(proof.changed_outside_allowed_pixels)
+    if changed_outside is not None and changed_outside > PROOF_CHANGED_OUTSIDE_ALLOWED_PIXELS:
+        return False
+    changed_ratio = _float_or_none(metrics.get("changed_outside_accepted_mask_ratio"))
+    if changed_ratio is None:
+        changed_ratio = _float_or_none(metrics.get("changed_outside_allowed_ratio"))
+    if changed_ratio is not None and changed_ratio > PROOF_CHANGED_OUTSIDE_ALLOWED_RATIO:
+        return False
+    return True
 
 
 def _proof_commit_candidate(result: CleanupResult, proof: CleanupProof) -> bool:
-    return _proof_passed_with_pixels(result, proof)
+    return _proof_passed_with_pixels(result, proof) or _proof_allows_degraded_commit(
+        proof,
+        result,
+    )
 
 
 def _is_component_projected_cleanup_mask(cleanup_mask: CleanupMask, visual_scope: str | None = None) -> bool:

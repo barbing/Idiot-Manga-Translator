@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+from app.pipeline.status_contracts import PipelineStage, PipelineStageTechnicalError
+
 try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover - optional runtime dependency
@@ -6277,16 +6279,14 @@ def build_text_area_plan(
 
     try:
         if not result.get("generated"):
-            reason = TextAreaFallbackReason(
-                reason="bubble_detection_missing_or_failed",
-                detail=str(result.get("error") or ""),
-                safe_to_ocr=True,
-                safe_to_translate=True,
+            raise PipelineStageTechnicalError(
+                stage=PipelineStage.DETECTION,
+                code="bubble_detection_artifact_unavailable",
+                message="TextAreaPlan requires a generated BubbleDetection artifact.",
+                detail=str(result.get("error") or "bubble detection was not generated"),
+                page_id=str(page_id),
+                operation="build_text_area_plan",
             )
-            plan.fallback_reasons.append(reason)
-            plan.containers.append(_full_page_fallback_container(page_id, image_size, reason.reason))
-            plan.generated = False
-            return _finish_plan(plan, started)
 
         luma_image = _load_luma_image(image_path)
         seen: set[str] = set()
@@ -6371,18 +6371,18 @@ def build_text_area_plan(
 
         plan.generated = True
         return _finish_plan(plan, started)
+    except PipelineStageTechnicalError:
+        raise
     except Exception as exc:
         plan.runtime.error = f"{type(exc).__name__}: {exc}"
-        plan.fallback_reasons.append(
-            TextAreaFallbackReason(
-                reason="text_area_plan_exception_compatibility_fallback",
-                detail=plan.runtime.error,
-                safe_to_ocr=True,
-                safe_to_translate=True,
-            )
-        )
-        plan.containers = [_full_page_fallback_container(page_id, image_size, "text_area_plan_exception_compatibility_fallback")]
-        return _finish_plan(plan, started)
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.DETECTION,
+            code="text_area_plan_failed",
+            message="TextAreaPlan could not produce a valid page-area artifact.",
+            detail=plan.runtime.error,
+            page_id=str(page_id),
+            operation="build_text_area_plan",
+        ) from exc
 
 
 def enrich_text_area_plan_with_region_records(
@@ -10595,26 +10595,6 @@ def _inside_ratio_xywh(inner: Sequence[Any], outer: Sequence[Any]) -> float:
     if not ibox or not obox:
         return 0.0
     return _intersection_area(ibox, obox) / max(1.0, _area(ibox))
-
-
-def _full_page_fallback_container(page_id: str, image_size: Tuple[int, int], reason: str) -> TextAreaContainer:
-    width, height = int(image_size[0]), int(image_size[1])
-    return TextAreaContainer(
-        container_id="fallback_full_page",
-        page_id=page_id,
-        container_type=CONTAINER_UNKNOWN,
-        bbox=[0, 0, max(1, width), max(1, height)],
-        confidence="fallback",
-        confidence_tier="compatibility_fallback",
-        route_intent=ROUTE_REVIEW_FALLBACK,
-        ocr_eligible=True,
-        comic_text_detector_scope_eligible=True,
-        fallback_reason=reason,
-        evidence_reason_codes=["text_area_plan:full_page_compatibility_fallback"],
-        human_review_required=True,
-        ocr_eligibility_reason="full_page_compatibility_fallback",
-        text_area_pre_ocr_authority=False,
-    )
 
 
 def _blocked_full_page_review_container(page_id: str, image_size: Tuple[int, int], reason: str) -> TextAreaContainer:

@@ -14,6 +14,7 @@ YomiFrame separates semantic authority from pixel evidence and from downstream e
 - ParentExecutionBundle converts finalized parent obligations into the downstream execution contract.
 - CleanupMask consumes upstream authorization and foreground projection; it does not infer speech, background, SFX, art, or review semantics from local component geometry.
 - Before parent finalization, OCR may remain review/conservation evidence without creating downstream work. Once a parent is finalized as executable, OCR, translation, cleanup, and rendering form a mandatory top-down chain and no later diagnostic can cancel that parent.
+- The normal required-stage result is valid-but-imperfect: quality limitations are retained as editable artifacts plus diagnostics. Only technical inability to produce a valid required artifact may fail; that failure is terminal and no dependent stage or later page executes.
 
 The target default chain is:
 

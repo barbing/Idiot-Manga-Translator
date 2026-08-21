@@ -19,6 +19,7 @@ from app.pipeline.status_contracts import (
     PipelineRunState,
     PipelineStage,
     PipelineStageEvent,
+    PipelineStageOutcome,
 )
 from app.ui.ui_contract import NAVIGATION_IDS, PresentationTone
 from app.ui.viewmodels.project_model import TypedListModelBase
@@ -71,6 +72,7 @@ class RunViewState:
     stage: PipelineStageEvent | None = None
     progress: PipelineProgressSnapshot | None = None
     errors: tuple[PipelineErrorReceipt, ...] = ()
+    stage_outcomes: tuple[PipelineStageOutcome, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name, expected_type in (
@@ -87,9 +89,15 @@ class RunViewState:
         if len({error.error_id for error in errors}) != len(errors):
             raise ValueError("errors must have unique identities")
         object.__setattr__(self, "errors", errors)
+        outcomes = tuple(self.stage_outcomes)
+        if any(not isinstance(outcome, PipelineStageOutcome) for outcome in outcomes):
+            raise TypeError("stage_outcomes must contain PipelineStageOutcome values")
+        if len({outcome.outcome_id for outcome in outcomes}) != len(outcomes):
+            raise ValueError("stage outcomes must have unique identities")
+        object.__setattr__(self, "stage_outcomes", outcomes)
         run_ids = {
             value.run_id
-            for value in (self.lifecycle, self.stage, self.progress, *errors)
+            for value in (self.lifecycle, self.stage, self.progress, *errors, *outcomes)
             if value is not None
         }
         if len(run_ids) > 1:
@@ -166,6 +174,24 @@ class PipelineRunProgressModel:
         if any(error.error_id == receipt.error_id for error in self._state.errors):
             raise ValueError("error receipt identity is duplicated")
         self._state = replace(self._state, errors=(*self._state.errors, receipt))
+        return self._state
+
+    def apply_stage_outcome(self, outcome: PipelineStageOutcome) -> RunViewState:
+        if not isinstance(outcome, PipelineStageOutcome):
+            raise TypeError("outcome must be PipelineStageOutcome")
+        self._require_run(outcome.run_id)
+        retained = tuple(
+            value
+            for value in self._state.stage_outcomes
+            if not (
+                value.page_id == outcome.page_id
+                and value.stage is outcome.stage
+            )
+        )
+        self._state = replace(
+            self._state,
+            stage_outcomes=(*retained, outcome),
+        )
         return self._state
 
     def clear_errors(self) -> RunViewState:

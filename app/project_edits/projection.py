@@ -832,7 +832,14 @@ def _target_text(parent: Mapping[str, Any]) -> str:
     return str(value or "")
 
 
-def _snapshot_parent(parent: Mapping[str, Any]) -> EffectiveParentSnapshot:
+def _snapshot_parent(
+    parent: Mapping[str, Any],
+    *,
+    page_id: str = "",
+    stage_outcomes: Iterable[Mapping[str, Any]] = (),
+    cleanup_current: bool = False,
+    page_output_current: bool = False,
+) -> EffectiveParentSnapshot:
     fingerprint = automatic_parent_fingerprint(parent)
     geometry = _automatic_geometry(parent)
     style = _first_mapping(parent, ("render_style", "resolved_style", "style"))
@@ -881,7 +888,154 @@ def _snapshot_parent(parent: Mapping[str, Any]) -> EffectiveParentSnapshot:
         applied_edit_ids=(),
         render_override_edit_ids=(),
         issues=(),
+        stage_requirements=_automatic_parent_stage_requirements(
+            page_id=str(page_id or parent.get("page_id") or ""),
+            parent=parent,
+            outcomes=tuple(stage_outcomes),
+            cleanup_current=cleanup_current,
+            page_output_current=page_output_current,
+        ),
     )
+
+
+def _automatic_parent_stage_requirements(
+    *,
+    page_id: str,
+    parent: Mapping[str, Any],
+    outcomes: tuple[Mapping[str, Any], ...],
+    cleanup_current: bool,
+    page_output_current: bool,
+) -> tuple[ParentStageRequirement, ...]:
+    parent_id = _parent_id(parent)
+    relevant: dict[str, Mapping[str, Any]] = {}
+    for outcome in outcomes:
+        if not isinstance(outcome, Mapping):
+            continue
+        outcome_parent_ids = {
+            str(value) for value in outcome.get("parent_ids") or [] if str(value)
+        }
+        if outcome_parent_ids and parent_id not in outcome_parent_ids:
+            continue
+        stage = str(outcome.get("stage") or "")
+        if stage:
+            relevant[stage] = outcome
+
+    source_current = bool(_source_text(parent))
+    translation_current = bool(_target_text(parent))
+    style = _first_mapping(parent, ("render_style", "resolved_style", "style"))
+    style_current = bool(validate_resolved_render_style(style).accepted)
+    render_eligibility_current = bool(
+        parent.get("render_decision_id") or cleanup_current
+    )
+    layout_current = bool(
+        parent.get("render_layout_summary")
+        or parent.get("renderer_audit_id")
+        or page_output_current
+    )
+
+    inferred = {
+        RevisionStage.HIERARCHY: True,
+        RevisionStage.SOURCE: source_current,
+        RevisionStage.TRANSLATION: translation_current,
+        RevisionStage.CLEANUP_BASE: cleanup_current,
+        RevisionStage.SOURCE_STYLE: style_current,
+        RevisionStage.RENDER_ELIGIBILITY: render_eligibility_current,
+        RevisionStage.LAYOUT_RENDER: layout_current,
+        RevisionStage.PAGE_OUTPUT: page_output_current,
+    }
+    pipeline_stage = {
+        RevisionStage.HIERARCHY: "hierarchy",
+        RevisionStage.SOURCE: "ocr",
+        RevisionStage.TRANSLATION: "translation",
+        RevisionStage.CLEANUP_BASE: "cleanup",
+        RevisionStage.SOURCE_STYLE: "style",
+        RevisionStage.RENDER_ELIGIBILITY: "cleanup",
+        RevisionStage.LAYOUT_RENDER: "rendering",
+        RevisionStage.PAGE_OUTPUT: "persistence",
+    }
+    dependencies = {
+        RevisionStage.TRANSLATION: (RevisionStage.SOURCE,),
+        RevisionStage.CLEANUP_BASE: (RevisionStage.TRANSLATION,),
+        RevisionStage.SOURCE_STYLE: (RevisionStage.CLEANUP_BASE,),
+        RevisionStage.RENDER_ELIGIBILITY: (RevisionStage.CLEANUP_BASE,),
+        RevisionStage.LAYOUT_RENDER: (
+            RevisionStage.TRANSLATION,
+            RevisionStage.CLEANUP_BASE,
+            RevisionStage.SOURCE_STYLE,
+        ),
+        RevisionStage.PAGE_OUTPUT: (RevisionStage.LAYOUT_RENDER,),
+    }
+    requirements: list[ParentStageRequirement] = []
+    prior_blocked = False
+    for stage in RevisionStage:
+        outcome = relevant.get(pipeline_stage[stage])
+        outcome_state = str((outcome or {}).get("state") or "")
+        if outcome_state == "technical_failure":
+            state = RevisionStageState.BLOCKED
+            prior_blocked = True
+        elif prior_blocked:
+            state = RevisionStageState.BLOCKED
+        elif outcome_state in {"valid", "valid_with_diagnostics"} or inferred[stage]:
+            state = RevisionStageState.CURRENT
+        else:
+            state = RevisionStageState.MISSING
+        if state is RevisionStageState.CURRENT:
+            action = RevisionRequiredAction.NONE
+        elif state is RevisionStageState.BLOCKED:
+            action = RevisionRequiredAction.WAIT_FOR_PREREQUISITES
+        elif stage is RevisionStage.CLEANUP_BASE:
+            action = RevisionRequiredAction.REBUILD
+        elif stage in {RevisionStage.LAYOUT_RENDER, RevisionStage.PAGE_OUTPUT}:
+            action = RevisionRequiredAction.RECOMPUTE
+        else:
+            action = RevisionRequiredAction.EXPLICIT_RUN
+        scope = (
+            RevisionScope.PAGE
+            if stage in {RevisionStage.CLEANUP_BASE, RevisionStage.PAGE_OUTPUT}
+            else RevisionScope.STYLE_CACHE_PREFIX
+            if stage is RevisionStage.SOURCE_STYLE
+            else RevisionScope.PARENT
+        )
+        requirements.append(
+            ParentStageRequirement(
+                parent_id=parent_id,
+                stage=stage,
+                state=state,
+                required_action=action,
+                scope=scope,
+                subject_id=page_id if scope is not RevisionScope.PARENT else parent_id,
+                reason=(
+                    str((outcome or {}).get("error_code") or "technical_stage_failure")
+                    if state is RevisionStageState.BLOCKED
+                    else "automatic_stage_artifact_current"
+                    if state is RevisionStageState.CURRENT
+                    else "automatic_stage_artifact_missing"
+                ),
+                depends_on=dependencies.get(stage, ()),
+            )
+        )
+    return tuple(requirements)
+
+
+def _stage_outcomes_for_page(
+    project: Mapping[str, Any],
+    page: Mapping[str, Any],
+    page_id: str,
+) -> tuple[Mapping[str, Any], ...]:
+    records: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for source in (project.get("stage_outcomes") or [], page.get("stage_outcomes") or []):
+        for outcome in source if isinstance(source, (list, tuple)) else []:
+            if not isinstance(outcome, Mapping):
+                continue
+            if str(outcome.get("page_id") or "") != page_id:
+                continue
+            identity = str(outcome.get("outcome_id") or "") or canonical_sha256(outcome)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            records.append(outcome)
+    return tuple(records)
 
 
 def _user_parent_stage_requirements(
@@ -2744,12 +2898,28 @@ def project_effective_page(
     page_fingerprint = automatic_page_fingerprint(page)
     base_revision_id = automatic_revision_id(page, prefix="automatic-page")
     automatic_parents = _automatic_parents(page, expected_page_id=page_id)
+    page_stage_outcomes = _stage_outcomes_for_page(project, page, page_id)
+    cleaned_record = page.get("cleaned_page_base")
+    cleanup_current = bool(
+        isinstance(cleaned_record, Mapping) and cleaned_record.get("valid")
+    )
+    processing_state = str(page.get("processing_state") or "")
+    page_output_current = bool(
+        str(page.get("output_path") or "")
+        and processing_state != "failed"
+    )
     automatic_parent_order = automatic_ordered_parent_ids_for_page(page)
     automatic_parent_by_id = {
         _parent_id(parent): parent for parent in automatic_parents
     }
     parent_map = {
-        parent_id: _snapshot_parent(automatic_parent_by_id[parent_id])
+        parent_id: _snapshot_parent(
+            automatic_parent_by_id[parent_id],
+            page_id=page_id,
+            stage_outcomes=page_stage_outcomes,
+            cleanup_current=cleanup_current,
+            page_output_current=page_output_current,
+        )
         for parent_id in automatic_parent_order
     }
     artifact_index = _artifact_index(project)

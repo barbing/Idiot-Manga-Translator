@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any, Mapping
 from uuid import uuid4
 
 
@@ -56,6 +57,14 @@ class PipelineRetryAction(str, Enum):
     RESET_SETTINGS = "reset_settings"
 
 
+class PipelineStageOutcomeState(str, Enum):
+    """Whether a required stage produced a valid downstream artifact."""
+
+    VALID = "valid"
+    VALID_WITH_DIAGNOSTICS = "valid_with_diagnostics"
+    TECHNICAL_FAILURE = "technical_failure"
+
+
 def utc_timestamp() -> str:
     """Return an ISO-8601 UTC timestamp suitable for immutable receipts."""
 
@@ -68,6 +77,10 @@ def new_run_id() -> str:
 
 def new_error_id() -> str:
     return f"error-{uuid4().hex}"
+
+
+def new_stage_outcome_id() -> str:
+    return f"outcome-{uuid4().hex}"
 
 
 def _require_text(value: str, field_name: str) -> None:
@@ -112,6 +125,139 @@ class PipelineStageEvent:
         _require_optional_text(self.parent_id, "parent_id")
         _require_optional_text(self.detail, "detail")
         _require_text(self.timestamp, "timestamp")
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineStageOutcome:
+    """Durable owner-stage result for one page barrier.
+
+    Quality limitations belong in ``diagnostics``.  Only
+    ``TECHNICAL_FAILURE`` prevents the next required stage from running.
+    """
+
+    run_id: str
+    page_id: str
+    page_index: int
+    stage: PipelineStage
+    state: PipelineStageOutcomeState
+    outcome_id: str = field(default_factory=new_stage_outcome_id)
+    page_name: str = ""
+    source_path: str = ""
+    output_path: str = ""
+    parent_ids: tuple[str, ...] = ()
+    artifact_kind: str = ""
+    artifact_summary: Mapping[str, Any] = field(default_factory=dict)
+    diagnostics: tuple[str, ...] = ()
+    error_code: str = ""
+    message: str = ""
+    detail: str = ""
+    timestamp: str = field(default_factory=utc_timestamp)
+
+    def __post_init__(self) -> None:
+        _require_text(self.run_id, "run_id")
+        _require_text(self.page_id, "page_id")
+        if isinstance(self.page_index, bool) or not isinstance(self.page_index, int):
+            raise TypeError("page_index must be an integer")
+        if self.page_index < 0:
+            raise ValueError("page_index cannot be negative")
+        if not isinstance(self.stage, PipelineStage):
+            raise TypeError("stage must be a PipelineStage")
+        if not isinstance(self.state, PipelineStageOutcomeState):
+            raise TypeError("state must be a PipelineStageOutcomeState")
+        _require_text(self.outcome_id, "outcome_id")
+        for field_name in (
+            "page_name",
+            "source_path",
+            "output_path",
+            "artifact_kind",
+            "error_code",
+            "message",
+            "detail",
+        ):
+            _require_optional_text(getattr(self, field_name), field_name)
+        parent_ids = tuple(str(value) for value in self.parent_ids if str(value))
+        diagnostics = tuple(str(value) for value in self.diagnostics if str(value))
+        object.__setattr__(self, "parent_ids", parent_ids)
+        object.__setattr__(self, "diagnostics", diagnostics)
+        if not isinstance(self.artifact_summary, Mapping):
+            raise TypeError("artifact_summary must be mapping-like")
+        if self.state is PipelineStageOutcomeState.TECHNICAL_FAILURE:
+            _require_text(self.error_code, "error_code")
+            _require_text(self.message, "message")
+        _require_text(self.timestamp, "timestamp")
+
+    @property
+    def valid_for_next_stage(self) -> bool:
+        return self.state in {
+            PipelineStageOutcomeState.VALID,
+            PipelineStageOutcomeState.VALID_WITH_DIAGNOSTICS,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outcome_id": self.outcome_id,
+            "run_id": self.run_id,
+            "page_id": self.page_id,
+            "page_index": self.page_index,
+            "page_name": self.page_name,
+            "source_path": self.source_path,
+            "output_path": self.output_path,
+            "stage": self.stage.value,
+            "state": self.state.value,
+            "valid_for_next_stage": self.valid_for_next_stage,
+            "parent_ids": list(self.parent_ids),
+            "artifact_kind": self.artifact_kind,
+            "artifact_summary": _json_safe(self.artifact_summary),
+            "diagnostics": list(self.diagnostics),
+            "error_code": self.error_code,
+            "message": self.message,
+            "detail": self.detail,
+            "timestamp": self.timestamp,
+        }
+
+
+class PipelineStageTechnicalError(RuntimeError):
+    """Raised only when a required stage cannot produce a valid artifact."""
+
+    def __init__(
+        self,
+        *,
+        stage: PipelineStage,
+        code: str,
+        message: str,
+        detail: str = "",
+        page_id: str = "",
+        parent_id: str = "",
+        operation: str = "",
+        artifact_summary: Mapping[str, Any] | None = None,
+        diagnostics: tuple[str, ...] = (),
+    ) -> None:
+        if not isinstance(stage, PipelineStage):
+            raise TypeError("stage must be a PipelineStage")
+        _require_text(code, "code")
+        _require_text(message, "message")
+        super().__init__(message)
+        self.stage = stage
+        self.code = str(code)
+        self.message = str(message)
+        self.detail = str(detail or "")
+        self.page_id = str(page_id or "")
+        self.parent_id = str(parent_id or "")
+        self.operation = str(operation or "")
+        self.artifact_summary = dict(artifact_summary or {})
+        self.diagnostics = tuple(str(value) for value in diagnostics if str(value))
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +353,11 @@ __all__ = [
     "PipelineRunState",
     "PipelineStage",
     "PipelineStageEvent",
+    "PipelineStageOutcome",
+    "PipelineStageOutcomeState",
+    "PipelineStageTechnicalError",
     "new_error_id",
     "new_run_id",
+    "new_stage_outcome_id",
     "utc_timestamp",
 ]

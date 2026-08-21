@@ -243,8 +243,6 @@ class ParentRow:
                 raise ValueError("automatic parent text must remain explicit strings")
             if self.source_authority is None or self.target_authority is None:
                 raise ValueError("automatic parent authority must remain available")
-            if self.stage_requirements:
-                raise ValueError("automatic parent cannot carry user revision requirements")
         else:
             if identity_namespace is not ParentIdentityNamespace.USER_PARENT_V1:
                 raise ValueError("user parent requires the user_parent_v1 namespace")

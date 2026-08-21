@@ -11,7 +11,6 @@ import time
 from datetime import datetime, timezone
 import sys
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
@@ -52,6 +51,9 @@ from app.pipeline.status_contracts import (
     PipelineRunState,
     PipelineStage,
     PipelineStageEvent,
+    PipelineStageOutcome,
+    PipelineStageOutcomeState,
+    PipelineStageTechnicalError,
     new_error_id,
     new_run_id,
 )
@@ -65,14 +67,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 _GLOSSARY_DEBUG = os.getenv("MT_DEBUG_GLOSSARY") == "1"
-_PARENT_SOURCE_BLOCKING_ACTIONS = {
-    "source_quality_blocked",
-    "block_auto_translation",
-    "split_required",
-    "unresolved_review",
-    "block_review_only",
-    "repair_required",
-}
 _TERMINAL_EMPHASIS_SYMBOL_EXPANSIONS = {
     "!": "!",
     "！": "!",
@@ -117,6 +111,49 @@ class PageProcessingResult:
     parent_execution_bundles: list[ParentExecutionBundle]
     page_class: str
     text_area_plan: Any | None = None
+
+
+def _stage_parent_bundle_records(
+    bundles: Iterable[ParentExecutionBundle | Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return durable bundle facts without debug-heavy pixel evidence."""
+
+    records: list[dict[str, Any]] = []
+    for bundle in bundles or ():
+        if isinstance(bundle, ParentExecutionBundle):
+            record = bundle.to_audit_dict()
+        elif isinstance(bundle, Mapping):
+            record = dict(bundle)
+        else:
+            continue
+        record.pop("execution_region", None)
+        record.pop("style_evidence_summary", None)
+        record.pop("source_candidates", None)
+        records.append(record)
+    return records
+
+
+def _compact_stage_outcome_artifact_summary(
+    stage: PipelineStage,
+    artifact_summary: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    summary = dict(artifact_summary or {})
+    bundles = summary.get("parent_execution_bundles")
+    if isinstance(bundles, (list, tuple)):
+        summary["parent_execution_bundles"] = _stage_parent_bundle_records(bundles)
+    style_evidence = summary.get("style_evidence")
+    if stage is PipelineStage.STYLE and isinstance(style_evidence, Mapping):
+        compact_evidence = {
+            str(key): value
+            for key, value in style_evidence.items()
+            if str(key) != "evidence"
+        }
+        evidence = style_evidence.get("evidence")
+        compact_evidence["evidence_count"] = (
+            len(evidence) if isinstance(evidence, (list, tuple)) else 0
+        )
+        summary["style_evidence"] = compact_evidence
+    return summary
 
 
 def resolve_parent_style_for_page(
@@ -666,6 +703,7 @@ class PipelineStatus(QtCore.QObject):
     # compatibility shell during migration.
     lifecycle_changed = QtCore.Signal(object)
     stage_changed = QtCore.Signal(object)
+    stage_outcome = QtCore.Signal(object)
     progress_snapshot = QtCore.Signal(object)
     structured_error = QtCore.Signal(object)
     progress_changed = QtCore.Signal(int)
@@ -876,6 +914,7 @@ def _create_selected_ocr_engine(settings: PipelineSettings, message_callback=Non
 class PipelineWorker(QtCore.QThread):
     lifecycle_changed = QtCore.Signal(object)
     stage_changed = QtCore.Signal(object)
+    stage_outcome = QtCore.Signal(object)
     progress_snapshot = QtCore.Signal(object)
     structured_error = QtCore.Signal(object)
     progress_changed = QtCore.Signal(int)
@@ -915,6 +954,8 @@ class PipelineWorker(QtCore.QThread):
         self._pending_terminal_state: PipelineRunState | None = None
         self._pending_terminal_message = ""
         self._stop_requested = False
+        self._checkpoint_session: ProjectCheckpointSession | None = None
+        self._stage_outcomes_by_page: dict[str, list[PipelineStageOutcome]] = {}
 
     @property
     def run_id(self) -> str:
@@ -977,6 +1018,50 @@ class PipelineWorker(QtCore.QThread):
                 detail=detail,
             )
         )
+
+    def _record_stage_outcome(
+        self,
+        *,
+        page_id: str,
+        page_index: int,
+        page_name: str,
+        source_path: str,
+        output_path: str,
+        stage: PipelineStage,
+        state: PipelineStageOutcomeState,
+        parent_ids: Iterable[str] = (),
+        artifact_kind: str = "",
+        artifact_summary: Mapping[str, Any] | None = None,
+        diagnostics: Iterable[str] = (),
+        error_code: str = "",
+        message: str = "",
+        detail: str = "",
+    ) -> PipelineStageOutcome:
+        outcome = PipelineStageOutcome(
+            run_id=self._run_id,
+            page_id=str(page_id or ""),
+            page_index=int(page_index),
+            page_name=str(page_name or ""),
+            source_path=str(source_path or ""),
+            output_path=str(output_path or ""),
+            stage=stage,
+            state=state,
+            parent_ids=tuple(str(value) for value in parent_ids if str(value)),
+            artifact_kind=str(artifact_kind or ""),
+            artifact_summary=_compact_stage_outcome_artifact_summary(
+                stage,
+                artifact_summary,
+            ),
+            diagnostics=tuple(str(value) for value in diagnostics if str(value)),
+            error_code=str(error_code or ""),
+            message=str(message or ""),
+            detail=str(detail or ""),
+        )
+        self._stage_outcomes_by_page.setdefault(outcome.page_id, []).append(outcome)
+        if self._checkpoint_session is not None:
+            self._checkpoint_session.record_stage_outcome(outcome.to_dict())
+        self.stage_outcome.emit(outcome)
+        return outcome
 
     def _emit_progress_snapshot(
         self,
@@ -1553,6 +1638,7 @@ class PipelineWorker(QtCore.QThread):
                 )
                 self.message.emit(message)
                 return
+            self._checkpoint_session = checkpoint_session
             style_font_manager = None
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
@@ -1647,6 +1733,14 @@ class PipelineWorker(QtCore.QThread):
                             detail,
                             page_id=page_id,
                         ),
+                        stage_outcome_callback=lambda **fields: self._record_stage_outcome(
+                            page_id=page_id,
+                            page_index=index - 1,
+                            page_name=name,
+                            source_path=source_path,
+                            output_path=output_path,
+                            **fields,
+                        ),
                     )
                     regions = page_result.regions
                     execution_regions = page_result.execution_regions
@@ -1687,19 +1781,68 @@ class PipelineWorker(QtCore.QThread):
                     )
                     page_elapsed = time.time() - page_start
                     self.queue_item.emit(index - 1, f"error ({_format_seconds(page_elapsed)}): {exc}")
-                    message = f"Failed to process {name}: {exc}"
+                    technical = (
+                        exc
+                        if isinstance(exc, PipelineStageTechnicalError)
+                        else PipelineStageTechnicalError(
+                            stage=self._current_stage,
+                            code=f"{self._current_stage.value}_technical_failure",
+                            message=f"{self._current_stage.value} could not produce a valid artifact.",
+                            detail=f"{type(exc).__name__}: {exc}",
+                            page_id=page_id,
+                            operation="process_page",
+                        )
+                    )
+                    try:
+                        self._record_stage_outcome(
+                            page_id=page_id,
+                            page_index=index - 1,
+                            page_name=name,
+                            source_path=source_path,
+                            output_path=output_path,
+                            stage=technical.stage,
+                            state=PipelineStageOutcomeState.TECHNICAL_FAILURE,
+                            parent_ids=([technical.parent_id] if technical.parent_id else ()),
+                            artifact_kind="technical_failure_evidence",
+                            artifact_summary=technical.artifact_summary,
+                            diagnostics=technical.diagnostics,
+                            error_code=technical.code,
+                            message=technical.message,
+                            detail=technical.detail,
+                        )
+                    except Exception as persistence_exc:
+                        message = (
+                            "Failed to persist the owning stage failure for "
+                            f"{name}: {type(persistence_exc).__name__}: {persistence_exc}"
+                        )
+                        self._emit_structured_error(
+                            code="stage_outcome_persistence_failed",
+                            owner_stage=PipelineStage.PERSISTENCE,
+                            message=message,
+                            detail=f"{type(persistence_exc).__name__}: {persistence_exc}",
+                            page_id=page_id,
+                            recoverable=True,
+                            retry_action=PipelineRetryAction.RETRY_RUN,
+                            operation="record_stage_outcome",
+                            terminal=True,
+                        )
+                        self.message.emit(message)
+                        return
+                    message = f"Failed to process {name}: {technical.message}"
                     self._emit_structured_error(
-                        code="page_processing_failed",
-                        owner_stage=self._current_stage,
+                        code=technical.code,
+                        owner_stage=technical.stage,
                         message=message,
-                        detail=f"{type(exc).__name__}: {exc}",
+                        detail=technical.detail,
                         page_id=page_id,
+                        parent_id=technical.parent_id,
                         recoverable=True,
                         retry_action=PipelineRetryAction.RETRY_PAGE,
-                        operation="process_page",
+                        operation=technical.operation or "process_page",
+                        terminal=True,
                     )
                     self.message.emit(message)
-                    continue
+                    return
 
                 source_glyph_mask_result = None
                 self._emit_stage(
@@ -1733,6 +1876,18 @@ class PipelineWorker(QtCore.QThread):
                                 render_fields.pop("region_id", None)
                                 render_fields.pop("page_id", None)
                                 mark_render_region(debug_context, rid, **render_fields)
+                    self._record_stage_outcome(
+                        page_id=page_id,
+                        page_index=index - 1,
+                        page_name=name,
+                        source_path=source_path,
+                        output_path=output_path,
+                        stage=PipelineStage.SOURCE_GLYPH,
+                        state=PipelineStageOutcomeState.VALID,
+                        parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                        artifact_kind="source_glyph_evidence",
+                        artifact_summary=source_glyph_mask_result.to_audit_dict(),
+                    )
                 except Exception as exc:
                     _page014_timeout_checkpoint(
                         "sourceglyph_generation",
@@ -1747,15 +1902,23 @@ class PipelineWorker(QtCore.QThread):
                             "source_glyph_mask_errors": [f"{type(exc).__name__}: {exc}"],
                             "source_glyph_masks": [],
                         }
-                    self._emit_structured_error(
-                        code="source_glyph_failed",
-                        owner_stage=PipelineStage.SOURCE_GLYPH,
-                        message=f"Source-glyph evidence failed for {name}.",
-                        detail=f"{type(exc).__name__}: {exc}",
+                    self._record_stage_outcome(
                         page_id=page_id,
-                        recoverable=True,
-                        retry_action=PipelineRetryAction.RETRY_PAGE,
-                        operation="build_source_glyph_evidence",
+                        page_index=index - 1,
+                        page_name=name,
+                        source_path=source_path,
+                        output_path=output_path,
+                        stage=PipelineStage.SOURCE_GLYPH,
+                        state=PipelineStageOutcomeState.VALID_WITH_DIAGNOSTICS,
+                        parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                        artifact_kind="source_glyph_unavailable_evidence",
+                        artifact_summary=dict(debug_context.get("source_glyph_masks") or {})
+                        if isinstance(debug_context, dict)
+                        else {},
+                        diagnostics=(f"source_glyph_unavailable:{type(exc).__name__}",),
+                    )
+                    self.message.emit(
+                        f"Source-glyph evidence is unavailable for {name}; cleanup will use its parent-owned fallback."
                     )
 
                 cleanup_job_contract_result = None
@@ -1767,7 +1930,6 @@ class PipelineWorker(QtCore.QThread):
                 render_input_path = source_path
                 cleaned_page_base_record = {}
                 cleanup_upstream_temp_path = ""
-                cleanup_stage_errors: list[str] = []
                 source_image_size = None
                 self._emit_stage(
                     PipelineStage.CLEANUP,
@@ -2026,6 +2188,15 @@ class PipelineWorker(QtCore.QThread):
                             cleanup_upstream_commit_result,
                             debug_context,
                         )
+                        cleanup_diagnostics = _validate_cleanup_parent_conservation(
+                            page_id=page_id,
+                            bundles=parent_execution_bundles,
+                            cleanup_jobs=cleanup_job_contract_result,
+                            cleanup_masks=cleanup_mask_contract_result,
+                            cleanup_plans=cleanup_plan_contract_result,
+                            cleanup_runtime=cleanup_runtime_contract_result,
+                            cleanup_commit=cleanup_upstream_commit_result,
+                        )
                         cleanup_required_for_cleaned_base = bool(
                             getattr(cleanup_job_contract_result, "jobs", []) or []
                         ) or bool(getattr(cleanup_mask_contract_result, "masks", []) or []) or bool(
@@ -2042,6 +2213,20 @@ class PipelineWorker(QtCore.QThread):
                             parent_execution_bundles=parent_execution_bundles,
                             cleanup_required=cleanup_required_for_cleaned_base,
                         )
+                        if not bool(cleaned_page_base_record.get("valid")):
+                            raise PipelineStageTechnicalError(
+                                stage=PipelineStage.CLEANUP,
+                                code="cleaned_page_base_invalid",
+                                message="Cleanup did not publish a valid CleanedPageBase artifact.",
+                                detail=str(
+                                    (cleaned_page_base_record.get("invalidation") or {}).get("reason")
+                                    or cleaned_page_base_record.get("state")
+                                    or "invalid cleaned page base"
+                                ),
+                                page_id=page_id,
+                                operation="persist_cleaned_page_base",
+                                artifact_summary=cleaned_page_base_record,
+                            )
                         cleaned_base_path = str(cleaned_page_base_record.get("image_path") or "")
                         if bool(cleaned_page_base_record.get("valid")) and cleaned_base_path and os.path.isfile(cleaned_base_path):
                             render_input_path = cleaned_base_path
@@ -2157,7 +2342,6 @@ class PipelineWorker(QtCore.QThread):
                                 len(cleanup_upstream_commit_result.commit_records),
                             )
                     except Exception as exc:
-                        cleanup_stage_errors.append(f"{type(exc).__name__}: {exc}")
                         _page014_timeout_checkpoint(
                             "cleanup_runtime_or_commit",
                             "error",
@@ -2210,6 +2394,7 @@ class PipelineWorker(QtCore.QThread):
                                     "renderer_consumed": False,
                                 },
                             }
+                        raise
                     if debug_context is not None:
                         if debug_context.get("perf_telemetry_only"):
                             render_eligibility_audit = render_eligibility_contract_result.to_audit_dict()
@@ -2238,7 +2423,18 @@ class PipelineWorker(QtCore.QThread):
                         elapsed_ms=round((time.time() - cleanup_contract_start) * 1000.0, 3),
                     )
                 except Exception as exc:
-                    cleanup_stage_errors.append(f"{type(exc).__name__}: {exc}")
+                    technical = (
+                        exc
+                        if isinstance(exc, PipelineStageTechnicalError)
+                        else PipelineStageTechnicalError(
+                            stage=PipelineStage.CLEANUP,
+                            code="cleanup_technical_failure",
+                            message="Cleanup could not produce a valid page artifact.",
+                            detail=f"{type(exc).__name__}: {exc}",
+                            page_id=page_id,
+                            operation="run_cleanup",
+                        )
+                    )
                     _page014_timeout_checkpoint(
                         "cleanup_contract_chain",
                         "error",
@@ -2289,78 +2485,36 @@ class PipelineWorker(QtCore.QThread):
                                 "renderer_consumed": False,
                                 },
                             }
-                    self._emit_structured_error(
-                        code="cleanup_failed",
-                        owner_stage=PipelineStage.CLEANUP,
-                        message=f"Cleanup processing failed for {name}.",
-                        detail=f"{type(exc).__name__}: {exc}",
+                    self._record_stage_outcome(
                         page_id=page_id,
+                        page_index=index - 1,
+                        page_name=name,
+                        source_path=source_path,
+                        output_path=output_path,
+                        stage=PipelineStage.CLEANUP,
+                        state=PipelineStageOutcomeState.TECHNICAL_FAILURE,
+                        parent_ids=([technical.parent_id] if technical.parent_id else ()),
+                        artifact_kind="cleanup_failure_evidence",
+                        artifact_summary=technical.artifact_summary,
+                        diagnostics=technical.diagnostics,
+                        error_code=technical.code,
+                        message=technical.message,
+                        detail=technical.detail,
+                    )
+                    self._emit_structured_error(
+                        code=technical.code,
+                        owner_stage=PipelineStage.CLEANUP,
+                        message=f"Cleanup processing failed for {name}: {technical.message}",
+                        detail=technical.detail,
+                        page_id=page_id,
+                        parent_id=technical.parent_id,
                         recoverable=True,
                         retry_action=PipelineRetryAction.RETRY_PAGE,
-                        operation="run_cleanup",
+                        operation=technical.operation or "run_cleanup",
+                        terminal=True,
                     )
-
-                if not cleaned_page_base_record and parent_execution_bundles:
-                    from PIL import Image
-
-                    with Image.open(source_path) as fallback_source:
-                        fallback_cleaned_image = fallback_source.convert("RGB")
-                    failure_reason = (
-                        cleanup_stage_errors[-1]
-                        if cleanup_stage_errors
-                        else "cleanup_stage_did_not_publish_cleaned_page_base"
-                    )
-                    cleanup_required_bundles = [
-                        bundle
-                        for bundle in parent_execution_bundles
-                        if bool(getattr(bundle, "cleanup_required", False))
-                    ]
-                    cleanup_upstream_commit_result = SimpleNamespace(
-                        version="cleanup_upstream_commit_top_down_failure_snapshot_v1",
-                        cleaned_image=fallback_cleaned_image,
-                        commit_records=[],
-                        blocked_records=[
-                            {
-                                "page_id": page_id,
-                                "region_id": str(bundle.bundle_id or bundle.parent_id or ""),
-                                "parent_execution_bundle_id": str(
-                                    bundle.bundle_id or bundle.parent_id or ""
-                                ),
-                                "parent_logical_text_unit_id": str(
-                                    bundle.parent_id or bundle.bundle_id or ""
-                                ),
-                                "text_block_root_id": str(bundle.root_id or ""),
-                                "cleanup_committed_to_working_image": False,
-                                "failure_reason": failure_reason,
-                            }
-                            for bundle in cleanup_required_bundles
-                        ],
-                        errors=list(cleanup_stage_errors or [failure_reason]),
-                    )
-                    cleaned_page_base_record = persist_cleaned_page_base(
-                        page_id=page_id,
-                        source_path=source_path,
-                        export_dir=self._settings.export_dir,
-                        cleanup_upstream_commit_result=cleanup_upstream_commit_result,
-                        parent_execution_bundles=parent_execution_bundles,
-                        cleanup_required=bool(cleanup_required_bundles),
-                    )
-                    fallback_base_path = str(
-                        cleaned_page_base_record.get("image_path") or ""
-                    )
-                    if fallback_base_path and os.path.isfile(fallback_base_path):
-                        render_input_path = fallback_base_path
-                    if debug_context is not None:
-                        debug_context["cleaned_page_base"] = dict(
-                            cleaned_page_base_record
-                        )
-                        debug_context["cleanup_top_down_failure_snapshot"] = {
-                            "failure_reason": failure_reason,
-                            "parent_ids": [
-                                str(bundle.bundle_id or bundle.parent_id or "")
-                                for bundle in cleanup_required_bundles
-                            ],
-                        }
+                    self.message.emit(f"Cleanup processing failed for {name}: {technical.message}")
+                    return
 
                 _sync_parent_execution_downstream_contracts(
                     parent_execution_bundles,
@@ -2369,6 +2523,28 @@ class PipelineWorker(QtCore.QThread):
                     cleanup_jobs=cleanup_job_contract_result,
                     cleanup_masks=cleanup_mask_contract_result,
                     render_eligibility=render_eligibility_contract_result,
+                )
+                self._record_stage_outcome(
+                    page_id=page_id,
+                    page_index=index - 1,
+                    page_name=name,
+                    source_path=source_path,
+                    output_path=output_path,
+                    stage=PipelineStage.CLEANUP,
+                    state=(
+                        PipelineStageOutcomeState.VALID_WITH_DIAGNOSTICS
+                        if cleanup_diagnostics
+                        else PipelineStageOutcomeState.VALID
+                    ),
+                    parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                    artifact_kind="cleaned_page_base",
+                    artifact_summary={
+                        "cleaned_page_base": cleaned_page_base_record,
+                        "parent_execution_bundles": [
+                            bundle.to_audit_dict() for bundle in parent_execution_bundles
+                        ],
+                    },
+                    diagnostics=cleanup_diagnostics,
                 )
 
                 if getattr(self._settings, "private_cleanup_validation_stop_after_cleanup", False):
@@ -2571,16 +2747,6 @@ class PipelineWorker(QtCore.QThread):
                                     f"Parent style evidence failed for {name}; "
                                     "current-page arbitration will use explicit unavailable evidence."
                                 )
-                                self._emit_structured_error(
-                                    code="style_evidence_unavailable",
-                                    owner_stage=PipelineStage.STYLE,
-                                    message=message,
-                                    detail=f"{type(exc).__name__}: {exc}",
-                                    page_id=page_id,
-                                    recoverable=False,
-                                    retry_action=PipelineRetryAction.NONE,
-                                    operation="observe_parent_style",
-                                )
                                 self.message.emit(message)
                             except Exception as fallback_exc:
                                 page_elapsed = time.time() - page_start
@@ -2592,18 +2758,40 @@ class PipelineWorker(QtCore.QThread):
                                     f"Failed to record unavailable parent style evidence for "
                                     f"{name}: {fallback_exc}"
                                 )
-                                self._emit_structured_error(
+                                technical = PipelineStageTechnicalError(
+                                    stage=PipelineStage.STYLE,
                                     code="style_evidence_fallback_failed",
+                                    message="Style could not produce valid unavailable-evidence fallback records.",
+                                    detail=f"{type(fallback_exc).__name__}: {fallback_exc}",
+                                    page_id=page_id,
+                                    operation="record_unavailable_style_evidence",
+                                )
+                                self._record_stage_outcome(
+                                    page_id=page_id,
+                                    page_index=index - 1,
+                                    page_name=name,
+                                    source_path=source_path,
+                                    output_path=output_path,
+                                    stage=PipelineStage.STYLE,
+                                    state=PipelineStageOutcomeState.TECHNICAL_FAILURE,
+                                    artifact_kind="style_failure_evidence",
+                                    error_code=technical.code,
+                                    message=technical.message,
+                                    detail=technical.detail,
+                                )
+                                self._emit_structured_error(
+                                    code=technical.code,
                                     owner_stage=PipelineStage.STYLE,
                                     message=message,
-                                    detail=f"{type(fallback_exc).__name__}: {fallback_exc}",
+                                    detail=technical.detail,
                                     page_id=page_id,
                                     recoverable=True,
                                     retry_action=PipelineRetryAction.RETRY_PAGE,
-                                    operation="record_unavailable_style_evidence",
+                                    operation=technical.operation,
+                                    terminal=True,
                                 )
                                 self.message.emit(message)
-                                continue
+                                return
                             if debug_context is not None and not debug_context.get(
                                 "perf_telemetry_only"
                             ):
@@ -2735,6 +2923,20 @@ class PipelineWorker(QtCore.QThread):
                         message = (
                             "Failed to resolve current-page parent styles for "
                             f"{name}: {type(exc).__name__}: {exc}"
+                        )
+                        self._record_stage_outcome(
+                            page_id=page_id,
+                            page_index=index - 1,
+                            page_name=name,
+                            source_path=source_path,
+                            output_path=output_path,
+                            stage=PipelineStage.STYLE,
+                            state=PipelineStageOutcomeState.TECHNICAL_FAILURE,
+                            parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                            artifact_kind="style_failure_evidence",
+                            error_code="style_resolution_failed",
+                            message="Style arbitration could not produce valid parent styles.",
+                            detail=f"{type(exc).__name__}: {exc}",
                         )
                         self._emit_structured_error(
                             code="style_resolution_failed",
@@ -2883,6 +3085,33 @@ class PipelineWorker(QtCore.QThread):
                                     parent_font_detection=record,
                                 )
 
+                    style_diagnostics = tuple(
+                        str(value)
+                        for value in getattr(parent_style_observation, "errors", ()) or ()
+                        if str(value)
+                    )
+                    self._record_stage_outcome(
+                        page_id=page_id,
+                        page_index=index - 1,
+                        page_name=name,
+                        source_path=source_path,
+                        output_path=output_path,
+                        stage=PipelineStage.STYLE,
+                        state=(
+                            PipelineStageOutcomeState.VALID_WITH_DIAGNOSTICS
+                            if style_diagnostics
+                            else PipelineStageOutcomeState.VALID
+                        ),
+                        parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                        artifact_kind="resolved_parent_styles",
+                        artifact_summary={
+                            "parent_execution_bundles": [
+                                bundle.to_audit_dict() for bundle in parent_execution_bundles
+                            ],
+                            "style_evidence": observation_audit,
+                        },
+                        diagnostics=style_diagnostics,
+                    )
                     self._emit_stage(
                         PipelineStage.RENDERING,
                         "Rendering the committed page output",
@@ -2946,6 +3175,23 @@ class PipelineWorker(QtCore.QThread):
                                 3,
                             ),
                         )
+                        self._record_stage_outcome(
+                            page_id=page_id,
+                            page_index=index - 1,
+                            page_name=name,
+                            source_path=source_path,
+                            output_path=output_path,
+                            stage=PipelineStage.RENDERING,
+                            state=PipelineStageOutcomeState.VALID,
+                            parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                            artifact_kind="rendered_page",
+                            artifact_summary={
+                                "output_path": output_path,
+                                "parent_execution_bundles": [
+                                    bundle.to_audit_dict() for bundle in parent_execution_bundles
+                                ],
+                            },
+                        )
                     except Exception as exc:
                         _page014_timeout_checkpoint(
                             "renderer_entry",
@@ -2963,6 +3209,20 @@ class PipelineWorker(QtCore.QThread):
                                 pass
                         self.queue_item.emit(index - 1, f"error: {exc}")
                         message = f"Failed to render {name}: {exc}"
+                        self._record_stage_outcome(
+                            page_id=page_id,
+                            page_index=index - 1,
+                            page_name=name,
+                            source_path=source_path,
+                            output_path=output_path,
+                            stage=PipelineStage.RENDERING,
+                            state=PipelineStageOutcomeState.TECHNICAL_FAILURE,
+                            parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                            artifact_kind="render_failure_evidence",
+                            error_code="render_failed",
+                            message="Renderer could not produce a valid page artifact.",
+                            detail=f"{type(exc).__name__}: {exc}",
+                        )
                         self._emit_structured_error(
                             code="render_failed",
                             owner_stage=PipelineStage.RENDERING,
@@ -3018,6 +3278,8 @@ class PipelineWorker(QtCore.QThread):
                     output_path,
                     page_class=page_class,
                 )
+                page_record["file_name"] = name
+                page_record["processing_state"] = "completed"
                 if cleaned_page_base_record:
                     page_record["cleaned_page_base"] = cleaned_page_base_record
                 if parent_execution_bundles:
@@ -3050,6 +3312,23 @@ class PipelineWorker(QtCore.QThread):
                         f"Failed to checkpoint project after {name}: "
                         f"{type(exc).__name__}: {exc}"
                     )
+                    try:
+                        self._record_stage_outcome(
+                            page_id=page_id,
+                            page_index=index - 1,
+                            page_name=name,
+                            source_path=source_path,
+                            output_path=output_path,
+                            stage=PipelineStage.PERSISTENCE,
+                            state=PipelineStageOutcomeState.TECHNICAL_FAILURE,
+                            parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                            artifact_kind="checkpoint_failure_evidence",
+                            error_code="checkpoint_commit_failed",
+                            message="The page checkpoint could not be committed.",
+                            detail=f"{type(exc).__name__}: {exc}",
+                        )
+                    except Exception:
+                        pass
                     self._emit_structured_error(
                         code="checkpoint_commit_failed",
                         owner_stage=PipelineStage.PERSISTENCE,
@@ -3063,6 +3342,21 @@ class PipelineWorker(QtCore.QThread):
                     )
                     self.message.emit(message)
                     return
+                self._record_stage_outcome(
+                    page_id=page_id,
+                    page_index=index - 1,
+                    page_name=name,
+                    source_path=source_path,
+                    output_path=output_path,
+                    stage=PipelineStage.PERSISTENCE,
+                    state=PipelineStageOutcomeState.VALID,
+                    parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+                    artifact_kind="page_checkpoint",
+                    artifact_summary={
+                        "page_id": page_id,
+                        "commit_sha256": str(checkpoint_receipt.commit_sha256 or ""),
+                    },
+                )
                 if isinstance(debug_context, dict):
                     set_timing(
                         debug_context,
@@ -3215,6 +3509,7 @@ class PipelineWorker(QtCore.QThread):
                 "Finalizing the durable project",
             )
             project["pages"] = list(pages)
+            project["stage_outcomes"] = checkpoint_session.stage_outcomes()
             project["style_context_cache"] = (
                 style_context_journal.to_project_dict()
             )
@@ -3442,6 +3737,7 @@ class PipelineWorker(QtCore.QThread):
                     ollama.close()
                 except Exception:
                     pass
+            self._checkpoint_session = None
             self._flush_terminal_lifecycle()
 
 
@@ -3538,6 +3834,7 @@ class PipelineController(QtCore.QObject):
         )
         self._worker.lifecycle_changed.connect(self.status.lifecycle_changed.emit)
         self._worker.stage_changed.connect(self.status.stage_changed.emit)
+        self._worker.stage_outcome.connect(self.status.stage_outcome.emit)
         self._worker.progress_snapshot.connect(self.status.progress_snapshot.emit)
         self._worker.structured_error.connect(self.status.structured_error.emit)
         self._worker.progress_changed.connect(self.status.progress_changed.emit)
@@ -5115,6 +5412,68 @@ def _attach_text_area_assignment(
             meta[key] = value
 
 
+def _append_empty_ocr_child_evidence(
+    regions: list[dict],
+    *,
+    idx: int,
+    polygons: list,
+    bbox: list[int],
+    det_conf: float,
+    ocr_conf: float,
+    assignment: dict,
+    debug_context: dict | None,
+    page_id: str,
+    retry_info: dict | None,
+    semantic_bg: bool,
+    region_type: str,
+    apply_text_area_assignment_to_region,
+    build_scoped_ocr_candidate,
+) -> dict:
+    """Retain empty child evidence until parent-boundary OCR owns the source."""
+
+    region = _region_record(
+        idx,
+        polygons,
+        bbox,
+        "",
+        "",
+        det_conf,
+        bg_text=semantic_bg,
+        needs_review=True,
+        ignore=True,
+        region_type=region_type,
+        ocr_conf=ocr_conf,
+        render_updates={
+            "cleanup_mode": "preserve",
+            "classification_reason": "empty_child_ocr_deferred_to_parent_source_contract",
+        },
+    )
+    _attach_text_area_assignment(
+        region,
+        assignment,
+        debug_context,
+        page_id,
+        "",
+        ocr_conf,
+        accepted=False,
+        apply_text_area_assignment_to_region=apply_text_area_assignment_to_region,
+        build_scoped_ocr_candidate=build_scoped_ocr_candidate,
+    )
+    _stamp_route_owned_ocr_retry(region, retry_info)
+    flags = region.setdefault("flags", {})
+    flags["ignore"] = True
+    flags["needs_review"] = True
+    region["translation"] = ""
+    region["ocr_source_deferred_to_parent_boundary"] = True
+    region["ocr_source_contract_state"] = "pending_parent_boundary_ocr"
+    region["ocr_source_diagnostic"] = "empty_child_ocr"
+    region.setdefault("render", {})[
+        "ocr_source_deferred_to_parent_boundary"
+    ] = True
+    regions.append(region)
+    return region
+
+
 def _append_parent_boundary_ocr_source_regions(
     *,
     regions: list[dict],
@@ -5998,6 +6357,11 @@ def _reconstruct_logical_text_block_sources(
     }
     attempts: list[dict[str, Any]] = []
     applied_count = 0
+    block_counts_by_physical: dict[str, int] = {}
+    for block in getattr(logical_block_result, "blocks", []) or []:
+        physical_id = str(getattr(block, "physical_bubble_id", "") or "")
+        if physical_id:
+            block_counts_by_physical[physical_id] = block_counts_by_physical.get(physical_id, 0) + 1
     for block in getattr(logical_block_result, "blocks", []) or []:
         if not _logical_block_needs_physical_reocr(block, region_by_id):
             continue
@@ -6005,7 +6369,28 @@ def _reconstruct_logical_text_block_sources(
             block.source_reconstruction_required = True
         except Exception:
             pass
-        crop_bbox = _logical_block_physical_reocr_bbox(block, group_bboxes, image_size)
+        physical_id = str(getattr(block, "physical_bubble_id", "") or "")
+        parent_scope_bbox = list(
+            getattr(block, "source_reconstruction_parent_bbox", []) or []
+        )
+        if block_counts_by_physical.get(physical_id, 0) > 1 and not parent_scope_bbox:
+            attempt = {
+                "logical_text_block_id": getattr(block, "block_id", None),
+                "physical_bubble_id": physical_id,
+                "before_source_text": getattr(block, "source_text", ""),
+                "crop_bbox": [],
+                "applied": False,
+                "reason_codes": _logical_block_reocr_candidate_reasons(block, region_by_id),
+                "status": "skipped_ambiguous_full_physical_bubble_reocr_parent_scope",
+            }
+            _mark_logical_block_reocr_unresolved(block, attempt["status"])
+            attempts.append(attempt)
+            continue
+        crop_bbox = (
+            _clip_controller_bbox(parent_scope_bbox, image_size)
+            if parent_scope_bbox
+            else _logical_block_physical_reocr_bbox(block, group_bboxes, image_size)
+        )
         attempt = {
             "logical_text_block_id": getattr(block, "block_id", None),
             "physical_bubble_id": getattr(block, "physical_bubble_id", None),
@@ -6101,9 +6486,20 @@ def _recover_punctuation_only_speech_containers(
     ocr_engine,
     settings,
     quality_func,
+    font_name: str = "",
     debug_context: dict | None = None,
 ) -> dict[str, Any]:
     """Recover speech containers where scoped CTD/OCR found only punctuation/noise."""
+    return {
+        "attempt_count": 0,
+        "applied_count": 0,
+        "attempts": [],
+        "status": "disabled_no_executable_recovery_after_logical_block_assembly",
+    }
+
+    # Historical implementation retained below as unreachable reference until
+    # the repair diff is accepted; no post-finalization executable recovery is
+    # permitted.
     if not logical_block_result or not getattr(logical_block_result, "physical_bubble_groups", None):
         return {"attempt_count": 0, "applied_count": 0, "attempts": []}
     if page_image is None or ocr_engine is None:
@@ -7204,113 +7600,25 @@ def _dedupe_multiscope_ctd_candidates(candidates: list[dict[str, Any]]) -> list[
     cleaned.sort(key=_multiscope_candidate_rank, reverse=True)
     result: list[dict[str, Any]] = []
     for candidate in cleaned:
-        bbox = candidate.get("bbox") or []
-        text = str(candidate.get("ocr_text") or "")
-        source_scope = str(candidate.get("source_scope") or "")
-        candidate_rejectable = _root_child_fragment_is_rejectable_noise(text)
-        if (
-            source_scope == "existing_scoped_root_child"
-            and candidate_rejectable
-        ):
+        bbox = list(candidate.get("bbox") or [])
+        if not bbox:
             continue
-        body = _root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))
-        if not bbox or not body:
-            continue
-        duplicate = False
-        remove_indices: list[int] = []
-        for existing_index, existing in enumerate(result):
-            ebbox = existing.get("bbox") or []
-            ebody = _root_reconstruction_source_body(str(existing.get("ocr_text") or ""))
-            overlap = _overlap_ratio(bbox, ebbox) if ebbox else 0.0
-            text_ratio = difflib.SequenceMatcher(None, body, ebody).ratio() if ebody else 0.0
-            existing_contains_candidate = bool(ebody and body in ebody)
-            candidate_contains_existing = bool(ebody and ebody in body)
-            body_contained = existing_contains_candidate or candidate_contains_existing
-            if body == ebody or text_ratio >= 0.92:
-                duplicate = True
-                break
-            if overlap >= 0.82:
-                existing_inside_candidate = _bbox_inside_ratio_controller(ebbox, bbox) if ebbox else 0.0
-                if existing_contains_candidate:
-                    duplicate = True
-                    break
-                if candidate_contains_existing:
-                    if (
-                        len(body) >= len(ebody) + 2
-                        and existing_inside_candidate >= 0.45
-                        and not candidate_rejectable
-                    ):
-                        remove_indices.append(existing_index)
-                        continue
-                    if (
-                        max(len(body), len(ebody)) <= 5
-                        and len(body) >= len(ebody) + 1
-                        and existing_inside_candidate >= 0.45
-                        and not candidate_rejectable
-                    ):
-                        remove_indices.append(existing_index)
-                        continue
-                    duplicate = True
-                    break
-                if text_ratio >= 0.58:
-                    if (
-                        len(body) >= len(ebody) + 4
-                        and existing_inside_candidate >= 0.55
-                        and not candidate_rejectable
-                    ):
-                        remove_indices.append(existing_index)
-                        continue
-                    if (
-                        max(len(body), len(ebody)) <= 5
-                        and len(body) >= len(ebody) + 1
-                        and existing_inside_candidate >= 0.45
-                        and not candidate_rejectable
-                    ):
-                        remove_indices.append(existing_index)
-                        continue
-                    duplicate = True
-                    break
-            if (
-                existing_contains_candidate
-                and _bbox_inside_ratio_controller(bbox, ebbox) >= 0.55
-                and len(ebody) >= len(body) + 2
-            ):
-                duplicate = True
-                break
-            existing_inside_candidate = _bbox_inside_ratio_controller(ebbox, bbox) if ebbox else 0.0
-            existing_area = max(1, int((ebbox or [0, 0, 0, 0])[2] or 1) * int((ebbox or [0, 0, 0, 0])[3] or 1))
-            candidate_area = max(1, int((bbox or [0, 0, 0, 0])[2] or 1) * int((bbox or [0, 0, 0, 0])[3] or 1))
-            if (
-                existing_inside_candidate >= 0.65
-                and candidate_area <= existing_area * 8
-                and len(body) >= len(ebody) + 1
-                and text_ratio >= 0.45
-                and not candidate_rejectable
-            ):
-                remove_indices.append(existing_index)
-                continue
-            if body_contained and min(len(body), len(ebody)) <= max(2, int(max(len(body), len(ebody)) * 0.45)):
-                smaller = body if len(body) <= len(ebody) else ebody
-                if smaller == body and _bbox_inside_ratio_controller(bbox, ebbox) >= 0.55:
-                    duplicate = True
-                    break
-            if (
-                str(candidate.get("source_scope") or "") == "existing_scoped_root_child"
-                and _bbox_inside_ratio_controller(bbox, ebbox) >= 0.72
-                and len(ebody) >= len(body) + 2
-                and not _root_child_fragment_is_rejectable_noise(str(existing.get("ocr_text") or ""))
-                and (
-                    existing_contains_candidate
-                    or text_ratio >= 0.40
-                    or candidate_rejectable
-                )
-            ):
-                duplicate = True
-                break
+        duplicate = any(
+            _overlap_ratio(bbox, list(existing.get("bbox") or [])) >= 0.92
+            and _bbox_inside_ratio_controller(
+                bbox,
+                list(existing.get("bbox") or []),
+            )
+            >= 0.90
+            and _bbox_inside_ratio_controller(
+                list(existing.get("bbox") or []),
+                bbox,
+            )
+            >= 0.90
+            for existing in result
+            if existing.get("bbox")
+        )
         if not duplicate:
-            for existing_index in sorted(set(remove_indices), reverse=True):
-                if 0 <= existing_index < len(result):
-                    result.pop(existing_index)
             result.append(candidate)
     return result
 
@@ -7506,15 +7814,10 @@ def _classify_nonselected_graph_candidate(
         overlap = _overlap_ratio(bbox, parent_bbox)
         inside_parent = _bbox_inside_ratio_controller(bbox, parent_bbox)
         parent_inside = _bbox_inside_ratio_controller(parent_bbox, bbox)
-        text_ratio = difflib.SequenceMatcher(None, body, parent_body).ratio() if parent_body else 0.0
-        if body == parent_body or text_ratio >= 0.92:
-            return "duplicate_fragment", "same_text_as_selected_candidate", parent_id
-        if body in parent_body and inside_parent >= 0.45:
-            return "duplicate_fragment", "source_body_contained_by_selected_candidate", parent_id
-        if inside_parent >= 0.55 and text_ratio >= 0.40:
+        if inside_parent >= 0.85:
             best_parent_id = parent_id
             best_reason = "spatially_contained_support_fragment"
-        elif overlap >= 0.82 and (text_ratio >= 0.50 or parent_inside >= 0.55):
+        elif overlap >= 0.82 and parent_inside >= 0.55:
             best_parent_id = parent_id
             best_reason = "overlapping_support_fragment"
     if best_parent_id:
@@ -7738,16 +8041,6 @@ def _root_parent_candidate_acceptance_v2(
         return False, ["root_parent_missing_meaningful_child_evidence"], score, child_status
     if base_accepted:
         return True, list(base_reasons or ["root_parent_source_accepted"]), score, child_status
-    if (
-        str(parent_candidate.get("parent_visual_group_id") or "")
-        and not str(parent_candidate.get("parent_visual_group_id") or "").startswith("overmerged:")
-        and "recovered_source_missing_meaningful_child_fragment" in set(base_reasons or [])
-        and len(_root_reconstruction_source_body(text)) >= 4
-        and float(ocr_conf or 0.0) >= 0.50
-    ):
-        return True, ["visual_parent_group_source_accepted"], score + 8.0, child_status
-    if _root_incomplete_source_visually_complete(root, parent_candidate, child_status, base_reasons, ocr_conf):
-        return True, ["incomplete_source_visual_complete_root_coverage"], score + 12.0, child_status
     return False, list(base_reasons or ["root_parent_source_rejected"]), score, child_status
 
 
@@ -7869,11 +8162,6 @@ def _root_parent_candidate_drops_graph_segments(
         body = _root_reconstruction_source_body(str(record.get("ocr_text") or ""))
         if not body:
             continue
-        if body in selected_body:
-            continue
-        ratio = difflib.SequenceMatcher(None, body, selected_body).ratio()
-        if ratio >= 0.72:
-            continue
         return True
     return False
 
@@ -7936,13 +8224,6 @@ def _root_reconstruction_child_fragment_status_v2(
         if not body:
             records.append({"region_id": rid, "source_text": source, "status": "punctuation_or_empty_child"})
             continue
-        if body in recovered_body or recovered_body in body:
-            records.append({"region_id": rid, "source_text": source, "status": "represented_in_recovered_source"})
-            continue
-        ratio = difflib.SequenceMatcher(None, body, recovered_body).ratio()
-        if ratio >= 0.55:
-            records.append({"region_id": rid, "source_text": source, "status": "represented_fuzzy", "ratio": round(ratio, 3)})
-            continue
         graph_record = graph_by_region.get(rid)
         graph_state = str((graph_record or {}).get("candidate_graph_state") or "")
         if graph_state in {"duplicate_fragment", "support_fragment", "punctuation_fragment", "noise_fragment"}:
@@ -7959,7 +8240,7 @@ def _root_reconstruction_child_fragment_status_v2(
         if _root_child_fragment_is_rejectable_noise(source):
             records.append({"region_id": rid, "source_text": source, "status": "deliberately_rejected_child_fragment"})
             continue
-        records.append({"region_id": rid, "source_text": source, "status": "missing_meaningful_child_fragment", "ratio": round(ratio, 3)})
+        records.append({"region_id": rid, "source_text": source, "status": "missing_meaningful_child_fragment"})
     return records
 
 
@@ -8053,11 +8334,6 @@ def _assemble_root_internal_source(
         if not body or _root_child_fragment_is_rejectable_noise(text):
             continue
         source_body = _root_reconstruction_source_body(source)
-        if body in source_body:
-            continue
-        ratio = difflib.SequenceMatcher(None, body, source_body).ratio() if source_body else 0.0
-        if ratio >= 0.55:
-            continue
         if len(body) <= 2 and len(source_body) >= 6:
             source = f"{source}{text}"
             merged.append({"region_id": rid, "source_text": text, "reason": "short_existing_child_fragment_merged"})
@@ -8378,17 +8654,8 @@ def _root_reconstruction_conserves_existing_sources(recovered_text: str, parents
     ]
     if not active_sources:
         return True
-    recovered_body = _root_reconstruction_source_body(recovered_text)
-    for source in active_sources:
-        source_body = _root_reconstruction_source_body(source)
-        if not source_body:
-            continue
-        if source_body in recovered_body:
-            continue
-        if difflib.SequenceMatcher(None, source_body, recovered_body).ratio() >= 0.72:
-            continue
-        return False
-    return True
+    # Root-wide OCR must never replace already finalized parent sources.
+    return False
 
 
 def _root_reconstruction_child_fragment_status(recovered_text: str, children: list[Any]) -> list[dict[str, Any]]:
@@ -8401,17 +8668,10 @@ def _root_reconstruction_child_fragment_status(recovered_text: str, children: li
         if not body:
             records.append({"region_id": rid, "source_text": source, "status": "punctuation_or_empty_child"})
             continue
-        if body in recovered_body or recovered_body in body:
-            records.append({"region_id": rid, "source_text": source, "status": "represented_in_recovered_source"})
-            continue
-        ratio = difflib.SequenceMatcher(None, body, recovered_body).ratio()
-        if ratio >= 0.55:
-            records.append({"region_id": rid, "source_text": source, "status": "represented_fuzzy", "ratio": round(ratio, 3)})
-            continue
         if _root_child_fragment_is_rejectable_noise(source):
             records.append({"region_id": rid, "source_text": source, "status": "deliberately_rejected_child_fragment"})
             continue
-        records.append({"region_id": rid, "source_text": source, "status": "missing_meaningful_child_fragment", "ratio": round(ratio, 3)})
+        records.append({"region_id": rid, "source_text": source, "status": "missing_meaningful_child_fragment"})
     return records
 
 
@@ -8457,29 +8717,6 @@ def _represented_child_region_ids_for_visual_parent(
     for rid in parent_record.get("included_child_region_ids") or []:
         rid = str(rid or "")
         if rid and rid not in ids:
-            ids.append(rid)
-    group_bbox = _clip_controller_bbox(list(parent_record.get("parent_visual_group_bbox") or []), None)
-    source_body = _root_reconstruction_source_body(str(parent_record.get("source_text") or ""))
-    for child in root_children or []:
-        rid = str(getattr(child, "source_region_id", "") or "")
-        if not rid or rid in ids:
-            continue
-        child_bbox = _clip_controller_bbox(list(getattr(child, "bbox", []) or []), None)
-        child_text = str(getattr(child, "ocr_text", "") or "")
-        child_body = _root_reconstruction_source_body(child_text)
-        if not child_body:
-            continue
-        if group_bbox and child_bbox:
-            inside_group = _bbox_inside_ratio_controller(child_bbox, group_bbox)
-            group_inside = _bbox_inside_ratio_controller(group_bbox, child_bbox)
-            overlap = _overlap_ratio(child_bbox, group_bbox)
-            if inside_group >= 0.22 or group_inside >= 0.18 or overlap >= 0.18:
-                ids.append(rid)
-                continue
-        if source_body and (
-            child_body in source_body
-            or difflib.SequenceMatcher(None, child_body, source_body).ratio() >= 0.72
-        ):
             ids.append(rid)
     return ids
 
@@ -8537,6 +8774,86 @@ def _apply_root_reconstruction_candidate(
     recovered_text = str(candidate.get("recovered_source_text") or "").strip()
     if not root_id or not crop_bbox or not recovered_text:
         return None
+    represented_child_ids = {
+        str(rid)
+        for rid in candidate.get("represented_child_region_ids") or []
+        if str(rid)
+    }
+    if not represented_child_ids:
+        return None
+    child_id_to_region = {
+        str(getattr(child, "child_id", "") or ""): str(
+            getattr(child, "source_region_id", "") or ""
+        )
+        for child in root_children
+        if str(getattr(child, "child_id", "") or "")
+        and str(getattr(child, "source_region_id", "") or "")
+    }
+    matching_parents: list[Any] = []
+    for parent in root_parents:
+        parent_region_ids = {
+            child_id_to_region.get(str(child_id or ""), "")
+            for child_id in getattr(parent, "child_segment_ids", []) or []
+        }
+        parent_region_ids.discard("")
+        if represented_child_ids and represented_child_ids <= parent_region_ids:
+            matching_parents.append(parent)
+    if root_parents and len(matching_parents) != 1:
+        return None
+    if matching_parents:
+        target_parent_id = str(getattr(matching_parents[0], "parent_id", "") or "")
+        target_block = next(
+            (
+                block
+                for block in getattr(logical_block_result, "blocks", []) or []
+                if str(getattr(block, "block_id", "") or "") == target_parent_id
+            ),
+            None,
+        )
+        if target_block is None:
+            return None
+        before_text = str(getattr(target_block, "source_text", "") or "")
+        target_block.source_text = recovered_text
+        target_block.source_quality_status = "root_reconstructed"
+        target_block.source_quality_action = "reocr_recovered"
+        target_block.source_reconstruction_status = "applied"
+        target_block.source_reconstruction_applied = True
+        target_block.source_reconstruction_before_text = before_text
+        target_block.source_reconstruction_after_text = recovered_text
+        target_block.source_reconstruction_crop_bbox = list(crop_bbox)
+        target_block.source_reconstruction_included_child_region_ids = sorted(
+            represented_child_ids
+        )
+        target_block.source_reconstruction_rejected_child_region_ids = []
+        target_block.source_reconstruction_reason_codes = list(
+            candidate.get("reasons") or []
+        )
+        region_by_id = {
+            str(region.get("region_id") or ""): region
+            for region in regions
+            if str(region.get("region_id") or "")
+        }
+        anchor = region_by_id.get(str(getattr(target_block, "anchor_region_id", "") or ""))
+        if anchor is not None:
+            anchor["ocr_text"] = recovered_text
+            anchor["translation"] = ""
+            anchor["translated_text"] = ""
+            anchor["logical_text_block_source_text"] = recovered_text
+            anchor["logical_text_source_quality_status"] = "root_reconstructed"
+            anchor["logical_text_source_quality_action"] = "reocr_recovered"
+            anchor["logical_text_source_reconstruction_status"] = "applied"
+            anchor["logical_text_source_reconstruction_before_text"] = before_text
+            anchor["logical_text_source_reconstruction_after_text"] = recovered_text
+            anchor["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
+            render = anchor.setdefault("render", {})
+            render["logical_text_block_source_text"] = recovered_text
+            render["logical_text_source_quality_action"] = "reocr_recovered"
+            render["logical_text_source_reconstruction_status"] = "applied"
+        return {
+            "repaired_block_id": target_parent_id,
+            "new_region_id": "",
+            "new_block_id": target_parent_id,
+        }
     old_parent_ids = {str(getattr(parent, "parent_id", "") or "") for parent in root_parents if str(getattr(parent, "parent_id", "") or "")}
     try:
         logical_block_result.blocks = [
@@ -8610,19 +8927,12 @@ def _apply_root_reconstruction_candidate(
     new_region["parent_visual_group_child_ids"] = list(candidate.get("parent_visual_group_child_ids") or [])
     new_region["reconstruction_rejected_for_visual_overmerge"] = bool(candidate.get("reconstruction_rejected_for_visual_overmerge"))
 
-    represented_child_ids = {str(rid) for rid in (candidate.get("represented_child_region_ids") or []) if str(rid)}
-    if represented_child_ids:
-        child_region_ids = [
-            str(getattr(child, "source_region_id", "") or "")
-            for child in root_children
-            if str(getattr(child, "source_region_id", "") or "") in represented_child_ids
-        ]
-    else:
-        child_region_ids = [
-            str(getattr(child, "source_region_id", "") or "")
-            for child in root_children
-            if str(getattr(child, "source_region_id", "") or "")
-        ]
+    child_region_ids = [
+        str(getattr(child, "source_region_id", "") or "")
+        for child in root_children
+        if str(getattr(child, "source_region_id", "") or "")
+        in represented_child_ids
+    ]
     member_ids = [new_region_id] + [rid for rid in child_region_ids if rid != new_region_id]
     child_member_texts: dict[str, str] = {new_region_id: recovered_text}
     region_by_id = {str(region.get("region_id") or ""): region for region in regions if str(region.get("region_id") or "")}
@@ -9047,11 +9357,6 @@ def _logical_block_recovered_source_is_better(
         for rid in getattr(block, "member_region_ids", []) or []
     ]
     useful_member_bodies = [body for body in member_bodies if len(body) >= 2]
-    if useful_member_bodies and not any(body in recovered_body for body in useful_member_bodies):
-        before_body = _source_body_for_ownership(before)
-        ratio = difflib.SequenceMatcher(None, before_body, recovered_body).ratio() if before_body else 0.0
-        if ratio < 0.36:
-            return False, "recovered_source_unrelated_to_members"
     before_score = _logical_source_quality_score(before, block, quality_func)
     recovered_score = _logical_source_quality_score(recovered, block, quality_func)
     if original_blocking_action and recovered_score >= before_score and float(recovered_conf or 0.0) >= 0.72:
@@ -9127,8 +9432,6 @@ def _insert_missing_prefix_before_overlap(recovered_text: str, fragment_text: st
     missing_prefix = fragment.split(best, 1)[0]
     if not missing_prefix or len(_source_body_for_ownership(missing_prefix)) > 2:
         return recovered
-    if any(token in fragment for token in ("果長", "無、こも", "それまで女", "返を", "牢")):
-        return recovered
     if _source_body_for_ownership(missing_prefix) in recovered_body:
         return recovered
     idx = recovered.find(best)
@@ -9180,8 +9483,6 @@ def _logical_source_fragmentation_score(source_text: str) -> int:
         if _source_body_for_ownership(part)
     ]
     score += sum(1 for part in fragments if len(part) <= 2)
-    if any(token in text for token in ("牢", "返を", "果長", "無、こも", "それまで女")):
-        score += 4
     if len(body) >= 8 and separator_count >= 4:
         score += 2
     return score
@@ -10522,7 +10823,6 @@ def _detect_regions_scoped_by_text_area_plan(
 ):
     from app.pipeline.text_area_plan import (
         DETECTION_BLOCKED,
-        DETECTION_COMPATIBILITY_FALLBACK,
         DETECTION_SCOPED,
         build_scoped_detection_candidates,
     )
@@ -10537,29 +10837,6 @@ def _detect_regions_scoped_by_text_area_plan(
                 return {}
         return plan if isinstance(plan, dict) else {}
 
-    def _full_page_fallback(reason: str):
-        _record_text_area_fallback_decision(
-            debug_context,
-            page_id,
-            [0, 0, int(image_size[0] or 0), int(image_size[1] or 0)],
-            {"text_area_detection_source": DETECTION_COMPATIBILITY_FALLBACK},
-            reason,
-        )
-        detections = _detect_regions(
-            detector,
-            image_path,
-            image_size,
-            input_size=input_size,
-            use_gpu=use_gpu,
-        )
-        candidates = build_scoped_detection_candidates(
-            page_id,
-            detections,
-            text_area_plan,
-            detection_source=DETECTION_COMPATIBILITY_FALLBACK,
-        )
-        return detections, candidates, DETECTION_COMPATIBILITY_FALLBACK
-
     plan_dict = _plan_to_dict(text_area_plan)
     scopes = [
         scope
@@ -10567,7 +10844,13 @@ def _detect_regions_scoped_by_text_area_plan(
         if bool(scope.get("ocr_eligible", True)) and bool(scope.get("comic_text_detector_scope_eligible", True))
     ]
     if not plan_dict.get("generated"):
-        return _full_page_fallback("text_area_plan_missing_or_no_ocr_eligible_scopes")
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.DETECTION,
+            code="text_area_plan_artifact_unavailable",
+            message="Scoped detection requires a generated TextAreaPlan artifact.",
+            page_id=str(page_id or ""),
+            operation="detect_regions_scoped_by_text_area_plan",
+        )
     if not scopes:
         _record_text_area_fallback_decision(
             debug_context,
@@ -10580,7 +10863,13 @@ def _detect_regions_scoped_by_text_area_plan(
 
     image = _read_image_cv(image_path)
     if image is None or not hasattr(detector, "detect_image"):
-        return _full_page_fallback("scoped_detector_api_unavailable")
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.DETECTION,
+            code="scoped_detector_api_unavailable",
+            message="Scoped ComicTextDetector is unavailable.",
+            page_id=str(page_id or ""),
+            operation="detect_regions_scoped_by_text_area_plan",
+        )
 
     detections: list[tuple[list[list[float]], float]] = []
     img_h, img_w = image.shape[:2]
@@ -10613,11 +10902,15 @@ def _detect_regions_scoped_by_text_area_plan(
                 except TypeError:
                     scoped = detector.detect_image(crop)
             except Exception as exc:
-                detector_name = detector.__class__.__name__
-                if detector_name != "ComicTextDetector":
-                    raise
-                logger.warning("Scoped ComicTextDetector failed on %s scope %s: %s", image_path, scope.get("scope_id"), exc)
-                return _full_page_fallback("scoped_comic_text_detector_failed_compatibility_fallback")
+                raise PipelineStageTechnicalError(
+                    stage=PipelineStage.DETECTION,
+                    code="scoped_comic_text_detector_failed",
+                    message="Scoped ComicTextDetector could not produce a valid detection artifact.",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    page_id=str(page_id or ""),
+                    operation="detect_regions_scoped_by_text_area_plan",
+                    diagnostics=(str(scope.get("scope_id") or ""),),
+                ) from exc
             for polygon, conf in scoped or []:
                 shifted: list[list[float]] = []
                 for point in polygon or []:
@@ -10691,6 +10984,7 @@ def _process_page(
     settings: PipelineSettings | None = None,
     debug_context: dict | None = None,
     stage_callback: Callable[[PipelineStage, str], None] | None = None,
+    stage_outcome_callback: Callable[..., None] | None = None,
 ) -> PageProcessingResult:
     from app.pipeline.debug_artifacts import add_count, add_timing, mark_render_region, mark_translation_plan, set_count
     from app.pipeline.bubble_detection import BubbleDetectionInput, run_bubble_detection
@@ -10721,11 +11015,49 @@ def _process_page(
             # Presentation status must never become a pipeline dependency.
             logger.debug("Pipeline stage callback failed", exc_info=True)
 
+    def publish_stage_outcome(
+        *,
+        stage: PipelineStage,
+        state: PipelineStageOutcomeState,
+        parent_ids: Iterable[str] = (),
+        artifact_kind: str = "",
+        artifact_summary: Mapping[str, Any] | None = None,
+        diagnostics: Iterable[str] = (),
+    ) -> None:
+        if stage_outcome_callback is None:
+            return
+        stage_outcome_callback(
+            stage=stage,
+            state=state,
+            parent_ids=tuple(parent_ids),
+            artifact_kind=artifact_kind,
+            artifact_summary=dict(artifact_summary or {}),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def fail_required_ocr(region_id: str, bbox: Iterable[Any], reason: str) -> None:
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.OCR,
+            code="ocr_required_source_unavailable",
+            message="OCR could not produce source text for an admitted workflow region.",
+            detail=str(reason or "ocr source unavailable"),
+            page_id=str(page_id or ""),
+            parent_id=str(region_id or ""),
+            operation="recognize_parent_source",
+            artifact_summary={"bbox": list(bbox or [])},
+        )
+
     # Initialize Filter
     text_filter = TextFilter(settings)
 
     if not image_path or not os.path.exists(image_path):
-        return PageProcessingResult([], [], [], "normal", None)
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.DETECTION,
+            code="source_page_missing",
+            message="The source page is unavailable.",
+            detail=str(image_path or ""),
+            operation="load_source_page",
+        )
     image_load_start = time.time()
     image_size = _get_image_size(image_path)
     page_image = _load_image_for_crop(image_path)
@@ -10769,6 +11101,7 @@ def _process_page(
         if debug_context is not None:
             debug_context["text_area_plan_error"] = f"{type(exc).__name__}: {exc}"
             debug_context["text_area_plan"] = None
+        raise
     add_timing(debug_context, "text_area_plan_time", time.time() - text_area_plan_start)
     detect_start = time.time()
     detections, scoped_detection_candidates, text_area_detection_source = _detect_regions_scoped_by_text_area_plan(
@@ -10790,7 +11123,7 @@ def _process_page(
             text_area_plan.runtime.compatibility_mode = (
                 "scoped_detector_by_text_area_plan"
                 if text_area_detection_source == DETECTION_SCOPED
-                else "compatibility_full_page_fallback_after_scoped_detector"
+                else "scoped_detector_returned_no_candidates"
             )
         except Exception:
             pass
@@ -10915,6 +11248,30 @@ def _process_page(
             )
     add_timing(debug_context, "grouping_time", time.time() - grouping_start)
     set_count(debug_context, "detected_regions", len(groups))
+    detection_diagnostics: list[str] = []
+    if bool(getattr(bubble_detection_result, "provider_fallback_used", False)):
+        detection_diagnostics.append("bubble_detection_provider_fallback")
+    detection_diagnostics.extend(
+        str(getattr(reason, "reason", "") or "")
+        for reason in getattr(text_area_plan, "fallback_reasons", []) or []
+        if str(getattr(reason, "reason", "") or "")
+    )
+    publish_stage_outcome(
+        stage=PipelineStage.DETECTION,
+        state=(
+            PipelineStageOutcomeState.VALID_WITH_DIAGNOSTICS
+            if detection_diagnostics
+            else PipelineStageOutcomeState.VALID
+        ),
+        artifact_kind="text_area_plan_and_scoped_detections",
+        artifact_summary={
+            "width": int(image_size[0] or 0),
+            "height": int(image_size[1] or 0),
+            "detection_count": len(groups),
+            "text_area_plan": text_area_plan.to_dict(),
+        },
+        diagnostics=detection_diagnostics,
+    )
     notify_stage(PipelineStage.OCR, "Recognizing source text")
     regions = []
     pending_texts: dict[str, list[str]] = {}
@@ -10938,6 +11295,8 @@ def _process_page(
         if is_bg_group:
             crop = _crop_image(image_path, bbox, image_obj=page_image)
             if crop is None:
+                if route_authority:
+                    fail_required_ocr(f"r{idx:03d}", bbox, "ocr crop unavailable")
                 continue
             ocr_start = time.time()
             ocr_text, ocr_conf = _recognize_with_fallback(
@@ -10986,6 +11345,22 @@ def _process_page(
                         bbox,
                         text_area_assignment,
                         "ocr_empty_blocker",
+                    )
+                    _append_empty_ocr_child_evidence(
+                        regions,
+                        idx=idx,
+                        polygons=polygons,
+                        bbox=bbox,
+                        det_conf=det_conf,
+                        ocr_conf=ocr_conf,
+                        assignment=text_area_assignment,
+                        debug_context=debug_context,
+                        page_id=page_id,
+                        retry_info=retry_info,
+                        semantic_bg=True,
+                        region_type="background_text",
+                        apply_text_area_assignment_to_region=apply_text_area_assignment_to_region,
+                        build_scoped_ocr_candidate=build_scoped_ocr_candidate,
                     )
                 if caption_quality_gate and debug_context is not None:
                     debug_context.setdefault("caption_container_recovery_candidates", []).append(
@@ -11181,6 +11556,8 @@ def _process_page(
         if bg_text:
             crop = _crop_image(image_path, bbox, image_obj=page_image)
             if crop is None:
+                if route_authority:
+                    fail_required_ocr(f"r{idx:03d}", bbox, "ocr crop unavailable")
                 continue
             ocr_start = time.time()
             ocr_text, ocr_conf = _recognize_with_fallback(
@@ -11221,6 +11598,23 @@ def _process_page(
                 group["polygons"] = polygons
                 group["route_owned_ocr_retry"] = retry_info
             if not ocr_text:
+                if route_authority:
+                    _append_empty_ocr_child_evidence(
+                        regions,
+                        idx=idx,
+                        polygons=polygons,
+                        bbox=bbox,
+                        det_conf=det_conf,
+                        ocr_conf=ocr_conf,
+                        assignment=text_area_assignment,
+                        debug_context=debug_context,
+                        page_id=page_id,
+                        retry_info=retry_info,
+                        semantic_bg=True,
+                        region_type="background_text",
+                        apply_text_area_assignment_to_region=apply_text_area_assignment_to_region,
+                        build_scoped_ocr_candidate=build_scoped_ocr_candidate,
+                    )
                 continue
             add_count(debug_context, "ocr_results")
             region_type, semantic_bg, semantic_ignore, semantic_review, render_updates = _classify_semantic_region(
@@ -11277,6 +11671,8 @@ def _process_page(
             continue
         crop = _crop_image(image_path, bbox, image_obj=page_image)
         if crop is None:
+            if route_authority:
+                fail_required_ocr(f"r{idx:03d}", bbox, "ocr crop unavailable")
             continue
         ocr_start = time.time()
         ocr_text, ocr_conf = _recognize_with_fallback(
@@ -11318,6 +11714,23 @@ def _process_page(
             group["route_owned_ocr_retry"] = retry_info
             crop = _crop_image(image_path, bbox, image_obj=page_image) or crop
         if not ocr_text:
+            if route_authority:
+                _append_empty_ocr_child_evidence(
+                    regions,
+                    idx=idx,
+                    polygons=polygons,
+                    bbox=bbox,
+                    det_conf=det_conf,
+                    ocr_conf=ocr_conf,
+                    assignment=text_area_assignment,
+                    debug_context=debug_context,
+                    page_id=page_id,
+                    retry_info=retry_info,
+                    semantic_bg=False,
+                    region_type="speech_bubble",
+                    apply_text_area_assignment_to_region=apply_text_area_assignment_to_region,
+                    build_scoped_ocr_candidate=build_scoped_ocr_candidate,
+                )
             continue
         add_count(debug_context, "ocr_results")
         region_type, semantic_bg, semantic_ignore, semantic_review, render_updates = _classify_semantic_region(
@@ -11630,6 +12043,28 @@ def _process_page(
         set_count(debug_context, "logical_text_block_skipped_containers", logical_block_result.skipped_container_count)
     hierarchy_start = time.time()
     initial_hierarchy_start = time.perf_counter()
+    ocr_diagnostics = [
+        "ocr_review_recommended"
+        for region in regions
+        if bool((region.get("flags") or {}).get("needs_review"))
+    ]
+    publish_stage_outcome(
+        stage=PipelineStage.OCR,
+        state=(
+            PipelineStageOutcomeState.VALID_WITH_DIAGNOSTICS
+            if ocr_diagnostics
+            else PipelineStageOutcomeState.VALID
+        ),
+        parent_ids=(str(region.get("region_id") or "") for region in regions),
+        artifact_kind="ocr_region_records",
+        artifact_summary={
+            "width": int(image_size[0] or 0),
+            "height": int(image_size[1] or 0),
+            "page_class": str(page_class or "normal"),
+            "regions": regions,
+        },
+        diagnostics=ocr_diagnostics,
+    )
     notify_stage(PipelineStage.HIERARCHY, "Building the effective text hierarchy")
     initial_text_block_hierarchy = build_text_block_hierarchy(
         page_id=page_id,
@@ -11725,6 +12160,26 @@ def _process_page(
         set_count(debug_context, "parent_execution_bundle_count", len(parent_execution_bundles))
         set_count(debug_context, "parent_execution_blocked_bundle_count", len(parent_execution_bundle_result.blocked_bundles))
         set_count(debug_context, "parent_execution_bundle_error_count", len(parent_execution_bundle_result.errors))
+    if parent_execution_bundle_result.errors or parent_execution_bundle_result.blocked_bundles:
+        blocked_ids = [
+            str(bundle.parent_id or bundle.bundle_id or "")
+            for bundle in parent_execution_bundle_result.blocked_bundles
+        ]
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.HIERARCHY,
+            code="parent_execution_bundle_contract_failed",
+            message="Hierarchy could not finalize every generated parent as executable.",
+            detail=",".join(
+                [
+                    *list(parent_execution_bundle_result.errors),
+                    *(f"blocked_parent:{value}" for value in blocked_ids if value),
+                ]
+            ),
+            page_id=str(page_id or ""),
+            parent_id=blocked_ids[0] if blocked_ids else "",
+            operation="build_parent_execution_bundles",
+            artifact_summary=parent_execution_bundle_result.to_audit_dict(),
+        )
     if not parent_execution_bundles:
         _enforce_no_bundle_parent_contract(
             page_id=page_id,
@@ -11734,6 +12189,19 @@ def _process_page(
         pending_texts = {}
         glossary_texts = []
     execution_regions = parent_execution_region_records(parent_execution_bundles)
+    publish_stage_outcome(
+        stage=PipelineStage.HIERARCHY,
+        state=PipelineStageOutcomeState.VALID,
+        parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+        artifact_kind="parent_execution_bundles",
+        artifact_summary={
+            "page_class": str(page_class or "normal"),
+            "regions": execution_regions,
+            "parent_execution_bundles": [
+                bundle.to_audit_dict() for bundle in parent_execution_bundles
+            ],
+        },
+    )
     if (
         parent_execution_bundles
         or logical_block_result.applied_count
@@ -11844,13 +12312,22 @@ def _process_page(
     )
     translation_touched = bool(translation_assignments)
     if translation_assignments:
+        perf_pending_texts = {
+            assignment_id: list(assignment.region_ids)
+            for assignment_id, assignment in translation_assignments.items()
+        }
+        perf_source_text_by_key = {
+            assignment_id: assignment.source_text
+            for assignment_id, assignment in translation_assignments.items()
+        }
         translation_perf_records = _translation_perf_records_for_page(
             debug_context,
-            pending_texts,
+            perf_pending_texts,
             execution_regions,
             source_lang=source_lang,
             target_lang=target_lang,
             settings=settings,
+            source_text_by_key=perf_source_text_by_key,
         )
         assignment_source_texts = [assignment.source_text for assignment in translation_assignments.values()]
         prompt_style_guide = _build_page_style_guide(
@@ -11872,7 +12349,10 @@ def _process_page(
             region_ids = assignment.region_ids
             available_terms = _matched_glossary_terms(text, active_style_guide)
             prompt_terms = _matched_glossary_terms(text, prompt_style_guide)
-            _translation_perf_set_glossary_context(translation_perf_records.get(text), available_terms)
+            _translation_perf_set_glossary_context(
+                translation_perf_records.get(assignment_id),
+                available_terms,
+            )
             prompt_sources = {str(item.get("source", "")).strip() for item in prompt_terms}
             ignored_terms = [
                 item for item in available_terms
@@ -11911,6 +12391,11 @@ def _process_page(
             id_to_assignment_id[item_id] = assignment_id
             id_to_context_lines[item_id] = list(context_lines or [])
         translations = {}
+        translation_perf_records_by_item_id = {
+            item_id: translation_perf_records.get(assignment_id)
+            for item_id, assignment_id in id_to_assignment_id.items()
+            if translation_perf_records.get(assignment_id) is not None
+        }
         if batch_items:
             translations.update(
                 _batch_translate(
@@ -11922,7 +12407,7 @@ def _process_page(
                     batch_items,
                     context_lines=context_lines,
                     settings=settings,
-                    debug_records_by_text=translation_perf_records,
+                    debug_records_by_text=translation_perf_records_by_item_id,
                 )
             )
         for use_context, short_batch_items in short_batch_items_by_context.items():
@@ -11942,7 +12427,7 @@ def _process_page(
                     short_batch_items,
                     context_lines=context_lines if use_context else [],
                     settings=settings,
-                    debug_records_by_text=translation_perf_records,
+                    debug_records_by_text=translation_perf_records_by_item_id,
                 )
             )
         if translations:
@@ -11961,10 +12446,10 @@ def _process_page(
                             target_lang,
                             text,
                             _matched_glossary_terms(text, active_style_guide),
-                            debug_record=translation_perf_records.get(text),
+                            debug_record=translation_perf_records.get(assignment_id or ""),
                             debug_phase="batch_glossary_placeholder",
                         )
-                        record = translation_perf_records.get(text)
+                        record = translation_perf_records.get(assignment_id or "")
                         if record:
                             _translation_perf_add_path(record, "glossary_placeholder_repair")
                             record.setdefault("json_repair_fallback_status", []).append(
@@ -11993,7 +12478,7 @@ def _process_page(
             text = assignment.source_text
             region_ids = assignment.region_ids
             text_context_lines = context_lines if _should_use_context_for_text(text, region_ids, execution_regions) else []
-            unit_record = translation_perf_records.get(text)
+            unit_record = translation_perf_records.get(assignment_id)
             raw_trans = _translate_single(
                 ollama,
                 model,
@@ -12058,12 +12543,12 @@ def _process_page(
                 text,
                 assignment_to_translation.get(assignment_id, ""),
                 is_bubble=is_bubble,
-                debug_record=translation_perf_records.get(text),
+                debug_record=translation_perf_records.get(assignment_id),
             )
             if translation:
                 translation = _enforce_glossary(translation, text, active_style_guide)
                 pre_repair_translation = translation
-                unit_record = translation_perf_records.get(text)
+                unit_record = translation_perf_records.get(assignment_id)
                 if _matched_glossary_terms(text, active_style_guide):
                     _translation_perf_add_path(unit_record, "glossary_repair_check")
                 translation = _repair_translation_with_glossary(
@@ -12088,10 +12573,10 @@ def _process_page(
                 translation = _normalize_translation_format_for_record(
                     target_lang,
                     translation,
-                    translation_perf_records.get(text),
+                    translation_perf_records.get(assignment_id),
                     stage="final_translation_assignment",
                 )
-                unit_record = translation_perf_records.get(text)
+                unit_record = translation_perf_records.get(assignment_id)
                 _translation_perf_set_final(unit_record, translation=translation)
                 bubble_local_ids = []
                 for candidate in execution_regions:
@@ -12147,7 +12632,7 @@ def _process_page(
                     ignored_terms.append(item)
                     if source and target:
                         warnings.append(f"missing_glossary_target:{source}->{target}")
-            unit_record = translation_perf_records.get(text)
+            unit_record = translation_perf_records.get(assignment_id)
             _translation_perf_set_glossary_status(
                 unit_record,
                 applied_terms=applied_terms,
@@ -12242,10 +12727,34 @@ def _process_page(
         and not str(bundle.translated_text or "").strip()
     ]
     if missing_translation_parent_ids:
-        raise RuntimeError(
-            "parent_translation_contract_error:missing_translation_output:"
-            + ",".join(missing_translation_parent_ids)
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.TRANSLATION,
+            code="parent_translation_output_missing",
+            message="Translation did not produce output for every required parent.",
+            detail=",".join(missing_translation_parent_ids),
+            page_id=str(page_id or ""),
+            parent_id=missing_translation_parent_ids[0],
+            operation="translate_parent_assignments",
+            artifact_summary={
+                "regions": execution_regions,
+                "parent_execution_bundles": [
+                    bundle.to_audit_dict() for bundle in parent_execution_bundles
+                ],
+            },
         )
+    publish_stage_outcome(
+        stage=PipelineStage.TRANSLATION,
+        state=PipelineStageOutcomeState.VALID,
+        parent_ids=(bundle.parent_id for bundle in parent_execution_bundles),
+        artifact_kind="translated_parent_execution_bundles",
+        artifact_summary={
+            "page_class": str(page_class or "normal"),
+            "regions": execution_regions,
+            "parent_execution_bundles": [
+                bundle.to_audit_dict() for bundle in parent_execution_bundles
+            ],
+        },
+    )
     if debug_context is not None and parent_execution_bundles:
         debug_context["parent_execution_bundles"] = parent_execution_bundle_result.to_audit_dict()
 
@@ -12296,9 +12805,15 @@ def _enforce_no_bundle_parent_contract(
         }
     if authorized_region_ids:
         joined = ",".join(authorized_region_ids)
-        raise RuntimeError(
-            "parent_execution_bundle_contract_error:"
-            f"no_executable_bundle_for_authorized_regions:{page_id}:{joined}"
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.HIERARCHY,
+            code="parent_execution_bundle_missing",
+            message="Authorized workflow regions have no executable parent bundle.",
+            detail=f"{page_id}:{joined}",
+            page_id=str(page_id or ""),
+            parent_id=authorized_region_ids[0],
+            operation="enforce_no_bundle_parent_contract",
+            artifact_summary={"authorized_region_ids": authorized_region_ids},
         )
 
 
@@ -12450,6 +12965,129 @@ def _sync_parent_execution_downstream_contracts(
             record["render_decision_id"] = parent_id
 
     sync_bundles_from_region_records(bundles, execution_regions)
+
+
+def _validate_cleanup_parent_conservation(
+    *,
+    page_id: str,
+    bundles: Iterable[ParentExecutionBundle],
+    cleanup_jobs: Any,
+    cleanup_masks: Any,
+    cleanup_plans: Any,
+    cleanup_runtime: Any,
+    cleanup_commit: Any,
+) -> tuple[str, ...]:
+    expected = {
+        str(bundle.bundle_id or bundle.parent_id or "")
+        for bundle in bundles or []
+        if bool(bundle.cleanup_required)
+        and str(bundle.bundle_id or bundle.parent_id or "")
+    }
+    if not expected:
+        return ()
+
+    job_parent_by_id: dict[str, str] = {}
+    job_parents: set[str] = set()
+    for job in getattr(cleanup_jobs, "jobs", []) or []:
+        parent_id = str(
+            getattr(job, "parent_execution_bundle_id", "")
+            or getattr(job, "parent_logical_text_unit_id", "")
+            or (getattr(job, "target_region_ids", []) or [""])[0]
+            or ""
+        )
+        job_id = str(getattr(job, "cleanup_job_id", "") or "")
+        if job_id and parent_id:
+            job_parent_by_id[job_id] = parent_id
+        if parent_id:
+            job_parents.add(parent_id)
+
+    mask_parents: set[str] = set()
+    for mask in getattr(cleanup_masks, "masks", []) or []:
+        parent_id = str(
+            getattr(mask, "parent_execution_bundle_id", "")
+            or getattr(mask, "parent_logical_text_unit_id", "")
+            or job_parent_by_id.get(str(getattr(mask, "cleanup_job_id", "") or ""), "")
+        )
+        if parent_id:
+            mask_parents.add(parent_id)
+
+    plan_parents: set[str] = set()
+    for plan in getattr(cleanup_plans, "plans", []) or []:
+        parent_id = str(
+            getattr(plan, "parent_execution_bundle_id", "")
+            or getattr(plan, "parent_logical_text_unit_id", "")
+            or job_parent_by_id.get(str(getattr(plan, "cleanup_job_id", "") or ""), "")
+        )
+        if parent_id:
+            plan_parents.add(parent_id)
+
+    runtime_parents: set[str] = set()
+    warning_parents: set[str] = set()
+    invalid_runtime: list[str] = []
+    for status in getattr(cleanup_runtime, "status_records", []) or []:
+        if not isinstance(status, Mapping):
+            continue
+        parent_id = str(
+            status.get("parent_execution_bundle_id")
+            or status.get("parent_logical_text_unit_id")
+            or status.get("region_id")
+            or ""
+        )
+        runtime_status = str(status.get("runtime_status") or "")
+        if runtime_status in {"passed", "warning"} and parent_id:
+            runtime_parents.add(parent_id)
+            if runtime_status == "warning":
+                warning_parents.add(parent_id)
+        elif parent_id:
+            invalid_runtime.append(f"{parent_id}:{runtime_status or 'missing_status'}")
+
+    commit_parents = {
+        str(
+            record.get("parent_execution_bundle_id")
+            or record.get("parent_logical_text_unit_id")
+            or record.get("region_id")
+            or ""
+        )
+        for record in getattr(cleanup_commit, "commit_records", []) or []
+        if isinstance(record, Mapping)
+    }
+    commit_parents.discard("")
+    blocked = [
+        str(record.get("parent_execution_bundle_id") or record.get("region_id") or "")
+        for record in getattr(cleanup_commit, "blocked_records", []) or []
+        if isinstance(record, Mapping)
+    ]
+    errors = [str(value) for value in getattr(cleanup_commit, "errors", []) or []]
+
+    failures: list[str] = []
+    for label, observed in (
+        ("job", job_parents),
+        ("mask", mask_parents),
+        ("plan", plan_parents),
+        ("runtime", runtime_parents),
+        ("commit", commit_parents),
+    ):
+        missing = sorted(expected - observed)
+        if missing:
+            failures.append(f"missing_{label}:" + ",".join(missing))
+    failures.extend(f"invalid_runtime:{value}" for value in invalid_runtime)
+    failures.extend(f"blocked_commit:{value}" for value in blocked if value)
+    failures.extend(f"commit_error:{value}" for value in errors if value)
+    if failures:
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.CLEANUP,
+            code="cleanup_parent_conservation_failed",
+            message="Cleanup did not produce a valid artifact for every required parent.",
+            detail=";".join(failures),
+            page_id=str(page_id or ""),
+            parent_id=sorted(expected)[0],
+            operation="validate_cleanup_parent_conservation",
+            artifact_summary={
+                "expected_parent_ids": sorted(expected),
+                "failures": failures,
+            },
+        )
+    return tuple(f"cleanup_quality_warning:{value}" for value in sorted(warning_parents))
 
 
 def _observe_parent_style_after_cleanup(
@@ -13497,8 +14135,6 @@ def _rebuild_translation_inputs_from_parent_execution_bundles(
         text = str(bundle.source_text or "").strip()
         if not parent_id or not text:
             continue
-        if str(bundle.source_quality_action or "") in _PARENT_SOURCE_BLOCKING_ACTIONS:
-            continue
         if not _parent_execution_bundle_is_translatable(bundle):
             continue
         glossary.append(text)
@@ -13515,8 +14151,6 @@ def _translation_assignments_from_parent_execution_bundles(
         parent_id = str(bundle.parent_id or bundle.bundle_id or "").strip()
         text = str(bundle.source_text or "").strip()
         if not parent_id or not text:
-            continue
-        if str(bundle.source_quality_action or "") in _PARENT_SOURCE_BLOCKING_ACTIONS:
             continue
         if not _parent_execution_bundle_is_translatable(bundle):
             continue
@@ -13559,8 +14193,6 @@ def _rebuild_translation_inputs_from_regions(regions: list[dict]) -> tuple[dict[
             rid = str(region.get("region_id", "") or "")
             if not rid or not text or str(region.get("translation", "") or "").strip():
                 continue
-            if _region_parent_source_action(region) in _PARENT_SOURCE_BLOCKING_ACTIONS:
-                continue
             glossary.append(text)
             pending.setdefault(text, []).append(rid)
             continue
@@ -13588,8 +14220,6 @@ def _rebuild_translation_inputs_from_regions(regions: list[dict]) -> tuple[dict[
             status = str(region.get("logical_text_ownership_status") or (region.get("render") or {}).get("logical_text_ownership_status") or "").strip()
             action = str(region.get("logical_text_source_quality_action") or (region.get("render") or {}).get("logical_text_source_quality_action") or "").strip()
             if status not in {"block_anchor", "standalone_block", "standalone_utterance"}:
-                continue
-            if action in _PARENT_SOURCE_BLOCKING_ACTIONS:
                 continue
         text = str(region.get("ocr_text", "") or "").strip()
         if not text:
@@ -13626,8 +14256,6 @@ def _translation_assignments_from_regions(
         parent_id = _region_parent_id(region)
         source_text = _region_parent_source_text(region)
         if not parent_id or not source_text:
-            continue
-        if _region_parent_source_action(region) in _PARENT_SOURCE_BLOCKING_ACTIONS:
             continue
         parent_region_ids: list[str] = []
         for candidate_id in pending_region_ids:
@@ -13673,6 +14301,43 @@ def _translation_assignments_from_regions(
             region_ids=legacy_ids,
         )
     return assignments
+
+
+def _translation_units_from_pending_texts(
+    pending_texts: Mapping[str, Iterable[str]],
+    regions: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return parent-keyed work units without deduplicating equal source text."""
+
+    region_by_id = {
+        str(region.get("region_id") or ""): region
+        for region in regions or []
+        if isinstance(region, Mapping) and str(region.get("region_id") or "")
+    }
+    units: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source_text, region_ids in (pending_texts or {}).items():
+        for region_id in region_ids or []:
+            region = region_by_id.get(str(region_id or ""), {})
+            render = region.get("render") if isinstance(region.get("render"), Mapping) else {}
+            unit_id = str(
+                region.get("parent_logical_text_unit_id")
+                or region.get("active_translation_unit_id")
+                or render.get("parent_logical_text_unit_id")
+                or region_id
+                or ""
+            )
+            if not unit_id or unit_id in seen:
+                continue
+            seen.add(unit_id)
+            units.append(
+                {
+                    "unit_id": unit_id,
+                    "source_text": str(source_text or ""),
+                    "region_ids": [str(region_id or "")],
+                }
+            )
+    return units
 
 
 def _region_order_index(region: dict | None) -> int:
@@ -14408,14 +15073,7 @@ def _recover_adjacent_vertical_speech_text_conservation_regions(
 
 
 def _is_duplicate_owned_fragment(parent_text: str, child_text: str) -> bool:
-    parent_body = _source_body_for_ownership(parent_text)
-    child_body = _source_body_for_ownership(child_text)
-    if not parent_body or not child_body:
-        return False
-    if child_body in parent_body:
-        return True
-    if len(child_body) >= 4 and len(parent_body) >= 4:
-        return difflib.SequenceMatcher(None, parent_body, child_body).ratio() >= 0.88
+    # Duplicate ownership is established by graph identity, never source text.
     return False
 
 
@@ -14587,10 +15245,6 @@ def _is_better_bubble_local_anchor_ocr(
     rescued_body = _source_body_for_ownership(rescued)
     if len(rescued_body) < max(2, len(original_body)):
         return False
-    if len(original_body) >= 4:
-        similarity = difflib.SequenceMatcher(None, original_body, rescued_body).ratio()
-        if similarity < 0.58 and original_body not in rescued_body:
-            return False
     total, kana_ratio, kanji_ratio = _source_script_mix(rescued)
     if total < 4 or (kana_ratio + kanji_ratio) < 0.70:
         return False
@@ -15730,8 +16384,6 @@ def _is_speech_short_or_ellipsis_source(text: str) -> bool:
     if not body or len(body) > 10:
         return False
     if not any(_is_kana(ch) or _is_cjk_char(ch) for ch in body):
-        return False
-    if any(token in cleaned for token in ("果長", "救出来", "悪かだけ", "無、こも", "それまで女", "返を")):
         return False
     return any(ch in cleaned for ch in ".．…‥・･〜～ー-—―－")
 
@@ -17945,6 +18597,7 @@ def _translation_perf_records_for_page(
     source_lang: str = "",
     target_lang: str = "",
     settings: PipelineSettings | None = None,
+    source_text_by_key: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not debug_context:
         return {}
@@ -17974,7 +18627,8 @@ def _translation_perf_records_for_page(
         for parent in (hierarchy.get("parent_logical_text_units") or [])
         if isinstance(parent, dict) and str(parent.get("parent_id") or "")
     }
-    for text, region_ids in pending_texts.items():
+    for work_key, region_ids in pending_texts.items():
+        text = str((source_text_by_key or {}).get(str(work_key), work_key) or "")
         rid_list = [str(rid) for rid in (region_ids or []) if str(rid)]
         source_regions = [region_by_id[rid] for rid in rid_list if rid in region_by_id]
         primary = source_regions[0] if source_regions else {}
@@ -18005,7 +18659,7 @@ def _translation_perf_records_for_page(
         if not child_ids and isinstance(parent, dict):
             child_ids = [str(cid) for cid in (parent.get("child_segment_ids") or []) if str(cid)]
         metrics = _translation_perf_source_metrics(text)
-        if text in existing_by_text:
+        if source_text_by_key is None and text in existing_by_text:
             existing = existing_by_text[text]
             _translation_perf_ensure_contract_fields(
                 existing,
@@ -18022,7 +18676,7 @@ def _translation_perf_records_for_page(
                 parent=parent,
                 root=root,
             )
-            records[text] = existing
+            records[str(work_key)] = existing
             continue
         translation_unit_id = _translation_perf_unit_id(
             page_id=str(debug_context.get("page_id") or ""),
@@ -18120,7 +18774,7 @@ def _translation_perf_records_for_page(
             "translation_result_consumed_region_ids": [],
         }
         existing_list.append(record)
-        records[text] = record
+        records[str(work_key)] = record
     return records
 
 
@@ -18906,7 +19560,8 @@ def _batch_translate(
             request_options["thinking"] = {"type": "disabled"}
             request_timeout = _deepseek_request_timeout(600)
         chunk_records = [
-            (debug_records_by_text or {}).get(str(item.get("text") or ""))
+            (debug_records_by_text or {}).get(str(item.get("id") or ""))
+            or (debug_records_by_text or {}).get(str(item.get("text") or ""))
             for item in chunk
             if isinstance(item, dict)
         ]
@@ -18970,7 +19625,10 @@ def _batch_translate(
                 for item in chunk:
                     if not isinstance(item, dict):
                         continue
-                    record = (debug_records_by_text or {}).get(str(item.get("text") or ""))
+                    record = (
+                        (debug_records_by_text or {}).get(str(item.get("id") or ""))
+                        or (debug_records_by_text or {}).get(str(item.get("text") or ""))
+                    )
                     if record:
                         record.setdefault("json_repair_fallback_status", []).append("batch_plain_line_fallback")
                 logger.warning(
@@ -19038,7 +19696,8 @@ def _batch_translate(
             all_empty_ids = [str(item.get("id") or "") for item in empty_chunk_items if isinstance(item, dict)]
             for group_index, repair_items in enumerate(repair_groups, start=1):
                 empty_records = [
-                    (debug_records_by_text or {}).get(str(item.get("text") or ""))
+                    (debug_records_by_text or {}).get(str(item.get("id") or ""))
+                    or (debug_records_by_text or {}).get(str(item.get("text") or ""))
                     for item in repair_items
                     if isinstance(item, dict)
                 ]
@@ -19101,7 +19760,10 @@ def _batch_translate(
                     for item in repair_items:
                         if not isinstance(item, dict):
                             continue
-                        record = (debug_records_by_text or {}).get(str(item.get("text") or ""))
+                        record = (
+                            (debug_records_by_text or {}).get(str(item.get("id") or ""))
+                            or (debug_records_by_text or {}).get(str(item.get("text") or ""))
+                        )
                         if not record:
                             continue
                         record["compact_repair_accepted_count"] = len(accepted_ids)

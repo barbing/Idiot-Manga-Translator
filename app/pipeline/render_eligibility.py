@@ -391,8 +391,8 @@ def _decision_for_region(
         return RenderEligibilityDecision(
             page_id=page_id,
             region_id=rid,
-            status=RenderEligibilityStatus.SUPPRESSED_SOURCE_UNGROUNDED,
-            reason="root_transaction_failed_closed",
+            status=RenderEligibilityStatus.REVIEW_ALLOWED,
+            reason="root_transaction_failure_review_diagnostic",
             translated_text_present=bool(str(translated_text or "").strip()),
             source_text=source_text,
             translated_text=translated_text,
@@ -406,8 +406,8 @@ def _decision_for_region(
         return RenderEligibilityDecision(
             page_id=page_id,
             region_id=rid,
-            status=RenderEligibilityStatus.SUPPRESSED_SOURCE_UNGROUNDED,
-            reason=_suppression_reason(hard_contradictions),
+            status=RenderEligibilityStatus.REVIEW_ALLOWED,
+            reason="source_erasure_unproven_review_allowed",
             translated_text_present=True,
             source_text=source_text,
             translated_text=translated_text,
@@ -482,8 +482,8 @@ def _decision_for_region(
         return RenderEligibilityDecision(
             page_id=page_id,
             region_id=rid,
-            status=RenderEligibilityStatus.SUPPRESSED_SOURCE_UNGROUNDED,
-            reason=_suppression_reason(hard_contradictions),
+            status=RenderEligibilityStatus.REVIEW_ALLOWED,
+            reason="source_grounding_risk_review_allowed",
             translated_text_present=True,
             source_text=source_text,
             translated_text=translated_text,
@@ -605,7 +605,7 @@ def _unsafe_cleanup_decision_for_region(
         status = RenderEligibilityStatus.REVIEW_ALLOWED
         reason = protected_reason
     elif _should_suppress_unsafe_cleanup_render(audit, semantic_class, hard_contradictions):
-        status = RenderEligibilityStatus.SUPPRESSED_UNSAFE_CLEANUP_RENDER
+        status = RenderEligibilityStatus.REVIEW_ALLOWED
         reason = _unsafe_cleanup_suppression_reason(hard_contradictions)
     elif hard_contradictions:
         status = RenderEligibilityStatus.REVIEW_ALLOWED
