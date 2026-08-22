@@ -839,24 +839,7 @@ def _route_owned_ocr_blocker_can_be_represented_by_parent(
         return False
     if not (parent.cleanup_unit and parent.render_unit):
         return False
-    if _parent_is_punctuation_identity(parent):
-        return state == "ocr_punctuation_only_blocker"
-    if not parent.translation_unit:
-        return False
-    parent_status, _parent_reasons, parent_action = _parent_source_coherence(parent.source_text, role=parent.role)
-    if parent_status not in {"coherent", "weak"} or parent_action not in {
-        "translate",
-        "translate_with_review",
-        "translate_with_root_proof",
-    }:
-        return False
-    if not _source_body_requires_root_blocker(parent.source_text):
-        return False
-    if state == "ocr_malformed_blocker":
-        return True
-    if _source_body_requires_root_blocker(child.ocr_text):
-        return False
-    return True
+    return _parent_is_downstream_execution_obligation(parent)
 
 
 def _represented_route_owned_ocr_blocker_state(child: ChildRecognizedTextSegment) -> str:

@@ -12162,6 +12162,7 @@ def _process_page(
         )
         pending_texts = {}
         glossary_texts = []
+    parent_translation_plan: dict[str, list[str]] = {}
     execution_regions = parent_execution_region_records(parent_execution_bundles)
     publish_stage_outcome(
         stage=PipelineStage.HIERARCHY,
@@ -12186,7 +12187,10 @@ def _process_page(
         or text_block_hierarchy.generated
     ):
         if parent_execution_bundles:
-            pending_texts, glossary_texts = _rebuild_translation_inputs_from_parent_execution_bundles(parent_execution_bundles)
+            parent_translation_plan, glossary_texts = _rebuild_translation_inputs_from_parent_execution_bundles(
+                parent_execution_bundles
+            )
+            pending_texts = {}
 
     active_style_guide = style_guide
     use_context_lines = bool(
@@ -12245,7 +12249,11 @@ def _process_page(
                 str(region.get("region_id", "") or ""),
                 glossary_terms_available=_debug_glossary_terms(terms),
             )
-    mark_translation_plan(debug_context, execution_regions, pending_texts)
+    mark_translation_plan(
+        debug_context,
+        execution_regions,
+        parent_translation_plan if parent_execution_bundles else pending_texts,
+    )
     post_plan_logical_repairs = {}
     if not parent_execution_bundles:
         post_plan_logical_repairs = enforce_logical_text_render_eligibility(execution_regions)
@@ -14109,18 +14117,21 @@ def _is_better_top_row_caption_ocr(
 def _rebuild_translation_inputs_from_parent_execution_bundles(
     bundles: list[ParentExecutionBundle],
 ) -> tuple[dict[str, list[str]], list[str]]:
+    """Build a parent-keyed plan while retaining source text as glossary input."""
+
     pending: dict[str, list[str]] = {}
     glossary: list[str] = []
     for bundle in bundles or []:
         parent_id = str(bundle.parent_id or bundle.bundle_id or "").strip()
+        execution_region_id = str(bundle.bundle_id or parent_id).strip()
         text = str(bundle.source_text or "").strip()
-        if not parent_id or not text:
+        if not parent_id or not execution_region_id or not text:
             continue
         if not _parent_execution_bundle_is_translatable(bundle):
             continue
         glossary.append(text)
         if not str(bundle.translated_text or "").strip():
-            pending.setdefault(text, []).append(parent_id)
+            pending[parent_id] = [execution_region_id]
     return pending, glossary
 
 
