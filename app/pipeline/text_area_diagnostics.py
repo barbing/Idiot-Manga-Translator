@@ -1163,43 +1163,8 @@ def _reference_case_results(
     blocks: list[dict[str, Any]],
     constraints: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    checks = []
-    ids = {item["region_id"]: item for item in instances}
-    if page_id == "014" and "r013" in ids:
-        c = _constraint_for(constraints, "r013")
-        explained = bool(c and c["constraint_status"] in {"violates_container", "violates_obstacle"})
-        checks.append(_case_result(page_id, "014:r013 render drift", explained, "correctly" if explained else "partially", c))
-    if page_id == "020":
-        same_container = _same_container(ownership, "r017", "r018")
-        block = _block_with_regions(blocks, {"r017", "r018"})
-        explained = same_container and block is not None
-        checks.append(_case_result(page_id, "020:r017/r018 ownership", explained, "correctly" if explained else "partially", block))
-    if page_id == "030":
-        block = _block_with_regions(blocks, {"r004", "r005", "r006"}) or _block_with_regions(blocks, {"r004", "r006"})
-        decorative = ids.get("r002", {}).get("visual_role_hint") in {"sfx", "decorative"}
-        explained = block is not None and decorative
-        checks.append(_case_result(page_id, "030 lower-left conservation and r002 SFX", explained, "correctly" if explained else "partially", block))
-    if page_id == "022":
-        captions = all(ids.get(rid, {}).get("visual_role_hint") == "caption" for rid in ("r003", "r006", "r008") if rid in ids)
-        haa = all(ids.get(rid, {}).get("visual_role_hint") in {"sfx", "decorative"} for rid in ("r000", "r007") if rid in ids)
-        explained = captions and haa
-        checks.append(_case_result(page_id, "022 captions and haa SFX", explained, "correctly" if explained else "partially", {"captions": captions, "haa": haa}))
-    if page_id == "008":
-        ok = all(ids.get(rid, {}).get("visual_role_hint") in {"sfx", "decorative"} for rid in ("r004", "r012", "r015") if rid in ids)
-        checks.append(_case_result(page_id, "008 decorative/SFX preserves", ok, "correctly" if ok else "partially", None))
-    if page_id == "024":
-        ok = ids.get("r009", {}).get("visual_role_hint") in {"sfx", "decorative"}
-        checks.append(_case_result(page_id, "024:r009 decorative/SFX preserve", ok, "correctly" if ok else "partially", None))
-    if page_id == "027":
-        inst = ids.get("r006")
-        link = _ownership_for(ownership, "r006")
-        ok = bool(inst and inst.get("visual_role_hint") == "speech" and link and link.get("container_id"))
-        checks.append(_case_result(page_id, "027:r006 recovered speech ownership", ok, "correctly" if ok else "partially", link))
-    if page_id == "033":
-        inst = ids.get("r014")
-        ok = bool(inst and inst.get("visual_role_hint") == "speech")
-        checks.append(_case_result(page_id, "033:r014 bubble laugh speech", ok, "correctly" if ok else "partially", None))
-    return checks
+    _ = page_id, instances, containers, ownership, blocks, constraints
+    return []
 
 
 def _case_result(page_id: str, case: str, ok: bool, result: str, evidence: Any) -> dict[str, Any]:

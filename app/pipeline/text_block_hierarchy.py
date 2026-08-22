@@ -646,8 +646,9 @@ def build_text_block_hierarchy(
             if isinstance(region, dict) and str(region.get("region_id") or "")
         }
 
+        graph_plan_present = isinstance(plan.get("root_parent_child_plan"), dict)
         graph_parent_nodes = _graph_parent_nodes(plan)
-        if graph_parent_nodes:
+        if graph_plan_present:
             graph_children = _materialize_graph_plan_parents(
                 page_id=page_id,
                 regions=regions,
@@ -686,7 +687,7 @@ def build_text_block_hierarchy(
             root = _root_for_region(page_id, region, roots_by_container, roots_by_key)
             child = _child_from_region(page_id, region, root.root_id, None, block=None)
             if child.final_state == STATE_STANDALONE_PARENT:
-                if graph_parent_nodes:
+                if graph_plan_present:
                     _set_child_final_state(child, STATE_UNRESOLVED_REVIEW_ONLY)
                     child.translated_independently = False
                     child.cleanup_independently = False
@@ -699,6 +700,13 @@ def build_text_block_hierarchy(
                     child.parent_id = parent.parent_id
                     child.represented_by_parent_id = parent.parent_id
                     _append_unique(root.parent_unit_ids, parent.parent_id)
+            if graph_plan_present and not child.parent_id:
+                _set_child_final_state(child, STATE_UNRESOLVED_REVIEW_ONLY)
+                child.translated_independently = False
+                child.cleanup_independently = False
+                child.render_independently = False
+                child.represented_by_parent_id = None
+                _append_unique(child.reason_codes, "text_area_graph_plan_unattached_source_evidence")
             children.append(child)
             child_by_region[rid] = child
             _append_unique(root.child_segment_ids, child.child_id)

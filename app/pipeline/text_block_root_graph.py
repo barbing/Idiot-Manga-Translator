@@ -7,7 +7,6 @@ root transaction status and graph audit semantics are centralized here.
 """
 from __future__ import annotations
 
-import difflib
 import json
 import os
 from typing import Any
@@ -412,14 +411,7 @@ def _meaningful_body(text: Any) -> str:
 
 
 def _distinct_candidate_bodies(records: list[dict[str, Any]]) -> bool:
-    bodies = [str(record.get("body") or "") for record in records if str(record.get("body") or "")]
-    for i, body in enumerate(bodies):
-        for other in bodies[i + 1:]:
-            if body == other or body in other or other in body:
-                continue
-            if difflib.SequenceMatcher(None, body, other).ratio() >= 0.84:
-                continue
-            return True
+    _ = records
     return False
 
 
@@ -428,28 +420,11 @@ def _visual_boxes_connected(a: dict[str, Any], b: dict[str, Any], root_bbox: lis
     bbox = list(b.get("bbox") or [])
     if not abox or not bbox:
         return False
-    abody = str(a.get("body") or "")
-    bbody = str(b.get("body") or "")
-    text_related = bool(
-        abody
-        and bbody
-        and (
-            abody == bbody
-            or abody in bbody
-            or bbody in abody
-            or difflib.SequenceMatcher(None, abody, bbody).ratio() >= 0.86
-        )
-    )
     aarea = max(1.0, float(abox[2]) * float(abox[3]))
     barea = max(1.0, float(bbox[2]) * float(bbox[3]))
     small_large_ratio = min(aarea, barea) / max(aarea, barea)
-    if small_large_ratio < 0.12 and not text_related:
+    if small_large_ratio < 0.12:
         return False
-
-    inside_a = _inside_ratio(abox, bbox)
-    inside_b = _inside_ratio(bbox, abox)
-    if text_related and max(inside_a, inside_b, _overlap_ratio(abox, bbox)) >= 0.22:
-        return True
 
     ax, ay, aw, ah = [float(v) for v in abox]
     bx, by, bw, bh = [float(v) for v in bbox]

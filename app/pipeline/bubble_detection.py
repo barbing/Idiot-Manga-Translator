@@ -1474,6 +1474,7 @@ def _semantic_role_evidence_for_ogkalu_record(record: Mapping[str, Any], linked_
         "class_name": class_name,
         "bbox": bbox,
         "confidence": record.get("confidence"),
+        "is_explicit_parent_boundary_evidence": class_name in {"text_bubble", "text_free"},
     }
     role_signals: List[str] = []
     candidate_roles: List[str] = []
@@ -1669,6 +1670,9 @@ def _annotate_fused_container_semantic_role_evidence(
                             "class_name": class_name,
                             "bbox": _float_list(entry.get("bbox")),
                             "confidence": entry.get("confidence"),
+                            "is_explicit_parent_boundary_evidence": bool(
+                                entry.get("is_explicit_parent_boundary_evidence", False)
+                            ),
                         }
                     )
                     confidence = _safe_float(entry.get("confidence"))

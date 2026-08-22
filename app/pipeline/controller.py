@@ -111,6 +111,7 @@ class PageProcessingResult:
     parent_execution_bundles: list[ParentExecutionBundle]
     page_class: str
     text_area_plan: Any | None = None
+    ctd_segmentation_result: Any | None = None
 
 
 def _stage_parent_bundle_records(
@@ -1747,6 +1748,7 @@ class PipelineWorker(QtCore.QThread):
                     parent_execution_bundles = page_result.parent_execution_bundles
                     page_class = page_result.page_class
                     text_area_plan = page_result.text_area_plan
+                    ctd_segmentation_result = page_result.ctd_segmentation_result
                     _page014_timeout_checkpoint(
                         "controller_process_page",
                         "end",
@@ -1971,6 +1973,7 @@ class PipelineWorker(QtCore.QThread):
                         page_id=page_id,
                         debug_context=debug_context,
                         text_area_plan=text_area_plan,
+                        segmentation_result=ctd_segmentation_result,
                     )
                     _page014_timeout_checkpoint(
                         "text_foreground_segmentation",
@@ -4436,6 +4439,7 @@ def _build_text_foreground_segmentation_mask(
     page_id: str,
     debug_context: dict | None,
     text_area_plan=None,
+    segmentation_result=None,
 ):
     from app.pipeline.cleanup_contracts import TextForegroundSegmentationMask
 
@@ -4446,27 +4450,29 @@ def _build_text_foreground_segmentation_mask(
             provider=getattr(detector, "__class__", type("", (), {})).__name__ if detector is not None else "",
             provenance={"status": "segmentation_api_unavailable"},
         )
-    try:
-        refinement_scopes = _text_area_ctd_refinement_scope_geometry(
-            text_area_plan,
-            image_size=image_size,
-        )
+    result = segmentation_result
+    if result is None:
         try:
-            result = detector.detect_with_segmentation(
-                source_path,
-                input_size=input_size,
-                keep_undetected_mask=True,
-                refinement_scopes=refinement_scopes,
+            refinement_scopes = _text_area_ctd_refinement_scope_geometry(
+                text_area_plan,
+                image_size=image_size,
             )
-        except TypeError:
-            result = detector.detect_with_segmentation(source_path)
-    except Exception as exc:
-        return TextForegroundSegmentationMask(
-            page_id=page_id,
-            image_size=image_size,
-            provider=detector.__class__.__name__,
-            provenance={"status": "segmentation_failed", "error": f"{type(exc).__name__}: {exc}"},
-        )
+            try:
+                result = detector.detect_with_segmentation(
+                    source_path,
+                    input_size=input_size,
+                    keep_undetected_mask=True,
+                    refinement_scopes=refinement_scopes,
+                )
+            except TypeError:
+                result = detector.detect_with_segmentation(source_path)
+        except Exception as exc:
+            return TextForegroundSegmentationMask(
+                page_id=page_id,
+                image_size=image_size,
+                provider=detector.__class__.__name__,
+                provenance={"status": "segmentation_failed", "error": f"{type(exc).__name__}: {exc}"},
+            )
 
     raw_ref = ""
     refined_ref = ""
@@ -4599,6 +4605,8 @@ def _ocr_trace_outcome(text: str, confidence: float, route_intent: str) -> tuple
         outcome = "recognized_meaningful"
     elif state == _OCR_LOW_CONFIDENCE_WARNING_STATE:
         outcome = "low_confidence_meaningful"
+    elif state == _OCR_PUNCTUATION_IDENTITY_STATE:
+        outcome = "punctuation_identity"
     elif state == "ocr_empty_blocker":
         outcome = "empty"
     elif state == "ocr_punctuation_only_blocker":
@@ -4974,15 +4982,18 @@ _TEXT_AREA_ASSIGNMENT_FIELD_KEYS = (
 )
 _OCR_TRANSLATION_READY_STATE = "recognized_for_translation"
 _OCR_LOW_CONFIDENCE_WARNING_STATE = "recognized_low_confidence_warning"
+_OCR_PUNCTUATION_IDENTITY_STATE = "recognized_punctuation_identity"
 _OCR_TRANSLATION_QUEUED_STATES = {
     _OCR_TRANSLATION_READY_STATE,
     _OCR_LOW_CONFIDENCE_WARNING_STATE,
+    _OCR_PUNCTUATION_IDENTITY_STATE,
 }
 _OCR_BLOCKER_STATES = {
     "ocr_empty_blocker",
     "ocr_punctuation_only_blocker",
     "ocr_malformed_blocker",
 }
+_NONLEXICAL_OCR_PROXY_CHARS = frozenset({"*", "＊", "∗", "☀"})
 
 
 def _is_text_area_translatable_assignment(assignment: dict | None) -> bool:
@@ -5019,24 +5030,31 @@ def _ocr_transaction_state_for_text_area_route(
     cleaned = _clean_ocr_text(ocr_text)
     if not cleaned:
         return "ocr_empty_blocker", "empty_ocr"
-    if _is_punct_only(cleaned) or _placeholder_ratio(cleaned) >= 0.18:
-        return "ocr_punctuation_only_blocker", "punctuation_or_placeholder_ocr"
+    if _is_nonlexical_ocr_proxy_run(cleaned):
+        return _OCR_LOW_CONFIDENCE_WARNING_STATE, "nonlexical_ocr_proxy_warning"
+    if _is_punct_only(cleaned):
+        return _OCR_PUNCTUATION_IDENTITY_STATE, "punctuation_identity_ocr"
     body = _non_punct_chars(cleaned)
     if not body:
-        return "ocr_punctuation_only_blocker", "no_nonpunctuation_ocr_body"
+        return _OCR_PUNCTUATION_IDENTITY_STATE, "punctuation_identity_ocr"
+    if _placeholder_ratio(cleaned) >= 0.18:
+        return _OCR_LOW_CONFIDENCE_WARNING_STATE, "placeholder_heavy_ocr_warning"
     has_cjk_or_kana = any(_is_kana(ch) or 0x4E00 <= ord(ch) <= 0x9FFF for ch in body)
     if not has_cjk_or_kana:
-        return "ocr_malformed_blocker", "ocr_not_japanese_cjk_or_kana"
-    # Short kana-only caption/background OCR is usually an impact sound or OCR
-    # fragment. Treat it as OCR evidence that needs review, not as semantic SFX.
+        return _OCR_LOW_CONFIDENCE_WARNING_STATE, "ocr_not_japanese_cjk_or_kana_warning"
     if route_intent == "translate_caption_background":
         kana_only = all(_is_kana(ch) or ch in {"ー", "～"} for ch in body)
         katakana_count = sum(1 for ch in body if 0x30A0 <= ord(ch) <= 0x30FF)
         if kana_only and len(body) <= 5 and katakana_count >= max(1, len(body) - 1):
-            return "ocr_malformed_blocker", "short_katakana_caption_ocr_requires_review"
+            return _OCR_LOW_CONFIDENCE_WARNING_STATE, "short_katakana_caption_ocr_warning"
     if float(ocr_conf or 0.0) < 0.45:
         return _OCR_LOW_CONFIDENCE_WARNING_STATE, "low_confidence_scoped_ocr_warning"
     return _OCR_TRANSLATION_READY_STATE, "text_area_route_ocr_sane"
+
+
+def _is_nonlexical_ocr_proxy_run(text: str) -> bool:
+    symbols = [char for char in str(text or "") if not char.isspace()]
+    return bool(symbols) and all(char in _NONLEXICAL_OCR_PROXY_CHARS for char in symbols)
 
 
 def _ocr_transaction_state_queues_translation(state: str) -> bool:
@@ -5494,11 +5512,27 @@ def _append_parent_boundary_ocr_source_regions(
 
     from app.pipeline.debug_artifacts import add_timing, set_count
 
+    # Initial hierarchy sources are provisional until this parent-owned OCR pass.
+    _ = existing_parent_units
+
     plan = _plan_to_dict_for_text_area(text_area_plan)
     graph_plan = plan.get("root_parent_child_plan") if isinstance(plan, dict) else {}
     parent_nodes = graph_plan.get("parent_nodes") if isinstance(graph_plan, dict) else []
     if not parent_nodes:
         return {"attempted": 0, "created": 0, "skipped": 0, "records": []}
+    root_nodes = graph_plan.get("root_nodes") if isinstance(graph_plan, dict) else []
+    root_nodes_by_id = {
+        str(root.get("root_node_id") or ""): root
+        for root in root_nodes or []
+        if isinstance(root, Mapping) and str(root.get("root_node_id") or "")
+    }
+    parent_count_by_root: dict[str, int] = {}
+    for node in parent_nodes:
+        if not isinstance(node, Mapping):
+            continue
+        root_id = str(node.get("root_node_id") or "")
+        if root_id:
+            parent_count_by_root[root_id] = parent_count_by_root.get(root_id, 0) + 1
 
     existing_parent_source_ids = {
         str(region.get("parent_ocr_source_parent_id") or "")
@@ -5534,77 +5568,144 @@ def _append_parent_boundary_ocr_source_regions(
             continue
         route = _parent_boundary_ocr_route(parent_node)
         region_id = _parent_boundary_ocr_region_id(parent_id, regions)
-        deterministic_source = _existing_parent_punctuation_identity_source(
-            parent_node,
-            existing_parent_units,
-        ) or _existing_region_punctuation_identity_source(parent_node, bbox, regions)
         source_scope = "parent_boundary"
         source_stage = "controller_parent_boundary_ocr"
         status = "created"
         ocr_backend_meta: dict[str, Any] = {}
-        if deterministic_source:
-            ocr_text = deterministic_source
-            ocr_conf = 1.0
-            state = "ocr_punctuation_only_blocker"
-            reason = "existing_parent_punctuation_identity_source"
-            source_scope = "parent_execution_region"
-            source_stage = "text_block_hierarchy_punctuation_identity"
-            status = "created_from_existing_punctuation_identity_source"
-            reused += 1
-        else:
-            crop = _crop_image(image_path, bbox, expand_wide=False, image_obj=page_image)
-            if crop is None:
-                skipped += 1
-                records.append({"parent_id": parent_id, "status": "skipped_crop_failed", "bbox": bbox})
-                continue
-            ocr_start = time.time()
-            ocr_text, ocr_conf = _recognize_with_fallback(
-                ocr_engine,
-                crop,
-                settings,
-                bbox,
-                debug_context=debug_context,
-                trace_context={
-                    "page_id": page_id,
-                    "region_id": region_id,
-                    "parent_id": parent_id,
-                    "root_id": parent_node.get("root_node_id"),
-                    "attempt_kind": "parent_boundary_ocr_source_contract",
-                    "text_area_container_id": parent_node.get("container_id"),
-                    "route_intent": route,
-                    "ocr_eligible": True,
-                    "source_bbox": list(bbox),
-                    "actual_crop_bbox": list(bbox),
-                    "container_bbox": list(bbox),
-                },
-            )
-            add_timing(debug_context, "ocr_time", time.time() - ocr_start)
-            if hasattr(ocr_engine, "backend_metadata"):
-                try:
-                    ocr_backend_meta = dict(ocr_engine.backend_metadata())
-                except Exception:
-                    ocr_backend_meta = {}
-            if not ocr_backend_meta:
-                ocr_backend_meta = {"ocr_backend": ocr_engine.__class__.__name__}
+        context_retry: dict[str, Any] = {}
+        crop = _crop_image(image_path, bbox, expand_wide=False, image_obj=page_image)
+        if crop is None:
+            skipped += 1
+            records.append({"parent_id": parent_id, "status": "skipped_crop_failed", "bbox": bbox})
+            continue
+        ocr_start = time.time()
+        ocr_text, ocr_conf = _recognize_with_fallback(
+            ocr_engine,
+            crop,
+            settings,
+            bbox,
+            debug_context=debug_context,
+            trace_context={
+                "page_id": page_id,
+                "region_id": region_id,
+                "parent_id": parent_id,
+                "root_id": parent_node.get("root_node_id"),
+                "attempt_kind": "parent_boundary_ocr_source_contract",
+                "text_area_container_id": parent_node.get("container_id"),
+                "route_intent": route,
+                "ocr_eligible": True,
+                "source_bbox": list(bbox),
+                "actual_crop_bbox": list(bbox),
+                "container_bbox": list(bbox),
+            },
+        )
+        add_timing(debug_context, "ocr_time", time.time() - ocr_start)
+        if hasattr(ocr_engine, "backend_metadata"):
+            try:
+                ocr_backend_meta = dict(ocr_engine.backend_metadata())
+            except Exception:
+                ocr_backend_meta = {}
+        if not ocr_backend_meta:
+            ocr_backend_meta = {"ocr_backend": ocr_engine.__class__.__name__}
         ocr_text = _clean_ocr_text(str(ocr_text or ""))
+        state, reason = _ocr_transaction_state_for_text_area_route(ocr_text, ocr_conf, route)
+        retry_reason = _parent_boundary_ocr_context_retry_reason(ocr_text, state, reason)
+        if retry_reason:
+                retry_bbox, retry_eligibility = _parent_boundary_ocr_context_bbox(
+                    parent_node,
+                    root_nodes_by_id=root_nodes_by_id,
+                    parent_count_by_root=parent_count_by_root,
+                    parent_bbox=bbox,
+                    image_size=image_size,
+                )
+                context_retry = {
+                    "trigger_reason": retry_reason,
+                    "eligibility": retry_eligibility,
+                    "attempted": False,
+                    "selected": False,
+                    "initial_text": ocr_text,
+                    "initial_confidence": float(ocr_conf or 0.0),
+                    "initial_state": state,
+                    "initial_reason": reason,
+                    "parent_bbox": list(bbox),
+                    "context_bbox": list(retry_bbox),
+                }
+                if retry_bbox:
+                    retry_crop = _crop_image(
+                        image_path,
+                        retry_bbox,
+                        expand_wide=False,
+                        image_obj=page_image,
+                    )
+                    if retry_crop is not None:
+                        retry_start = time.time()
+                        retry_text, retry_conf = _recognize_with_fallback(
+                            ocr_engine,
+                            retry_crop,
+                            settings,
+                            retry_bbox,
+                            debug_context=debug_context,
+                            trace_context={
+                                "page_id": page_id,
+                                "region_id": region_id,
+                                "parent_id": parent_id,
+                                "root_id": parent_node.get("root_node_id"),
+                                "attempt_kind": "parent_boundary_ocr_source_contract_context_retry",
+                                "text_area_container_id": parent_node.get("container_id"),
+                                "route_intent": route,
+                                "ocr_eligible": True,
+                                "source_bbox": list(bbox),
+                                "actual_crop_bbox": list(retry_bbox),
+                                "container_bbox": list(retry_bbox),
+                            },
+                        )
+                        add_timing(debug_context, "ocr_time", time.time() - retry_start)
+                        retry_text = _clean_ocr_text(str(retry_text or ""))
+                        retry_state, retry_state_reason = _ocr_transaction_state_for_text_area_route(
+                            retry_text,
+                            retry_conf,
+                            route,
+                        )
+                        selected = _parent_boundary_ocr_candidate_rank(
+                            retry_text,
+                            retry_state,
+                            retry_conf,
+                        ) > _parent_boundary_ocr_candidate_rank(ocr_text, state, ocr_conf)
+                        context_retry.update(
+                            {
+                                "attempted": True,
+                                "selected": selected,
+                                "retry_text": retry_text,
+                                "retry_confidence": float(retry_conf or 0.0),
+                                "retry_state": retry_state,
+                                "retry_reason": retry_state_reason,
+                            }
+                        )
+                        if selected:
+                            ocr_text = retry_text
+                            ocr_conf = retry_conf
+                            state = retry_state
+                            reason = retry_state_reason
+                            source_stage = "controller_parent_boundary_ocr_context_retry"
+                            status = "created_from_parent_owned_context_retry"
+                    else:
+                        context_retry["eligibility"] = "context_crop_failed"
         terminal_symbol_evidence = {
             "text": ocr_text,
             "raw_text": ocr_text,
             "applied": False,
-            "reason": "deterministic_source_preserved" if deterministic_source else "no_qualifying_terminal_symbol_evidence",
+            "reason": "no_qualifying_terminal_symbol_evidence",
         }
-        if not deterministic_source:
-            terminal_symbol_evidence = _reconcile_parent_terminal_symbol_multiplicity(
-                ocr_text,
-                parent_node=parent_node,
-                parent_bbox=bbox,
-                regions=regions,
-            )
-            ocr_text = str(terminal_symbol_evidence.get("text") or ocr_text)
-            if terminal_symbol_evidence.get("applied"):
-                status = "created_with_terminal_symbol_multiplicity_evidence"
-        if not deterministic_source:
-            state, reason = _ocr_transaction_state_for_text_area_route(ocr_text, ocr_conf, route)
+        terminal_symbol_evidence = _reconcile_parent_terminal_symbol_multiplicity(
+            ocr_text,
+            parent_node=parent_node,
+            parent_bbox=bbox,
+            regions=regions,
+        )
+        ocr_text = str(terminal_symbol_evidence.get("text") or ocr_text)
+        if terminal_symbol_evidence.get("applied"):
+            status = "created_with_terminal_symbol_multiplicity_evidence"
+        state, reason = _ocr_transaction_state_for_text_area_route(ocr_text, ocr_conf, route)
         assignment = _parent_boundary_ocr_assignment(
             parent_node,
             assign_bbox_to_text_area_plan(text_area_plan, bbox, detection_source="parent_boundary_ocr_source_contract"),
@@ -5650,6 +5751,9 @@ def _append_parent_boundary_ocr_source_regions(
             source_contract_stage=source_stage,
         )
         _stamp_parent_terminal_symbol_evidence(region, terminal_symbol_evidence)
+        if context_retry:
+            region["parent_ocr_context_retry"] = dict(context_retry)
+            region.setdefault("render", {})["parent_ocr_context_retry"] = dict(context_retry)
         for meta_key, meta_value in ocr_backend_meta.items():
             region[meta_key] = meta_value
             region.setdefault("render", {})[meta_key] = meta_value
@@ -5677,6 +5781,7 @@ def _append_parent_boundary_ocr_source_regions(
                     "source_contract_scope": source_scope,
                     "source_contract_stage": source_stage,
                     "source_contract_ocr_confidence": float(ocr_conf or 0.0),
+                    "parent_ocr_context_retry": dict(context_retry),
                     **_parent_terminal_symbol_audit_fields(terminal_symbol_evidence),
                     **ocr_backend_meta,
                 }
@@ -5700,6 +5805,7 @@ def _append_parent_boundary_ocr_source_regions(
                 "source_contract_scope": source_scope,
                 "source_contract_stage": source_stage,
                 "source_contract_ocr_confidence": float(ocr_conf or 0.0),
+                "parent_ocr_context_retry": dict(context_retry),
                 **_parent_terminal_symbol_audit_fields(terminal_symbol_evidence),
                 "ocr_backend": ocr_backend_meta.get("ocr_backend", ""),
                 "ocr_model_path": ocr_backend_meta.get("ocr_model_path", ""),
@@ -5728,149 +5834,81 @@ def _parent_boundary_ocr_region_id(parent_id: str, regions: list[dict]) -> str:
     return f"{base}_{suffix}"
 
 
-def _existing_parent_punctuation_identity_source(
-    parent_node: Mapping[str, Any],
-    existing_parent_units: Iterable[Any] | None,
-) -> str:
-    parent_id = str(parent_node.get("parent_node_id") or "").strip()
-    if not parent_id:
-        return ""
-    for parent_unit in existing_parent_units or []:
-        if isinstance(parent_unit, Mapping):
-            unit_parent_id = str(parent_unit.get("parent_id") or parent_unit.get("parent_node_id") or "").strip()
-            source_text = str(parent_unit.get("source_text") or "")
-            quality_action = str(
-                parent_unit.get("source_contract_quality_action")
-                or parent_unit.get("source_coherence_action")
-                or parent_unit.get("source_quality_action")
-                or ""
-            )
-            quality_state = str(parent_unit.get("source_contract_quality_state") or "")
-        else:
-            unit_parent_id = str(
-                getattr(parent_unit, "parent_id", "")
-                or getattr(parent_unit, "parent_node_id", "")
-                or ""
-            ).strip()
-            source_text = str(getattr(parent_unit, "source_text", "") or "")
-            quality_action = str(
-                getattr(parent_unit, "source_contract_quality_action", "")
-                or getattr(parent_unit, "source_coherence_action", "")
-                or getattr(parent_unit, "source_quality_action", "")
-                or ""
-            )
-            quality_state = str(getattr(parent_unit, "source_contract_quality_state", "") or "")
-        if unit_parent_id != parent_id:
-            continue
-        if _source_reconstruction_is_applied(parent_unit):
-            return ""
-        cleaned = _clean_ocr_text(source_text)
-        if not cleaned:
-            return ""
-        if quality_action == "identity_punctuation" or quality_state == "punctuation_identity_source":
-            return cleaned
-        if _is_identity_punctuation_source_text(cleaned):
-            return cleaned
-        return ""
+_PARENT_OCR_IDENTITY_PUNCTUATION = set(
+    "。．.、，,！？!?：:；;…‥・･ー〜～~—―－-︙︴〰⋯⋮"
+    "「」『』（）()［］[]【】《》〈〉☆★♡♥♪♫♬"
+)
+
+
+def _parent_boundary_ocr_context_retry_reason(text: str, state: str, reason: str) -> str:
+    cleaned = _clean_ocr_text(text)
+    if not cleaned:
+        return "empty_parent_boundary_ocr"
+    if state in _OCR_BLOCKER_STATES:
+        return reason or "blocked_parent_boundary_ocr"
+    body = _non_punct_chars(cleaned)
+    has_japanese = any(_is_kana(ch) or 0x4E00 <= ord(ch) <= 0x9FFF for ch in body)
+    if state == _OCR_LOW_CONFIDENCE_WARNING_STATE and not has_japanese:
+        return reason or "non_japanese_parent_boundary_ocr"
+    if state == _OCR_PUNCTUATION_IDENTITY_STATE:
+        punctuation = [ch for ch in cleaned if not ch.isspace()]
+        if len(punctuation) == 1:
+            return "single_punctuation_parent_source_requires_context_verification"
+        if punctuation and not all(ch in _PARENT_OCR_IDENTITY_PUNCTUATION for ch in punctuation):
+            return "unsupported_parent_boundary_punctuation_placeholder"
     return ""
 
 
-def _existing_region_punctuation_identity_source(
+def _parent_boundary_ocr_context_bbox(
     parent_node: Mapping[str, Any],
+    *,
+    root_nodes_by_id: Mapping[str, Mapping[str, Any]],
+    parent_count_by_root: Mapping[str, int],
     parent_bbox: list[int],
-    regions: list[dict],
-) -> str:
-    parent_id = str(parent_node.get("parent_node_id") or "").strip()
-    container_id = str(parent_node.get("container_id") or "").strip()
-    if not parent_id or not parent_bbox:
-        return ""
-    candidates: list[str] = []
-    for region in regions:
-        if not isinstance(region, dict) or bool(region.get("parent_boundary_ocr_source_contract")):
-            continue
-        if _source_reconstruction_is_applied(region):
-            continue
-        text = _clean_ocr_text(str(region.get("ocr_text") or ""))
-        if not text:
-            continue
-        render = region.get("render") if isinstance(region.get("render"), dict) else {}
-        region_parent_id = str(
-            region.get("parent_logical_text_unit_id")
-            or render.get("parent_logical_text_unit_id")
-            or region.get("source_text_represented_by_block_id")
-            or render.get("source_text_represented_by_block_id")
-            or ""
-        ).strip()
-        region_container_id = str(
-            region.get("text_area_container_id")
-            or render.get("text_area_container_id")
-            or region.get("logical_text_block_container_id")
-            or render.get("logical_text_block_container_id")
-            or ""
-        ).strip()
-        region_bbox = _clip_controller_bbox(list(region.get("bbox") or []), None)
-        if not region_bbox:
-            continue
-        if region_parent_id and region_parent_id != parent_id:
-            continue
-        if not region_parent_id:
-            if container_id and region_container_id and region_container_id != container_id:
-                continue
-            inside_parent = _bbox_inside_ratio_controller(region_bbox, parent_bbox)
-            overlap = _overlap_ratio(region_bbox, parent_bbox)
-            if inside_parent < 0.55 and not (_bbox_center_inside(region_bbox, parent_bbox) and overlap >= 0.45):
-                continue
-        block_source = _clean_ocr_text(
-            str(region.get("logical_text_block_source_text") or render.get("logical_text_block_source_text") or "")
-        )
-        if region_parent_id == parent_id and _is_identity_punctuation_source_text(block_source):
-            candidates.append(block_source)
-            continue
-        if not _is_identity_punctuation_source_text(text):
-            return ""
-        candidates.append(text)
-    if not candidates:
-        return ""
-    unique_candidates = list(dict.fromkeys(candidates))
-    if len(unique_candidates) != 1:
-        return ""
-    return unique_candidates[0]
+    image_size: tuple[int, int] | None,
+) -> tuple[list[int], str]:
+    root_id = str(parent_node.get("root_node_id") or "")
+    if not root_id or int(parent_count_by_root.get(root_id, 0)) != 1:
+        return [], "root_context_requires_single_parent"
+    root_node = root_nodes_by_id.get(root_id)
+    if not isinstance(root_node, Mapping):
+        return [], "root_context_missing"
+    root_bbox = _clip_controller_bbox(
+        [int(round(float(value or 0))) for value in (root_node.get("bbox") or [])[:4]],
+        image_size,
+    )
+    if not root_bbox or root_bbox == parent_bbox:
+        return [], "root_context_not_larger_than_parent"
+    if _bbox_inside_ratio_controller(parent_bbox, root_bbox) < 0.95:
+        return [], "root_context_does_not_contain_parent"
+    parent_area = max(1, int(parent_bbox[2]) * int(parent_bbox[3]))
+    root_area = max(1, int(root_bbox[2]) * int(root_bbox[3]))
+    if root_area > parent_area * 6:
+        return [], "root_context_excessively_broad"
+    return root_bbox, "eligible_single_parent_root_context"
 
 
-def _source_reconstruction_is_applied(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        render = value.get("render") if isinstance(value.get("render"), Mapping) else {}
-
-        def read(key: str) -> Any:
-            return value.get(key) if value.get(key) is not None else render.get(key)
-    else:
-        render = getattr(value, "render", None)
-
-        def read(key: str) -> Any:
-            direct = getattr(value, key, None)
-            if direct is not None:
-                return direct
-            if isinstance(render, Mapping):
-                return render.get(key)
-            return None
-
-    if any(
-        bool(read(key))
-        for key in (
-            "source_reconstruction_applied",
-            "root_reconstruction_applied",
-            "logical_text_source_reconstruction_applied",
-        )
-    ):
-        return True
-    return str(read("source_reconstruction_status") or "").strip().lower() == "applied"
-
-
-def _is_identity_punctuation_source_text(text: str) -> bool:
+def _parent_boundary_ocr_candidate_rank(text: str, state: str, confidence: float) -> tuple[int, int, float]:
     cleaned = _clean_ocr_text(text)
     if not cleaned:
-        return False
-    return _is_punct_only(cleaned) or not _non_punct_chars(cleaned)
+        return (0, 0, 0.0)
+    body = _non_punct_chars(cleaned)
+    has_japanese = any(_is_kana(ch) or 0x4E00 <= ord(ch) <= 0x9FFF for ch in body)
+    if state == _OCR_TRANSLATION_READY_STATE:
+        quality = 5
+    elif state == _OCR_LOW_CONFIDENCE_WARNING_STATE and has_japanese:
+        quality = 4
+    elif state == _OCR_PUNCTUATION_IDENTITY_STATE and not _parent_boundary_ocr_context_retry_reason(
+        cleaned,
+        state,
+        "",
+    ):
+        quality = 3
+    elif state == _OCR_LOW_CONFIDENCE_WARNING_STATE:
+        quality = 2
+    else:
+        quality = 1
+    return (quality, len(body), float(confidence or 0.0))
 
 
 def _terminal_emphasis_symbol_run(text: str) -> str:
@@ -6097,7 +6135,7 @@ def _parent_boundary_ocr_source_quality(
         return "verified_source", "translate", []
     if state == _OCR_LOW_CONFIDENCE_WARNING_STATE:
         return "usable_source_with_warning", "translate_with_review", [reason or "low_confidence_parent_ocr"]
-    if state == "ocr_punctuation_only_blocker":
+    if state in {_OCR_PUNCTUATION_IDENTITY_STATE, "ocr_punctuation_only_blocker"}:
         return "punctuation_identity_source", "identity_punctuation", [reason or "parent_ocr_punctuation_identity"]
     body = _non_punct_chars(ocr_text)
     has_japanese = any(_is_kana(ch) or 0x4E00 <= ord(ch) <= 0x9FFF for ch in body)
@@ -10989,10 +11027,9 @@ def _process_page(
     from app.pipeline.debug_artifacts import add_count, add_timing, mark_render_region, mark_translation_plan, set_count
     from app.pipeline.bubble_detection import BubbleDetectionInput, run_bubble_detection
     from app.pipeline.logical_text_blocks import (
-        assess_logical_text_source_quality,
-        apply_same_container_logical_text_blocks,
+        LOGICAL_TEXT_BLOCK_VERSION,
+        LogicalTextBlockAssemblyResult,
         enforce_logical_text_render_eligibility,
-        restore_text_area_owned_speech_fragments,
     )
     from app.pipeline.text_block_hierarchy import build_text_block_hierarchy
     from app.pipeline.text_area_plan import (
@@ -11002,8 +11039,10 @@ def _process_page(
         apply_text_area_assignment_to_region,
         assign_bbox_to_text_area_plan,
         build_scoped_ocr_candidate,
+        build_scoped_detection_candidates,
         build_text_area_plan,
         enrich_text_area_plan_with_region_records,
+        finalize_text_area_plan_with_ctd_boundary_evidence,
     )
 
     def notify_stage(stage: PipelineStage, detail: str) -> None:
@@ -11064,6 +11103,7 @@ def _process_page(
     add_timing(debug_context, "image_loading_time", time.time() - image_load_start)
     page_id = os.path.splitext(os.path.basename(image_path))[0]
     text_area_plan = None
+    ctd_segmentation_result = None
     text_area_plan_start = time.time()
     notify_stage(PipelineStage.DETECTION, "Detecting page text areas")
     try:
@@ -11085,6 +11125,7 @@ def _process_page(
             image_size,
             bubble_detection_result,
             current_region_records=None,
+            finalize_graph=False,
         )
         add_timing(
             debug_context,
@@ -11093,8 +11134,7 @@ def _process_page(
         )
         if debug_context is not None:
             debug_context["bubble_detection_pre_ocr"] = bubble_detection_result.to_dict()
-            debug_context["text_area_plan"] = text_area_plan.to_dict()
-            debug_context["text_area_plan_pre_ocr"] = text_area_plan.to_dict()
+            debug_context["text_area_plan_semantic_pre_ctd"] = text_area_plan.to_dict()
             set_count(debug_context, "text_area_plan_containers", len(text_area_plan.containers))
             set_count(debug_context, "text_area_plan_scopes", len(text_area_plan.scopes))
     except Exception as exc:
@@ -11117,6 +11157,54 @@ def _process_page(
     primary_detection_elapsed = time.time() - detect_start
     add_timing(debug_context, "detection_time", primary_detection_elapsed)
     add_timing(debug_context, "detection_primary_time", primary_detection_elapsed)
+    ctd_parent_boundary_start = time.perf_counter()
+    full_page_parent_boundary_candidates: list[dict[str, Any]] = []
+    if hasattr(detector, "detect_with_segmentation"):
+        refinement_scopes = _text_area_ctd_refinement_scope_geometry(
+            text_area_plan,
+            image_size=image_size,
+        )
+        try:
+            try:
+                ctd_segmentation_result = detector.detect_with_segmentation(
+                    image_path,
+                    input_size=image_input_size,
+                    keep_undetected_mask=True,
+                    refinement_scopes=refinement_scopes,
+                )
+            except TypeError:
+                ctd_segmentation_result = detector.detect_with_segmentation(image_path)
+        except Exception as exc:
+            raise PipelineStageTechnicalError(
+                stage=PipelineStage.DETECTION,
+                code="ctd_parent_boundary_provider_failed",
+                message="ComicTextDetector could not provide parent-boundary geometry.",
+                detail=f"{type(exc).__name__}: {exc}",
+                page_id=page_id,
+                operation="detect_ctd_parent_boundaries",
+            ) from exc
+        full_page_parent_boundary_candidates = build_scoped_detection_candidates(
+            page_id,
+            list(getattr(ctd_segmentation_result, "detections", []) or []),
+            text_area_plan,
+            detection_source="comic_text_detector_parent_boundary_evidence",
+        )
+        for index, candidate in enumerate(full_page_parent_boundary_candidates):
+            candidate["detection_id"] = "ctd_full_{:04d}".format(index)
+    text_area_plan = finalize_text_area_plan_with_ctd_boundary_evidence(
+        text_area_plan,
+        scoped_detection_candidates=scoped_detection_candidates,
+        full_page_detection_candidates=full_page_parent_boundary_candidates,
+    )
+    add_timing(
+        debug_context,
+        "ctd_parent_boundary_graph_finalization_time",
+        time.perf_counter() - ctd_parent_boundary_start,
+    )
+    if debug_context is not None:
+        debug_context["ctd_parent_boundary_candidates"] = full_page_parent_boundary_candidates
+        debug_context["text_area_plan"] = text_area_plan.to_dict()
+        debug_context["text_area_plan_pre_ocr"] = text_area_plan.to_dict()
     if text_area_plan is not None and hasattr(text_area_plan, "runtime"):
         try:
             text_area_plan.runtime.true_scoped_detector_available = text_area_detection_source == DETECTION_SCOPED
@@ -11834,149 +11922,51 @@ def _process_page(
             pending_texts.setdefault(ocr_text, []).append(region["region_id"])
 
     page_class = _classify_page(regions, page_image)
-    if page_class in {"cover", "contents", "chapter_title"}:
-        for region in regions:
-            if not _should_preserve_region_on_page_class(region, page_class, page_image.size if page_image is not None else None):
-                continue
-            region["translation"] = ""
-            flags = dict(region.get("flags", {}))
-            flags["ignore"] = True
-            flags["bg_text"] = True
-            flags["needs_review"] = False
-            region["flags"] = flags
-        pending_texts = {
-            text: [
-                rid
-                for rid in region_ids
-                if not next(
-                    (
-                        r.get("flags", {}).get("ignore")
-                        for r in regions
-                        if r.get("region_id") == rid
-                    ),
-                    False,
-                )
-            ]
-            for text, region_ids in pending_texts.items()
+    if debug_context is not None:
+        debug_context["controller_semantic_mutation_status"] = {
+            "status": "disabled_text_area_plan_is_semantic_authority",
+            "page_class": page_class,
+            "disabled_paths": [
+                "page_class_region_suppression",
+                "top_row_caption_ocr_rescue",
+                "low_confidence_sfx_reroute",
+                "missed_speech_region_creation",
+                "adjacent_vertical_region_merge",
+                "bubble_local_region_merge",
+            ],
         }
-        pending_texts = {text: ids for text, ids in pending_texts.items() if ids}
-        glossary_texts = [
-            str(region.get("ocr_text", "")).strip()
-            for region in regions
-            if not region.get("flags", {}).get("ignore")
-        ]
-
-    pending_texts, glossary_texts = _rescue_top_row_caption_ocr_regions(
-        regions,
-        page_image,
-        image_size,
-        ocr_engine,
-        settings,
-        text_filter,
-        pending_texts,
-        glossary_texts,
-        page_class=page_class,
-        debug_context=debug_context,
-    )
-
-    pending_texts, glossary_texts = _route_low_conf_dark_short_art_sfx_regions(
-        regions,
-        page_image,
-        image_size,
-        pending_texts,
-        glossary_texts,
-    )
-
-    pending_texts, glossary_texts = _recover_missed_speech_text_area_regions(
-        regions,
-        detections,
-        page_image,
-        image_size,
-        ocr_engine,
-        settings,
-        font_name,
-        pending_texts,
-        glossary_texts,
-        page_class=page_class,
-        debug_context=debug_context,
-    )
-
-    pending_texts, glossary_texts = _recover_adjacent_vertical_speech_text_conservation_regions(
-        regions,
-        page_image,
-        image_size,
-        ocr_engine,
-        settings,
-        font_name,
-        pending_texts,
-        glossary_texts,
-        page_class=page_class,
-        debug_context=debug_context,
-    )
-
-    pending_texts, glossary_texts = _apply_bubble_local_nested_speech_ownership(
-        regions,
-        page_image,
-        image_size,
-        ocr_engine,
-        settings,
-        font_name,
-        pending_texts,
-        glossary_texts,
-        page_class=page_class,
-        debug_context=debug_context,
-    )
 
     if text_area_plan is not None:
         try:
             logical_assignment_plan = enrich_text_area_plan_with_region_records(text_area_plan, regions)
-            for region in regions:
-                assignment = assign_bbox_to_text_area_plan(
-                    logical_assignment_plan,
-                    region.get("bbox") or [0, 0, 0, 0],
-                    detection_source=region.get("text_area_detection_source") or text_area_detection_source,
-                )
-                apply_text_area_assignment_to_region(region, assignment)
             if debug_context is not None:
                 debug_context["text_area_plan_logical_assignment_enriched"] = True
+                debug_context["text_area_plan_logical_assignment_enriched_audit_only"] = logical_assignment_plan
         except Exception as exc:
             if debug_context is not None:
                 debug_context["text_area_plan_logical_assignment_error"] = f"{type(exc).__name__}: {exc}"
 
-    route_assist_status = _apply_experimental_text_area_route_assist(
-        image_path=image_path,
-        page_class=page_class,
-        regions=regions,
-    )
+    route_assist_status = {
+        "route_assist_version": "text_area_route_assist_disabled_by_topology_contract",
+        "route_assist_enabled": False,
+        "route_assist_generated": False,
+        "route_assist_error": None,
+        "route_assist_suggestions_considered": 0,
+        "route_assist_eligible_count": 0,
+        "route_assist_applied_count": 0,
+        "route_assist_applied": [],
+        "route_assist_runtime_sec": 0.0,
+    }
     if debug_context is not None:
         debug_context["route_assist"] = route_assist_status
         add_timing(debug_context, "route_assist_time", float(route_assist_status.get("route_assist_runtime_sec") or 0.0))
         set_count(debug_context, "route_assist_suggestions_considered", int(route_assist_status.get("route_assist_suggestions_considered") or 0))
         set_count(debug_context, "route_assist_eligible_suggestions", int(route_assist_status.get("route_assist_eligible_count") or 0))
         set_count(debug_context, "route_assist_applied_regions", int(route_assist_status.get("route_assist_applied_count") or 0))
-    if route_assist_status.get("route_assist_applied_count"):
-        pending_texts, glossary_texts = _refresh_translation_inputs_after_route_assist(
-            regions,
-            translation_cache,
-        )
-
     logical_text_area_plan = text_area_plan
     if text_area_plan is not None:
         try:
             enriched_plan = enrich_text_area_plan_with_region_records(text_area_plan, regions)
-            logical_text_area_plan = enriched_plan
-            for region in regions:
-                enriched_assignment = assign_bbox_to_text_area_plan(
-                    enriched_plan,
-                    region.get("bbox") or [0, 0, 0, 0],
-                    detection_source=region.get("text_area_detection_source") or text_area_detection_source,
-                )
-                apply_text_area_assignment_to_region(region, enriched_assignment)
-                if debug_context is not None:
-                    meta = debug_context.setdefault("regions", {}).setdefault(str(region.get("region_id") or ""), {})
-                    for key, value in region.items():
-                        if key.startswith("text_area_"):
-                            meta[key] = value
             if debug_context is not None:
                 debug_context["text_area_plan"] = enriched_plan
                 debug_context.setdefault("text_area_plan_pre_ocr", text_area_plan.to_dict() if hasattr(text_area_plan, "to_dict") else text_area_plan)
@@ -11987,9 +11977,11 @@ def _process_page(
                 debug_context["text_area_plan_enrichment_error"] = f"{type(exc).__name__}: {exc}"
 
     logical_block_start = time.time()
-    speech_fragment_restore_status = _restore_text_area_speech_fragments_after_assignment(regions, debug_context)
-    if not speech_fragment_restore_status.get("logical_text_speech_container_override_count"):
-        speech_fragment_restore_status = restore_text_area_owned_speech_fragments(regions)
+    speech_fragment_restore_status = {
+        "logical_text_speech_container_override_count": 0,
+        "logical_text_speech_container_override_region_ids": [],
+        "status": "disabled_text_area_graph_is_semantic_authority",
+    }
     if debug_context is not None:
         debug_context["logical_text_speech_container_override"] = speech_fragment_restore_status
         set_count(
@@ -11997,35 +11989,25 @@ def _process_page(
             "logical_text_speech_container_overrides",
             int(speech_fragment_restore_status.get("logical_text_speech_container_override_count") or 0),
         )
-    logical_block_result = apply_same_container_logical_text_blocks(
-        regions,
+    logical_block_result = LogicalTextBlockAssemblyResult(
+        version=LOGICAL_TEXT_BLOCK_VERSION,
         page_id=page_id,
-        image_size=image_size,
-        text_area_plan=logical_text_area_plan,
+        generated=True,
+        applied_count=0,
+        blocks=[],
     )
-    source_reconstruction_status = _reconstruct_logical_text_block_sources(
-        regions,
-        logical_block_result,
-        image_path=image_path,
-        page_image=page_image,
-        image_size=image_size,
-        ocr_engine=ocr_engine,
-        settings=settings,
-        quality_func=assess_logical_text_source_quality,
-        debug_context=debug_context,
-    )
-    punctuation_recovery_status = _recover_punctuation_only_speech_containers(
-        regions,
-        logical_block_result,
-        page_id=page_id,
-        image_path=image_path,
-        page_image=page_image,
-        image_size=image_size,
-        ocr_engine=ocr_engine,
-        settings=settings,
-        quality_func=assess_logical_text_source_quality,
-        debug_context=debug_context,
-    )
+    source_reconstruction_status = {
+        "attempt_count": 0,
+        "applied_count": 0,
+        "attempts": [],
+        "status": "disabled_parent_source_attaches_to_text_area_graph",
+    }
+    punctuation_recovery_status = {
+        "attempt_count": 0,
+        "applied_count": 0,
+        "attempts": [],
+        "status": "disabled_punctuation_identity_is_graph_owned",
+    }
     add_timing(debug_context, "logical_text_block_time", time.time() - logical_block_start)
     if debug_context is not None:
         debug_context["logical_text_source_reconstruction"] = source_reconstruction_status
@@ -12079,22 +12061,14 @@ def _process_page(
         time.perf_counter() - initial_hierarchy_start,
     )
     root_reconstruction_start = time.perf_counter()
-    root_reconstruction_status = _reconstruct_text_block_roots(
-        regions,
-        logical_block_result,
-        initial_text_block_hierarchy,
-        page_id=page_id,
-        image_path=image_path,
-        page_image=page_image,
-        image_size=image_size,
-        ocr_engine=ocr_engine,
-        detector=detector,
-        settings=settings,
-        input_size=image_input_size,
-        font_name=font_name,
-        quality_func=assess_logical_text_source_quality,
-        debug_context=debug_context,
-    )
+    root_reconstruction_status = {
+        "attempt_count": 0,
+        "applied_count": 0,
+        "failed_count": 0,
+        "attempts": [],
+        "roots": {},
+        "status": "disabled_text_area_graph_is_sole_topology_owner",
+    }
     add_timing(
         debug_context,
         "root_reconstruction_time",
@@ -12772,7 +12746,14 @@ def _process_page(
         while len(context_window) > 4:
             context_window.pop(0)
 
-    return PageProcessingResult(regions, execution_regions, parent_execution_bundles, page_class, text_area_plan)
+    return PageProcessingResult(
+        regions,
+        execution_regions,
+        parent_execution_bundles,
+        page_class,
+        text_area_plan,
+        ctd_segmentation_result,
+    )
 
 
 def _enforce_no_bundle_parent_contract(
@@ -16553,65 +16534,9 @@ def _translate_short_reaction_fallback(text: str, target_lang: str) -> str:
     if not cleaned:
         return ""
     stripped = "".join(ch for ch in cleaned if ch.strip())
-    if _is_ellipsis_like(stripped):
+    if _is_ellipsis_like(stripped) or _is_punct_only(stripped):
         return _normalize_short_reaction_terminal_symbols(stripped)
-
-    lexical_text, terminal_symbols = _split_short_reaction_terminal_symbols(cleaned)
-    if not lexical_text:
-        return _normalize_short_reaction_terminal_symbols(terminal_symbols)
-
-    key = _short_reaction_key(lexical_text)
-    mapping = {
-        "あ": "啊",
-        "あっ": "啊",
-        "ああ": "啊啊",
-        "あら": "哎呀",
-        "え": "诶",
-        "えっ": "诶",
-        "えー": "诶——",
-        "ええ": "嗯",
-        "う": "唔",
-        "うっ": "唔",
-        "わ": "哇",
-        "わっ": "哇",
-        "ま": "嘛",
-        "きゃ": "呀",
-        "ぎゃ": "呀",
-        "ふん": "哼",
-        "フン": "哼",
-        "ふふ": "呵呵",
-        "ほら": "你看",
-        "まあ": "嘛",
-        "はい": "好的",
-        "いいえ": "不",
-        "ううん": "嗯嗯",
-        "すいません": "对不起",
-        "はっ": "哈",
-        "はあ": "哈啊",
-        "やん": "呀嗯",
-    }
-    base = mapping.get(key, "")
-    if not base:
-        body = _non_punct_chars(lexical_text)
-        if body and len(body) <= 4 and all(_is_kana(ch) or ch == "ー" for ch in body):
-            seed = "".join(ch for ch in body if ch != "ー")
-            if seed and len(set(seed)) == 1:
-                seed_map = {
-                    "ラ": "啦",
-                    "ら": "啦",
-                    "フ": "呵",
-                    "ふ": "呵",
-                    "ハ": "哈",
-                    "は": "哈",
-                    "ワ": "哇",
-                    "わ": "哇",
-                }
-                syllable = seed_map.get(seed[0], "")
-                if syllable:
-                    base = syllable * len(seed)
-    if not base:
-        return ""
-    return base + _normalize_short_reaction_terminal_symbols(terminal_symbols)
+    return ""
 
 
 def _translation_bad_shape_reasons(translation: str, source_text: str = "") -> list[str]:
@@ -16855,11 +16780,6 @@ def _translation_is_unsafe_for_output(text: str, source_text: str = "") -> bool:
     return False
 
 
-def _source_has_nosebleed_semantics(source_text: str) -> bool:
-    source = str(source_text or "").strip()
-    return "ハナ血" in source or "鼻血" in source
-
-
 def _normalized_kana_body(source_text: str) -> str:
     source = str(source_text or "").strip()
     if not source:
@@ -16874,52 +16794,9 @@ def _normalized_kana_body(source_text: str) -> str:
     return "".join(_non_punct_chars("".join(normalized_chars)))
 
 
-def _source_has_vacation_last_day_semantics(source_text: str) -> bool:
-    source = str(source_text or "").strip()
-    if not source or "最終日" not in source:
-        return False
-    body = _normalized_kana_body(source)
-    if not body:
-        return False
-    return "ばかんす" in body or "ばかしす" in body
-
-
-def _looks_like_mukimuki_fragment(source_text: str) -> bool:
-    body = _normalized_kana_body(source_text)
-    if not body:
-        return False
-    if body == "むきむき" or re.fullmatch(r"(?:むき){2,}", body):
-        return True
-    return body in {"むき", "むさ", "むぎ"}
-
-
 def _apply_source_level_semantic_corrections(source_text: str, translation: str) -> str:
-    source = str(source_text or "").strip()
-    result = str(translation or "").strip()
-    if not source or not result:
-        return result
-    if _source_has_nosebleed_semantics(source):
-        has_blow = any(token in source for token in ("ブー", "ぶー", "プー", "ぷー"))
-        if "また" in source:
-            return "又流鼻血了"
-        if any(token in result for token in ("月经", "经血", "例假", "大姨妈", "姨妈", "生理期")):
-            if has_blow:
-                return "鼻血喷出来了"
-            return "鼻血"
-        if has_blow:
-            if "鼻血喷" in result:
-                return result
-            return "鼻血喷出来了"
-        if "鼻血" not in result:
-            return "鼻血"
-    if _source_has_vacation_last_day_semantics(source):
-        if "じゃ" in source and "なくて" in source:
-            return "不是……是假期的最后一天"
-        if "今日" in source:
-            return "今天是假期的最后一天"
-        if any(token in result for token in ("笨蛋", "希斯", "巴卡", "バカ", "ばか")):
-            return "假期的最后一天"
-    return result
+    _ = source_text
+    return str(translation or "").strip()
 
 
 def _repair_bubble_local_nested_speech_translation(
@@ -16939,26 +16816,7 @@ def _repair_bubble_local_nested_speech_translation(
     if cleaned != result:
         reasons.append("escaped_newline_removed")
         result = cleaned
-    if target_lang != "Simplified Chinese":
-        return result, reasons
-    if "無人島" in source and not any(token in result for token in ("无人岛", "無人島")):
-        before = result
-        if "遇难" in result:
-            result = result.replace("遇难", "在无人岛上遇难", 1)
-        elif "遭难" in result:
-            result = result.replace("遭难", "在无人岛上遭难", 1)
-        if result != before:
-            reasons.append("missing_uninhabited_island_repaired")
-    if "その" in source and not any(token in result for token in ("那个", "那個", "嗯", "呃")):
-        before = result
-        if "现在" in result:
-            result = result.replace("现在", "现在……那个", 1)
-        elif "在无人岛" in result:
-            result = result.replace("在无人岛", "那个……在无人岛", 1)
-        elif "遇难" in result:
-            result = result.replace("遇难", "那个……遇难", 1)
-        if result != before:
-            reasons.append("missing_sono_filler_repaired")
+    _ = source, target_lang
     return result, reasons
 
 
@@ -16970,8 +16828,6 @@ def _should_preserve_decorative_fragment_translation(
     if _is_authoritative_parent_execution_region(region):
         return False
     source = str(source_text or "").strip()
-    if _looks_like_mukimuki_fragment(source):
-        return True
     region_type = str(region.get("type", "") or "").strip().lower()
     if region_type not in {"background_text", "decorative_text", "sfx"}:
         return False
@@ -17006,8 +16862,6 @@ def _should_preserve_decorative_fragment_translation(
         and contains_kana
         and not any(ch.isdigit() for ch in source)
     ):
-        return True
-    if body == "むきむき" or re.fullmatch(r"(?:むき){2,}", body):
         return True
     return False
 
@@ -20558,14 +20412,36 @@ def _classify_semantic_region(
             render_updates,
         )
 
+    if isinstance(text_area_assignment, dict):
+        authorization = str(
+            text_area_assignment.get("text_area_semantic_authorization_state")
+            or text_area_assignment.get("text_area_cleanup_authorization")
+            or ""
+        ).strip()
+        container_type = str(text_area_assignment.get("text_area_container_type") or "").strip()
+        if authorization in {"protect_sfx_decorative", "protect_art_or_non_text"}:
+            semantic_type = "sfx" if container_type == "sfx_decorative_art" else "decorative_text"
+            return semantic_type, True, True, False, {
+                "cleanup_mode": "preserve",
+                "classification_reason": "text_area_plan_protected_nonworkflow_authority",
+            }
+        if authorization in {
+            "review_unknown_not_cleanup",
+            "outside_cleanup_scope",
+            "ambiguous_component_owner",
+        }:
+            return "unknown", True, True, True, {
+                "cleanup_mode": "preserve",
+                "classification_reason": "text_area_plan_nonworkflow_review_authority",
+            }
+
+    return "unknown", True, True, True, {
+        "cleanup_mode": "preserve",
+        "classification_reason": "missing_text_area_semantic_authority",
+    }
+
     if not cleaned:
         return region_type, bg_text, True, True, render_updates
-    if not initial_bg and _looks_like_mukimuki_fragment(cleaned):
-        return "decorative_text", True, True, False, {
-            "cleanup_mode": "preserve",
-            "classification_reason": "low_conf_dark_short_art_sfx_candidate",
-        }
-
     stats = _box_luma_stats_pil(image_obj, bbox)
     _, _, w, h = bbox
     aspect = w / max(1, h)

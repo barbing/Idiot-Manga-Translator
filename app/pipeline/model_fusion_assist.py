@@ -52,48 +52,9 @@ SAFE_FUTURE_CLASSES = {
     "safe_future_missed_text_hint",
 }
 
-OWNERSHIP_PROOF_ALLOWLIST = {
-    "020": {"r017", "r018"},
-}
-
-TEXT_CONSERVATION_PROOF_ALLOWLIST = {
-    "030": {"r004", "r005", "r006"},
-}
-
-ROUTE_GUARD_PROOF_REFERENCES = {
-    "008": {
-        "r004": "008_sfx_decorative_preserve",
-        "r012": "008_sfx_decorative_preserve",
-        "r015": "008_sfx_decorative_preserve",
-    },
-    "020": {
-        "r017": "020_shared_bubble_ownership",
-        "r018": "020_shared_bubble_ownership",
-    },
-    "022": {
-        "r000": "022_breath_sfx_haa",
-        "r003": "022_top_row_captions",
-        "r006": "022_top_row_captions",
-        "r007": "022_breath_sfx_haa",
-        "r008": "022_top_row_captions",
-        "r009": "022_breath_sfx_haa",
-    },
-    "024": {
-        "r009": "024_large_sfx_preserve",
-    },
-    "027": {
-        "r006": "027_recovered_speech",
-    },
-    "030": {
-        "r002": "030_sfx_preserve",
-        "r004": "030_lower_left_text_conservation",
-        "r005": "030_lower_left_text_conservation",
-        "r006": "030_lower_left_text_conservation",
-    },
-    "033": {
-        "r014": "033_bubble_contained_laugh",
-    },
-}
+OWNERSHIP_PROOF_ALLOWLIST: dict[str, set[str]] = {}
+TEXT_CONSERVATION_PROOF_ALLOWLIST: dict[str, set[str]] = {}
+ROUTE_GUARD_PROOF_REFERENCES: dict[str, dict[str, str]] = {}
 
 BUBBLE_LOCAL_OWNERSHIP_REASON = "bubble_local_nested_speech_fragment_ownership"
 ADJACENT_VERTICAL_TEXT_CONSERVATION_REASON = "adjacent_vertical_speech_text_conservation_recovery"
@@ -1189,84 +1150,8 @@ def _regions_have_sfx_or_background_role(region_by_id: Mapping[str, Mapping[str,
 
 
 def _build_030_phrase_status(region_by_id: Mapping[str, Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    r004 = region_by_id.get("r004") or {}
-    r005 = region_by_id.get("r005") or {}
-    r006 = region_by_id.get("r006") or {}
-    target_regions = {"r004": r004, "r005": r005, "r006": r006}
-    phrase_specs = [
-        {
-            "source_phrase": "べ...別に",
-            "ocr_region_ids": ["r004"],
-            "translation_region_id": "r004",
-            "translation_markers": ["也"],
-            "render_markers": ["也"],
-        },
-        {
-            "source_phrase": "楽しかった",
-            "ocr_region_ids": ["r004"],
-            "translation_region_id": "r004",
-            "translation_markers": ["开心"],
-            "render_markers": ["开心"],
-        },
-        {
-            "source_phrase": "わけでは",
-            "ocr_region_ids": ["r004", "r006"],
-            "translation_region_id": "r004",
-            "translation_markers": ["没有"],
-            "render_markers": ["没"],
-            "transferred_region_id": "r006",
-        },
-        {
-            "source_phrase": "ないが",
-            "ocr_region_ids": ["r004"],
-            "translation_region_id": "r004",
-            "translation_markers": ["没有"],
-            "render_markers": ["没"],
-        },
-        {
-            "source_phrase": "ま...まあ食事も悪くないし",
-            "ocr_region_ids": ["r005"],
-            "translation_region_id": "r005",
-            "translation_markers": ["饭菜", ["不错", "不差"]],
-            "render_markers": ["饭", ["不错", "不差"]],
-        },
-    ]
-    statuses: List[Dict[str, Any]] = []
-    for spec in phrase_specs:
-        ocr_region_ids = spec["ocr_region_ids"]
-        translation_region_id = spec["translation_region_id"]
-        translation_region = target_regions.get(translation_region_id) or {}
-        translation = str(translation_region.get("translated_text") or "")
-        wrapped_text = "".join(str(line or "") for line in translation_region.get("wrapped_lines") or [])
-        ocr_covered = any(_phrase_source_marker_present(spec["source_phrase"], str(target_regions.get(rid, {}).get("ocr_text") or "")) for rid in ocr_region_ids)
-        translation_covered = all(_text_marker_present(translation, marker) for marker in spec["translation_markers"])
-        render_covered = all(_text_marker_present(wrapped_text, marker) for marker in spec["render_markers"])
-        duplicate_render = _phrase_duplicate_rendered(spec, target_regions)
-        transferred_ok = True
-        transferred_id = spec.get("transferred_region_id")
-        if transferred_id:
-            transferred = target_regions.get(str(transferred_id)) or {}
-            transferred_ok = (
-                transferred.get("skip_reason") == "ignored_by_pipeline"
-                and not str(transferred.get("translated_text") or "").strip()
-                and transferred.get("final_render_bbox") is None
-            )
-        exactly_once = "yes" if ocr_covered and translation_covered and render_covered and not duplicate_render and transferred_ok else "no"
-        statuses.append(
-            {
-                "source_phrase": spec["source_phrase"],
-                "ocr_region_ids": ocr_region_ids,
-                "translation_region_id": translation_region_id,
-                "ocr_status": "covered" if ocr_covered else "missing",
-                "translated_text_status": "represented" if translation_covered else "missing",
-                "wrapped_render_status": "represented" if render_covered else "missing",
-                "visible_output_status": "visually_confirmed_required; expected_from_render_metadata" if render_covered else "missing_from_render_metadata",
-                "duplicate_status": "duplicate" if duplicate_render else "not_duplicated",
-                "transferred_status": "ok" if transferred_ok else "not_transferred_or_rendered",
-                "exactly_once": exactly_once,
-            }
-        )
-    return statuses
+    _ = region_by_id
+    return []
 
 
 def _text_marker_present(text: str, marker: Any) -> bool:
@@ -1276,23 +1161,9 @@ def _text_marker_present(text: str, marker: Any) -> bool:
 
 
 def _phrase_source_marker_present(source_phrase: str, ocr_text: str) -> bool:
-    phrase = str(source_phrase or "")
-    text = str(ocr_text or "")
-    compact_phrase = re.sub(r"[.\s…‥・･]+", "", phrase)
-    compact_text = re.sub(r"[.\s…‥・･]+", "", text)
-    if compact_phrase and compact_phrase in compact_text:
-        return True
-    if "楽しかった" in phrase:
-        return "楽しかった" in text
-    if "食事" in phrase:
-        return "食事" in text and "悪くない" in text
-    if "別に" in phrase:
-        return "別に" in text
-    if "わけでは" in phrase:
-        return "わけでは" in text
-    if "ないが" in phrase:
-        return "ないが" in text
-    return False
+    compact_phrase = re.sub(r"[.\s…‥・･]+", "", str(source_phrase or ""))
+    compact_text = re.sub(r"[.\s…‥・･]+", "", str(ocr_text or ""))
+    return bool(compact_phrase and compact_phrase in compact_text)
 
 
 def _phrase_duplicate_rendered(spec: Mapping[str, Any], regions: Mapping[str, Mapping[str, Any]]) -> bool:
@@ -1534,8 +1405,6 @@ def _model_review_text_conservation_record(
     if not region_ids:
         return None
     region_set = set(region_ids)
-    if page_id == "030" and region_set.issubset(TEXT_CONSERVATION_PROOF_ALLOWLIST.get("030", set())):
-        return None
     if any(_route_guard_is_preserve_decorative_sfx(region_by_id[rid]) or _route_guard_is_caption_or_background(region_by_id[rid]) for rid in region_ids):
         return None
     return _text_conservation_record(
@@ -2302,8 +2171,6 @@ def _render_constraint_status(
         return "blocked_by_fit_risk", ["fit_simulation_text_completeness_failed"]
     if float(fit.get("estimated_fit_ratio") or 0.0) > 0.98:
         return "blocked_by_fit_risk", [f"fit_ratio_high:{float(fit.get('estimated_fit_ratio') or 0.0):.3f}"]
-    if page_id == "014" and region_id in {"r011", "r013"}:
-        return "proven_existing_allowlist", ["existing_phase4b_render_constraint_allowlist"]
     if tier == "strong_model_container" and render_outside >= 0.30 and source_inside >= 0.70:
         return "safe_future_candidate", ["strong_model_container_with_render_outside_container"]
     if tier == "mask_primary_container" and render_outside >= 0.45 and source_inside >= 0.70:
@@ -2649,10 +2516,6 @@ def _cleanup_boundary_group_id(page_id: str, region: Mapping[str, Any]) -> str |
         return "bubble_local_nested_speech_fragment_ownership"
     if reason == ADJACENT_VERTICAL_TEXT_CONSERVATION_REASON:
         return "adjacent_vertical_speech_text_conservation_recovery"
-    if page_id == "020" and region_id in OWNERSHIP_PROOF_ALLOWLIST.get("020", set()):
-        return "020_shared_bubble_ownership_reference"
-    if page_id == "030" and region_id in TEXT_CONSERVATION_PROOF_ALLOWLIST.get("030", set()):
-        return "030_lower_left_text_conservation_reference"
     return None
 
 

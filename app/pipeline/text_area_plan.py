@@ -128,6 +128,7 @@ PROVIDER_KITSUMED_SPEECH_MASK = "kitsumed_speech_mask_evidence"
 PROVIDER_OGKALU_TEXT_BUBBLE = "ogkalu_text_bubble_evidence"
 PROVIDER_OGKALU_TEXT_FREE_BACKGROUND = "ogkalu_text_free_background_evidence"
 PROVIDER_OGKALU_SFX_DECORATIVE = "ogkalu_sfx_decorative_evidence"
+PROVIDER_COMIC_TEXT_DETECTOR_PARENT_BOUNDARY = "comic_text_detector_parent_boundary_evidence"
 PROVIDER_CURRENT_REGION_SEMANTIC = "current_region_semantic_evidence"
 PROVIDER_TEXTAREA_DETERMINISTIC_TOP_BAND = "textarea_deterministic_top_band_background_evidence"
 PROVIDER_TEXTAREA_DETERMINISTIC_SIDE_NARRATION = "textarea_deterministic_side_narration_evidence"
@@ -138,6 +139,7 @@ APPROVED_SEMANTIC_EVIDENCE_PROVIDERS = {
     PROVIDER_OGKALU_TEXT_BUBBLE,
     PROVIDER_OGKALU_TEXT_FREE_BACKGROUND,
     PROVIDER_OGKALU_SFX_DECORATIVE,
+    PROVIDER_COMIC_TEXT_DETECTOR_PARENT_BOUNDARY,
     PROVIDER_CURRENT_REGION_SEMANTIC,
     PROVIDER_TEXTAREA_DETERMINISTIC_TOP_BAND,
     PROVIDER_TEXTAREA_DETERMINISTIC_SIDE_NARRATION,
@@ -1606,6 +1608,8 @@ def _text_area_graph_workflow_roots_should_merge(
     if not metrics:
         return False
     shared_evidence = bool(_text_area_graph_root_evidence_ids(first) & _text_area_graph_root_evidence_ids(second))
+    if not shared_evidence and not _text_area_graph_has_typed_speech_mask_seam(first, second):
+        return False
     if metrics["intersection_min_ratio"] >= 0.55:
         return True
     if shared_evidence and metrics["intersection_min_ratio"] >= 0.12:
@@ -1859,23 +1863,13 @@ def _text_area_graph_parent_boundary_entries(
     image_size: Tuple[int, int] = (1, 1),
     luma_image: Any = None,
 ) -> List[Dict[str, Any]]:
-    if isinstance(container, TextAreaContainer):
+    ctd_entries = _text_area_graph_ctd_parent_boundary_entries(container)
+    if ctd_entries:
+        entries = ctd_entries
+    elif isinstance(container, TextAreaContainer):
         entries = _semantic_unit_evidence_bboxes_for_container(container)
     else:
         entries = _text_area_graph_mapping_parent_boundary_entries(container)
-    if entries:
-        entries = _text_area_graph_refine_semantic_parent_boundary_entries(
-            container,
-            entries,
-            image_size=image_size,
-            luma_image=luma_image,
-        )
-    if not entries:
-        entries = _text_area_graph_visual_parent_boundary_entries(
-            container,
-            image_size=image_size,
-            luma_image=luma_image,
-        )
     if not entries:
         entries = _linked_text_free_speech_parent_boundary_entries(container)
     output: List[Dict[str, Any]] = []
@@ -1899,7 +1893,7 @@ def _text_area_graph_parent_boundary_entries(
                 "boundary_source": str(entry.get("boundary_source") or TEXT_AREA_GRAPH_PARENT_SOURCE_TEXT_UNIT),
                 "container_overlap_ratio": float(entry.get("container_overlap_ratio") or 0.0),
                 "is_explicit_parent_boundary_evidence": bool(
-                    entry.get("is_explicit_parent_boundary_evidence", True)
+                    entry.get("is_explicit_parent_boundary_evidence", False)
                 ),
             }
         )
@@ -1919,7 +1913,7 @@ def _text_area_graph_refine_semantic_parent_boundary_entries(
     if len(output) != 1 or luma_image is None or np is None:
         return output
     entry = output[0]
-    if not bool(entry.get("is_explicit_parent_boundary_evidence", True)):
+    if not bool(entry.get("is_explicit_parent_boundary_evidence", False)):
         return output
     if str(entry.get("class_name") or "") != "text_bubble":
         return output
@@ -2448,12 +2442,231 @@ def _text_area_graph_mapping_parent_boundary_entries(container: Mapping[str, Any
                 "evidence_id": str(entry.get("evidence_id") or ""),
                 "class_name": class_name,
                 "container_overlap_ratio": round(overlap_ratio, 6),
-                "is_explicit_parent_boundary_evidence": bool(
-                    entry.get("is_explicit_parent_boundary_evidence", True)
+                "is_explicit_parent_boundary_evidence": _text_area_graph_provider_authored_parent_boundary(
+                    container,
+                    entry,
                 ),
             }
         )
     return output
+
+
+def _text_area_graph_ctd_parent_boundary_entries(
+    container: TextAreaContainer | Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    role_evidence = _container_semantic_role_evidence(container)
+    entries = role_evidence.get("ctd_parent_boundary_evidence_bboxes") or []
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        return []
+    output: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        bbox = _text_area_graph_bbox_from_entry(entry)
+        if not bbox:
+            continue
+        output.append(
+            {
+                "bbox": bbox,
+                "evidence_id": str(entry.get("evidence_id") or ""),
+                "class_name": "ctd_text_block",
+                "confidence": float(entry.get("confidence") or 0.0),
+                "boundary_source": "ctd_text_block_evidence",
+                "is_explicit_parent_boundary_evidence": True,
+            }
+        )
+    return output
+
+
+def _text_area_graph_provider_authored_parent_boundary(
+    container: TextAreaContainer | Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> bool:
+    if bool(entry.get("is_explicit_parent_boundary_evidence", False)):
+        return True
+    evidence_id = str(entry.get("evidence_id") or "").strip()
+    class_name = str(entry.get("class_name") or "").strip()
+    if not evidence_id or class_name not in {"text_bubble", "text_free"}:
+        return False
+    expected_provider = {
+        "text_bubble": "ogkalu_text_bubble_evidence",
+        "text_free": "ogkalu_text_free_background_evidence",
+    }[class_name]
+    role_evidence = _container_semantic_role_evidence(container)
+    for record in _semantic_evidence_records(role_evidence):
+        provider = str(record.get("provider") or "").strip()
+        if provider != expected_provider:
+            continue
+        record_id = str(record.get("evidence_id") or "").strip()
+        source_ids = {str(value) for value in record.get("source_model_ids") or [] if str(value)}
+        if evidence_id in source_ids or record_id == f"{expected_provider}:{evidence_id}":
+            return True
+    return False
+
+
+def _text_area_graph_has_typed_speech_mask_seam(
+    first: TextAreaContainer | Mapping[str, Any],
+    second: TextAreaContainer | Mapping[str, Any],
+) -> bool:
+    shared_context = _text_area_graph_shared_speech_context_ids(first, second)
+    if len(shared_context) < 2:
+        return False
+    first_masks = _text_area_graph_typed_speech_mask_polygons(first)
+    second_masks = _text_area_graph_typed_speech_mask_polygons(second)
+    if not first_masks or not second_masks:
+        return False
+    for first_polygon in first_masks:
+        for second_polygon in second_masks:
+            first_bbox = polygon_to_bbox(first_polygon)
+            second_bbox = polygon_to_bbox(second_polygon)
+            dimensions = [
+                first_bbox[2],
+                first_bbox[3],
+                second_bbox[2],
+                second_bbox[3],
+            ]
+            seam_limit = max(4.0, min(float(value) for value in dimensions if value > 0) * 0.04)
+            if _text_area_graph_polygon_distance(first_polygon, second_polygon) <= seam_limit:
+                return True
+    return False
+
+
+def _text_area_graph_shared_speech_context_ids(
+    first: TextAreaContainer | Mapping[str, Any],
+    second: TextAreaContainer | Mapping[str, Any],
+) -> set[str]:
+    first_ids = set(
+        _semantic_role_values(
+            _container_semantic_role_evidence(first),
+            "neighboring_speech_context_ids",
+        )
+    )
+    second_ids = set(
+        _semantic_role_values(
+            _container_semantic_role_evidence(second),
+            "neighboring_speech_context_ids",
+        )
+    )
+    return first_ids & second_ids
+
+
+def _text_area_graph_typed_speech_mask_polygons(
+    container: TextAreaContainer | Mapping[str, Any],
+) -> List[List[List[float]]]:
+    role_evidence = _container_semantic_role_evidence(container)
+    typed_ids = {
+        str(item)
+        for record in _semantic_evidence_records(role_evidence)
+        if str(record.get("provider") or "") == PROVIDER_KITSUMED_SPEECH_MASK
+        and str(record.get("semantic_target") or "") == SEMANTIC_KIND_SPEECH
+        and str(record.get("authority_state") or "") == AUTH_CLEANUP_TRANSLATE_SPEECH
+        and not bool(record.get("requires_review"))
+        for item in record.get("source_model_ids") or []
+        if str(item)
+    }
+    if not typed_ids:
+        return []
+    output: List[List[List[float]]] = []
+    entries = role_evidence.get("speech_mask_polygons") or []
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        return []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or str(entry.get("evidence_id") or "") not in typed_ids:
+            continue
+        polygon = _text_area_graph_polygon_points(entry.get("polygon") or [])
+        if len(polygon) >= 3:
+            output.append(polygon)
+    return output
+
+
+def _text_area_graph_polygon_points(value: Any) -> List[List[float]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    output: List[List[float]] = []
+    for point in value:
+        if not isinstance(point, Sequence) or isinstance(point, (str, bytes)) or len(point) < 2:
+            continue
+        try:
+            output.append([float(point[0]), float(point[1])])
+        except Exception:
+            continue
+    return output
+
+
+def _text_area_graph_polygon_distance(
+    first: Sequence[Sequence[float]],
+    second: Sequence[Sequence[float]],
+) -> float:
+    first_points = _text_area_graph_polygon_points(first)
+    second_points = _text_area_graph_polygon_points(second)
+    if len(first_points) < 2 or len(second_points) < 2:
+        return float("inf")
+    first_segments = list(zip(first_points, first_points[1:] + first_points[:1]))
+    second_segments = list(zip(second_points, second_points[1:] + second_points[:1]))
+    best = float("inf")
+    for first_start, first_end in first_segments:
+        for second_start, second_end in second_segments:
+            if _text_area_graph_segments_intersect(first_start, first_end, second_start, second_end):
+                return 0.0
+            best = min(
+                best,
+                _text_area_graph_point_segment_distance(first_start, second_start, second_end),
+                _text_area_graph_point_segment_distance(first_end, second_start, second_end),
+                _text_area_graph_point_segment_distance(second_start, first_start, first_end),
+                _text_area_graph_point_segment_distance(second_end, first_start, first_end),
+            )
+    return best
+
+
+def _text_area_graph_segments_intersect(
+    first_start: Sequence[float],
+    first_end: Sequence[float],
+    second_start: Sequence[float],
+    second_end: Sequence[float],
+) -> bool:
+    def cross(origin: Sequence[float], first_point: Sequence[float], second_point: Sequence[float]) -> float:
+        return (
+            (float(first_point[0]) - float(origin[0])) * (float(second_point[1]) - float(origin[1]))
+            - (float(first_point[1]) - float(origin[1])) * (float(second_point[0]) - float(origin[0]))
+        )
+
+    first_cross = cross(first_start, first_end, second_start)
+    second_cross = cross(first_start, first_end, second_end)
+    third_cross = cross(second_start, second_end, first_start)
+    fourth_cross = cross(second_start, second_end, first_end)
+    epsilon = 1e-6
+    if (
+        ((first_cross > epsilon and second_cross < -epsilon) or (first_cross < -epsilon and second_cross > epsilon))
+        and ((third_cross > epsilon and fourth_cross < -epsilon) or (third_cross < -epsilon and fourth_cross > epsilon))
+    ):
+        return True
+    return any(
+        _text_area_graph_point_segment_distance(point, start, end) <= epsilon
+        for point, start, end in (
+            (second_start, first_start, first_end),
+            (second_end, first_start, first_end),
+            (first_start, second_start, second_end),
+            (first_end, second_start, second_end),
+        )
+    )
+
+
+def _text_area_graph_point_segment_distance(
+    point: Sequence[float],
+    start: Sequence[float],
+    end: Sequence[float],
+) -> float:
+    px, py = float(point[0]), float(point[1])
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    dx, dy = ex - sx, ey - sy
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 1e-12:
+        return math.hypot(px - sx, py - sy)
+    position = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / length_squared))
+    nearest_x = sx + position * dx
+    nearest_y = sy + position * dy
+    return math.hypot(px - nearest_x, py - nearest_y)
 
 
 def _text_area_graph_parent_boundary_key(entry: Mapping[str, Any]) -> str:
@@ -6267,6 +6480,8 @@ def build_text_area_plan(
     image_size: Tuple[int, int],
     bubble_detection_result: Any,
     current_region_records: Optional[Sequence[Mapping[str, Any]]] = None,
+    *,
+    finalize_graph: bool = True,
 ) -> TextAreaPlan:
     """Build a front-of-pipeline TextAreaPlan from BubbleDetection evidence."""
 
@@ -6370,7 +6585,7 @@ def build_text_area_plan(
             )
 
         plan.generated = True
-        return _finish_plan(plan, started)
+        return _finish_plan(plan, started, finalize_graph=finalize_graph)
     except PipelineStageTechnicalError:
         raise
     except Exception as exc:
@@ -6421,6 +6636,315 @@ def enrich_text_area_plan_with_region_records(
     plan_dict["summary"] = _summary_for_container_dicts(plan_dict.get("containers") or [], len(plan_dict.get("fallback_reasons") or []), plan_dict.get("runtime", {}).get("compatibility_mode"))
     plan_dict["summary"]["enriched_from_region_count"] = enriched_count
     return plan_dict
+
+
+def finalize_text_area_plan_with_ctd_boundary_evidence(
+    plan: TextAreaPlan,
+    *,
+    scoped_detection_candidates: Sequence[Mapping[str, Any]] | None,
+    full_page_detection_candidates: Sequence[Mapping[str, Any]] | None,
+) -> TextAreaPlan:
+    """Finalize graph topology after TextAreaPlan adjudicates CTD geometry."""
+
+    if not isinstance(plan, TextAreaPlan):
+        raise TypeError("CTD parent-boundary finalization requires a TextAreaPlan object")
+    for container in plan.containers:
+        role_evidence = dict(container.semantic_role_evidence or {})
+        role_evidence.pop("ctd_parent_boundary_evidence_bboxes", None)
+        container.semantic_role_evidence = role_evidence
+
+    workflow_containers = [
+        container
+        for container in plan.containers
+        if _text_area_graph_is_workflow_container(container)
+    ]
+    root_groups, _demoted = _text_area_graph_normalized_root_groups(
+        workflow_containers,
+        image_size=plan.image_size,
+    )
+    containers_by_id = {
+        str(container.container_id or ""): container
+        for container in plan.containers
+        if str(container.container_id or "")
+    }
+    scoped_by_container = _ctd_parent_boundary_candidates_by_container(
+        scoped_detection_candidates or [],
+        containers_by_id,
+    )
+    full_by_container = _ctd_parent_boundary_candidates_by_container(
+        full_page_detection_candidates or [],
+        containers_by_id,
+    )
+
+    for group in root_groups:
+        members = [
+            member
+            for member in group.get("containers") or []
+            if isinstance(member, TextAreaContainer)
+        ]
+        member_ids = {
+            str(member.container_id or "")
+            for member in members
+            if str(member.container_id or "")
+        }
+        existing: List[Tuple[TextAreaContainer, Dict[str, Any]]] = []
+        for member in members:
+            for entry in _text_area_graph_parent_boundary_entries(
+                member,
+                image_size=plan.image_size,
+                luma_image=None,
+            ):
+                if bool(entry.get("is_explicit_parent_boundary_evidence")):
+                    existing.append((member, dict(entry)))
+
+        if not existing:
+            root_candidates = _ctd_dedupe_parent_boundary_candidates(
+                [
+                    candidate
+                    for container_id in member_ids
+                    for candidate in full_by_container.get(container_id, [])
+                ]
+            )
+            for candidate in root_candidates:
+                owner = containers_by_id.get(str(candidate.get("container_id") or ""))
+                if owner is not None:
+                    _attach_ctd_parent_boundary_records(owner, [candidate])
+            continue
+
+        if len(existing) != 1:
+            continue
+        owner, provider_entry = existing[0]
+        owner_id = str(owner.container_id or "")
+        split_candidates = _ctd_vertical_parent_island_partition(
+            _text_area_graph_bbox_from_entry(provider_entry),
+            scoped_by_container.get(owner_id, []),
+        )
+        if split_candidates:
+            _attach_ctd_parent_boundary_records(owner, split_candidates)
+
+    plan.root_parent_child_plan = build_text_area_root_parent_child_plan(plan)
+    _update_text_area_graph_summary(plan)
+    return plan
+
+
+def _ctd_parent_boundary_candidates_by_container(
+    candidates: Sequence[Mapping[str, Any]],
+    containers_by_id: Mapping[str, TextAreaContainer],
+) -> Dict[str, List[Dict[str, Any]]]:
+    output: Dict[str, List[Dict[str, Any]]] = {}
+    seen_ids: set[str] = set()
+    for index, candidate in enumerate(candidates or []):
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_id = str(candidate.get("detection_id") or f"ctd_{index:04d}")
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        container_id = str(candidate.get("text_area_container_id") or "")
+        container = containers_by_id.get(container_id)
+        if container is None:
+            continue
+        route = str(candidate.get("route_intent") or "")
+        auth = str(
+            candidate.get("semantic_authorization_state")
+            or candidate.get("cleanup_authorization")
+            or ""
+        )
+        if route not in {ROUTE_TRANSLATE_SPEECH, ROUTE_TRANSLATE_CAPTION}:
+            continue
+        if auth not in {
+            AUTH_CLEANUP_TRANSLATE_SPEECH,
+            AUTH_CLEANUP_TRANSLATE_BACKGROUND,
+            AUTH_CLEANUP_TRANSLATE_CAPTION,
+        }:
+            continue
+        if not bool(candidate.get("authorization_explicit")):
+            continue
+        if bool(candidate.get("must_not_mutate")):
+            continue
+        bbox = _text_area_graph_bbox_from_any(candidate.get("bbox") or [])
+        if not bbox or _inside_ratio_xywh(bbox, container.bbox) < 0.50:
+            continue
+        output.setdefault(container_id, []).append(
+            {
+                "candidate_id": candidate_id,
+                "container_id": container_id,
+                "bbox": bbox,
+                "confidence": float(candidate.get("confidence") or 0.0),
+            }
+        )
+    return output
+
+
+def _ctd_dedupe_parent_boundary_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    ordered = sorted(
+        (dict(candidate) for candidate in candidates if isinstance(candidate, Mapping)),
+        key=lambda item: (
+            -float(item.get("confidence") or 0.0),
+            -_bbox_area_xywh(item.get("bbox") or []),
+            str(item.get("candidate_id") or ""),
+        ),
+    )
+    output: List[Dict[str, Any]] = []
+    for candidate in ordered:
+        bbox = candidate.get("bbox") or []
+        if any(
+            _ctd_bbox_intersection_min_ratio(bbox, existing.get("bbox") or []) >= 0.72
+            for existing in output
+        ):
+            continue
+        output.append(candidate)
+    return output
+
+
+def _ctd_vertical_parent_island_partition(
+    provider_bbox: Sequence[Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    px, py, pw, ph = _coerce_xywh(provider_bbox)
+    if pw <= 0 or ph <= 0:
+        return []
+    provider_area = float(max(1, pw * ph))
+    eligible: List[Dict[str, Any]] = []
+    for candidate in _ctd_dedupe_parent_boundary_candidates(candidates):
+        bbox = _text_area_graph_bbox_from_any(candidate.get("bbox") or [])
+        if not bbox or _bbox_area_xywh(bbox) < provider_area * 0.12:
+            continue
+        center_x = bbox[0] + bbox[2] / 2.0
+        center_y = bbox[1] + bbox[3] / 2.0
+        if not (px <= center_x <= px + pw and py <= center_y <= py + ph):
+            continue
+        eligible.append({**candidate, "bbox": bbox})
+    if len(eligible) != 2:
+        return []
+    upper, lower = sorted(eligible, key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    upper_bbox = upper["bbox"]
+    lower_bbox = lower["bbox"]
+    metrics = _text_area_graph_axis_overlap_metrics(upper_bbox, lower_bbox)
+    if not metrics or metrics["x_overlap_min_ratio"] < 0.55:
+        return []
+    minimum_height = float(max(1, min(upper_bbox[3], lower_bbox[3])))
+    minimum_gap = max(4.0, minimum_height * 0.03)
+    maximum_gap = max(12.0, float(ph) * 0.25)
+    if not (minimum_gap <= metrics["y_gap"] <= maximum_gap):
+        return []
+    coverage = (
+        _bbox_area_xywh(upper_bbox) + _bbox_area_xywh(lower_bbox)
+    ) / provider_area
+    if coverage < 0.32:
+        return []
+    return _ctd_pad_vertical_parent_island_partition(
+        [px, py, pw, ph],
+        [upper, lower],
+    )
+
+
+def _ctd_pad_vertical_parent_island_partition(
+    provider_bbox: Sequence[Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    px, py, pw, ph = _coerce_xywh(provider_bbox)
+    if pw <= 0 or ph <= 0 or len(candidates) != 2:
+        return []
+    upper, lower = [dict(candidate) for candidate in candidates]
+    ux, uy, uw, uh = _coerce_xywh(upper.get("bbox") or [])
+    lx, ly, lw, lh = _coerce_xywh(lower.get("bbox") or [])
+    separator = int(round(((uy + uh) + ly) / 2.0))
+    separator = max(py + 1, min(py + ph - 1, separator))
+
+    def padded(
+        candidate: Dict[str, Any],
+        bbox: Sequence[Any],
+        *,
+        top_limit: int,
+        bottom_limit: int,
+    ) -> Dict[str, Any]:
+        x, y, width, height = _coerce_xywh(bbox)
+        pad_x = max(6, int(round(width * 0.10)))
+        pad_y = max(6, int(round(height * 0.10)))
+        x0 = max(px, x - pad_x)
+        x1 = min(px + pw, x + width + pad_x)
+        y0 = max(top_limit, y - pad_y)
+        y1 = min(bottom_limit, y + height + pad_y)
+        return {
+            **candidate,
+            "bbox": [x0, y0, max(1, x1 - x0), max(1, y1 - y0)],
+        }
+
+    return [
+        padded(upper, [ux, uy, uw, uh], top_limit=py, bottom_limit=separator),
+        padded(lower, [lx, ly, lw, lh], top_limit=separator, bottom_limit=py + ph),
+    ]
+
+
+def _ctd_bbox_intersection_min_ratio(
+    first: Sequence[Any],
+    second: Sequence[Any],
+) -> float:
+    ax, ay, aw, ah = _coerce_xywh(first)
+    bx, by, bw, bh = _coerce_xywh(second)
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    intersection = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(
+        0,
+        min(ay + ah, by + bh) - max(ay, by),
+    )
+    return float(intersection) / float(max(1, min(aw * ah, bw * bh)))
+
+
+def _attach_ctd_parent_boundary_records(
+    container: TextAreaContainer,
+    candidates: Sequence[Mapping[str, Any]],
+) -> None:
+    role_evidence = dict(container.semantic_role_evidence or {})
+    records: List[Dict[str, Any]] = []
+    semantic_records = list(role_evidence.get("semantic_evidence_records") or [])
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        bbox = _text_area_graph_bbox_from_any(candidate.get("bbox") or [])
+        if not candidate_id or not bbox:
+            continue
+        evidence_id = f"{PROVIDER_COMIC_TEXT_DETECTOR_PARENT_BOUNDARY}:{candidate_id}"
+        records.append(
+            {
+                "evidence_id": evidence_id,
+                "provider": PROVIDER_COMIC_TEXT_DETECTOR_PARENT_BOUNDARY,
+                "class_name": "ctd_text_block",
+                "bbox": bbox,
+                "confidence": float(candidate.get("confidence") or 0.0),
+                "is_explicit_parent_boundary_evidence": True,
+            }
+        )
+        semantic_records.append(
+            {
+                "evidence_id": evidence_id,
+                "provider": PROVIDER_COMIC_TEXT_DETECTOR_PARENT_BOUNDARY,
+                "provider_version": SEMANTIC_EVIDENCE_PROVIDER_VERSION,
+                "semantic_target": _text_area_graph_semantic_role(container),
+                "authority_state": str(
+                    container.semantic_authorization_state
+                    or container.cleanup_authorization
+                    or ""
+                ),
+                "bbox": bbox,
+                "source_model_ids": [candidate_id],
+                "source_container_ids": [str(container.container_id or "")],
+                "basis": "typed_source_text_free_ctd_text_block_geometry",
+                "confidence_tier": str(candidate.get("confidence") or ""),
+                "reason_codes": ["typed_source_text_free_ctd_parent_boundary"],
+                "negative_evidence": [],
+                "requires_review": False,
+                "created_by": "model",
+                "page_id": str(container.page_id or ""),
+            }
+        )
+    if not records:
+        return
+    role_evidence["ctd_parent_boundary_evidence_bboxes"] = records
+    role_evidence["semantic_evidence_records"] = semantic_records
+    container.semantic_role_evidence = role_evidence
 
 
 def assign_bbox_to_text_area_plan(
@@ -7853,8 +8377,9 @@ def _semantic_unit_evidence_bboxes_for_container(container: TextAreaContainer) -
                 "evidence_id": str(entry.get("evidence_id") or ""),
                 "class_name": class_name,
                 "container_overlap_ratio": round(overlap_ratio, 6),
-                "is_explicit_parent_boundary_evidence": bool(
-                    entry.get("is_explicit_parent_boundary_evidence", True)
+                "is_explicit_parent_boundary_evidence": _text_area_graph_provider_authored_parent_boundary(
+                    container,
+                    entry,
                 ),
             }
         )
@@ -8063,7 +8588,12 @@ def _semantic_units_from_container(container: TextAreaContainer) -> List[TextAre
     return units
 
 
-def _finish_plan(plan: TextAreaPlan, started: float) -> TextAreaPlan:
+def _finish_plan(
+    plan: TextAreaPlan,
+    started: float,
+    *,
+    finalize_graph: bool = True,
+) -> TextAreaPlan:
     plan.runtime.generated = bool(plan.generated)
     plan.runtime.runtime_sec = round(time.perf_counter() - started, 6)
     by_type: Dict[str, int] = {}
@@ -8085,7 +8615,7 @@ def _finish_plan(plan: TextAreaPlan, started: float) -> TextAreaPlan:
         container = containers_by_id.get(str(scope.container_id or ""))
         if container:
             _copy_container_authorization_to_scope(scope, container)
-    if plan.root_parent_child_plan is None:
+    if finalize_graph and plan.root_parent_child_plan is None:
         plan.root_parent_child_plan = build_text_area_root_parent_child_plan(plan)
     for container in plan.containers:
         by_type[container.container_type] = by_type.get(container.container_type, 0) + 1
@@ -8111,23 +8641,29 @@ def _finish_plan(plan: TextAreaPlan, started: float) -> TextAreaPlan:
         "fallback_count": len(plan.fallback_reasons),
         "compatibility_mode": plan.runtime.compatibility_mode,
     }
-    if plan.root_parent_child_plan is not None:
-        graph_plan = _root_parent_child_plan_to_dict(plan.root_parent_child_plan)
-        diagnostics = graph_plan.get("diagnostics") if isinstance(graph_plan.get("diagnostics"), Mapping) else {}
-        plan.summary["root_parent_child_plan"] = {
-            "root_node_count": len(graph_plan.get("root_nodes") or []),
-            "parent_boundary_candidate_count": len(graph_plan.get("parent_boundary_candidates") or []),
-            "parent_node_count": len(graph_plan.get("parent_nodes") or []),
-            "child_evidence_slot_count": len(graph_plan.get("child_evidence_slots") or []),
-            "excluded_inventory_count": len(graph_plan.get("excluded_inventory") or []),
-            "graph_blocker_count": len(graph_plan.get("graph_blockers") or []),
-            "source_evidence_payload_count": len(graph_plan.get("source_evidence_payloads") or []),
-            "parent_boundary_candidate_state_counts": dict(
-                diagnostics.get("parent_boundary_candidate_state_counts") or {}
-            ),
-            "blocker_counts": dict(diagnostics.get("blocker_counts") or {}),
-        }
+    _update_text_area_graph_summary(plan)
     return plan
+
+
+def _update_text_area_graph_summary(plan: TextAreaPlan) -> None:
+    if plan.root_parent_child_plan is None:
+        plan.summary.pop("root_parent_child_plan", None)
+        return
+    graph_plan = _root_parent_child_plan_to_dict(plan.root_parent_child_plan)
+    diagnostics = graph_plan.get("diagnostics") if isinstance(graph_plan.get("diagnostics"), Mapping) else {}
+    plan.summary["root_parent_child_plan"] = {
+        "root_node_count": len(graph_plan.get("root_nodes") or []),
+        "parent_boundary_candidate_count": len(graph_plan.get("parent_boundary_candidates") or []),
+        "parent_node_count": len(graph_plan.get("parent_nodes") or []),
+        "child_evidence_slot_count": len(graph_plan.get("child_evidence_slots") or []),
+        "excluded_inventory_count": len(graph_plan.get("excluded_inventory") or []),
+        "graph_blocker_count": len(graph_plan.get("graph_blockers") or []),
+        "source_evidence_payload_count": len(graph_plan.get("source_evidence_payloads") or []),
+        "parent_boundary_candidate_state_counts": dict(
+            diagnostics.get("parent_boundary_candidate_state_counts") or {}
+        ),
+        "blocker_counts": dict(diagnostics.get("blocker_counts") or {}),
+    }
 
 
 def _sync_scopes_to_authorized_containers(plan: TextAreaPlan) -> None:

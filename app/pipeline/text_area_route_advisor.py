@@ -87,7 +87,7 @@ def enrich_audit_with_route_advisor(audit: dict[str, Any]) -> dict[str, Any]:
 
 
 def route_assist_enabled() -> bool:
-    return _truthy_env(ROUTE_ASSIST_FLAG)
+    return False
 
 
 def route_consumption_proof_enabled() -> bool:

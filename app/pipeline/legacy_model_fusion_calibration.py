@@ -76,10 +76,7 @@ def current_route_summary(region_infos: list[RegionInfo]) -> str:
 
 
 def has_render_constraint_case(page: str, regions: set[str], region_infos: list[RegionInfo]) -> bool:
-    if page == "014" and regions.intersection({"r011", "r013"}):
-        return True
-    if page == "020" and regions.intersection({"r013"}):
-        return True
+    _ = page, regions
     for info in region_infos:
         for suggestion in info.render_suggestions:
             if suggestion.get("suggestion_type") in {
@@ -204,14 +201,6 @@ def classify_fused_record(
         )
 
     if fused_type == "ambiguous":
-        if page == "030" and affected_ids.intersection({"r004", "r006"}) and has_text_bubble:
-            return (
-                "safe_future_missed_text_hint",
-                True,
-                "ogkalu text_bubble recovers known lower-left speech text evidence missed by kitsumed",
-                "safe as review/missed-text hint, not automatic translation",
-                ["strong speech-bubble visual evidence", "OCR phrase conservation", "no duplicate source text"],
-            )
         if has_text_free:
             return (
                 "review_only_text_free",
