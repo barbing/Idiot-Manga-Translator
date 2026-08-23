@@ -348,3 +348,33 @@ def write_diagnostic_checkpoint(
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
     return path
+
+
+def pipeline_diagnostic_checkpoint(
+    *,
+    module: str,
+    stage: str,
+    event: str,
+    fields: Mapping[str, Any] | None = None,
+    debug_dir: str | None = None,
+) -> str:
+    """Write one generic opt-in pipeline checkpoint.
+
+    Checkpoints are diagnostic artifacts only. They are disabled unless the
+    normal debug controls and MT_PIPELINE_DIAGNOSTIC_CHECKPOINTS are enabled.
+    """
+
+    if not diagnostic_enabled("MT_PIPELINE_DIAGNOSTIC_CHECKPOINTS"):
+        return ""
+    try:
+        return write_diagnostic_checkpoint(
+            "pipeline_diagnostic_checkpoints.jsonl",
+            module=module,
+            stage=stage,
+            event=event,
+            fields=fields,
+            debug_dir=debug_dir,
+            include_monotonic=False,
+        )
+    except Exception:
+        return ""

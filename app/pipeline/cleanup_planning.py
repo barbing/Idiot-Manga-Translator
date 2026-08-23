@@ -31,7 +31,11 @@ from app.pipeline.cleanup_masks import CleanupMaskBuildResult
 from app.pipeline import cleanup_execution
 from app.pipeline import cleanup_backend_runner
 from app.pipeline.debug_artifacts import mask_stats, write_debug_image_file
-from app.pipeline.debug_runtime import diagnostic_enabled, write_diagnostic_checkpoint
+from app.pipeline.debug_runtime import (
+    diagnostic_enabled,
+    pipeline_diagnostic_checkpoint,
+    write_diagnostic_checkpoint,
+)
 from app.pipeline.status_contracts import PipelineStage, PipelineStageTechnicalError
 
 try:
@@ -154,10 +158,6 @@ def _perf_add(bucket: dict[str, Any] | None, key: str, value: float) -> None:
     bucket[key] = round(float(bucket.get(key) or 0.0) + max(0.0, float(value or 0.0)), 3)
 
 
-def _page014_timeout_diag_enabled() -> bool:
-    return diagnostic_enabled("MT_PAGE014_TIMEOUT_DIAGNOSTIC")
-
-
 def _cleanup_perf_contract_diag_enabled() -> bool:
     return diagnostic_enabled("MT_CLEANUP_PERF_CONTRACT_DIAGNOSTIC")
 
@@ -190,21 +190,14 @@ def _cleanup_perf_contract_checkpoint(stage: str, event: str, **fields: Any) -> 
         return
 
 
-def _page014_timeout_checkpoint(stage: str, event: str, **fields: Any) -> None:
+def _pipeline_runtime_checkpoint(stage: str, event: str, **fields: Any) -> None:
     _cleanup_perf_contract_checkpoint(stage, event, **fields)
-    if not _page014_timeout_diag_enabled():
-        return
-    try:
-        write_diagnostic_checkpoint(
-            "page014_timeout_checkpoints.jsonl",
-            module="app.pipeline.cleanup_planning",
-            stage=stage,
-            event=event,
-            fields=fields,
-            include_monotonic=False,
-        )
-    except Exception:
-        return
+    pipeline_diagnostic_checkpoint(
+        module="app.pipeline.cleanup_planning",
+        stage=stage,
+        event=event,
+        fields=fields,
+    )
 
 
 @dataclass(frozen=True)
@@ -391,7 +384,7 @@ def build_cleanup_plans(
     plan_started = time.time()
     jobs = _extract_jobs(job_candidates)
     jobs_by_id = {str(job.cleanup_job_id): job for job in jobs}
-    render_eligibility_by_region = _render_eligibility_by_region_id(render_eligibility)
+    _ = render_eligibility
     mask_result = _extract_masks(mask_contracts)
     masks_by_job_id: dict[str, list[CleanupMask]] = {}
     for cleanup_mask in mask_result:
@@ -439,7 +432,6 @@ def build_cleanup_plans(
                 "stage": "CleanupPlan",
                 "owner": "CleanupPlan accounting",
             }
-            suppressed_decision = _source_grounding_suppressed_decision(job, render_eligibility_by_region)
             blocked_reason = _job_exclusion_reason(job)
             if blocked_reason:
                 protected_records.append({**base_with_mask, "reason": blocked_reason})
@@ -528,12 +520,6 @@ def build_cleanup_plans(
                     "partition_strategy_required": bool(mask_rejection),
                     "flatness_metrics": flat_metrics,
                     "backend_inventory": backend_inventory,
-                    "render_eligibility_suppressed_source_ungrounded": bool(suppressed_decision is not None),
-                    "render_eligibility_source_grounding_failure_reason": (
-                        _decision_value(suppressed_decision, "reason")
-                        if suppressed_decision is not None
-                        else ""
-                    ),
                 }
             )
             plan = CleanupPlan(
@@ -1540,10 +1526,10 @@ def run_cleanup_runtime_contract(
     masks_by_job_id: dict[str, list[CleanupMask]] = {}
     for cleanup_mask in masks:
         masks_by_job_id.setdefault(str(cleanup_mask.cleanup_job_id), []).append(cleanup_mask)
-    render_eligibility_by_region = _render_eligibility_by_region_id(render_eligibility)
+    _ = render_eligibility
     proof_context = _cleanup_proof_page_context(source_image)
     execution_context = _cleanup_execution_page_context(image)
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_runtime_contract",
         "start",
         page_id=page_id,
@@ -1705,7 +1691,7 @@ def run_cleanup_runtime_contract(
     except Exception:
         warmup_min_plans = 4
     if prewarmed_cleanup_model:
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_runtime_model_warmup",
             "skipped",
             page_id=page_id,
@@ -1715,7 +1701,7 @@ def run_cleanup_runtime_contract(
         )
     elif use_gpu and model_required_obligation_count >= warmup_min_plans:
         warmup_started = time.time()
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_runtime_model_warmup",
             "start",
             page_id=page_id,
@@ -1731,7 +1717,7 @@ def run_cleanup_runtime_contract(
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_runtime_model_warmup",
             "end",
             page_id=page_id,
@@ -1757,7 +1743,7 @@ def run_cleanup_runtime_contract(
             runtime_class=planned_runtime_class or _enum_value(job.cleanup_class),
         )
         target_region_ids = [str(rid) for rid in job.target_region_ids or [] if str(rid)]
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_runtime_job",
             "start",
             page_id=page_id,
@@ -1766,21 +1752,11 @@ def run_cleanup_runtime_contract(
             cleanup_class=_enum_value(job.cleanup_class),
         )
         try:
-            suppressed_decision = _source_grounding_suppressed_decision(job, render_eligibility_by_region)
-            if suppressed_decision is not None:
-                base_record = {
-                    **base_record,
-                    "render_eligibility_suppressed_source_ungrounded": True,
-                    "render_eligibility_source_grounding_failure_reason": _decision_value(
-                        suppressed_decision,
-                        "reason",
-                    ),
-                }
             if planned_runtime_class is None:
                 contract_error = _contract_error_for_reason(
                     "runtime_cleanup_class_not_executable"
                 )
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_runtime_job",
                     "contract_error",
                     page_id=page_id,
@@ -1804,7 +1780,7 @@ def run_cleanup_runtime_contract(
             exclusion = _runtime_job_exclusion_reason(job, cleanup_mask)
             if exclusion:
                 contract_error = _contract_error_for_reason(exclusion)
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_runtime_job",
                     "contract_error",
                     page_id=page_id,
@@ -1902,7 +1878,7 @@ def run_cleanup_runtime_contract(
                     proof_records.extend(partition_proofs)
                     status_records.extend(partition_statuses)
                     parent_cleanup_unit_aggregate_records.extend(partition_aggregate_records)
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_runtime_job",
                         "end",
                         page_id=page_id,
@@ -1914,7 +1890,7 @@ def run_cleanup_runtime_contract(
                         elapsed_ms=round((time.time() - job_started) * 1000.0, 3),
                     )
                     continue
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_runtime_job",
                     "contract_error",
                     page_id=page_id,
@@ -1973,7 +1949,7 @@ def run_cleanup_runtime_contract(
                 cleanup_class=planned_runtime_class,
             )
             before = image.copy() if hasattr(image, "copy") else image
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_cleanup_attempts",
                 "start",
                 page_id=page_id,
@@ -1996,7 +1972,7 @@ def run_cleanup_runtime_contract(
                 artifact_dir=artifact_dir,
                 proof_context=proof_context,
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_cleanup_attempts",
                 "end",
                 page_id=page_id,
@@ -2115,7 +2091,7 @@ def run_cleanup_runtime_contract(
                     "renderer_consumed": False,
                 }
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_runtime_job",
                 "end",
                 page_id=page_id,
@@ -2130,7 +2106,7 @@ def run_cleanup_runtime_contract(
             raise
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_runtime_job",
                 "error",
                 page_id=page_id,
@@ -2160,7 +2136,7 @@ def run_cleanup_runtime_contract(
         perf_contract["runtime_obligation_count"] = len(runtime_obligations)
         perf_contract["result_count"] = len(result_records)
         perf_contract["proof_count"] = len(proof_records)
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_runtime_contract",
         "end",
         page_id=page_id,
@@ -2217,7 +2193,7 @@ def commit_cleanup_runtime_results_to_working_image(
     result_records = list(getattr(runtime_contract, "result_records", []) or [])
     proof_records = list(getattr(runtime_contract, "proof_records", []) or [])
     status_records = list(getattr(runtime_contract, "status_records", []) or [])
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_upstream_commit",
         "start",
         page_id=page_id,
@@ -2418,7 +2394,7 @@ def commit_cleanup_runtime_results_to_working_image(
                 root_committed_obligations.add(
                     str(base.get("cleanup_obligation_id") or base.get("cleanup_mask_id") or "")
                 )
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_upstream_commit_result",
                     "root_candidate_committed",
                     page_id=page_id,
@@ -2449,7 +2425,7 @@ def commit_cleanup_runtime_results_to_working_image(
                         "root_block_reason": root_failure,
                     }
                 )
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_upstream_commit_result",
                     "root_blocked",
                     page_id=page_id,
@@ -2506,7 +2482,7 @@ def commit_cleanup_runtime_results_to_working_image(
         record["cleanup_upstream_diff_ref"] = refs.get("commit_diff_ref", "")
         record["cleanup_upstream_mask_ref"] = refs.get("commit_mask_ref", "")
 
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_upstream_commit",
         "end",
         page_id=page_id,
@@ -3116,7 +3092,7 @@ def execute_cleanup_runtime_plan(
         debug_info["backend_context_commit_scope"] = "cleanup_mask"
     debug_info["model_required"] = bool(model_required)
     debug_info["requested_model_id"] = str(model_id or "")
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_execute_runtime_plan",
         "start",
         page_id=page_id,
@@ -3312,7 +3288,7 @@ def execute_cleanup_runtime_plan(
     )
     if runtime_perf is not None:
         _perf_add(runtime_perf, "artifact_write_ms", _perf_elapsed_ms(perf_artifact_started))
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_execute_runtime_plan",
         "end",
         page_id=page_id,
@@ -3774,37 +3750,39 @@ def _runtime_cleanup_class_for_job(job: CleanupJob, requested_class: CleanupClas
 
 
 def _runtime_job_exclusion_reason(job: CleanupJob, cleanup_mask: CleanupMask | None = None) -> str:
-    if bool(job.protected):
+    canonical_parent = bool(str(getattr(job, "parent_execution_bundle_id", "") or "").strip())
+    if bool(job.protected) and not canonical_parent:
         return job.protection_reason or "job_protected"
     cleanup_only = bool(getattr(job, "cleanup_only_obligation", False))
     if cleanup_only:
         return "cleanup_only_obligation_not_runtime_authority"
-    source_evidence_reason = _runtime_source_evidence_exclusion_reason(job, cleanup_mask)
-    if source_evidence_reason:
-        return source_evidence_reason
-    combined = " ".join(
-        str(value or "")
-        for value in (
-            _enum_value(job.cleanup_class),
-            job.route_intent,
-            job.semantic_class,
-            job.cleanup_mode,
-            job.container_type,
-            " ".join(job.source_glyph_mask_ids or []),
-        )
-    ).lower()
-    for blocked in (
-        "preserve",
-        "sfx",
-        "decorative",
-        "non_text",
-        "non_translation_art",
-        "art_only",
-        "source_grounding_protected",
-        "source_ungrounded",
-    ):
-        if blocked in combined:
-            return f"phase5_runtime_excludes_{blocked}"
+    if not canonical_parent:
+        source_evidence_reason = _runtime_source_evidence_exclusion_reason(job, cleanup_mask)
+        if source_evidence_reason:
+            return source_evidence_reason
+        combined = " ".join(
+            str(value or "")
+            for value in (
+                _enum_value(job.cleanup_class),
+                job.route_intent,
+                job.semantic_class,
+                job.cleanup_mode,
+                job.container_type,
+                " ".join(job.source_glyph_mask_ids or []),
+            )
+        ).lower()
+        for blocked in (
+            "preserve",
+            "sfx",
+            "decorative",
+            "non_text",
+            "non_translation_art",
+            "art_only",
+            "source_grounding_protected",
+            "source_ungrounded",
+        ):
+            if blocked in combined:
+                return f"phase5_runtime_excludes_{blocked}"
     if not job.source_text_present and not cleanup_only:
         return "source_text_missing"
     if not job.translated_text_present and not cleanup_only:
@@ -6079,7 +6057,7 @@ def _run_adaptive_cleanup_attempts(
         model_plan.backend_parameters["authorized_ai_retry_source"] = (
             "formal_cleanup_plan_exact_cleanup_mask"
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "start",
             page_id=page_id,
@@ -6119,7 +6097,7 @@ def _run_adaptive_cleanup_attempts(
                 "model_required_by_ai_mode",
             )
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "end",
             page_id=page_id,
@@ -6132,7 +6110,7 @@ def _run_adaptive_cleanup_attempts(
             runtime_ms=model_result.runtime_ms,
         )
         if _proof_passed_with_pixels(model_result, model_proof):
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_cleanup_attempts",
                 "early_pass",
                 page_id=page_id,
@@ -6152,7 +6130,7 @@ def _run_adaptive_cleanup_attempts(
             retry_reason="initial_attempt",
             suffix="",
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "start",
             page_id=page_id,
@@ -6184,7 +6162,7 @@ def _run_adaptive_cleanup_attempts(
         results.append(first_result)
         proofs.append(first_proof)
         attempts.append(_adaptive_attempt_record(first_result, first_proof, 0, "current_conservative", "initial_attempt"))
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "end",
             page_id=page_id,
@@ -6197,7 +6175,7 @@ def _run_adaptive_cleanup_attempts(
             runtime_ms=first_result.runtime_ms,
         )
         if _proof_passed_with_pixels(first_result, first_proof):
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_cleanup_attempts",
                 "early_pass",
                 page_id=page_id,
@@ -6223,7 +6201,7 @@ def _run_adaptive_cleanup_attempts(
                 retry_reason=last_proof.failure_reason or last_result.failure_reason or "backend_noop_or_error",
                 suffix=f"_attempt{attempt_index}_{strategy}",
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_attempt",
                 "start",
                 page_id=page_id,
@@ -6263,7 +6241,7 @@ def _run_adaptive_cleanup_attempts(
                     last_proof.failure_reason or last_result.failure_reason or "backend_noop_or_error",
                 )
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_attempt",
                 "end",
                 page_id=page_id,
@@ -6279,7 +6257,7 @@ def _run_adaptive_cleanup_attempts(
             last_proof = noop_proof
             attempt_index += 1
             if _proof_passed_with_pixels(noop_result, noop_proof):
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "adaptive_cleanup_attempts",
                     "early_pass",
                     page_id=page_id,
@@ -6303,7 +6281,7 @@ def _run_adaptive_cleanup_attempts(
         inpaint_plan.backend_parameters["mask_faithful_root_inpaint_source"] = (
             "formal_cleanup_plan_exact_cleanup_mask"
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "start",
             page_id=page_id,
@@ -6343,7 +6321,7 @@ def _run_adaptive_cleanup_attempts(
                 last_proof.failure_reason or last_result.failure_reason or "background_cleanup_incomplete",
             )
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "end",
             page_id=page_id,
@@ -6359,7 +6337,7 @@ def _run_adaptive_cleanup_attempts(
         last_proof = inpaint_proof
         attempt_index += 1
         if _proof_passed_with_pixels(inpaint_result, inpaint_proof):
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_cleanup_attempts",
                 "early_pass",
                 page_id=page_id,
@@ -6384,7 +6362,7 @@ def _run_adaptive_cleanup_attempts(
                     "skip_reason": residual_retry_skip_reason,
                 }
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_attempt",
                 "skipped",
                 page_id=page_id,
@@ -6410,7 +6388,7 @@ def _run_adaptive_cleanup_attempts(
                 "previous_cleanup_candidate"
             )
             residual_plan.backend_parameters["residual_retry_foreground_pixels"] = retry_pixels
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_attempt",
                 "start",
                 page_id=page_id,
@@ -6454,7 +6432,7 @@ def _run_adaptive_cleanup_attempts(
                     last_proof.failure_reason or "source_residual_remaining",
                 )
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_attempt",
                 "end",
                 page_id=page_id,
@@ -6506,7 +6484,7 @@ def _run_adaptive_cleanup_attempts(
             last_proof = combined_proof
             attempt_index += 2
             if _proof_passed_with_pixels(combined_result, combined_proof):
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "adaptive_cleanup_attempts",
                     "early_pass",
                     page_id=page_id,
@@ -6525,7 +6503,7 @@ def _run_adaptive_cleanup_attempts(
             retry_reason=last_proof.failure_reason or "collateral_or_destructive_fill",
             suffix=f"_attempt{attempt_index}_restoration_retry",
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "start",
             page_id=page_id,
@@ -6565,7 +6543,7 @@ def _run_adaptive_cleanup_attempts(
                 last_proof.failure_reason or "collateral_or_destructive_fill",
             )
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "end",
             page_id=page_id,
@@ -6593,7 +6571,7 @@ def _run_adaptive_cleanup_attempts(
         ai_plan = replace(ai_plan, inpaint_mode="ai")
         ai_plan.backend_parameters["inpaint_mode"] = "ai"
         ai_plan.backend_parameters["authorized_ai_retry_source"] = "formal_cleanup_plan_exact_cleanup_mask"
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "start",
             page_id=page_id,
@@ -6633,7 +6611,7 @@ def _run_adaptive_cleanup_attempts(
                 last_proof.failure_reason or "caption_background_cleanup_incomplete",
             )
         )
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "adaptive_attempt",
             "end",
             page_id=page_id,
@@ -6646,7 +6624,7 @@ def _run_adaptive_cleanup_attempts(
             runtime_ms=ai_result.runtime_ms,
         )
         if _proof_passed_with_pixels(ai_result, ai_proof):
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "adaptive_cleanup_attempts",
                 "early_pass",
                 page_id=page_id,
@@ -6670,7 +6648,7 @@ def _run_adaptive_cleanup_attempts(
                         "skip_reason": residual_retry_skip_reason,
                     }
                 )
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "adaptive_attempt",
                     "skipped",
                     page_id=page_id,
@@ -6698,7 +6676,7 @@ def _run_adaptive_cleanup_attempts(
                     "previous_cleanup_candidate"
                 )
                 residual_plan.backend_parameters["residual_retry_foreground_pixels"] = residual_pixels
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "adaptive_attempt",
                     "start",
                     page_id=page_id,
@@ -6738,7 +6716,7 @@ def _run_adaptive_cleanup_attempts(
                         ai_proof.failure_reason or "source_residual_remaining_after_ai",
                     )
                 )
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "adaptive_attempt",
                     "end",
                     page_id=page_id,
@@ -6790,7 +6768,7 @@ def _run_adaptive_cleanup_attempts(
                     )
                 )
                 if _proof_passed_with_pixels(combined_result, combined_proof):
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "adaptive_cleanup_attempts",
                         "early_pass",
                         page_id=page_id,
@@ -6800,7 +6778,7 @@ def _run_adaptive_cleanup_attempts(
                     )
                     return results, proofs, attempts
 
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "adaptive_cleanup_attempts",
         "end",
         page_id=page_id,
@@ -6832,7 +6810,7 @@ def _execute_cleanup_attempt(
 ) -> tuple[CleanupResult, CleanupProof]:
     attempt_started = time.time()
     canonical_region_id = _canonical_parent_region_id(cleanup_plan, cleanup_mask, fallback_region_id=region_id)
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_attempt_execute",
         "start",
         page_id=page_id,
@@ -6895,7 +6873,7 @@ def _execute_cleanup_attempt(
     ):
         if key in cleanup_plan.backend_parameters:
             result.backend_parameters.setdefault(key, cleanup_plan.backend_parameters.get(key))
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_attempt_proof",
         "start",
         page_id=page_id,
@@ -6920,7 +6898,7 @@ def _execute_cleanup_attempt(
         proof.metrics["proof_elapsed_ms"] = proof_elapsed_ms
     except Exception:
         pass
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_attempt_execute",
         "end",
         page_id=page_id,
@@ -7796,8 +7774,11 @@ def _int_or_none(value: Any) -> int | None:
 
 
 def _job_exclusion_reason(job: CleanupJob) -> str:
-    if bool(job.protected):
+    canonical_parent = bool(str(getattr(job, "parent_execution_bundle_id", "") or "").strip())
+    if bool(job.protected) and not canonical_parent:
         return job.protection_reason or "job_protected"
+    if canonical_parent:
+        return ""
     combined = " ".join(
         str(value or "")
         for value in (
@@ -7825,6 +7806,8 @@ def _job_exclusion_reason(job: CleanupJob) -> str:
 
 
 def _mask_exclusion_reason(cleanup_mask: CleanupMask, image_size: tuple[int, int] | None) -> str:
+    if _canonical_parent_cleanup_mask(cleanup_mask):
+        return _runtime_structural_mask_error(cleanup_mask)
     if cleanup_mask.protected:
         return cleanup_mask.protection_reason or "mask_protected"
     if _is_diagnostic_non_segmentation_cleanup_mask(cleanup_mask):
@@ -7918,12 +7901,13 @@ def _runtime_structural_mask_error(cleanup_mask: CleanupMask) -> str:
     dropped runtime task before the exact mask reaches the backend.
     """
 
-    if cleanup_mask.protected:
+    canonical_parent = _canonical_parent_cleanup_mask(cleanup_mask)
+    if cleanup_mask.protected and not canonical_parent:
         return cleanup_mask.protection_reason or "mask_protected"
     if _is_diagnostic_non_segmentation_cleanup_mask(cleanup_mask):
         return "diagnostic_non_segmentation_fallback_not_executable"
     protected_conflict = _mask_protected_conflict_reason(cleanup_mask)
-    if protected_conflict:
+    if protected_conflict and not canonical_parent:
         return protected_conflict
     visual_scope = _normalise_cleanup_visual_scope(cleanup_mask.visual_scope)
     if not visual_scope:
@@ -7934,19 +7918,23 @@ def _runtime_structural_mask_error(cleanup_mask: CleanupMask) -> str:
         return "cleanup_job_id_missing"
     component_projected = _is_component_projected_cleanup_mask(cleanup_mask, visual_scope)
     rejection_reason = str(getattr(cleanup_mask, "rejection_reason", "") or "")
-    if rejection_reason and not _is_component_projection_ready_audit_rejection(cleanup_mask, rejection_reason):
+    if (
+        rejection_reason
+        and not canonical_parent
+        and not _is_component_projection_ready_audit_rejection(cleanup_mask, rejection_reason)
+    ):
         return f"mask_rejected_{rejection_reason}"
     consumed_source_ids = _unique_texts(cleanup_mask.consumed_source_glyph_mask_ids)
     missing_source_ids = _unique_texts(cleanup_mask.missing_source_glyph_mask_ids)
-    if missing_source_ids and not component_projected:
+    if missing_source_ids and not component_projected and not canonical_parent:
         return "missing_required_source_glyph_evidence"
-    if not consumed_source_ids and not component_projected:
+    if not consumed_source_ids and not component_projected and not canonical_parent:
         return "consumed_source_glyph_evidence_missing"
-    if visual_scope == "source_glyph_local" and len(consumed_source_ids) != 1 and not component_projected:
+    if visual_scope == "source_glyph_local" and len(consumed_source_ids) != 1 and not component_projected and not canonical_parent:
         return "source_glyph_local_membership_count_mismatch"
-    if visual_scope == "source_glyph_union" and len(consumed_source_ids) <= 1 and not component_projected:
+    if visual_scope == "source_glyph_union" and len(consumed_source_ids) <= 1 and not component_projected and not canonical_parent:
         return "source_glyph_union_membership_count_mismatch"
-    if visual_scope == "source_glyph_union_partition" and len(consumed_source_ids) <= 1 and not component_projected:
+    if visual_scope == "source_glyph_union_partition" and len(consumed_source_ids) <= 1 and not component_projected and not canonical_parent:
         return "source_glyph_union_partition_membership_count_mismatch"
     if cleanup_mask.foreground_mask is None or cleanup_mask.erase_mask is None:
         return "mask_raw_arrays_missing"
@@ -7960,83 +7948,28 @@ def _runtime_structural_mask_error(cleanup_mask: CleanupMask) -> str:
         return "segmentation_contract_override_detected"
     # Sparse component coverage is recorded on the mask/plan for audit, but it
     # is not a structural runtime defect.
+    if int(cleanup_mask.foreground_mask_pixels or 0) <= 0:
+        return "foreground_mask_empty"
     if int(cleanup_mask.erase_mask_pixels or 0) <= 0:
         return "erase_mask_empty"
     return ""
 
 
 def _accepted_executable_cleanup_mask(cleanup_mask: CleanupMask) -> bool:
-    if cleanup_mask is None:
-        return False
-    if bool(getattr(cleanup_mask, "protected", False)):
-        return False
-    if _is_diagnostic_non_segmentation_cleanup_mask(cleanup_mask):
-        return False
-    if getattr(cleanup_mask, "foreground_mask", None) is None or getattr(cleanup_mask, "erase_mask", None) is None:
-        return False
-    if int(getattr(cleanup_mask, "foreground_mask_pixels", 0) or 0) <= 0:
-        return False
-    if int(getattr(cleanup_mask, "erase_mask_pixels", 0) or 0) <= 0:
-        return False
-    rejection_reason = str(getattr(cleanup_mask, "rejection_reason", "") or "")
-    audit_only_projection_warning = _component_projection_outside_warning_is_audit_only(
-        cleanup_mask,
-        rejection_reason,
-    )
-    projection_state = str(getattr(cleanup_mask, "projection_quality_state", "") or "")
-    if projection_state and projection_state != PROJECTION_READY_STATE and not audit_only_projection_warning:
-        return False
-    readiness_state = str(getattr(cleanup_mask, "mask_readiness_state", "") or "")
-    if readiness_state and readiness_state != MASK_READY_STATE and not audit_only_projection_warning:
-        return False
-    if rejection_reason and not _is_component_projection_ready_audit_rejection(cleanup_mask, rejection_reason):
-        return False
-    if bool(getattr(cleanup_mask, "sourceglyph_executable_influence_detected", False)):
-        return False
-    if bool(getattr(cleanup_mask, "segmentation_contract_override_detected", False)):
-        return False
-    if bool(getattr(cleanup_mask, "bbox_executable_foreground_detected", False)):
-        return False
-    if bool(getattr(cleanup_mask, "page_level_executable_foreground_detected", False)):
-        return False
-    return True
+    return cleanup_mask is not None and not _runtime_structural_mask_error(cleanup_mask)
 
 
 def _cleanup_mask_non_executable_defect(cleanup_mask: CleanupMask) -> str:
     if cleanup_mask is None:
         return "cleanup_mask_missing"
-    if bool(getattr(cleanup_mask, "protected", False)):
-        return getattr(cleanup_mask, "protection_reason", "") or "cleanup_mask_protected"
-    if _is_diagnostic_non_segmentation_cleanup_mask(cleanup_mask):
-        return "diagnostic_non_segmentation_fallback_not_executable"
-    if getattr(cleanup_mask, "foreground_mask", None) is None or getattr(cleanup_mask, "erase_mask", None) is None:
-        return "mask_raw_arrays_missing"
-    if int(getattr(cleanup_mask, "foreground_mask_pixels", 0) or 0) <= 0:
-        return "foreground_mask_empty"
-    if int(getattr(cleanup_mask, "erase_mask_pixels", 0) or 0) <= 0:
-        return "erase_mask_empty"
-    rejection_reason = str(getattr(cleanup_mask, "rejection_reason", "") or "")
-    audit_only_projection_warning = _component_projection_outside_warning_is_audit_only(
-        cleanup_mask,
-        rejection_reason,
+    return _runtime_structural_mask_error(cleanup_mask) or "cleanup_mask_not_executable"
+
+
+def _canonical_parent_cleanup_mask(cleanup_mask: CleanupMask) -> bool:
+    return bool(
+        str(getattr(cleanup_mask, "parent_execution_bundle_id", "") or "").strip()
+        or str(getattr(cleanup_mask, "parent_logical_text_unit_id", "") or "").strip()
     )
-    projection_state = str(getattr(cleanup_mask, "projection_quality_state", "") or "")
-    if projection_state and projection_state != PROJECTION_READY_STATE and not audit_only_projection_warning:
-        return f"projection_not_ready_{_safe_reason_token(projection_state)}"
-    readiness_state = str(getattr(cleanup_mask, "mask_readiness_state", "") or "")
-    if readiness_state and readiness_state != MASK_READY_STATE and not audit_only_projection_warning:
-        return f"mask_not_ready_{_safe_reason_token(readiness_state)}"
-    if rejection_reason and not _is_component_projection_ready_audit_rejection(cleanup_mask, rejection_reason):
-        return f"mask_rejected_{rejection_reason}"
-    if bool(getattr(cleanup_mask, "sourceglyph_executable_influence_detected", False)):
-        return "sourceglyph_executable_influence_detected"
-    if bool(getattr(cleanup_mask, "segmentation_contract_override_detected", False)):
-        return "segmentation_contract_override_detected"
-    if bool(getattr(cleanup_mask, "bbox_executable_foreground_detected", False)):
-        return "bbox_executable_foreground_detected"
-    if bool(getattr(cleanup_mask, "page_level_executable_foreground_detected", False)):
-        return "page_level_executable_foreground_detected"
-    return "cleanup_mask_not_executable"
 
 
 def _is_diagnostic_non_segmentation_cleanup_mask(cleanup_mask: CleanupMask) -> bool:
@@ -8647,38 +8580,6 @@ def _first_identity_list(sources: Sequence[Any], key: str) -> list[str]:
             if items:
                 return items
     return []
-
-
-def _render_eligibility_by_region_id(render_eligibility: Any | None) -> dict[str, Any]:
-    if render_eligibility is None:
-        return {}
-    decisions = getattr(render_eligibility, "decisions_by_region_id", None)
-    if isinstance(decisions, Mapping):
-        return {str(key): value for key, value in decisions.items()}
-    if isinstance(render_eligibility, Mapping):
-        raw = render_eligibility.get("decisions_by_region_id")
-        if isinstance(raw, Mapping):
-            return {str(key): value for key, value in raw.items()}
-        raw_list = render_eligibility.get("decisions")
-        if isinstance(raw_list, Sequence) and not isinstance(raw_list, (str, bytes)):
-            output: dict[str, Any] = {}
-            for item in raw_list:
-                rid = str(_decision_value(item, "region_id") or "")
-                if rid:
-                    output[rid] = item
-            return output
-    return {}
-
-
-def _source_grounding_suppressed_decision(
-    job: CleanupJob,
-    decisions_by_region_id: Mapping[str, Any],
-) -> Any | None:
-    for region_id in job.target_region_ids or []:
-        decision = decisions_by_region_id.get(str(region_id or ""))
-        if str(_decision_value(decision, "status") or "") == "suppressed_source_ungrounded":
-            return decision
-    return None
 
 
 def _decision_value(decision: Any, key: str) -> Any:

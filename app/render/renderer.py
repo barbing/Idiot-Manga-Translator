@@ -137,13 +137,13 @@ def _renderer_stage5_renderable_parent_bundles(
             bundle_id
         ) or render_eligibility_by_region.get(parent_id)
         status = _render_eligibility_status(decision)
-        if status.startswith("suppressed_"):
+        if decision is not None:
             _renderer_perf_mark_region(
                 debug_context,
                 perf_telemetry_context,
                 bundle_id or parent_id,
                 renderer_input_authority="parent_execution_bundle",
-                render_suppressed_by_upstream_eligibility=True,
+                render_readiness_diagnostic_present=True,
                 render_eligibility_status=status,
                 render_eligibility_reason=_render_eligibility_value(decision, "reason"),
                 legacy_region_rendering_used=False,

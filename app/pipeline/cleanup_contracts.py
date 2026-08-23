@@ -552,6 +552,9 @@ def build_cleanup_job_candidates(
             region.get("cleanup_required")
             or render.get("cleanup_required")
         )
+        authoritative_cleanup_parent = bool(
+            parent_execution_authoritative and parent_cleanup_required
+        )
         parent_execution_id = str(
             region.get("parent_execution_bundle_id")
             or region.get("parent_logical_text_unit_id")
@@ -646,7 +649,7 @@ def build_cleanup_job_candidates(
             skipped_records.append({**base_record, "reason": "cleanup_unit_membership_ambiguous", "detail": cleanup_unit.ambiguous_reason})
             continue
 
-        if _explicitly_inactive(region, render):
+        if _explicitly_inactive(region, render) and not authoritative_cleanup_parent:
             if accepted_cleanup_obligation:
                 obligation_records.append(
                     _obligation_record(
@@ -663,7 +666,7 @@ def build_cleanup_job_candidates(
             skipped_records.append({**base_record, "reason": "region_inactive"})
             continue
 
-        if protected_reason:
+        if protected_reason and not authoritative_cleanup_parent:
             if accepted_cleanup_obligation:
                 obligation_records.append(
                     _obligation_record(
@@ -761,7 +764,10 @@ def build_cleanup_job_candidates(
             skipped_records.append({**base_record, "reason": "no_translated_text"})
             continue
 
-        if _region_flag(region, render, "ignore", "skip_translation", "no_translation"):
+        if (
+            _region_flag(region, render, "ignore", "skip_translation", "no_translation")
+            and not authoritative_cleanup_parent
+        ):
             if accepted_cleanup_obligation:
                 obligation_records.append(
                     _obligation_record(
@@ -807,6 +813,19 @@ def build_cleanup_job_candidates(
             semantic_class=semantic_class,
             cleanup_mode=cleanup_mode,
         )
+        if authoritative_cleanup_parent and cleanup_class == CleanupClass.PRESERVE_SFX_DECORATIVE:
+            cleanup_class, classification_reason, skip_reason = _classify_cleanup_class(
+                region=region,
+                render=render,
+                source_records=[],
+                route_intent=route_intent,
+                semantic_class="",
+                cleanup_mode="",
+            )
+            classification_reason = (
+                "parent_execution_bundle_cleanup_required_overrides_legacy_preserve_class:"
+                f"{classification_reason}"
+            )
         job_blocking_reason = ""
         if skip_reason:
             skip_record = {

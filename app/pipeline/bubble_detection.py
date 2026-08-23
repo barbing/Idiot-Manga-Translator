@@ -254,37 +254,6 @@ class BubbleDetectionResult:
             "cache_invalidation_reason": self.cache_invalidation_reason,
         }
 
-    def legacy_model_fusion_evidence(self) -> Dict[str, Any]:
-        return {
-            "backend": {
-                "bubble_detection_version": self.version,
-                "providers_requested": self.providers_requested,
-                "kitsumed_session_providers": self.providers_used.get("kitsumed", []),
-                "ogkalu_session_providers": self.providers_used.get("ogkalu", []),
-                "kitsumed_provider_used": _primary_provider(self.providers_used.get("kitsumed", [])),
-                "ogkalu_provider_used": _primary_provider(self.providers_used.get("ogkalu", [])),
-                "kitsumed_latency_sec": self.runtime.get("latency_sec", {}).get("kitsumed", {}),
-                "ogkalu_latency_sec": self.runtime.get("latency_sec", {}).get("ogkalu", {}),
-                "model_paths": self.model_paths,
-                "model_hashes": self.model_hashes,
-                "provider_fallback_used": self.provider_fallback_used,
-                "service_runtime_sec": self.runtime_sec,
-                "cache_enabled": self.cache_enabled,
-                "cache_key": self.cache_key,
-                "cache_hit": self.cache_hit,
-                "cache_read_path": self.cache_read_path,
-                "cache_write_path": self.cache_write_path,
-                "cache_error": self.cache_error,
-                "cache_invalidation_reason": self.cache_invalidation_reason,
-            },
-            "kitsumed_speech_bubbles": self.bubble_model_evidence,
-            "ogkalu_text_bubble_detections": self.text_area_model_evidence,
-            "region_model_links": self.region_model_links,
-            "fused_containers": self.fused_containers,
-            "bubble_detection_service": self.to_dict(),
-        }
-
-
 @dataclass
 class _BubbleDetectionRuntime:
     fusion_module: Any

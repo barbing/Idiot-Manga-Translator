@@ -392,8 +392,12 @@ def build_cleanup_masks(
                 rejected_records.append({**base, "reason": "allowed_cleanup_area_missing_or_invalid"})
                 continue
 
+            canonical_parent = bool(
+                str(getattr(job, "parent_execution_bundle_id", "") or "").strip()
+                or str(getattr(job, "parent_logical_text_unit_id", "") or "").strip()
+            )
             allowed_rejection = _allowed_area_rejection(allowed, image_size)
-            if allowed_rejection:
+            if allowed_rejection and not canonical_parent:
                 rejected_records.append({**base, "reason": allowed_rejection, "allowed_area": allowed})
                 continue
 
@@ -562,7 +566,7 @@ def build_cleanup_masks(
                 allow_growth_exception=bool(exception_reason),
             )
             component_projected = _effective_uses_component_projection(effective)
-            if broad_rejection and not component_projected:
+            if broad_rejection and not component_projected and not canonical_parent:
                 rejected_records.append(
                     {
                         **base,
@@ -3356,6 +3360,11 @@ def _allowed_area_rejection(allowed: list[int], image_size: tuple[int, int] | No
 
 
 def _job_protection_reason(job: CleanupJob) -> str:
+    if (
+        str(getattr(job, "parent_execution_bundle_id", "") or "").strip()
+        or str(getattr(job, "parent_logical_text_unit_id", "") or "").strip()
+    ):
+        return ""
     if bool(getattr(job, "protected", False)):
         return str(getattr(job, "protection_reason", "") or "job_protected")
     cleanup_class = getattr(job, "cleanup_class", "")

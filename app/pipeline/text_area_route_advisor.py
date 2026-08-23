@@ -7,19 +7,11 @@ production region routing, cleanup, translation, rendering, or project output.
 """
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
 
 ROUTE_ADVISOR_VERSION = "text_area_route_advisor_phase2a_v1"
-ROUTE_ASSIST_VERSION = "text_area_route_assist_phase2c_v1"
-ROUTE_ASSIST_FLAG = "MT_TEXT_AREA_ROUTE_ASSIST"
-ROUTE_CONSUMPTION_PROOF_VERSION = "phase4b18_route_consumption_proof_v1"
-ROUTE_CONSUMPTION_PROOF_FLAG = "MT_MODEL_FUSION_ROUTE_CONSUMPTION_PROOF"
-MODEL_FUSION_ASSIST_FLAG = "MT_MODEL_FUSION_ASSIST"
-HIGH_ACCURACY_BUBBLE_MODE_FLAG = "MT_HIGH_ACCURACY_BUBBLE_MODE"
-LEGACY_PAGE_SPECIFIC_ASSIST_FLAG = "MT_LEGACY_PAGE_SPECIFIC_ASSIST"
 PHASE2_STATUS = "advisory_only"
 
 SPEECH_REASONS = {
@@ -51,13 +43,6 @@ DECORATIVE_REASONS = {
     "low_conf_dark_short_art_sfx_candidate",
 }
 
-ELIGIBLE_ROUTE_ASSIST_TYPES = {
-    "probable_sfx_decorative_preserve",
-    "probable_bubble_contained_short_speech",
-    "probable_caption_not_speech",
-}
-
-
 def enrich_audit_with_route_advisor(audit: dict[str, Any]) -> dict[str, Any]:
     """Attach advisory route suggestions to an enriched debug audit.
 
@@ -81,93 +66,14 @@ def enrich_audit_with_route_advisor(audit: dict[str, Any]) -> dict[str, Any]:
         enriched["route_advisor_error"] = str(exc)
         for region in enriched.get("regions", []) or []:
             region["diagnostic_route_suggestions"] = []
-    _attach_route_consumption_proof(enriched, enriched.get("route_suggestions", []) or [])
     enriched["route_advisor_runtime_sec"] = round(time.time() - start, 6)
     return enriched
 
 
 def route_assist_enabled() -> bool:
+    """Compatibility probe: route suggestions never have mutation authority."""
+
     return False
-
-
-def route_consumption_proof_enabled() -> bool:
-    """Return whether Phase 4b-18 dry-run proof metadata should be generated."""
-    return _truthy_env(ROUTE_CONSUMPTION_PROOF_FLAG) and (
-        _truthy_env(LEGACY_PAGE_SPECIFIC_ASSIST_FLAG)
-        and (
-            _truthy_env(MODEL_FUSION_ASSIST_FLAG)
-            or _truthy_env(HIGH_ACCURACY_BUBBLE_MODE_FLAG)
-        )
-    )
-
-
-def apply_route_assist_to_regions(
-    *,
-    page_id: str,
-    source_path: str,
-    output_path: str | None,
-    page_class: str | None,
-    regions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Apply eligible high-confidence route suggestions when explicitly enabled.
-
-    This function is intentionally fail-closed. When the experimental flag is
-    off it returns without inspecting diagnostics. When the flag is on, failures
-    are reported in the returned status and no exception is propagated.
-    """
-    start = time.time()
-    status: dict[str, Any] = {
-        "route_assist_version": ROUTE_ASSIST_VERSION,
-        "route_assist_enabled": route_assist_enabled(),
-        "route_assist_generated": False,
-        "route_assist_error": None,
-        "route_assist_suggestions_considered": 0,
-        "route_assist_eligible_count": 0,
-        "route_assist_applied_count": 0,
-        "route_assist_applied": [],
-    }
-    if not status["route_assist_enabled"]:
-        status["route_assist_runtime_sec"] = round(time.time() - start, 6)
-        return status
-    try:
-        from app.pipeline.text_area_diagnostics import enrich_audit_with_text_area_diagnostics
-
-        audit = _build_route_assist_audit(page_id, source_path, output_path, page_class, regions)
-        project_regions = {
-            str(region.get("region_id") or ""): region
-            for region in regions
-            if str(region.get("region_id") or "")
-        }
-        enriched = enrich_audit_with_text_area_diagnostics(
-            audit,
-            audit_path=None,
-            project_regions=project_regions,
-        )
-        if not enriched.get("diagnostic_generated"):
-            raise ValueError(str(enriched.get("diagnostic_error") or "text-area diagnostics unavailable"))
-        suggestions = build_route_suggestions(enriched)
-        status["route_assist_suggestions_considered"] = len(suggestions)
-        regions_by_id = {
-            str(region.get("region_id") or ""): region
-            for region in regions
-            if str(region.get("region_id") or "")
-        }
-        eligible = [item for item in suggestions if _eligible_route_assist_suggestion(item)]
-        status["route_assist_eligible_count"] = len(eligible)
-        for suggestion in eligible:
-            region = regions_by_id.get(str(suggestion.get("region_id") or ""))
-            if not region:
-                continue
-            applied = _apply_route_assist_suggestion(region, suggestion)
-            if applied:
-                status["route_assist_applied"].append(applied)
-        status["route_assist_applied_count"] = len(status["route_assist_applied"])
-        status["route_assist_generated"] = True
-    except Exception as exc:  # pragma: no cover - experimental path fails closed
-        status["route_assist_generated"] = False
-        status["route_assist_error"] = str(exc)
-    status["route_assist_runtime_sec"] = round(time.time() - start, 6)
-    return status
 
 
 def build_route_suggestions(audit: dict[str, Any]) -> list[dict[str, Any]]:
@@ -208,194 +114,14 @@ def build_route_suggestions(audit: dict[str, Any]) -> list[dict[str, Any]]:
     return suggestions
 
 
-def _build_route_assist_audit(
-    page_id: str,
-    source_path: str,
-    output_path: str | None,
-    page_class: str | None,
-    regions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    audit_regions = []
-    for order_idx, region in enumerate(regions):
-        flags = region.get("flags", {}) or {}
-        confidence = region.get("confidence", {}) or {}
-        render = region.get("render", {}) or {}
-        semantic = str(region.get("type") or "unknown")
-        audit_regions.append(
-            {
-                "page_id": page_id,
-                "region_id": str(region.get("region_id") or ""),
-                "bbox": region.get("bbox"),
-                "polygon": region.get("polygon"),
-                "detection_confidence": confidence.get("det"),
-                "ocr_confidence": confidence.get("ocr"),
-                "ocr_text": region.get("ocr_text", ""),
-                "normalized_ocr_text": _normalize_for_assist_audit(region.get("ocr_text", "")),
-                "reading_order_index": order_idx,
-                "group_id": region.get("group_id"),
-                "bubble_id": region.get("bubble_id"),
-                "semantic_class": semantic,
-                "is_speech_bubble": semantic == "speech_bubble",
-                "is_background": semantic == "background_text" or bool(flags.get("bg_text")),
-                "is_decorative": semantic == "decorative_text",
-                "is_sfx": semantic in {"decorative_text", "sfx"} or bool(flags.get("sfx")),
-                "classification_reason": render.get("classification_reason"),
-                "cleanup_mode": render.get("cleanup_mode"),
-                "translated_text": region.get("translation", ""),
-                "skip_reason": "ignored_by_pipeline" if flags.get("ignore") else None,
-                "source_orientation": render.get("source_orientation"),
-                "source_size_hint": render.get("source_size_hint"),
-                "source_size_min": render.get("source_size_min"),
-                "source_size_max": render.get("source_size_max"),
-                "flags": flags,
-            }
-        )
-    return {
-        "page_id": page_id,
-        "page_class": page_class,
-        "source_path": source_path,
-        "output_path": output_path,
-        "regions": audit_regions,
-    }
 
 
-def _normalize_for_assist_audit(text: Any) -> str:
-    return "".join(str(text or "").split())
 
 
-def _eligible_route_assist_suggestion(suggestion: dict[str, Any]) -> bool:
-    if suggestion.get("confidence") != "high":
-        return False
-    if suggestion.get("suggestion_type") not in ELIGIBLE_ROUTE_ASSIST_TYPES:
-        return False
-    if suggestion.get("contraindications"):
-        return False
-    reason_codes = set(str(item) for item in (suggestion.get("reason_codes") or []))
-    suggestion_type = suggestion.get("suggestion_type")
-    if suggestion_type == "probable_sfx_decorative_preserve":
-        return (
-            suggestion.get("suggested_semantic_class") == "decorative_text"
-            and suggestion.get("suggested_cleanup_mode") == "preserve"
-            and "container_type:sfx_decorative" in reason_codes
-            and "non_speech_decorative_container" in reason_codes
-            and "preserve_policy_candidate" in reason_codes
-        )
-    if suggestion_type == "probable_bubble_contained_short_speech":
-        return (
-            suggestion.get("suggested_semantic_class") == "speech_bubble"
-            and "container_type:speech_bubble" in reason_codes
-            and "bubble_boundary_evidence" in reason_codes
-            and "short_kana_laugh_or_reaction_text" in reason_codes
-            and "high_ocr_confidence" in reason_codes
-        )
-    if suggestion_type == "probable_caption_not_speech":
-        return (
-            suggestion.get("suggested_semantic_class") == "background_text"
-            and "container_type:caption" in reason_codes
-            and "caption_band_evidence" in reason_codes
-            and any(str(item).startswith("current_reason:") for item in reason_codes)
-        )
-    return False
 
 
-def _apply_route_assist_suggestion(region: dict[str, Any], suggestion: dict[str, Any]) -> dict[str, Any] | None:
-    previous_semantic = str(region.get("type") or "")
-    flags = region.setdefault("flags", {})
-    render = region.setdefault("render", {})
-    previous_cleanup = render.get("cleanup_mode")
-    previous_ignore = bool(flags.get("ignore"))
-    previous_bg = bool(flags.get("bg_text"))
-
-    target_semantic = str(suggestion.get("suggested_semantic_class") or previous_semantic)
-    target_cleanup = _route_assist_cleanup_mode(suggestion, target_semantic, previous_cleanup)
-    target_ignore = previous_ignore
-    target_bg = previous_bg
-    target_review = bool(flags.get("needs_review"))
-
-    suggestion_type = str(suggestion.get("suggestion_type") or "")
-    if suggestion_type == "probable_sfx_decorative_preserve":
-        target_ignore = True
-        target_bg = True
-        target_review = False
-    elif suggestion_type == "probable_bubble_contained_short_speech":
-        target_ignore = False
-        target_bg = False
-    elif suggestion_type == "probable_caption_not_speech":
-        target_ignore = False
-        target_bg = True
-
-    changed = (
-        previous_semantic != target_semantic
-        or previous_cleanup != target_cleanup
-        or previous_ignore != target_ignore
-        or previous_bg != target_bg
-    )
-    if not changed:
-        return None
-
-    region["type"] = target_semantic
-    render["cleanup_mode"] = target_cleanup
-    flags["ignore"] = target_ignore
-    flags["bg_text"] = target_bg
-    flags["needs_review"] = target_review
-    if target_ignore:
-        region["translation"] = ""
-    if target_semantic == "speech_bubble":
-        flags.pop("hard_fail", None)
-        if str(render.get("source_orientation") or "").strip().lower() == "vertical":
-            render["wrap_mode"] = "vertical"
-
-    audit_payload = {
-        "route_assist_applied": True,
-        "route_assist_version": ROUTE_ASSIST_VERSION,
-        "route_assist_suggestion_type": suggestion_type,
-        "route_assist_reason_codes": suggestion.get("reason_codes", []),
-        "route_assist_previous_semantic_class": previous_semantic,
-        "route_assist_previous_cleanup_mode": previous_cleanup,
-        "route_assist_previous_ignore": previous_ignore,
-        "route_assist_previous_bg_text": previous_bg,
-        "route_assist_new_semantic_class": target_semantic,
-        "route_assist_new_cleanup_mode": target_cleanup,
-        "route_assist_new_ignore": target_ignore,
-        "route_assist_new_bg_text": target_bg,
-        "route_assist_confidence": suggestion.get("confidence"),
-        "route_assist_linked_container_id": suggestion.get("linked_container_id"),
-        "route_assist_linked_ownership_id": suggestion.get("linked_ownership_id"),
-    }
-    render.update(audit_payload)
-    return {
-        "region_id": str(region.get("region_id") or ""),
-        "suggestion_type": suggestion_type,
-        "previous_semantic_class": previous_semantic,
-        "previous_cleanup_mode": previous_cleanup,
-        "previous_ignore": previous_ignore,
-        "previous_bg_text": previous_bg,
-        "new_semantic_class": target_semantic,
-        "new_cleanup_mode": target_cleanup,
-        "new_ignore": target_ignore,
-        "new_bg_text": target_bg,
-        "confidence": suggestion.get("confidence"),
-        "reason_codes": suggestion.get("reason_codes", []),
-        "linked_container_id": suggestion.get("linked_container_id"),
-        "linked_ownership_id": suggestion.get("linked_ownership_id"),
-    }
 
 
-def _route_assist_cleanup_mode(
-    suggestion: dict[str, Any],
-    target_semantic: str,
-    previous_cleanup: Any,
-) -> str:
-    suggested = suggestion.get("suggested_cleanup_mode")
-    if suggested:
-        return str(suggested)
-    if target_semantic == "speech_bubble":
-        return "bubble"
-    if target_semantic == "background_text":
-        return "local_text_mask"
-    if target_semantic in {"decorative_text", "sfx"}:
-        return "preserve"
-    return str(previous_cleanup or "")
 
 
 def summarize_route_suggestions(suggestions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -412,232 +138,14 @@ def summarize_route_suggestions(suggestions: list[dict[str, Any]]) -> dict[str, 
     }
 
 
-def _attach_route_consumption_proof(audit: dict[str, Any], suggestions: list[dict[str, Any]]) -> None:
-    start = time.time()
-    requested = _truthy_env(ROUTE_CONSUMPTION_PROOF_FLAG)
-    source_enabled = _truthy_env(LEGACY_PAGE_SPECIFIC_ASSIST_FLAG) and (
-        _truthy_env(MODEL_FUSION_ASSIST_FLAG) or _truthy_env(HIGH_ACCURACY_BUBBLE_MODE_FLAG)
-    )
-    enabled = requested and source_enabled
-    audit["model_fusion_route_consumption_proof_version"] = ROUTE_CONSUMPTION_PROOF_VERSION
-    audit["model_fusion_route_consumption_proof_enabled"] = enabled
-    audit["model_fusion_route_consumption_proof_requested"] = requested
-    audit["model_fusion_route_consumption_proof_generated"] = False
-    audit["model_fusion_route_consumption_proof_error"] = None
-    audit["route_consumption_candidates"] = []
-    audit["route_consumption_candidate_summary"] = _route_consumption_summary([])
-    audit["route_consumption_mutation_count"] = 0
-    audit["route_consumption_mutations"] = []
-    audit["route_consumption_proof_status"] = "disabled"
-    for region in audit.get("regions", []) or []:
-        region["diagnostic_route_consumption_candidates"] = []
-        region["diagnostic_route_consumption_candidate_types"] = []
-        region["diagnostic_route_consumption_status"] = "disabled"
-        region["diagnostic_route_consumption_reason_codes"] = []
-        region["diagnostic_route_consumption_would_change_behavior"] = False
-
-    if not requested:
-        audit["model_fusion_route_consumption_proof_runtime_sec"] = round(time.time() - start, 6)
-        return
-    if not source_enabled:
-        audit["model_fusion_route_consumption_proof_error"] = (
-            "MT_MODEL_FUSION_ROUTE_CONSUMPTION_PROOF requires "
-            "MT_LEGACY_PAGE_SPECIFIC_ASSIST=1 plus MT_MODEL_FUSION_ASSIST=1 "
-            "or MT_HIGH_ACCURACY_BUBBLE_MODE=1"
-        )
-        audit["route_consumption_proof_status"] = "failed_closed_missing_bubble_evidence_mode"
-        audit["model_fusion_route_consumption_proof_runtime_sec"] = round(time.time() - start, 6)
-        return
-    if audit.get("route_advisor_error"):
-        audit["model_fusion_route_consumption_proof_error"] = str(audit.get("route_advisor_error"))
-        audit["route_consumption_proof_status"] = "failed_closed_route_advisor_unavailable"
-        audit["model_fusion_route_consumption_proof_runtime_sec"] = round(time.time() - start, 6)
-        return
-
-    try:
-        regions_by_id = {
-            str(region.get("region_id") or ""): region
-            for region in audit.get("regions", []) or []
-            if str(region.get("region_id") or "")
-        }
-        candidates: list[dict[str, Any]] = []
-        for suggestion in suggestions:
-            evidence = suggestion.get("bubble_detection_evidence") or {}
-            if not evidence.get("available"):
-                continue
-            region = regions_by_id.get(str(suggestion.get("region_id") or ""))
-            candidate = _route_consumption_candidate(suggestion, region)
-            if candidate:
-                candidate["route_consumption_candidate_id"] = f"route_consumption_{len(candidates):03d}"
-                candidates.append(candidate)
-        _attach_route_consumption_candidates_to_regions(audit, candidates)
-        audit["route_consumption_candidates"] = candidates
-        audit["route_consumption_candidate_summary"] = _route_consumption_summary(candidates)
-        audit["model_fusion_route_consumption_proof_generated"] = True
-        audit["route_consumption_proof_status"] = "dry_run_only_no_real_mutation_justified"
-    except Exception as exc:  # pragma: no cover - debug isolation
-        audit["model_fusion_route_consumption_proof_generated"] = False
-        audit["model_fusion_route_consumption_proof_error"] = str(exc)
-        audit["route_consumption_proof_status"] = "failed_closed"
-    audit["model_fusion_route_consumption_proof_runtime_sec"] = round(time.time() - start, 6)
 
 
-def _route_consumption_candidate(suggestion: dict[str, Any], region: dict[str, Any] | None) -> dict[str, Any] | None:
-    evidence = suggestion.get("bubble_detection_evidence") or {}
-    if not evidence.get("available"):
-        return None
-    classification, status, future_allowed, reason_codes = _route_consumption_classification(
-        suggestion,
-        region,
-        evidence,
-    )
-    if classification is None:
-        return None
-    return {
-        "route_consumption_candidate_id": None,
-        "region_id": str(suggestion.get("region_id") or ""),
-        "suggestion_id": suggestion.get("suggestion_id"),
-        "suggestion_type": suggestion.get("suggestion_type"),
-        "route_consumption_class": classification,
-        "current_semantic_class": suggestion.get("current_semantic_class"),
-        "suggested_semantic_class": suggestion.get("suggested_semantic_class"),
-        "current_cleanup_mode": suggestion.get("current_cleanup_mode"),
-        "suggested_cleanup_mode": suggestion.get("suggested_cleanup_mode"),
-        "diagnostic_bubble_container_id": evidence.get("container_id"),
-        "diagnostic_bubble_confidence_tier": evidence.get("confidence_tier"),
-        "diagnostic_bubble_supported_actions": evidence.get("supported_actions", []),
-        "diagnostic_bubble_blocked_actions": evidence.get("blocked_actions", []),
-        "diagnostic_bubble_conflict_flags": evidence.get("conflict_flags", []),
-        "diagnostic_bubble_review_only": bool(evidence.get("review_only")),
-        "evidence_source": evidence.get("source") or "bubble_detection_service",
-        "reason_codes": sorted(set(reason_codes + list(suggestion.get("reason_codes", []) or []))),
-        "would_change_behavior": False,
-        "phase4b18_status": status,
-        "future_assist_allowed": future_allowed,
-        "human_review_required": True,
-    }
 
 
-def _route_consumption_classification(
-    suggestion: dict[str, Any],
-    region: dict[str, Any] | None,
-    evidence: dict[str, Any],
-) -> tuple[str | None, str, bool, list[str]]:
-    suggestion_type = str(suggestion.get("suggestion_type") or "")
-    tier = str(evidence.get("confidence_tier") or "")
-    supported = set(_string_list(evidence.get("supported_actions")))
-    blocked = set(_string_list(evidence.get("blocked_actions")))
-    conflicts = set(_string_list(evidence.get("conflict_flags")))
-    review_only = bool(evidence.get("review_only"))
-    current_semantic = str(suggestion.get("current_semantic_class") or "")
-    suggested_semantic = str(suggestion.get("suggested_semantic_class") or "")
-    current_cleanup = str(suggestion.get("current_cleanup_mode") or "")
-    suggested_cleanup = str(suggestion.get("suggested_cleanup_mode") or "")
-    reason = _classification_reason(region or {})
-    reason_codes = [
-        "phase4b18_route_consumption_dry_run",
-        f"bubble_confidence_tier:{tier}",
-    ]
-    if suggestion_type == "probable_bubble_contained_short_speech":
-        reason_codes.append("route_consumption_class:model_supported_bubble_contained_short_speech")
-        safe = (
-            current_semantic == "speech_bubble"
-            and suggested_semantic == "speech_bubble"
-            and tier in {"strong_model_container", "mask_primary_container"}
-            and not review_only
-            and not conflicts
-            and "preserve_wins" not in blocked
-            and "sfx_conflict" not in blocked
-        )
-        status = "dry_run_only" if safe else "dry_run_blocked_review_only"
-        return "model_supported_bubble_contained_short_speech", status, False, reason_codes
-    if suggestion_type == "probable_caption_not_speech":
-        reason_codes.append("route_consumption_class:model_supported_caption_background_guard")
-        caption_route_agrees = (
-            current_semantic == "background_text"
-            and suggested_semantic == "background_text"
-            and (reason in CAPTION_REASONS or "caption" in current_cleanup or "caption" in suggested_cleanup)
-        )
-        if tier in {"strong_model_container", "mask_primary_container"}:
-            reason_codes.append("model_speech_evidence_does_not_override_caption_route")
-            return "model_supported_caption_background_guard", "dry_run_blocked_caption_speech_conflict", False, reason_codes
-        if caption_route_agrees:
-            reason_codes.append("deterministic_caption_route_agrees")
-            return "model_supported_caption_background_guard", "dry_run_only", False, reason_codes
-        return "model_supported_caption_background_guard", "dry_run_blocked_review_only", False, reason_codes
-    if suggestion_type == "probable_sfx_decorative_preserve":
-        reason_codes.append("route_consumption_class:conflict_preserve_wins_guard")
-        preserve_route_agrees = (
-            current_semantic in {"decorative_text", "sfx"}
-            or suggested_semantic in {"decorative_text", "sfx"}
-            or current_cleanup == "preserve"
-            or suggested_cleanup == "preserve"
-            or reason in DECORATIVE_REASONS
-        )
-        preserve_wins = (
-            tier == "conflict_preserve_wins"
-            or preserve_route_agrees
-            or bool(conflicts)
-            or bool(blocked)
-        )
-        if preserve_wins:
-            reason_codes.append("deterministic_preserve_route_wins")
-            return "conflict_preserve_wins_guard", "dry_run_only_preserve_authoritative", False, reason_codes
-        return "conflict_preserve_wins_guard", "dry_run_blocked_review_only", False, reason_codes
-    if suggestion_type in {"probable_shared_speech_ownership", "route_uncertain_review_only"}:
-        reason_codes.append("route_consumption_class:blocked_review_only")
-        return "blocked_review_only", "dry_run_blocked_class_not_eligible", False, reason_codes
-    if "text_free" in tier or review_only or not supported:
-        reason_codes.append("route_consumption_class:blocked_review_only")
-        return "blocked_review_only", "dry_run_blocked_review_only", False, reason_codes
-    return None, "not_applicable", False, reason_codes
 
 
-def _attach_route_consumption_candidates_to_regions(audit: dict[str, Any], candidates: list[dict[str, Any]]) -> None:
-    by_rid: dict[str, list[dict[str, Any]]] = {}
-    for candidate in candidates:
-        by_rid.setdefault(str(candidate.get("region_id") or ""), []).append(candidate)
-    for region in audit.get("regions", []) or []:
-        rid = str(region.get("region_id") or "")
-        items = by_rid.get(rid, [])
-        region["diagnostic_route_consumption_candidates"] = items
-        region["diagnostic_route_consumption_candidate_types"] = sorted(
-            set(str(item.get("route_consumption_class") or "unknown") for item in items)
-        )
-        region["diagnostic_route_consumption_status"] = "dry_run_only" if items else "not_applicable"
-        region["diagnostic_route_consumption_reason_codes"] = sorted(
-            set(str(reason) for item in items for reason in (item.get("reason_codes") or []))
-        )
-        region["diagnostic_route_consumption_would_change_behavior"] = False
-        if items and region.get("diagnostic_bubble_confidence_tier") is not None:
-            _append_bubble_consumer_source(region, "text_area_route_consumption_proof")
 
 
-def _route_consumption_summary(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    by_class: dict[str, int] = {}
-    by_status: dict[str, int] = {}
-    by_tier: dict[str, int] = {}
-    for item in candidates:
-        by_class[str(item.get("route_consumption_class") or "unknown")] = by_class.get(
-            str(item.get("route_consumption_class") or "unknown"),
-            0,
-        ) + 1
-        by_status[str(item.get("phase4b18_status") or "unknown")] = by_status.get(
-            str(item.get("phase4b18_status") or "unknown"),
-            0,
-        ) + 1
-        by_tier[str(item.get("diagnostic_bubble_confidence_tier") or "unknown")] = by_tier.get(
-            str(item.get("diagnostic_bubble_confidence_tier") or "unknown"),
-            0,
-        ) + 1
-    return {
-        "total": len(candidates),
-        "by_class": by_class,
-        "by_status": by_status,
-        "by_confidence_tier": by_tier,
-        "mutation_count": 0,
-        "proof_mode": "dry_run_only",
-    }
 
 
 def _attach_route_suggestions_to_regions(audit: dict[str, Any], suggestions: list[dict[str, Any]]) -> None:
@@ -723,8 +231,6 @@ def _string_list(value: Any) -> list[str]:
     return [str(value)] if str(value) else []
 
 
-def _truthy_env(name: str) -> bool:
-    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _base_suggestion(

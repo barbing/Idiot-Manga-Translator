@@ -27,16 +27,16 @@ except Exception:  # pragma: no cover - optional dependency
     np = None
 
 from app.pipeline.debug_artifacts import mask_stats
-from app.pipeline.debug_runtime import diagnostic_enabled, write_diagnostic_checkpoint
+from app.pipeline.debug_runtime import (
+    diagnostic_enabled,
+    pipeline_diagnostic_checkpoint,
+    write_diagnostic_checkpoint,
+)
 from app.inpaint.simple_lama_engine import (
     FIXED_CLEANUP_INPAINT_MODEL_ID,
     FIXED_CLEANUP_INPAINT_MODEL_RELATIVE_PATH,
     resolve_cleanup_inpaint_model,
 )
-
-
-def _page014_timeout_diag_enabled() -> bool:
-    return diagnostic_enabled("MT_PAGE014_TIMEOUT_DIAGNOSTIC")
 
 
 def _cleanup_perf_contract_diag_enabled() -> bool:
@@ -71,21 +71,14 @@ def _cleanup_perf_contract_checkpoint(stage: str, event: str, **fields: Any) -> 
         return
 
 
-def _page014_timeout_checkpoint(stage: str, event: str, **fields: Any) -> None:
+def _pipeline_runtime_checkpoint(stage: str, event: str, **fields: Any) -> None:
     _cleanup_perf_contract_checkpoint(stage, event, **fields)
-    if not _page014_timeout_diag_enabled():
-        return
-    try:
-        write_diagnostic_checkpoint(
-            "page014_timeout_checkpoints.jsonl",
-            module="app.pipeline.cleanup_execution",
-            stage=stage,
-            event=event,
-            fields=fields,
-            include_monotonic=False,
-        )
-    except Exception:
-        return
+    pipeline_diagnostic_checkpoint(
+        module="app.pipeline.cleanup_execution",
+        stage=stage,
+        event=event,
+        fields=fields,
+    )
 
 
 def _perf_bucket(perf_timings: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
@@ -157,7 +150,7 @@ def apply_text_removal(
     model_required = bool((debug_info or {}).get("model_required"))
     if text_mask is None:
         _set_cleanup_backend(debug_info, "none", backend_detail="empty_mask")
-        _page014_timeout_checkpoint("cleanup_apply_text_removal", "end", backend="none", reason="empty_mask")
+        _pipeline_runtime_checkpoint("cleanup_apply_text_removal", "end", backend="none", reason="empty_mask")
         return _result(image, debug_info)
     mode = (mode or "fast").lower()
     if debug_info is not None:
@@ -183,7 +176,7 @@ def apply_text_removal(
                 fallback_reason=reason,
                 errors=[reason],
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_apply_text_removal",
                 "end",
                 backend="model_required_backend_error",
@@ -193,7 +186,7 @@ def apply_text_removal(
             return _result(image, debug_info)
         print("[TextRemoval] No CV2/numpy, using simple white mask")
         _set_cleanup_backend(debug_info, "white_mask", backend_detail="cv2_or_numpy_unavailable")
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_apply_text_removal",
             "end",
             backend="white_mask",
@@ -212,7 +205,7 @@ def apply_text_removal(
         debug_info["crop_area"] = image_area
         debug_info["mask_ratio"] = round(mask_ratio, 4)
         debug_info["crop_bbox"] = list(box) if box else None
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_apply_text_removal",
         "start",
         mode=mode,
@@ -230,7 +223,7 @@ def apply_text_removal(
         if bubble_fill is not None:
             print("[TextRemoval] Used WHITE BUBBLE FILL")
             _set_cleanup_backend(debug_info, "white_bubble_fill", backend_detail=None)
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_apply_text_removal",
                 "end",
                 backend="white_bubble_fill",
@@ -243,7 +236,7 @@ def apply_text_removal(
         if uniform_fill is not None:
             print("[TextRemoval] Used UNIFORM FILL")
             _set_cleanup_backend(debug_info, "uniform_fill", backend_detail=None)
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_apply_text_removal",
                 "end",
                 backend="uniform_fill",
@@ -266,7 +259,7 @@ def apply_text_removal(
                 debug_info["requested_model_id"] = model_id
                 debug_info["actual_model_name"] = model_info["actual_model_name"]
                 debug_info["actual_model_path"] = model_info["actual_model_path"]
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_apply_text_removal_ai",
                 "start",
                 model_id=model_id,
@@ -304,7 +297,7 @@ def apply_text_removal(
                 model_invocation_attempted=True,
                 model_invocation_succeeded=True,
             )
-            _page014_timeout_checkpoint(
+            _pipeline_runtime_checkpoint(
                 "cleanup_apply_text_removal",
                 "end",
                 backend="cleanup_ai_inpaint",
@@ -333,7 +326,7 @@ def apply_text_removal(
                     fallback_reason=reason,
                     errors=[reason],
                 )
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_apply_text_removal",
                     "end",
                     backend="model_required_backend_error",
@@ -355,7 +348,7 @@ def apply_text_removal(
     inpainted = cv2.inpaint(img_bgr, dilated, 5, cv2.INPAINT_NS)
     rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
     _set_cleanup_backend(debug_info, "cv2_inpaint", backend_detail=cv2_detail)
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_apply_text_removal",
         "end",
         backend="cv2_inpaint",
@@ -478,7 +471,7 @@ def apply_local_text_removal(
     local_bucket = _perf_bucket(perf_timings, "local")
     cleanup_tag_normalized = str(cleanup_tag or "").strip().lower()
     model_required = bool((debug_info or {}).get("model_required"))
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_apply_local_text_removal",
         "start",
         cleanup_tag=cleanup_tag_normalized,
@@ -501,7 +494,7 @@ def apply_local_text_removal(
             )
         else:
             _set_cleanup_backend(debug_info, "none", backend_detail="cv2_numpy_or_mask_unavailable")
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_apply_local_text_removal",
             "end",
             backend="none",
@@ -512,7 +505,7 @@ def apply_local_text_removal(
     ys, xs = np.where(local_mask > 0)
     if ys.size == 0 or xs.size == 0:
         _set_cleanup_backend(debug_info, "none", backend_detail="empty_local_mask")
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_apply_local_text_removal",
             "end",
             backend="none",
@@ -546,7 +539,7 @@ def apply_local_text_removal(
     x1 = min(mask_w, x1 + pad)
     y1 = min(mask_h, y1 + pad)
     if x1 <= x0 or y1 <= y0:
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_apply_local_text_removal",
             "end",
             backend="none",
@@ -557,7 +550,7 @@ def apply_local_text_removal(
     crop_mask = local_mask[y0:y1, x0:x1]
     if crop_mask.size == 0 or not np.any(crop_mask):
         _set_cleanup_backend(debug_info, "none", backend_detail="empty_crop_mask")
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_apply_local_text_removal",
             "end",
             backend="none",
@@ -594,7 +587,7 @@ def apply_local_text_removal(
         debug_info["crop_area"] = int(crop_area)
         debug_info["mask_pixels"] = int(mask_pixels)
         debug_info["mask_ratio"] = round(mask_ratio, 4)
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_apply_local_text_removal",
         "crop",
         cleanup_tag=cleanup_tag_normalized,
@@ -960,7 +953,7 @@ def apply_local_text_removal(
             )
         else:
             _set_cleanup_backend(debug_info, "none", backend_detail=f"{backend}_produced_no_output")
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_apply_local_text_removal",
             "end",
             backend="none",
@@ -988,7 +981,7 @@ def apply_local_text_removal(
     if return_full_image:
         patched = image.copy()
         patched.paste(cleaned, (x0, y0))
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_apply_local_text_removal",
         "end",
         backend=backend,

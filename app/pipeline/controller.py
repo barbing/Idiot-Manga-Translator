@@ -30,6 +30,7 @@ from app.pipeline.parent_execution_bundle import (
 )
 from app.pipeline.debug_runtime import (
     diagnostic_enabled,
+    pipeline_diagnostic_checkpoint,
     safe_trace_token,
     save_context_image,
     write_diagnostic_checkpoint,
@@ -282,10 +283,6 @@ def _commit_page_project_checkpoint(
     if style_context_cache_supplied:
         project["style_context_cache"] = style_context_cache
     return receipt
-
-
-def _page014_timeout_diag_enabled() -> bool:
-    return diagnostic_enabled("MT_PAGE014_TIMEOUT_DIAGNOSTIC")
 
 
 def _cleanup_perf_contract_diag_enabled() -> bool:
@@ -681,23 +678,16 @@ def _cleanup_mask_region_records_with_protection(
     return records
 
 
-def _page014_timeout_checkpoint(stage: str, event: str, **fields: Any) -> None:
+def _pipeline_runtime_checkpoint(stage: str, event: str, **fields: Any) -> None:
     _cleanup_perf_contract_checkpoint(stage, event, **fields)
-    if not _page014_timeout_diag_enabled():
-        return
-    try:
-        debug_dir = str(fields.pop("debug_dir", "") or "")
-        write_diagnostic_checkpoint(
-            "page014_timeout_checkpoints.jsonl",
-            module="app.pipeline.controller",
-            stage=stage,
-            event=event,
-            fields=fields,
-            debug_dir=debug_dir,
-            include_monotonic=False,
-        )
-    except Exception:
-        return
+    debug_dir = str(fields.pop("debug_dir", "") or "")
+    pipeline_diagnostic_checkpoint(
+        module="app.pipeline.controller",
+        stage=stage,
+        event=event,
+        fields=fields,
+        debug_dir=debug_dir,
+    )
 
 class PipelineStatus(QtCore.QObject):
     # GUI-5 typed status seam.  Historical signals below remain intact for the
@@ -1592,7 +1582,7 @@ class PipelineWorker(QtCore.QThread):
                     "warmed",
                     "already_warmed",
                 }
-                _page014_timeout_checkpoint(
+                _pipeline_runtime_checkpoint(
                     "cleanup_model_pre_page_warmup",
                     "end",
                     status=str(cleanup_model_warmup_record.get("status") or ""),
@@ -1698,7 +1688,7 @@ class PipelineWorker(QtCore.QThread):
                     )
 
                 try:
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "controller_process_page",
                         "start",
                         page_name=name,
@@ -1749,7 +1739,7 @@ class PipelineWorker(QtCore.QThread):
                     page_class = page_result.page_class
                     text_area_plan = page_result.text_area_plan
                     ctd_segmentation_result = page_result.ctd_segmentation_result
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "controller_process_page",
                         "end",
                         page_name=name,
@@ -1759,7 +1749,7 @@ class PipelineWorker(QtCore.QThread):
                         page_class=page_class,
                         elapsed_ms=round((time.time() - process_page_start) * 1000.0, 3),
                     )
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "post_ocr_detection_hierarchy",
                         "end",
                         page_name=name,
@@ -1775,7 +1765,7 @@ class PipelineWorker(QtCore.QThread):
                         if new_client is not None and new_client is not ollama:
                             ollama = new_client
                 except Exception as exc:
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "controller_process_page",
                         "error",
                         page_name=name,
@@ -1854,13 +1844,13 @@ class PipelineWorker(QtCore.QThread):
                 )
                 try:
                     source_glyph_start = time.time()
-                    _page014_timeout_checkpoint("sourceglyph_generation", "start", page_id=page_id)
+                    _pipeline_runtime_checkpoint("sourceglyph_generation", "start", page_id=page_id)
                     source_glyph_mask_result = generate_source_glyph_masks_for_parent_bundles(
                         page_id=page_id,
                         image_path=source_path,
                         parent_execution_bundles=parent_execution_bundles,
                     )
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "sourceglyph_generation",
                         "end",
                         page_id=page_id,
@@ -1891,7 +1881,7 @@ class PipelineWorker(QtCore.QThread):
                         artifact_summary=source_glyph_mask_result.to_audit_dict(),
                     )
                 except Exception as exc:
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "sourceglyph_generation",
                         "error",
                         page_id=page_id,
@@ -1940,9 +1930,9 @@ class PipelineWorker(QtCore.QThread):
                 )
                 try:
                     cleanup_contract_start = time.time()
-                    _page014_timeout_checkpoint("cleanup_contract_chain", "start", page_id=page_id)
+                    _pipeline_runtime_checkpoint("cleanup_contract_chain", "start", page_id=page_id)
                     cleanup_job_start = time.time()
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_job_build",
                         "start",
                         page_id=page_id,
@@ -1953,7 +1943,7 @@ class PipelineWorker(QtCore.QThread):
                         parent_execution_bundles=parent_execution_bundles,
                         source_glyph_masks=source_glyph_mask_result,
                     )
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_job_build",
                         "end",
                         page_id=page_id,
@@ -1964,7 +1954,7 @@ class PipelineWorker(QtCore.QThread):
                     if not source_image_size or source_image_size[0] <= 0 or source_image_size[1] <= 0:
                         source_image_size = None
                     segmentation_start = time.time()
-                    _page014_timeout_checkpoint("text_foreground_segmentation", "start", page_id=page_id)
+                    _pipeline_runtime_checkpoint("text_foreground_segmentation", "start", page_id=page_id)
                     text_foreground_segmentation_mask = _build_text_foreground_segmentation_mask(
                         detector=detector,
                         source_path=source_path,
@@ -1975,7 +1965,7 @@ class PipelineWorker(QtCore.QThread):
                         text_area_plan=text_area_plan,
                         segmentation_result=ctd_segmentation_result,
                     )
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "text_foreground_segmentation",
                         "end",
                         page_id=page_id,
@@ -1983,7 +1973,7 @@ class PipelineWorker(QtCore.QThread):
                         elapsed_ms=round((time.time() - segmentation_start) * 1000.0, 3),
                     )
                     cleanup_mask_start = time.time()
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_mask_build",
                         "start",
                         page_id=page_id,
@@ -2004,7 +1994,7 @@ class PipelineWorker(QtCore.QThread):
                         cleanup_jobs=cleanup_job_contract_result.jobs,
                     )
                     component_authorization_elapsed = time.time() - component_authorization_start
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "text_area_component_authorization",
                         "end",
                         page_id=page_id,
@@ -2049,7 +2039,7 @@ class PipelineWorker(QtCore.QThread):
                                 cleanup_job_contracts=cleanup_job_contract_result,
                                 cleanup_mask_contracts=cleanup_mask_contract_result,
                             )
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_mask_build",
                         "end",
                         page_id=page_id,
@@ -2058,7 +2048,7 @@ class PipelineWorker(QtCore.QThread):
                         elapsed_ms=round((time.time() - cleanup_mask_start) * 1000.0, 3),
                     )
                     render_eligibility_start = time.time()
-                    _page014_timeout_checkpoint("render_eligibility_build", "start", page_id=page_id)
+                    _pipeline_runtime_checkpoint("render_eligibility_build", "start", page_id=page_id)
                     render_eligibility_contract_result = build_render_eligibility_decisions_for_parent_bundles(
                         page_id=page_id,
                         parent_execution_bundles=parent_execution_bundles,
@@ -2069,19 +2059,19 @@ class PipelineWorker(QtCore.QThread):
                         image_size=source_image_size,
                     )
                     render_eligibility_elapsed = time.time() - render_eligibility_start
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "render_eligibility_build",
                         "end",
                         page_id=page_id,
                         decision_count=len(getattr(render_eligibility_contract_result, "decisions", []) or []),
-                        suppressed_count=len(getattr(render_eligibility_contract_result, "suppressed_records", []) or []),
+                        diagnostic_count=len(getattr(render_eligibility_contract_result, "diagnostic_records", []) or []),
                         elapsed_ms=round(render_eligibility_elapsed * 1000.0, 3),
                     )
                     if debug_context is not None:
                         set_timing(debug_context, "render_eligibility_contract_time", render_eligibility_elapsed)
                     cleanup_plan_start = time.time()
                     cleanup_plan_mask_contracts = cleanup_mask_contract_result
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_plan_build",
                         "start",
                         page_id=page_id,
@@ -2098,7 +2088,7 @@ class PipelineWorker(QtCore.QThread):
                         inpaint_mode=self._settings.inpaint_mode,
                     )
                     cleanup_plan_elapsed = time.time() - cleanup_plan_start
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_plan_build",
                         "end",
                         page_id=page_id,
@@ -2125,7 +2115,7 @@ class PipelineWorker(QtCore.QThread):
                         from PIL import Image
                         with Image.open(source_path) as runtime_source:
                             runtime_source_image = runtime_source.convert("RGB")
-                        _page014_timeout_checkpoint("cleanup_runtime_contract", "start", page_id=page_id)
+                        _pipeline_runtime_checkpoint("cleanup_runtime_contract", "start", page_id=page_id)
                         with collect_cleanup_runtime_perf(
                             bool(debug_context and debug_context.get("perf_telemetry_only"))
                         ) as cleanup_runtime_perf:
@@ -2144,7 +2134,7 @@ class PipelineWorker(QtCore.QThread):
                                 prewarmed_cleanup_model=cleanup_model_prewarmed,
                             )
                         cleanup_runtime_elapsed = time.time() - cleanup_runtime_start
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "cleanup_runtime_contract",
                             "end",
                             page_id=page_id,
@@ -2167,7 +2157,7 @@ class PipelineWorker(QtCore.QThread):
                             debug_context,
                         )
                         commit_start = time.time()
-                        _page014_timeout_checkpoint("cleanup_upstream_commit", "start", page_id=page_id)
+                        _pipeline_runtime_checkpoint("cleanup_upstream_commit", "start", page_id=page_id)
                         cleanup_upstream_commit_result = commit_cleanup_runtime_results_to_working_image(
                             page_id=page_id,
                             source_image=runtime_source_image.copy(),
@@ -2176,7 +2166,7 @@ class PipelineWorker(QtCore.QThread):
                             excluded_region_ids=_phase5_upstream_protected_region_ids(page_id),
                         )
                         commit_elapsed = time.time() - commit_start
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "cleanup_upstream_commit",
                             "end",
                             page_id=page_id,
@@ -2345,7 +2335,7 @@ class PipelineWorker(QtCore.QThread):
                                 len(cleanup_upstream_commit_result.commit_records),
                             )
                     except Exception as exc:
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "cleanup_runtime_or_commit",
                             "error",
                             page_id=page_id,
@@ -2403,7 +2393,7 @@ class PipelineWorker(QtCore.QThread):
                             render_eligibility_audit = render_eligibility_contract_result.to_audit_dict()
                             debug_context["render_eligibility_contracts"] = {
                                 "summary": render_eligibility_audit.get("summary", {}),
-                                "suppressed_records": render_eligibility_audit.get("suppressed_records", []),
+                                "diagnostic_records": render_eligibility_audit.get("diagnostic_records", []),
                             }
                         else:
                             debug_context["cleanup_job_contracts"] = cleanup_job_contract_result.to_audit_dict()
@@ -2415,11 +2405,11 @@ class PipelineWorker(QtCore.QThread):
                         set_timing(debug_context, "render_eligibility_contract_time", render_eligibility_elapsed)
                         set_count(debug_context, "cleanup_job_contract_count", len(cleanup_job_contract_result.jobs))
                         set_count(debug_context, "cleanup_mask_contract_count", len(cleanup_mask_contract_result.masks))
-                        set_count(debug_context, "render_eligibility_suppressed_count", len(render_eligibility_contract_result.suppressed_records))
+                        set_count(debug_context, "render_eligibility_diagnostic_count", len(render_eligibility_contract_result.diagnostic_records))
                         set_count(debug_context, "cleanup_plan_contract_count", len(cleanup_plan_contract_result.plans))
                         set_count(debug_context, "cleanup_mask_rejected_count", len(cleanup_mask_contract_result.rejected_records))
                         set_count(debug_context, "cleanup_mask_protected_count", len(cleanup_mask_contract_result.protected_records))
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_contract_chain",
                         "end",
                         page_id=page_id,
@@ -2438,7 +2428,7 @@ class PipelineWorker(QtCore.QThread):
                             operation="run_cleanup",
                         )
                     )
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "cleanup_contract_chain",
                         "error",
                         page_id=page_id,
@@ -2474,15 +2464,14 @@ class PipelineWorker(QtCore.QThread):
                             },
                         }
                         debug_context["render_eligibility_contracts"] = {
-                            "version": "render_eligibility_source_grounding_v1",
+                            "version": "render_readiness_diagnostics_v2",
                             "page_id": page_id,
                             "renderer_consumed": False,
                             "decisions": [],
                             "errors": [f"{type(exc).__name__}: {exc}"],
                             "summary": {
                                 "decision_count": 0,
-                                "suppressed_count": 0,
-                                "review_allowed_count": 0,
+                                "diagnostic_count": 0,
                                 "eligible_count": 0,
                                 "error_count": 1,
                                 "renderer_consumed": False,
@@ -2560,14 +2549,14 @@ class PipelineWorker(QtCore.QThread):
                             debug_context["render_translations_called"] = False
                             debug_context["final_translated_text_drawn"] = False
                             debug_context["cleanup_upstream_renderer_input_path"] = render_input_path
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "renderer_entry",
                             "skipped_private_cleanup_validation",
                             page_id=page_id,
                             render_input_path=render_input_path,
                         )
                     except Exception as exc:
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "renderer_entry",
                             "error",
                             page_id=page_id,
@@ -2601,7 +2590,7 @@ class PipelineWorker(QtCore.QThread):
                     if parent_execution_bundles:
                         parent_font_start = time.time()
                         try:
-                            _page014_timeout_checkpoint(
+                            _pipeline_runtime_checkpoint(
                                 "parent_style_after_cleanup",
                                 "start",
                                 page_id=page_id,
@@ -2639,7 +2628,7 @@ class PipelineWorker(QtCore.QThread):
                                     detector=parent_style_detector,
                                 )
                             )
-                            _page014_timeout_checkpoint(
+                            _pipeline_runtime_checkpoint(
                                 "parent_style_after_cleanup",
                                 "observed_current_page",
                                 page_id=page_id,
@@ -2706,7 +2695,7 @@ class PipelineWorker(QtCore.QThread):
                                     ),
                                 )
                         except Exception as exc:
-                            _page014_timeout_checkpoint(
+                            _pipeline_runtime_checkpoint(
                                 "parent_style_after_cleanup",
                                 "error",
                                 page_id=page_id,
@@ -3121,7 +3110,7 @@ class PipelineWorker(QtCore.QThread):
                         page_id=page_id,
                     )
                     render_start = time.time()
-                    _page014_timeout_checkpoint(
+                    _pipeline_runtime_checkpoint(
                         "renderer_entry",
                         "start_after_current_page_style",
                         page_id=page_id,
@@ -3169,7 +3158,7 @@ class PipelineWorker(QtCore.QThread):
                                 debug_context[
                                     "cleanup_upstream_renderer_input_path"
                                 ] = render_input_path
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "renderer_entry",
                             "end_after_current_page_style",
                             page_id=page_id,
@@ -3196,7 +3185,7 @@ class PipelineWorker(QtCore.QThread):
                             },
                         )
                     except Exception as exc:
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "renderer_entry",
                             "error_after_current_page_style",
                             page_id=page_id,
@@ -3408,12 +3397,12 @@ class PipelineWorker(QtCore.QThread):
                 if debug_artifacts_enabled and debug_context is not None:
                     try:
                         artifact_start = time.time()
-                        _page014_timeout_checkpoint("debug_artifact_write", "start", page_id=page_id)
+                        _pipeline_runtime_checkpoint("debug_artifact_write", "start", page_id=page_id)
                         write_page_artifacts(
                             debug_context,
                             execution_regions if parent_execution_bundles else regions,
                         )
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "debug_artifact_write",
                             "end",
                             page_id=page_id,
@@ -3421,7 +3410,7 @@ class PipelineWorker(QtCore.QThread):
                         )
                         self.message.emit(f"Debug artifacts written for {name}")
                     except Exception as exc:
-                        _page014_timeout_checkpoint(
+                        _pipeline_runtime_checkpoint(
                             "debug_artifact_write",
                             "error",
                             page_id=page_id,
@@ -4260,132 +4249,6 @@ def _apply_cleanup_upstream_commit_render_blocks(
                 pass
 
     return render_eligibility_result
-
-
-def _suppress_render_eligibility_for_cleanup_blocks(
-    render_eligibility_result: Any,
-    records: list[dict[str, Any]],
-    *,
-    reason: str,
-    contradiction: str,
-) -> None:
-    if render_eligibility_result is None or not records:
-        return
-    decisions_by_region = getattr(render_eligibility_result, "decisions_by_region_id", None)
-    decisions = getattr(render_eligibility_result, "decisions", None)
-    if not isinstance(decisions_by_region, dict) or not isinstance(decisions, list):
-        return
-    try:
-        from app.pipeline.render_eligibility import RenderEligibilityDecision, RenderEligibilityStatus
-    except Exception:
-        return
-
-    changed = False
-    for record in records:
-        for region_id in _cleanup_block_region_ids(record):
-            current = decisions_by_region.get(region_id)
-            if current is None:
-                continue
-            current_status = str(_render_eligibility_decision_value(current, "status") or "")
-            if current_status in {
-                "suppressed_source_ungrounded",
-                "RenderEligibilityStatus.SUPPRESSED_SOURCE_UNGROUNDED",
-            }:
-                continue
-            if not bool(_render_eligibility_decision_value(current, "translated_text_present")):
-                continue
-            existing_hard = list(_render_eligibility_decision_value(current, "hard_contradictions") or [])
-            if contradiction not in existing_hard:
-                existing_hard.append(contradiction)
-            evidence = dict(_render_eligibility_decision_value(current, "evidence") or {})
-            evidence.update(
-                {
-                    "cleanup_render_permission_gate_released": False,
-                    "cleanup_render_permission_gate_release_reason": reason,
-                    "cleanup_block_failure_reason": record.get("failure_reason"),
-                    "cleanup_result_id": record.get("cleanup_result_id"),
-                    "cleanup_proof_id": record.get("cleanup_proof_id"),
-                }
-            )
-            replacement = RenderEligibilityDecision(
-                page_id=str(_render_eligibility_decision_value(current, "page_id") or ""),
-                region_id=region_id,
-                status=RenderEligibilityStatus.SUPPRESSED_SOURCE_UNGROUNDED,
-                reason=reason,
-                translated_text_present=True,
-                source_text=str(_render_eligibility_decision_value(current, "source_text") or ""),
-                translated_text=str(_render_eligibility_decision_value(current, "translated_text") or ""),
-                ocr_confidence=_render_eligibility_decision_value(current, "ocr_confidence"),
-                risky_detection_source=str(_render_eligibility_decision_value(current, "risky_detection_source") or ""),
-                hard_contradictions=existing_hard,
-                preservation_reason=str(_render_eligibility_decision_value(current, "preservation_reason") or ""),
-                evidence=evidence,
-            )
-            decisions_by_region[region_id] = replacement
-            for index, decision in enumerate(decisions):
-                if str(_render_eligibility_decision_value(decision, "region_id") or "") == region_id:
-                    decisions[index] = replacement
-                    break
-            changed = True
-    if changed:
-        _rebuild_render_eligibility_status_lists(render_eligibility_result)
-
-
-def _cleanup_block_region_ids(record: Mapping[str, Any]) -> list[str]:
-    region_ids: list[str] = []
-    for key in ("region_id", "target_region_id"):
-        value = str(record.get(key) or "")
-        if value:
-            region_ids.append(value)
-    for key in ("target_region_ids", "region_ids", "cleanup_unit_child_region_ids"):
-        value = record.get(key)
-        if isinstance(value, (list, tuple, set)):
-            region_ids.extend(str(item) for item in value if str(item or ""))
-    return list(dict.fromkeys(region_ids))
-
-
-def _rebuild_render_eligibility_status_lists(render_eligibility_result: Any) -> None:
-    decisions = getattr(render_eligibility_result, "decisions", None)
-    if not isinstance(decisions, list):
-        return
-    suppressed = getattr(render_eligibility_result, "suppressed_records", None)
-    review_allowed = getattr(render_eligibility_result, "review_allowed_records", None)
-    eligible = getattr(render_eligibility_result, "eligible_records", None)
-    if not all(isinstance(item, list) for item in (suppressed, review_allowed, eligible)):
-        return
-    suppressed[:] = []
-    review_allowed[:] = []
-    eligible[:] = []
-    for decision in decisions:
-        audit = _render_eligibility_decision_audit(decision)
-        status = str(audit.get("status") or _render_eligibility_decision_value(decision, "status") or "")
-        if status in {"suppressed_source_ungrounded", "RenderEligibilityStatus.SUPPRESSED_SOURCE_UNGROUNDED"}:
-            suppressed.append(audit)
-        elif status == "review_allowed":
-            review_allowed.append(audit)
-        else:
-            eligible.append(audit)
-
-
-def _render_eligibility_decision_value(decision: Any, key: str) -> Any:
-    if decision is None:
-        return None
-    if isinstance(decision, dict):
-        return decision.get(key)
-    return getattr(decision, key, None)
-
-
-def _render_eligibility_decision_audit(decision: Any) -> dict[str, Any]:
-    if decision is None:
-        return {}
-    try:
-        if hasattr(decision, "to_audit_dict"):
-            return decision.to_audit_dict()
-    except Exception:
-        return {}
-    if isinstance(decision, dict):
-        return dict(decision)
-    return {}
 
 
 def _is_torch_missing(exc: Exception | None) -> bool:
@@ -6370,3373 +6233,142 @@ def _bbox_inside_ratio_controller(inner: list, outer: list) -> float:
     return (overlap_w * overlap_h) / max(1.0, iw * ih)
 
 
-def _reconstruct_logical_text_block_sources(
-    regions: list[dict],
-    logical_block_result,
-    *,
-    image_path: str,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    quality_func,
-    debug_context: dict | None = None,
-) -> dict[str, Any]:
-    """Re-OCR malformed speech logical blocks from their TextAreaPlan physical bubble crop."""
-    if not logical_block_result or not getattr(logical_block_result, "blocks", None):
-        return {"attempt_count": 0, "applied_count": 0, "attempts": []}
-    if page_image is None or ocr_engine is None:
-        return {"attempt_count": 0, "applied_count": 0, "attempts": [], "error": "missing_page_image_or_ocr_engine"}
-    region_by_id = {str(region.get("region_id") or ""): region for region in regions if str(region.get("region_id") or "")}
-    group_bboxes = {
-        str(group.physical_bubble_id): list(group.bbox or [])
-        for group in getattr(logical_block_result, "physical_bubble_groups", []) or []
-        if str(getattr(group, "physical_bubble_id", "") or "")
-    }
-    attempts: list[dict[str, Any]] = []
-    applied_count = 0
-    block_counts_by_physical: dict[str, int] = {}
-    for block in getattr(logical_block_result, "blocks", []) or []:
-        physical_id = str(getattr(block, "physical_bubble_id", "") or "")
-        if physical_id:
-            block_counts_by_physical[physical_id] = block_counts_by_physical.get(physical_id, 0) + 1
-    for block in getattr(logical_block_result, "blocks", []) or []:
-        if not _logical_block_needs_physical_reocr(block, region_by_id):
-            continue
-        try:
-            block.source_reconstruction_required = True
-        except Exception:
-            pass
-        physical_id = str(getattr(block, "physical_bubble_id", "") or "")
-        parent_scope_bbox = list(
-            getattr(block, "source_reconstruction_parent_bbox", []) or []
-        )
-        if block_counts_by_physical.get(physical_id, 0) > 1 and not parent_scope_bbox:
-            attempt = {
-                "logical_text_block_id": getattr(block, "block_id", None),
-                "physical_bubble_id": physical_id,
-                "before_source_text": getattr(block, "source_text", ""),
-                "crop_bbox": [],
-                "applied": False,
-                "reason_codes": _logical_block_reocr_candidate_reasons(block, region_by_id),
-                "status": "skipped_ambiguous_full_physical_bubble_reocr_parent_scope",
-            }
-            _mark_logical_block_reocr_unresolved(block, attempt["status"])
-            attempts.append(attempt)
-            continue
-        crop_bbox = (
-            _clip_controller_bbox(parent_scope_bbox, image_size)
-            if parent_scope_bbox
-            else _logical_block_physical_reocr_bbox(block, group_bboxes, image_size)
-        )
-        attempt = {
-            "logical_text_block_id": getattr(block, "block_id", None),
-            "physical_bubble_id": getattr(block, "physical_bubble_id", None),
-            "before_source_text": getattr(block, "source_text", ""),
-            "crop_bbox": crop_bbox,
-            "applied": False,
-            "reason_codes": _logical_block_reocr_candidate_reasons(block, region_by_id),
-        }
-        if not crop_bbox:
-            attempt["status"] = "skipped_no_physical_crop"
-            _mark_logical_block_reocr_unresolved(block, attempt["status"])
-            attempts.append(attempt)
-            continue
-        crop = _crop_image(image_path, crop_bbox, expand_wide=False, image_obj=page_image)
-        if crop is None:
-            attempt["status"] = "skipped_crop_failed"
-            _mark_logical_block_reocr_unresolved(block, attempt["status"])
-            attempts.append(attempt)
-            continue
-        try:
-            recovered_text, recovered_conf = _recognize_with_fallback(
-                ocr_engine,
-                crop,
-                settings,
-                crop_bbox,
-                debug_context=debug_context,
-                trace_context={
-                    "page_id": debug_context.get("page_id") if debug_context else "",
-                    "attempt_kind": "logical_block_physical_reocr",
-                    "logical_block_id": getattr(block, "block_id", None),
-                    "root_id": getattr(block, "root_id", None),
-                    "source_bbox": list(crop_bbox or []),
-                    "actual_crop_bbox": list(crop_bbox or []),
-                    "container_bbox": list(crop_bbox or []),
-                    "route_intent": "translate_speech",
-                    "ocr_eligible": True,
-                },
-            )
-        except Exception as exc:
-            attempt["status"] = "ocr_failed"
-            attempt["error"] = f"{type(exc).__name__}: {exc}"
-            _mark_logical_block_reocr_unresolved(block, attempt["status"])
-            attempts.append(attempt)
-            continue
-        recovered_text = _clean_ocr_text(str(recovered_text or ""))
-        recovered_text, child_fragment_status = _merge_recovered_source_child_fragments(
-            recovered_text,
-            block,
-            region_by_id,
-        )
-        attempt["recovered_source_text"] = recovered_text
-        attempt["ocr_confidence"] = float(recovered_conf or 0.0)
-        attempt["child_fragment_status"] = child_fragment_status
-        accepted, accept_reason = _logical_block_recovered_source_is_better(
-            getattr(block, "source_text", ""),
-            recovered_text,
-            block,
-            region_by_id,
-            quality_func,
-            float(recovered_conf or 0.0),
-        )
-        attempt["acceptance_reason"] = accept_reason
-        if not accepted:
-            attempt["status"] = "rejected_not_better"
-            _mark_logical_block_reocr_unresolved(block, accept_reason)
-            attempts.append(attempt)
-            continue
-        _apply_logical_text_source_reconstruction(
-            block,
-            region_by_id,
-            recovered_text,
-            float(recovered_conf or 0.0),
-            crop_bbox,
-            attempt["reason_codes"] + [accept_reason],
-            quality_func,
-            child_fragment_status,
-        )
-        attempt["status"] = "applied"
-        attempt["applied"] = True
-        applied_count += 1
-        attempts.append(attempt)
-    return {"attempt_count": len(attempts), "applied_count": applied_count, "attempts": attempts}
-
-
-def _recover_punctuation_only_speech_containers(
-    regions: list[dict],
-    logical_block_result,
-    *,
-    page_id: str,
-    image_path: str,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    quality_func,
-    font_name: str = "",
-    debug_context: dict | None = None,
-) -> dict[str, Any]:
-    """Recover speech containers where scoped CTD/OCR found only punctuation/noise."""
-    return {
-        "attempt_count": 0,
-        "applied_count": 0,
-        "attempts": [],
-        "status": "disabled_no_executable_recovery_after_logical_block_assembly",
-    }
-
-    # Historical implementation retained below as unreachable reference until
-    # the repair diff is accepted; no post-finalization executable recovery is
-    # permitted.
-    if not logical_block_result or not getattr(logical_block_result, "physical_bubble_groups", None):
-        return {"attempt_count": 0, "applied_count": 0, "attempts": []}
-    if page_image is None or ocr_engine is None:
-        return {"attempt_count": 0, "applied_count": 0, "attempts": [], "error": "missing_page_image_or_ocr_engine"}
-
-    active_group_ids = {
-        str(getattr(block, "physical_bubble_id", "") or "")
-        for block in getattr(logical_block_result, "blocks", []) or []
-        if _source_body_for_ownership(str(getattr(block, "source_text", "") or ""))
-        and str(getattr(block, "source_quality_action", "") or "") not in {"source_quality_blocked", "block_auto_translation"}
-    }
-    attempts: list[dict[str, Any]] = []
-    applied_count = 0
-    for group in getattr(logical_block_result, "physical_bubble_groups", []) or []:
-        group_id = str(getattr(group, "physical_bubble_id", "") or "")
-        if not group_id or group_id in active_group_ids:
-            continue
-        container_ids = {str(cid) for cid in getattr(group, "member_container_ids", []) or [] if str(cid)}
-        local_regions = [
-            region
-            for region in regions
-            if str(region.get("text_area_container_id") or "") in container_ids
-            and str(region.get("text_area_container_type") or "") == "speech_bubble"
-            and not any(str(flag).strip() for flag in region.get("text_area_conflict_flags") or [])
-        ]
-        active_meaningful = [
-            region for region in local_regions
-            if _source_body_for_ownership(str(region.get("ocr_text") or ""))
-            and not bool((region.get("flags") or {}).get("ignore"))
-            and str(region.get("skip_reason") or "") != "ignored_by_pipeline"
-        ]
-        if active_meaningful:
-            continue
-        punctuation_or_noise = [
-            region for region in local_regions
-            if _is_punctuation_or_ellipsis_only_controller(str(region.get("ocr_text") or ""))
-            or str(region.get("logical_text_ownership_status") or "") == "noise_review_only"
-            or bool((region.get("flags") or {}).get("ignore"))
-        ]
-        no_ocr_regions = not local_regions
-        if not punctuation_or_noise and not no_ocr_regions:
-            continue
-        crop_bbox = _clip_controller_bbox(list(getattr(group, "bbox", []) or []), image_size)
-        reason_codes = ["speech_bubble_container_has_no_active_meaningful_ocr"]
-        if no_ocr_regions:
-            reason_codes.append("speech_bubble_container_has_no_ocr_regions")
-        else:
-            reason_codes.insert(0, "punctuation_only_speech_recovery_required")
-        attempt = {
-            "physical_bubble_id": group_id,
-            "container_ids": sorted(container_ids),
-            "punctuation_region_ids": [str(region.get("region_id") or "") for region in punctuation_or_noise],
-            "crop_bbox": crop_bbox,
-            "applied": False,
-            "reason_codes": reason_codes,
-        }
-        if not crop_bbox:
-            attempt["status"] = "skipped_no_physical_crop"
-            attempts.append(attempt)
-            continue
-        crop = _crop_image(image_path, crop_bbox, expand_wide=False, image_obj=page_image)
-        if crop is None:
-            attempt["status"] = "skipped_crop_failed"
-            attempts.append(attempt)
-            continue
-        try:
-            recovered_text, recovered_conf = _recognize_with_fallback(
-                ocr_engine,
-                crop,
-                settings,
-                crop_bbox,
-                debug_context=debug_context,
-                trace_context={
-                    "page_id": page_id,
-                    "attempt_kind": "punctuation_only_speech_recovery",
-                    "root_id": group_id,
-                    "text_area_container_id": ",".join(sorted(container_ids)),
-                    "route_intent": "translate_speech",
-                    "ocr_eligible": True,
-                    "source_bbox": list(crop_bbox or []),
-                    "actual_crop_bbox": list(crop_bbox or []),
-                    "container_bbox": list(crop_bbox or []),
-                },
-            )
-        except Exception as exc:
-            attempt["status"] = "ocr_failed"
-            attempt["error"] = f"{type(exc).__name__}: {exc}"
-            attempts.append(attempt)
-            continue
-        recovered_text = _clean_ocr_text(str(recovered_text or ""))
-        attempt["recovered_source_text"] = recovered_text
-        attempt["ocr_confidence"] = float(recovered_conf or 0.0)
-        recovered_body = _source_body_for_ownership(recovered_text)
-        status, reasons, action = quality_func(recovered_text, local_regions)
-        recovered_short_laugh = _is_short_kana_laugh_source(recovered_text)
-        if len(recovered_body) < 5 and not (recovered_short_laugh and float(recovered_conf or 0.0) >= 0.90):
-            attempt["status"] = "rejected_recovered_source_too_short"
-            attempts.append(attempt)
-            continue
-        if _is_punctuation_or_ellipsis_only_controller(recovered_text):
-            attempt["status"] = "rejected_recovered_source_punctuation_only"
-            attempts.append(attempt)
-            continue
-        if _is_valid_japanese(recovered_text) < 0.55 or action in {"source_quality_blocked", "block_auto_translation", "split_required", "unresolved_review"}:
-            attempt["status"] = "rejected_recovered_source_quality"
-            attempt["quality_status"] = status
-            attempt["quality_reason_codes"] = reasons
-            attempts.append(attempt)
-            continue
-
-        new_region_id = _next_region_id(regions)
-        new_idx = int(new_region_id[1:]) if new_region_id.startswith("r") and new_region_id[1:].isdigit() else len(regions)
-        new_region = _region_record(
-            new_idx,
-            _bbox_to_polygon(crop_bbox),
-            list(crop_bbox),
-            recovered_text,
-            "",
-            0.5,
-            False,
-            False,
-            False,
-            region_type="speech_bubble",
-            ocr_conf=float(recovered_conf or 0.0),
-            render_updates={"classification_reason": "punctuation_only_speech_container_recovered", "cleanup_mode": "bubble"},
-        )
-        new_region["region_id"] = new_region_id
-        primary_container_id = sorted(container_ids)[0] if container_ids else ""
-        _stamp_punctuation_recovery_region(new_region, page_id, group, primary_container_id, recovered_text, crop_bbox, float(recovered_conf or 0.0), reasons)
-        if no_ocr_regions:
-            new_region["text_area_fallback_reason"] = "speech_container_no_ocr_reocr_recovery"
-            new_region.setdefault("render", {})["classification_reason"] = "speech_container_no_ocr_reocr_recovery"
-            new_region["logical_text_block_reason_codes"] = list(
-                dict.fromkeys(list(new_region.get("logical_text_block_reason_codes") or []) + ["speech_bubble_container_has_no_ocr_regions"])
-            )
-        for region in punctuation_or_noise:
-            _stamp_punctuation_recovery_child(region, page_id, group, primary_container_id, new_region_id, recovered_text, crop_bbox)
-        regions.append(new_region)
-
-        try:
-            from app.pipeline.logical_text_blocks import LogicalTextBlock
-            block = LogicalTextBlock(
-                block_id=f"ltb_{page_id}_{group_id}_punctuation_reocr",
-                page_id=page_id,
-                container_id=primary_container_id,
-                role="speech_bubble",
-                member_region_ids=[new_region_id] + [str(region.get("region_id") or "") for region in punctuation_or_noise],
-                anchor_region_id=new_region_id,
-                punctuation_child_ids=[str(region.get("region_id") or "") for region in punctuation_or_noise],
-                source_text=recovered_text,
-                reason_codes=["logical_text_block_v3", "physical_bubble_crop_reocr"] + list(reason_codes),
-                confidence=round(float(recovered_conf or 0.0), 3),
-                would_change_behavior=True,
-                member_source_texts={new_region_id: recovered_text},
-                anchor_original_text="",
-                bbox=list(crop_bbox),
-                allowed_bbox=list(crop_bbox),
-                text_conservation_status="complete",
-                ownership_status_by_region={
-                    new_region_id: "block_anchor",
-                    **{str(region.get("region_id") or ""): "punctuation_child" for region in punctuation_or_noise},
-                },
-                physical_bubble_id=group_id,
-                physical_bubble_member_container_ids=sorted(container_ids),
-                physical_bubble_source="TextAreaPlan",
-                physical_bubble_reason_codes=list(getattr(group, "reason_codes", []) or []),
-                source_quality_status="recovered",
-                source_quality_reason_codes=["punctuation_only_speech_recovered_from_physical_bubble"],
-                source_quality_action="reocr_recovered",
-                source_reconstruction_status="applied",
-                source_reconstruction_applied=True,
-                source_reconstruction_after_text=recovered_text,
-                source_reconstruction_ocr_confidence=float(recovered_conf or 0.0),
-                source_reconstruction_crop_bbox=list(crop_bbox),
-                source_reconstruction_reason_codes=["physical_bubble_crop_reocr"] + list(reason_codes),
-                source_reconstruction_required=True,
-            )
-            logical_block_result.blocks.append(block)
-            logical_block_result.applied_count += 1
-            logical_block_result.owned_region_count += 1
-            logical_block_result.speech_container_meaningful_fragment_count += 1
-        except Exception:
-            pass
-        attempt["status"] = "applied"
-        attempt["applied"] = True
-        attempt["new_region_id"] = new_region_id
-        applied_count += 1
-        attempts.append(attempt)
-    return {"attempt_count": len(attempts), "applied_count": applied_count, "attempts": attempts}
-
-
-def _reconstruct_text_block_roots(
-    regions: list[dict],
-    logical_block_result,
-    text_block_hierarchy,
-    *,
-    page_id: str,
-    image_path: str,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    detector=None,
-    settings,
-    input_size: int = 1024,
-    font_name: str,
-    quality_func,
-    debug_context: dict | None = None,
-) -> dict[str, Any]:
-    """Re-OCR unsafe speech/caption roots from their TextAreaPlan-owned root crop."""
-    if text_block_hierarchy is None or not getattr(text_block_hierarchy, "roots", None):
-        return {"attempt_count": 0, "applied_count": 0, "failed_count": 0, "attempts": [], "roots": {}}
-    if page_image is None or ocr_engine is None:
-        return {
-            "attempt_count": 0,
-            "applied_count": 0,
-            "failed_count": 0,
-            "attempts": [],
-            "roots": {},
-            "error": "missing_page_image_or_ocr_engine",
-        }
-    roots_by_id = {str(getattr(root, "root_id", "") or ""): root for root in getattr(text_block_hierarchy, "roots", []) or []}
-    parents_by_root: dict[str, list[Any]] = {}
-    children_by_root: dict[str, list[Any]] = {}
-    for parent in getattr(text_block_hierarchy, "parent_units", []) or []:
-        parents_by_root.setdefault(str(getattr(parent, "root_id", "") or ""), []).append(parent)
-    for child in getattr(text_block_hierarchy, "child_segments", []) or []:
-        children_by_root.setdefault(str(getattr(child, "root_id", "") or ""), []).append(child)
-
-    attempts: list[dict[str, Any]] = []
-    root_records: dict[str, dict[str, Any]] = {}
-    all_roots = list(roots_by_id.values())
-    full_page_ctd_cache: dict[str, Any] = {}
-    applied_count = 0
-    for root_id, root in roots_by_id.items():
-        root_parents = parents_by_root.get(root_id, [])
-        root_children = children_by_root.get(root_id, [])
-        if not _root_reconstruction_should_attempt(root, root_parents, root_children):
-            continue
-        before_sources = [str(getattr(parent, "source_text", "") or "") for parent in root_parents if str(getattr(parent, "source_text", "") or "").strip()]
-        base_record = {
-            "root_id": root_id,
-            "root_type": getattr(root, "root_type", ""),
-            "required": True,
-            "attempted": True,
-            "status": "reconstruction_failed",
-            "before_sources": before_sources,
-            "after_source": "",
-            "applied": False,
-            "rejected_attempts": [],
-        }
-        root_records[root_id] = base_record
-        root_attempt = dict(base_record)
-        root_attempt["crop_attempts"] = []
-        crop_variants = _root_reconstruction_crop_variants(list(getattr(root, "bbox", []) or []), image_size, str(getattr(root, "root_type", "") or ""))
-        if not crop_variants:
-            root_attempt["status"] = "skipped_no_root_crop"
-            base_record["status"] = root_attempt["status"]
-            attempts.append(root_attempt)
-            continue
-        best_candidate: dict[str, Any] | None = None
-        root_crop_candidates: list[dict[str, Any]] = []
-        visual_split_candidates: list[dict[str, Any]] = []
-        internal_candidate = _multi_scope_ctd_evidence_candidate(
-            root,
-            root_parents,
-            root_children,
-            all_roots=all_roots,
-            full_page_ctd_cache=full_page_ctd_cache,
-            detector=detector,
-            image_path=image_path,
-            page_image=page_image,
-            image_size=image_size,
-            ocr_engine=ocr_engine,
-            settings=settings,
-            input_size=input_size,
-            quality_func=quality_func,
-            debug_context=debug_context,
-        )
-        if internal_candidate is not None:
-            root_attempt["root_internal_child_detection"] = internal_candidate
-            root_attempt["multi_scope_ctd_evidence"] = internal_candidate
-            visual_separation = internal_candidate.get("visual_separation") or {}
-            root_attempt["visual_separation"] = visual_separation
-            base_record["visual_separation"] = visual_separation
-            base_record["root_internal_child_detection"] = {
-                "status": internal_candidate.get("status"),
-                "candidate_count": len(internal_candidate.get("candidates") or []),
-                "assembled_source_text": internal_candidate.get("assembled_source_text"),
-                "accepted": internal_candidate.get("accepted"),
-                "acceptance_reasons": internal_candidate.get("acceptance_reasons"),
-                "visual_separation": visual_separation,
-            }
-            base_record["multi_scope_ctd_evidence"] = {
-                "status": internal_candidate.get("status"),
-                "candidate_count": len(internal_candidate.get("candidates") or []),
-                "accepted_count": int(internal_candidate.get("accepted_candidate_count") or 0),
-                "rejected_count": int(internal_candidate.get("rejected_candidate_count") or 0),
-                "source_scopes": list(internal_candidate.get("source_scopes") or []),
-                "assembled_source_text": internal_candidate.get("assembled_source_text"),
-                "accepted": internal_candidate.get("accepted"),
-                "acceptance_reasons": internal_candidate.get("acceptance_reasons"),
-                "visual_separation": visual_separation,
-            }
-            if internal_candidate.get("accepted"):
-                split_parent_records = list(internal_candidate.get("split_parent_candidates") or [])
-                if split_parent_records:
-                    visual_split_candidates = [
-                        _root_reconstruction_candidate_from_visual_parent(
-                            root,
-                            root_children,
-                            parent_record,
-                            default_crop_bbox=internal_candidate.get("crop_bbox") or list(getattr(root, "bbox", []) or []),
-                        )
-                        for parent_record in split_parent_records
-                    ]
-                    base_record["visual_parent_split_count"] = len(visual_split_candidates)
-                else:
-                    best_candidate = {
-                        "variant": "bubble_owned_multiscope_ctd_ocr",
-                        "crop_bbox": internal_candidate.get("crop_bbox") or list(getattr(root, "bbox", []) or []),
-                        "recovered_source_text": internal_candidate.get("assembled_source_text") or "",
-                        "ocr_confidence": float(internal_candidate.get("ocr_confidence") or 0.0),
-                        "reasons": ["bubble_owned_multiscope_ctd_evidence", "root_internal_child_assembly"]
-                        + list(internal_candidate.get("acceptance_reasons") or []),
-                        "score": float(internal_candidate.get("score") or 0.0) + 30.0,
-                        "child_fragment_status": list(internal_candidate.get("child_fragment_status") or []),
-                        "root_internal_child_candidates": list(internal_candidate.get("candidates") or []),
-                        "represented_child_region_ids": [
-                            str(candidate.get("source_region_id") or "")
-                            for candidate in (internal_candidate.get("candidates") or [])
-                            if str(candidate.get("source_region_id") or "")
-                        ],
-                    }
-        for variant_name, crop_bbox in crop_variants:
-            crop_attempt = {
-                "variant": variant_name,
-                "crop_bbox": crop_bbox,
-                "status": "not_attempted",
-                "accepted": False,
-            }
-            crop = _crop_image(image_path, crop_bbox, expand_wide=False, image_obj=page_image)
-            if crop is None:
-                crop_attempt["status"] = "crop_failed"
-                root_attempt["crop_attempts"].append(crop_attempt)
-                continue
-            try:
-                recovered_text, recovered_conf = _recognize_with_fallback(
-                    ocr_engine,
-                    crop,
-                    settings,
-                    crop_bbox,
-                    debug_context=debug_context,
-                    trace_context={
-                        "page_id": debug_context.get("page_id") if debug_context else "",
-                        "attempt_kind": f"root_reconstruction_{variant_name}",
-                        "root_id": root_id,
-                        "text_area_container_id": getattr(root, "container_id", None),
-                        "route_intent": getattr(root, "route_intent", None),
-                        "ocr_eligible": True,
-                        "source_bbox": list(getattr(root, "bbox", []) or []),
-                        "actual_crop_bbox": list(crop_bbox or []),
-                        "container_bbox": list(getattr(root, "bbox", []) or []),
-                    },
-                )
-            except Exception as exc:
-                crop_attempt["status"] = "ocr_failed"
-                crop_attempt["error"] = f"{type(exc).__name__}: {exc}"
-                root_attempt["crop_attempts"].append(crop_attempt)
-                continue
-            recovered_text = _clean_ocr_text(str(recovered_text or ""))
-            crop_attempt["recovered_source_text"] = recovered_text
-            crop_attempt["ocr_confidence"] = float(recovered_conf or 0.0)
-            represented_child_region_ids = (
-                _derive_exact_represented_child_scope_for_root_reconstruction(
-                    recovered_text,
-                    root_children,
-                )
-            )
-            crop_attempt["represented_child_region_ids"] = list(represented_child_region_ids)
-            accepted, reasons, score, child_status = _root_reconstruction_candidate_acceptance(
-                root,
-                root_parents,
-                root_children,
-                recovered_text,
-                float(recovered_conf or 0.0),
-                quality_func,
-                represented_child_region_ids=represented_child_region_ids,
-            )
-            crop_attempt["acceptance_reasons"] = reasons
-            crop_attempt["score"] = score
-            crop_attempt["child_fragment_status"] = child_status
-            crop_attempt["status"] = "accepted_candidate" if accepted else "rejected"
-            crop_attempt["accepted"] = accepted
-            root_attempt["crop_attempts"].append(crop_attempt)
-            if not accepted:
-                base_record.setdefault("rejected_attempts", []).append(
-                    {
-                        "variant": variant_name,
-                        "crop_bbox": crop_bbox,
-                        "recovered_source_text": recovered_text,
-                        "ocr_confidence": float(recovered_conf or 0.0),
-                        "reasons": reasons,
-                    }
-                )
-                continue
-            root_crop_candidates.append(
-                {
-                    "variant": variant_name,
-                    "crop_bbox": crop_bbox,
-                    "recovered_source_text": recovered_text,
-                    "ocr_confidence": float(recovered_conf or 0.0),
-                    "reasons": reasons,
-                    "score": score,
-                    "child_fragment_status": child_status,
-                    "represented_child_region_ids": list(represented_child_region_ids),
-                }
-            )
-        stable_crop_candidate = _select_stable_root_crop_candidate(root_crop_candidates)
-        if stable_crop_candidate is not None and (
-            best_candidate is None
-            or float(stable_crop_candidate.get("score") or 0.0)
-            > float(best_candidate.get("score") or 0.0)
-        ):
-            best_candidate = stable_crop_candidate
-        if visual_split_candidates:
-            applied_records: list[dict[str, Any]] = []
-            for split_candidate in visual_split_candidates:
-                applied = _apply_root_reconstruction_candidate(
-                    regions,
-                    logical_block_result,
-                    page_id=page_id,
-                    root=root,
-                    root_parents=root_parents,
-                    root_children=root_children,
-                    candidate=split_candidate,
-                    font_name=font_name,
-                )
-                if applied:
-                    applied_records.append(applied)
-            if applied_records:
-                root_attempt["status"] = "applied_visual_parent_split"
-                root_attempt["applied"] = True
-                root_attempt["selected_variant"] = "bubble_owned_multiscope_ctd_ocr_visual_parent_split"
-                root_attempt["after_source"] = " / ".join(
-                    str(candidate.get("recovered_source_text") or "")
-                    for candidate in visual_split_candidates
-                    if str(candidate.get("recovered_source_text") or "")
-                )
-                root_attempt["new_region_ids"] = [record.get("new_region_id") for record in applied_records]
-                root_attempt["new_block_ids"] = [record.get("new_block_id") for record in applied_records]
-                base_record.update(
-                    {
-                        "status": "applied_visual_parent_split",
-                        "applied": True,
-                        "after_source": root_attempt["after_source"],
-                        "new_region_ids": list(root_attempt["new_region_ids"]),
-                        "new_block_ids": list(root_attempt["new_block_ids"]),
-                    }
-                )
-                applied_count += 1
-                attempts.append(root_attempt)
-                continue
-            root_attempt["visual_parent_split_apply_failed"] = True
-        if best_candidate is None:
-            root_attempt["status"] = "reconstruction_failed"
-            root_attempt["rejected_attempts"] = list(base_record.get("rejected_attempts") or [])
-            base_record["status"] = root_attempt["status"]
-            attempts.append(root_attempt)
-            continue
-        applied = _apply_root_reconstruction_candidate(
-            regions,
-            logical_block_result,
-            page_id=page_id,
-            root=root,
-            root_parents=root_parents,
-            root_children=root_children,
-            candidate=best_candidate,
-            font_name=font_name,
-        )
-        if not applied:
-            root_attempt["status"] = "apply_failed"
-            base_record["status"] = root_attempt["status"]
-            attempts.append(root_attempt)
-            continue
-        root_attempt["status"] = "applied"
-        root_attempt["applied"] = True
-        root_attempt["selected_variant"] = best_candidate.get("variant")
-        root_attempt["after_source"] = best_candidate.get("recovered_source_text", "")
-        root_attempt["new_region_id"] = applied.get("new_region_id")
-        root_attempt["new_block_id"] = applied.get("new_block_id")
-        base_record.update(
-            {
-                "status": "applied",
-                "applied": True,
-                "after_source": best_candidate.get("recovered_source_text", ""),
-                "new_region_id": applied.get("new_region_id"),
-                "new_block_id": applied.get("new_block_id"),
-            }
-        )
-        applied_count += 1
-        attempts.append(root_attempt)
-    failed_count = sum(1 for record in root_records.values() if record.get("status") not in {"applied", "applied_visual_parent_split"})
-    return {
-        "attempt_count": len(attempts),
-        "applied_count": applied_count,
-        "failed_count": failed_count,
-        "unresolved_blocker_count": failed_count,
-        "multi_scope_full_page_ctd_ran": bool(full_page_ctd_cache.get("attempted")),
-        "multi_scope_full_page_ctd_candidate_count": len(full_page_ctd_cache.get("detections") or []),
-        "attempts": attempts,
-        "roots": root_records,
-    }
-
-
-
-def _multi_scope_ctd_evidence_candidate(
-    root,
-    parents: list[Any],
-    children: list[Any],
-    *,
-    all_roots: list[Any],
-    full_page_ctd_cache: dict[str, Any],
-    detector,
-    image_path: str,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    input_size: int,
-    quality_func,
-    debug_context: dict | None = None,
-) -> dict[str, Any] | None:
-    """Collect CTD/OCR evidence from root-owned scopes and admit it through TextAreaPlan root gates."""
-    root_type = str(getattr(root, "root_type", "") or "")
-    if root_type not in {"speech_bubble", "caption_background"}:
-        return None
-    if page_image is None or ocr_engine is None:
-        return None
-    root_bbox = _clip_controller_bbox(list(getattr(root, "bbox", []) or []), image_size)
-    if not root_bbox:
-        return None
-    image_cv = _read_image_cv(image_path)
-    if image_cv is None:
-        return {"status": "image_load_failed", "variant": "multi_scope", "crop_bbox": root_bbox, "candidates": []}
-
-    inventory: list[dict[str, Any]] = []
-    accepted_candidates: list[dict[str, Any]] = []
-    rejected_candidates: list[dict[str, Any]] = []
-    scope_errors: list[dict[str, Any]] = []
-
-    for child_candidate in _existing_root_child_evidence_candidates(root, children):
-        admitted = _admit_multiscope_ctd_candidate(child_candidate, root, all_roots, image_size)
-        record = dict(child_candidate)
-        record.update(admitted)
-        inventory.append(record)
-        if record.get("admission_status") == "accepted":
-            accepted_candidates.append(record)
-        else:
-            rejected_candidates.append(record)
-
-    detector_available = detector is not None and hasattr(detector, "detect_image")
-    if detector_available:
-        crop_scope_variants = _root_ctd_scope_variants(root_bbox, image_size, root_type)
-        for source_scope, crop_bbox in crop_scope_variants:
-            scoped, errors = _collect_ctd_scope_candidates(
-                detector,
-                image_path,
-                image_cv,
-                page_image,
-                crop_bbox,
-                image_size,
-                ocr_engine,
-                settings,
-                input_size,
-                source_scope=source_scope,
-                root=root,
-                all_roots=all_roots,
-                debug_context=debug_context,
-            )
-            scope_errors.extend(errors)
-            inventory.extend(scoped)
-            for candidate in scoped:
-                if candidate.get("admission_status") == "accepted":
-                    accepted_candidates.append(candidate)
-                else:
-                    rejected_candidates.append(candidate)
-    else:
-        scope_errors.append({"source_scope": "ctd_scopes", "status": "skipped_detector_unavailable"})
-
-    full_page_used = False
-    if detector_available:
-        full_page_candidates, full_errors = _collect_full_page_ctd_evidence_for_root(
-            detector,
-            image_path,
-            image_cv,
-            page_image,
-            image_size,
-            ocr_engine,
-            settings,
-            input_size,
-                root=root,
-                all_roots=all_roots,
-                full_page_ctd_cache=full_page_ctd_cache,
-                debug_context=debug_context,
-            )
-        full_page_used = bool(full_page_candidates or full_errors)
-        scope_errors.extend(full_errors)
-        inventory.extend(full_page_candidates)
-        for candidate in full_page_candidates:
-            if candidate.get("admission_status") == "accepted":
-                accepted_candidates.append(candidate)
-            else:
-                rejected_candidates.append(candidate)
-
-    graph_eval = _evaluate_multiscope_ctd_graph_assembly(
-        root,
-        parents,
-        children,
-        accepted_candidates,
-        quality_func,
-    )
-    candidate_graph_records = list(graph_eval.get("candidate_graph_records") or [])
-    graph_by_id = {
-        str(record.get("candidate_id") or ""): record
-        for record in candidate_graph_records
-        if str(record.get("candidate_id") or "")
-    }
-    for candidate in inventory:
-        graph_record = graph_by_id.get(str(candidate.get("candidate_id") or ""))
-        if graph_record:
-            candidate.update(
-                {
-                    "candidate_graph_state": graph_record.get("candidate_graph_state"),
-                    "candidate_graph_reason": graph_record.get("candidate_graph_reason"),
-                    "parent_candidate_id": graph_record.get("parent_candidate_id"),
-                }
-            )
-    ordered_candidates = list(graph_eval.get("candidates") or [])
-    assembled_text = str(graph_eval.get("assembled_source_text") or "")
-    ocr_conf = float(graph_eval.get("ocr_confidence") or 0.0)
-    accepted = bool(graph_eval.get("accepted"))
-    reasons = list(graph_eval.get("acceptance_reasons") or [])
-    score = float(graph_eval.get("score") or 0.0)
-    child_status = list(graph_eval.get("child_fragment_status") or [])
-    if accepted:
-        reasons = ["bubble_owned_multiscope_ctd_child_source"] + list(reasons or [])
-    status = "accepted" if accepted else ("rejected" if accepted_candidates else "no_admitted_multiscope_candidates")
-    return {
-        "status": status,
-        "variant": "bubble_owned_multiscope_ctd_ocr",
-        "crop_bbox": root_bbox,
-        "candidates": ordered_candidates,
-        "candidate_inventory": inventory,
-        "rejected_candidates": rejected_candidates,
-        "accepted_candidate_count": len(ordered_candidates),
-        "rejected_candidate_count": len(rejected_candidates),
-        "source_scopes": sorted({str(candidate.get("source_scope") or "") for candidate in inventory if candidate.get("source_scope")}),
-        "full_page_ctd_evidence_used": full_page_used,
-        "scope_errors": scope_errors,
-        "candidate_graph_records": candidate_graph_records,
-        "candidate_graph_state_counts": graph_eval.get("candidate_graph_state_counts") or {},
-        "parent_candidates": list(graph_eval.get("parent_candidates") or []),
-        "split_parent_candidates": list(graph_eval.get("split_parent_candidates") or []),
-        "visual_separation": graph_eval.get("visual_separation") or {},
-        "accepted_parent_candidate_id": graph_eval.get("accepted_parent_candidate_id"),
-        "assembled_source_text": assembled_text,
-        "assembled_source_parts": list(graph_eval.get("assembled_source_parts") or []),
-        "merged_existing_child_fragments": list(graph_eval.get("merged_existing_child_fragments") or []),
-        "ocr_confidence": ocr_conf,
-        "accepted": accepted,
-        "acceptance_reasons": reasons,
-        "score": score,
-        "child_fragment_status": child_status,
-    }
-
-
-def _root_internal_child_detection_candidate(
-    root,
-    parents: list[Any],
-    children: list[Any],
-    *,
-    detector,
-    image_path: str,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    input_size: int,
-    quality_func,
-    debug_context: dict | None = None,
-) -> dict[str, Any] | None:
-    """Compatibility wrapper for the previous root-local CTD evidence API."""
-    return _multi_scope_ctd_evidence_candidate(
-        root,
-        parents,
-        children,
-        all_roots=[root],
-        full_page_ctd_cache={},
-        detector=detector,
-        image_path=image_path,
-        page_image=page_image,
-        image_size=image_size,
-        ocr_engine=ocr_engine,
-        settings=settings,
-        input_size=input_size,
-        quality_func=quality_func,
-        debug_context=debug_context,
-    )
-
-
-def _root_ctd_scope_variants(
-    root_bbox: list[int],
-    image_size: tuple[int, int] | None,
-    root_type: str,
-) -> list[tuple[str, list[int]]]:
-    variants = _root_reconstruction_crop_variants(root_bbox, image_size, root_type)
-    if not variants:
-        return []
-    named: list[tuple[str, list[int]]] = []
-    for idx, (_variant, bbox) in enumerate(variants):
-        if idx == 0:
-            scope = "tight_root_crop"
-        elif idx == 1:
-            scope = "padded_root_crop"
-        else:
-            scope = "expanded_root_crop"
-        if bbox not in [existing for _scope, existing in named]:
-            named.append((scope, bbox))
-    return named
-
-
-def _existing_root_child_evidence_candidates(root, children: list[Any]) -> list[dict[str, Any]]:
-    root_id = str(getattr(root, "root_id", "") or "")
-    candidates: list[dict[str, Any]] = []
-    for idx, child in enumerate(children or []):
-        bbox = _clip_controller_bbox(list(getattr(child, "bbox", []) or []), None)
-        text = _clean_ocr_text(str(getattr(child, "ocr_text", "") or ""))
-        if not bbox or not text:
-            continue
-        candidates.append(
-            {
-                "candidate_id": f"existing_child_{idx:02d}",
-                "source_scope": "existing_scoped_root_child",
-                "source_root_id": root_id,
-                "bbox": bbox,
-                "polygon": _bbox_to_polygon(bbox),
-                "detection_confidence": 1.0,
-                "ocr_text": text,
-                "ocr_confidence": float(getattr(child, "ocr_confidence", 0.0) or 0.0),
-                "evidence_source": "existing_scoped_root_child_ocr",
-                "source_region_id": str(getattr(child, "source_region_id", "") or ""),
-            }
-        )
-    return candidates
-
-
-
-def _collect_ctd_scope_candidates(
-    detector,
-    image_path: str,
-    image_cv,
-    page_image,
-    crop_bbox: list[int],
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    input_size: int,
-    *,
-    source_scope: str,
-    root,
-    all_roots: list[Any],
-    debug_context: dict | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    errors: list[dict[str, Any]] = []
-    candidates: list[dict[str, Any]] = []
-    if image_cv is None or not crop_bbox:
-        return candidates, [{"source_scope": source_scope, "status": "image_or_crop_missing"}]
-    try:
-        x, y, w, h = [int(v) for v in crop_bbox[:4]]
-        crop = image_cv[y : y + h, x : x + w]
-    except Exception:
-        crop = None
-    if crop is None or getattr(crop, "size", 0) == 0:
-        return candidates, [{"source_scope": source_scope, "crop_bbox": crop_bbox, "status": "crop_failed"}]
-    try:
-        try:
-            detections = detector.detect_image(crop, input_size=input_size)
-        except TypeError:
-            detections = detector.detect_image(crop)
-    except Exception as exc:
-        return candidates, [
-            {
-                "source_scope": source_scope,
-                "crop_bbox": crop_bbox,
-                "status": "ctd_failed",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        ]
-    x0, y0 = int(crop_bbox[0]), int(crop_bbox[1])
-    for index, item in enumerate(detections or []):
-        if not item or len(item) < 2:
-            continue
-        polygon, det_conf = item
-        shifted = _shift_polygon_to_page(polygon, x0, y0)
-        if len(shifted) < 2:
-            continue
-        bbox = _clip_controller_bbox(_polygon_to_bbox(shifted), image_size)
-        candidate = _ctd_detection_candidate_record(
-            candidate_id=f"{source_scope}_{index:03d}",
-            source_scope=source_scope,
-            source_root_id=str(getattr(root, "root_id", "") or ""),
-            bbox=bbox,
-            polygon=shifted,
-            det_conf=float(det_conf or 0.0),
-            image_path=image_path,
-            page_image=page_image,
-            image_size=image_size,
-            ocr_engine=ocr_engine,
-            settings=settings,
-            root=root,
-            all_roots=all_roots,
-            debug_context=debug_context,
-        )
-        candidates.append(candidate)
-    return candidates, errors
-
-
-def _collect_full_page_ctd_evidence_for_root(
-    detector,
-    image_path: str,
-    image_cv,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    input_size: int,
-    *,
-    root,
-    all_roots: list[Any],
-    full_page_ctd_cache: dict[str, Any],
-    debug_context: dict | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    candidates: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    if image_cv is None:
-        return candidates, [{"source_scope": "full_page_ctd_evidence", "status": "image_missing"}]
-    if not full_page_ctd_cache.get("attempted"):
-        full_page_ctd_cache["attempted"] = True
-        try:
-            try:
-                detections = detector.detect_image(image_cv, input_size=input_size)
-            except TypeError:
-                detections = detector.detect_image(image_cv)
-            full_page_ctd_cache["detections"] = list(detections or [])
-            full_page_ctd_cache["status"] = "completed"
-        except Exception as exc:
-            full_page_ctd_cache["detections"] = []
-            full_page_ctd_cache["status"] = "failed"
-            full_page_ctd_cache["error"] = f"{type(exc).__name__}: {exc}"
-    if full_page_ctd_cache.get("status") == "failed":
-        return candidates, [
-            {
-                "source_scope": "full_page_ctd_evidence",
-                "status": "ctd_failed",
-                "error": full_page_ctd_cache.get("error"),
-            }
-        ]
-    for index, item in enumerate(full_page_ctd_cache.get("detections") or []):
-        if not item or len(item) < 2:
-            continue
-        polygon, det_conf = item
-        shifted = _shift_polygon_to_page(polygon, 0, 0)
-        if len(shifted) < 2:
-            continue
-        bbox = _clip_controller_bbox(_polygon_to_bbox(shifted), image_size)
-        candidate = _ctd_detection_candidate_record(
-            candidate_id=f"full_page_ctd_evidence_{index:03d}",
-            source_scope="full_page_ctd_evidence",
-            source_root_id=str(getattr(root, "root_id", "") or ""),
-            bbox=bbox,
-            polygon=shifted,
-            det_conf=float(det_conf or 0.0),
-            image_path=image_path,
-            page_image=page_image,
-            image_size=image_size,
-            ocr_engine=ocr_engine,
-            settings=settings,
-            root=root,
-            all_roots=all_roots,
-            debug_context=debug_context,
-        )
-        if (
-            candidate.get("admission_status") == "accepted"
-            or candidate.get("target_root_overlap_ratio", 0.0) > 0.02
-            or bool(candidate.get("sfx_decorative_conflict"))
-        ):
-            candidates.append(candidate)
-    return candidates, errors
-
-
-def _ctd_detection_candidate_record(
-    *,
-    candidate_id: str,
-    source_scope: str,
-    source_root_id: str,
-    bbox: list[int],
-    polygon: list[list[float]],
-    det_conf: float,
-    image_path: str,
-    page_image,
-    image_size: tuple[int, int] | None,
-    ocr_engine,
-    settings,
-    root,
-    all_roots: list[Any],
-    debug_context: dict | None = None,
-) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "candidate_id": candidate_id,
-        "source_scope": source_scope,
-        "source_root_id": source_root_id,
-        "bbox": list(bbox or []),
-        "polygon": polygon,
-        "detection_confidence": float(det_conf or 0.0),
-        "evidence_source": "bubble_owned_multiscope_ctd",
-    }
-    admission = _admit_multiscope_ctd_candidate(record, root, all_roots, image_size)
-    record.update(admission)
-    if record.get("admission_status") != "accepted":
-        return record
-    child_crop = _crop_image(image_path, bbox, expand_wide=False, image_obj=page_image)
-    if child_crop is None:
-        record["admission_status"] = "rejected"
-        record.setdefault("rejection_reasons", []).append("ocr_crop_failed")
-        record["ocr_status"] = "crop_failed"
-        return record
-    try:
-        text, conf = _recognize_with_fallback(
-            ocr_engine,
-            child_crop,
-            settings,
-            bbox,
-            debug_context=debug_context,
-            trace_context={
-                "page_id": debug_context.get("page_id") if debug_context else "",
-                "attempt_kind": f"multiscope_ctd_{source_scope}",
-                "root_id": source_root_id,
-                "text_area_container_id": getattr(root, "container_id", None),
-                "route_intent": getattr(root, "route_intent", None),
-                "ocr_eligible": True,
-                "source_bbox": list(bbox or []),
-                "actual_crop_bbox": list(bbox or []),
-                "container_bbox": list(getattr(root, "bbox", []) or []),
-            },
-        )
-    except Exception as exc:
-        record["admission_status"] = "rejected"
-        record.setdefault("rejection_reasons", []).append("ocr_failed")
-        record["ocr_status"] = "failed"
-        record["failure_reason"] = f"{type(exc).__name__}: {exc}"
-        return record
-    text = _clean_ocr_text(str(text or ""))
-    record["ocr_text"] = text
-    record["ocr_confidence"] = float(conf or 0.0)
-    record["ocr_status"] = "completed"
-    if not text or _is_punctuation_or_ellipsis_only_controller(text):
-        record["admission_status"] = "rejected"
-        record.setdefault("rejection_reasons", []).append("punctuation_or_empty_ocr")
-    return record
-
-
-def _shift_polygon_to_page(polygon, offset_x: int, offset_y: int) -> list[list[float]]:
-    shifted: list[list[float]] = []
-    for point in polygon or []:
-        if point is None or len(point) < 2:
-            continue
-        shifted.append([float(point[0]) + float(offset_x), float(point[1]) + float(offset_y)])
-    return shifted
-
-
-def _admit_multiscope_ctd_candidate(
-    candidate: dict[str, Any],
-    root,
-    all_roots: list[Any],
-    image_size: tuple[int, int] | None,
-) -> dict[str, Any]:
-    bbox = _clip_controller_bbox(list(candidate.get("bbox") or []), image_size)
-    root_bbox = _clip_controller_bbox(list(getattr(root, "bbox", []) or []), image_size)
-    root_id = str(getattr(root, "root_id", "") or "")
-    root_type = str(getattr(root, "root_type", "") or "")
-    route = str(getattr(root, "route_policy", "") or "")
-    reasons: list[str] = []
-    if not bbox or not root_bbox:
-        return {"admission_status": "rejected", "rejection_reasons": ["invalid_candidate_or_root_bbox"]}
-    target_overlap = _bbox_inside_ratio_controller(bbox, root_bbox)
-    center_in_root = _bbox_center_inside(bbox, root_bbox)
-    root_area = max(1, int(root_bbox[2]) * int(root_bbox[3]))
-    cand_area = max(1, int(bbox[2]) * int(bbox[3]))
-    if root_type == "speech_bubble":
-        compatible_route = route == "translate_speech"
-    elif root_type == "caption_background":
-        compatible_route = route in {"translate_caption", "translate_caption_background"}
-    else:
-        compatible_route = False
-    if not compatible_route:
-        reasons.append("root_route_not_ocr_translation_eligible")
-    if cand_area > root_area * 1.45:
-        reasons.append("candidate_implausibly_larger_than_root")
-    min_overlap = 0.35 if candidate.get("source_scope") == "full_page_ctd_evidence" else 0.20
-    if not center_in_root and target_overlap < min_overlap:
-        reasons.append("candidate_not_owned_by_target_root")
-
-    root_overlaps: list[dict[str, Any]] = []
-    stronger_other_root = None
-    preserve_conflict = None
-    for other in all_roots or []:
-        other_id = str(getattr(other, "root_id", "") or "")
-        other_bbox = _clip_controller_bbox(list(getattr(other, "bbox", []) or []), image_size)
-        if not other_bbox:
-            continue
-        overlap = _bbox_inside_ratio_controller(bbox, other_bbox)
-        center = _bbox_center_inside(bbox, other_bbox)
-        if overlap <= 0 and not center:
-            continue
-        other_type = str(getattr(other, "root_type", "") or "")
-        other_route = str(getattr(other, "route_policy", "") or "")
-        root_overlaps.append(
-            {
-                "root_id": other_id,
-                "root_type": other_type,
-                "overlap_ratio": round(overlap, 4),
-                "center_in_root": bool(center),
-            }
-        )
-        if other_id != root_id and (other_type == "sfx_decorative_art" or other_route in {"preserve", "preserve_sfx_decorative"}):
-            if center or overlap >= 0.18:
-                preserve_conflict = other_id
-        if other_id != root_id and other_route in {"translate_speech", "translate_caption", "translate_caption_background"}:
-            if center and not center_in_root:
-                stronger_other_root = other_id
-            elif overlap > target_overlap + 0.25:
-                stronger_other_root = other_id
-    if preserve_conflict:
-        reasons.append(f"overlaps_preserve_sfx_root:{preserve_conflict}")
-    if stronger_other_root:
-        reasons.append(f"stronger_other_text_root_owner:{stronger_other_root}")
-    status = "accepted" if not reasons else "rejected"
-    return {
-        "admission_status": status,
-        "rejection_reasons": reasons,
-        "admitted_root_id": root_id if status == "accepted" else None,
-        "role_compatible": bool(compatible_route),
-        "root_role_compatibility": "compatible" if compatible_route else "route_mismatch",
-        "target_root_overlap_ratio": round(target_overlap, 4),
-        "center_in_root": bool(center_in_root),
-        "root_overlap_ratios": root_overlaps,
-        "sfx_decorative_conflict": bool(preserve_conflict),
-    }
-
-
-def _bbox_center_inside(inner: list[int], outer: list[int]) -> bool:
-    try:
-        x, y, w, h = [float(v) for v in (inner or [0, 0, 0, 0])[:4]]
-        ox, oy, ow, oh = [float(v) for v in (outer or [0, 0, 0, 0])[:4]]
-    except Exception:
-        return False
-    cx = x + w / 2.0
-    cy = y + h / 2.0
-    return ox <= cx <= ox + ow and oy <= cy <= oy + oh
-
-
-def _multiscope_candidate_rank(candidate: dict[str, Any]) -> float:
-    text = str(candidate.get("ocr_text") or "")
-    body_len = len(_root_reconstruction_source_body(text))
-    scope_bonus = {
-        "tight_root_crop": 14.0,
-        "padded_root_crop": 12.0,
-        "expanded_root_crop": 10.0,
-        "full_page_ctd_evidence": 8.0,
-        "existing_scoped_root_child": 0.0,
-    }.get(str(candidate.get("source_scope") or ""), 0.0)
-    return (
-        float(candidate.get("target_root_overlap_ratio") or 0.0) * 80.0
-        + float(candidate.get("ocr_confidence") or 0.0) * 35.0
-        + float(candidate.get("detection_confidence") or 0.0) * 10.0
-        + min(24, body_len) * 0.8
-        + scope_bonus
-    )
-
-
-def _dedupe_multiscope_ctd_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    cleaned = [
-        candidate for candidate in candidates
-        if candidate.get("admission_status") == "accepted"
-        and str(candidate.get("ocr_text") or "").strip()
-        and not _is_punctuation_or_ellipsis_only_controller(str(candidate.get("ocr_text") or ""))
-    ]
-    cleaned.sort(key=_multiscope_candidate_rank, reverse=True)
-    result: list[dict[str, Any]] = []
-    for candidate in cleaned:
-        bbox = list(candidate.get("bbox") or [])
-        if not bbox:
-            continue
-        duplicate = any(
-            _overlap_ratio(bbox, list(existing.get("bbox") or [])) >= 0.92
-            and _bbox_inside_ratio_controller(
-                bbox,
-                list(existing.get("bbox") or []),
-            )
-            >= 0.90
-            and _bbox_inside_ratio_controller(
-                list(existing.get("bbox") or []),
-                bbox,
-            )
-            >= 0.90
-            for existing in result
-            if existing.get("bbox")
-        )
-        if not duplicate:
-            result.append(candidate)
-    return result
-
-
-def _evaluate_multiscope_ctd_graph_assembly(
-    root,
-    parents: list[Any],
-    children: list[Any],
-    candidates: list[dict[str, Any]],
-    quality_func,
-) -> dict[str, Any]:
-    graph = _build_multiscope_candidate_graph(candidates)
-    selected = list(graph.get("assembly_candidates") or [])
-    visual_analysis = visual_parent_group_analysis(root, selected)
-    group_map = visual_analysis.get("candidate_group_map") or {}
-    for record in graph.get("candidate_graph_records") or []:
-        candidate_id = str(record.get("candidate_id") or "")
-        record["parent_visual_group_id"] = str(group_map.get(candidate_id) or "")
-    parent_candidates = _build_root_parent_candidates_from_graph(root, selected, graph, visual_analysis)
-    evaluated: list[dict[str, Any]] = []
-    for parent_candidate in parent_candidates:
-        accepted, reasons, score, child_status = _root_parent_candidate_acceptance_v2(
-            root,
-            parents,
-            children,
-            parent_candidate,
-            graph,
-            quality_func,
-        )
-        record = parent_candidate_contract(
-            root,
-            parent_candidate,
-            accepted=bool(accepted),
-            reasons=list(reasons or []),
-            score=float(score or 0.0),
-            child_status=child_status,
-        )
-        evaluated.append(record)
-
-    accepted_parents = [candidate for candidate in evaluated if candidate.get("accepted")]
-    split_parent_candidates: list[dict[str, Any]] = []
-    if bool(visual_analysis.get("overmerge_risk")):
-        split_parent_candidates = [
-            candidate for candidate in accepted_parents
-            if str(candidate.get("parent_visual_group_id") or "")
-            and not str(candidate.get("parent_visual_group_id") or "").startswith("overmerged:")
-        ]
-        group_ids = {str(candidate.get("parent_visual_group_id") or "") for candidate in split_parent_candidates}
-        if len(group_ids) < 2:
-            split_parent_candidates = []
-    if split_parent_candidates:
-        best_parent = max(split_parent_candidates, key=lambda item: float(item.get("score") or 0.0))
-    elif accepted_parents:
-        best_parent = max(accepted_parents, key=lambda item: float(item.get("score") or 0.0))
-    else:
-        best_parent = max(evaluated, key=lambda item: float(item.get("score") or 0.0), default=None)
-    accepted = bool((split_parent_candidates or (best_parent and best_parent.get("accepted"))))
-    accepted_id = str(best_parent.get("parent_candidate_id") or "") if best_parent else ""
-    graph_records = list(graph.get("candidate_graph_records") or [])
-    if split_parent_candidates:
-        child_candidate_ids = {
-            str(item)
-            for candidate in split_parent_candidates
-            for item in (candidate.get("child_candidate_ids") or [])
-            if str(item)
-        }
-    else:
-        child_candidate_ids = set(str(item) for item in (best_parent or {}).get("child_candidate_ids", []) if str(item))
-    for record in graph_records:
-        candidate_id = str(record.get("candidate_id") or "")
-        if candidate_id in child_candidate_ids:
-            if split_parent_candidates:
-                owner = next(
-                    (
-                        candidate for candidate in split_parent_candidates
-                        if candidate_id in {str(item) for item in (candidate.get("child_candidate_ids") or [])}
-                    ),
-                    None,
-                )
-                record["parent_candidate_id"] = str((owner or {}).get("parent_candidate_id") or accepted_id)
-            else:
-                record["parent_candidate_id"] = accepted_id
-            record["candidate_graph_state"] = "accepted_parent_segment" if accepted else "rejected_parent_segment"
-            record["candidate_graph_reason"] = (
-                "selected_for_accepted_root_parent"
-                if accepted
-                else "selected_parent_candidate_rejected"
-            )
-    state_counts: dict[str, int] = {}
-    for record in graph_records:
-        state = str(record.get("candidate_graph_state") or "unclassified")
-        state_counts[state] = state_counts.get(state, 0) + 1
-    return {
-        "accepted": accepted,
-        "accepted_parent_candidate_id": accepted_id if accepted else "",
-        "acceptance_reasons": list((best_parent or {}).get("acceptance_reasons") or (best_parent or {}).get("rejection_reasons") or []),
-        "score": float((best_parent or {}).get("score") or 0.0),
-        "child_fragment_status": list((best_parent or {}).get("child_fragment_status") or []),
-        "candidates": [candidate for candidate in selected if str(candidate.get("candidate_id") or "") in child_candidate_ids] if best_parent else selected,
-        "candidate_graph_records": graph_records,
-        "candidate_graph_state_counts": state_counts,
-        "parent_candidates": evaluated,
-        "split_parent_candidates": split_parent_candidates,
-        "visual_separation": visual_analysis,
-        "assembled_source_text": str((best_parent or {}).get("source_text") or ""),
-        "assembled_source_parts": list((best_parent or {}).get("source_parts") or []),
-        "merged_existing_child_fragments": [],
-        "ocr_confidence": float((best_parent or {}).get("ocr_confidence") or 0.0),
-    }
-
-
-def _build_multiscope_candidate_graph(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    admitted = [
-        dict(candidate)
-        for candidate in candidates
-        if candidate.get("admission_status") == "accepted"
-        and str(candidate.get("ocr_text") or "").strip()
-    ]
-    meaningful = [
-        candidate for candidate in admitted
-        if not _is_punctuation_or_ellipsis_only_controller(str(candidate.get("ocr_text") or ""))
-        and _root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))
-    ]
-    selected = _dedupe_multiscope_ctd_candidates(meaningful)
-    selected = _suppress_short_root_crop_fragments_with_strong_parent(selected)
-    selected_by_id = {str(candidate.get("candidate_id") or ""): candidate for candidate in selected}
-    graph_records: list[dict[str, Any]] = []
-    for candidate in admitted:
-        candidate_id = str(candidate.get("candidate_id") or "")
-        text = _clean_ocr_text(str(candidate.get("ocr_text") or ""))
-        body = _root_reconstruction_source_body(text)
-        state = "root_spatial_admitted"
-        reason = "admitted_by_text_area_root"
-        parent_candidate_id = ""
-        if not body or _is_punctuation_or_ellipsis_only_controller(text):
-            state = "punctuation_fragment"
-            reason = "punctuation_or_ellipsis_only"
-        elif candidate_id in selected_by_id:
-            state = "assembly_candidate"
-            reason = "selected_for_root_parent_assembly"
-        else:
-            state, reason, parent_candidate_id = _classify_nonselected_graph_candidate(candidate, selected)
-        record = {
-            "candidate_id": candidate_id,
-            "source_scope": candidate.get("source_scope"),
-            "bbox": list(candidate.get("bbox") or []),
-            "ocr_text": text,
-            "ocr_confidence": candidate.get("ocr_confidence"),
-            "root_overlap": candidate.get("target_root_overlap_ratio"),
-            "center_in_root": candidate.get("center_in_root"),
-            "role_compatible": candidate.get("role_compatible"),
-            "root_role_compatibility": candidate.get("root_role_compatibility"),
-            "sfx_decorative_conflict": candidate.get("sfx_decorative_conflict"),
-            "candidate_graph_state": state,
-            "candidate_graph_reason": reason,
-            "parent_candidate_id": parent_candidate_id,
-            "source_region_id": candidate.get("source_region_id"),
-        }
-        graph_records.append(record)
-    return {
-        "assembly_candidates": selected,
-        "candidate_graph_records": graph_records,
-    }
-
-
-def _classify_nonselected_graph_candidate(
-    candidate: dict[str, Any],
-    selected: list[dict[str, Any]],
-) -> tuple[str, str, str]:
-    text = _clean_ocr_text(str(candidate.get("ocr_text") or ""))
-    body = _root_reconstruction_source_body(text)
-    bbox = list(candidate.get("bbox") or [])
-    if not body:
-        return "noise_fragment", "empty_source_body", ""
-    suppressed_reason = str(candidate.get("_candidate_graph_suppressed_reason") or "")
-    if suppressed_reason:
-        return (
-            "support_fragment",
-            suppressed_reason,
-            str(candidate.get("_candidate_graph_suppressed_parent_id") or ""),
-        )
-    if len(body) <= 1:
-        return "noise_fragment", "single_character_dependent_fragment", ""
-    best_parent_id = ""
-    best_reason = ""
-    for parent in selected:
-        parent_id = str(parent.get("candidate_id") or "")
-        parent_text = _clean_ocr_text(str(parent.get("ocr_text") or ""))
-        parent_body = _root_reconstruction_source_body(parent_text)
-        parent_bbox = list(parent.get("bbox") or [])
-        if not parent_body or not parent_bbox or not bbox:
-            continue
-        overlap = _overlap_ratio(bbox, parent_bbox)
-        inside_parent = _bbox_inside_ratio_controller(bbox, parent_bbox)
-        parent_inside = _bbox_inside_ratio_controller(parent_bbox, bbox)
-        if inside_parent >= 0.85:
-            best_parent_id = parent_id
-            best_reason = "spatially_contained_support_fragment"
-        elif overlap >= 0.82 and parent_inside >= 0.55:
-            best_parent_id = parent_id
-            best_reason = "overlapping_support_fragment"
-    if best_parent_id:
-        return "support_fragment", best_reason, best_parent_id
-    if len(body) <= 2 and selected:
-        return "support_fragment", "short_dependent_fragment_without_standalone_proof", str(selected[0].get("candidate_id") or "")
-    return "rejected_parent_segment", "not_selected_for_best_parent_candidate", ""
-
-
-def _suppress_short_root_crop_fragments_with_strong_parent(
-    selected: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    strong_candidates: list[dict[str, Any]] = []
-    for candidate in selected:
-        body = _root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))
-        if len(body) < 8:
-            continue
-        if float(candidate.get("ocr_confidence") or 0.0) < 0.75:
-            continue
-        if float(candidate.get("target_root_overlap_ratio") or 0.0) < 0.85:
-            continue
-        strong_candidates.append(candidate)
-    if not strong_candidates:
-        return selected
-
-    filtered: list[dict[str, Any]] = []
-    root_crop_scopes = {"tight_root_crop", "padded_root_crop", "expanded_root_crop"}
-    for candidate in selected:
-        body = _root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))
-        scope = str(candidate.get("source_scope") or "")
-        if (
-            len(body) <= 2
-            and scope in root_crop_scopes
-            and not str(candidate.get("source_region_id") or "")
-        ):
-            bbox = list(candidate.get("bbox") or [])
-            parent = _nearest_strong_parent_for_short_candidate(candidate, strong_candidates)
-            if parent is not None and bbox:
-                candidate["_candidate_graph_suppressed_reason"] = "short_root_crop_fragment_suppressed_by_strong_parent"
-                candidate["_candidate_graph_suppressed_parent_id"] = str(parent.get("candidate_id") or "")
-                continue
-        filtered.append(candidate)
-    return filtered
-
-
-def _nearest_strong_parent_for_short_candidate(
-    candidate: dict[str, Any],
-    strong_candidates: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    bbox = list(candidate.get("bbox") or [])
-    if not bbox:
-        return None
-    best: tuple[float, dict[str, Any]] | None = None
-    for parent in strong_candidates:
-        parent_bbox = list(parent.get("bbox") or [])
-        if not parent_bbox:
-            continue
-        inside_parent = _bbox_inside_ratio_controller(bbox, parent_bbox)
-        overlap = _overlap_ratio(bbox, parent_bbox)
-        if inside_parent < 0.35 and overlap < 0.20:
-            continue
-        score = inside_parent + overlap
-        if best is None or score > best[0]:
-            best = (score, parent)
-    return best[1] if best else None
-
-
-def _build_root_parent_candidates_from_graph(
-    root,
-    selected: list[dict[str, Any]],
-    graph: dict[str, Any],
-    visual_analysis: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    if not selected:
-        return []
-    ordered = _sort_root_internal_candidates(selected)
-    assembled = _assemble_root_internal_source(ordered, [])
-    duplicate_count = sum(1 for record in graph.get("candidate_graph_records") or [] if record.get("candidate_graph_state") == "duplicate_fragment")
-    punctuation_count = sum(1 for record in graph.get("candidate_graph_records") or [] if record.get("candidate_graph_state") == "punctuation_fragment")
-    noise_count = sum(1 for record in graph.get("candidate_graph_records") or [] if record.get("candidate_graph_state") == "noise_fragment")
-    root_overlap_values = [float(candidate.get("target_root_overlap_ratio") or 0.0) for candidate in ordered]
-    main = {
-        "parent_candidate_id": f"pc_{str(getattr(root, 'root_id', '') or 'root')}_000",
-        "source_text": assembled.get("source_text") or "",
-        "source_parts": list(assembled.get("source_parts") or []),
-        "child_candidate_ids": [str(candidate.get("candidate_id") or "") for candidate in ordered],
-        "child_candidates": ordered,
-        "evidence_scopes": sorted({str(candidate.get("source_scope") or "") for candidate in ordered if candidate.get("source_scope")}),
-        "text_coverage_score": sum(len(_root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))) for candidate in ordered),
-        "root_coverage_score": max(root_overlap_values or [0.0]),
-        "duplicate_suppression_count": duplicate_count,
-        "punctuation_child_count": punctuation_count,
-        "noise_child_count": noise_count,
-        "source_quality_score": 0.0,
-        "ocr_confidence": _root_internal_aggregate_confidence(ordered),
-    }
-    parent_candidates = [main]
-    visual_analysis = visual_analysis or {}
-    group_map = visual_analysis.get("candidate_group_map") or {}
-    groups = visual_analysis.get("groups") or []
-    selected_by_id = {str(candidate.get("candidate_id") or ""): candidate for candidate in ordered}
-    existing_child_sets: set[tuple[str, ...]] = {
-        tuple(str(candidate.get("candidate_id") or "") for candidate in ordered)
-    }
-    for group in groups:
-        group_ids = [
-            str(candidate_id)
-            for candidate_id in (group.get("parent_visual_group_child_ids") or [])
-            if str(candidate_id) in selected_by_id
-        ]
-        if not group_ids or len(group_ids) >= len(ordered):
-            continue
-        child_key = tuple(group_ids)
-        if child_key in existing_child_sets:
-            continue
-        group_candidates = [selected_by_id[candidate_id] for candidate_id in group_ids]
-        group_ordered = _sort_root_internal_candidates(group_candidates)
-        group_assembled = _assemble_root_internal_source(group_ordered, [])
-        group_body = _root_reconstruction_source_body(str(group_assembled.get("source_text") or ""))
-        if not group_body:
-            continue
-        group_overlap_values = [float(candidate.get("target_root_overlap_ratio") or 0.0) for candidate in group_ordered]
-        parent_candidates.append(
-            {
-                "parent_candidate_id": f"pc_{str(getattr(root, 'root_id', '') or 'root')}_{len(parent_candidates):03d}",
-                "source_text": group_assembled.get("source_text") or "",
-                "source_parts": list(group_assembled.get("source_parts") or []),
-                "child_candidate_ids": [str(candidate.get("candidate_id") or "") for candidate in group_ordered],
-                "child_candidates": group_ordered,
-                "evidence_scopes": sorted({str(candidate.get("source_scope") or "") for candidate in group_ordered if candidate.get("source_scope")}),
-                "text_coverage_score": sum(len(_root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))) for candidate in group_ordered),
-                "root_coverage_score": max(group_overlap_values or [0.0]),
-                "duplicate_suppression_count": duplicate_count,
-                "punctuation_child_count": punctuation_count,
-                "noise_child_count": noise_count,
-                "source_quality_score": 0.0,
-                "ocr_confidence": _root_internal_aggregate_confidence(group_ordered),
-            }
-        )
-        existing_child_sets.add(child_key)
-    for index, candidate in enumerate(ordered, start=1):
-        body = _root_reconstruction_source_body(str(candidate.get("ocr_text") or ""))
-        if len(body) < 5:
-            continue
-        if len(ordered) == 1:
-            continue
-        child_key = (str(candidate.get("candidate_id") or ""),)
-        if child_key in existing_child_sets:
-            continue
-        single = {
-            "parent_candidate_id": f"pc_{str(getattr(root, 'root_id', '') or 'root')}_{len(parent_candidates):03d}",
-            "source_text": _clean_ocr_text(str(candidate.get("ocr_text") or "")),
-            "source_parts": [_clean_ocr_text(str(candidate.get("ocr_text") or ""))],
-            "child_candidate_ids": [str(candidate.get("candidate_id") or "")],
-            "child_candidates": [candidate],
-            "evidence_scopes": [str(candidate.get("source_scope") or "")],
-            "text_coverage_score": len(body),
-            "root_coverage_score": float(candidate.get("target_root_overlap_ratio") or 0.0),
-            "duplicate_suppression_count": duplicate_count,
-            "punctuation_child_count": punctuation_count,
-            "noise_child_count": noise_count,
-            "source_quality_score": 0.0,
-            "ocr_confidence": float(candidate.get("ocr_confidence") or 0.0),
-        }
-        if _root_reconstruction_source_body(single["source_text"]) != _root_reconstruction_source_body(main["source_text"]):
-            parent_candidates.append(single)
-            existing_child_sets.add(child_key)
-    return [annotate_parent_candidate_visual_group(parent_candidate, visual_analysis) for parent_candidate in parent_candidates]
-
-
-def _root_parent_candidate_acceptance_v2(
-    root,
-    parents: list[Any],
-    children: list[Any],
-    parent_candidate: dict[str, Any],
-    graph: dict[str, Any],
-    quality_func,
-) -> tuple[bool, list[str], float, list[dict[str, Any]]]:
-    text = _clean_ocr_text(str(parent_candidate.get("source_text") or ""))
-    selected = list(parent_candidate.get("child_candidates") or [])
-    ocr_conf = float(parent_candidate.get("ocr_confidence") or 0.0)
-    child_status = _root_reconstruction_child_fragment_status_v2(text, children, graph)
-    child_status = _scope_child_status_to_visual_parent(parent_candidate, children, child_status)
-    graph_rejections = _root_graph_source_rejection_reasons(text, selected)
-    if any(bool(candidate.get("sfx_decorative_conflict")) for candidate in selected):
-        graph_rejections.append("sfx_decorative_conflict")
-    if any(not bool(candidate.get("role_compatible", True)) for candidate in selected):
-        graph_rejections.append("root_role_incompatible_candidate")
-    if bool(parent_candidate.get("reconstruction_rejected_for_visual_overmerge")):
-        graph_rejections.append(
-            str(parent_candidate.get("root_overmerge_rejection_reason") or "reconstruction_rejected_for_visual_overmerge")
-        )
-    if _root_parent_candidate_drops_graph_segments(parent_candidate, graph):
-        graph_rejections.append("single_parent_candidate_drops_graph_segments")
-    base_accepted, base_reasons, base_score, _base_child_status = _root_reconstruction_candidate_acceptance(
-        root,
-        parents,
-        children,
-        text,
-        ocr_conf,
-        quality_func,
-        represented_child_region_ids=[
-            str(candidate.get("source_region_id") or "")
-            for candidate in selected
-            if str(candidate.get("source_region_id") or "")
-        ],
-    )
-    missing_meaningful = [
-        item for item in child_status
-        if item.get("status") == "missing_meaningful_child_fragment"
-    ]
-    score = float(base_score or 0.0)
-    score += float(parent_candidate.get("text_coverage_score") or 0.0)
-    score += float(parent_candidate.get("root_coverage_score") or 0.0) * 12.0
-    score -= len(graph_rejections) * 18.0
-    score -= len(missing_meaningful) * 20.0
-    parent_candidate["source_quality_score"] = score
-    if graph_rejections:
-        return False, graph_rejections, score, child_status
-    if missing_meaningful:
-        return False, ["root_parent_missing_meaningful_child_evidence"], score, child_status
-    if base_accepted:
-        return True, list(base_reasons or ["root_parent_source_accepted"]), score, child_status
-    return False, list(base_reasons or ["root_parent_source_rejected"]), score, child_status
-
-
-def _scope_child_status_to_visual_parent(
-    parent_candidate: dict[str, Any],
-    children: list[Any],
-    child_status: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    visual_group_id = str(parent_candidate.get("parent_visual_group_id") or "")
-    if not visual_group_id or visual_group_id.startswith("overmerged:"):
-        return child_status
-    group_bbox = _clip_controller_bbox(list(parent_candidate.get("parent_visual_group_bbox") or []), None)
-    if not group_bbox:
-        return child_status
-    child_by_region = {
-        str(getattr(child, "source_region_id", "") or ""): child
-        for child in children or []
-        if str(getattr(child, "source_region_id", "") or "")
-    }
-    candidate_region_ids = {
-        str(candidate.get("source_region_id") or "")
-        for candidate in parent_candidate.get("child_candidates") or []
-        if isinstance(candidate, dict) and str(candidate.get("source_region_id") or "")
-    }
-    visual_group_child_ids = {
-        str(candidate_id)
-        for candidate_id in parent_candidate.get("parent_visual_group_child_ids") or []
-        if str(candidate_id)
-    }
-    scoped: list[dict[str, Any]] = []
-    for item in child_status or []:
-        if str(item.get("status") or "") != "missing_meaningful_child_fragment":
-            scoped.append(item)
-            continue
-        rid = str(item.get("region_id") or "")
-        if candidate_region_ids and rid and rid not in candidate_region_ids:
-            updated = dict(item)
-            updated["status"] = "outside_visual_parent_group"
-            updated["parent_visual_group_id"] = visual_group_id
-            updated["outside_visual_parent_group_reason"] = "different_visual_parent_group_child"
-            scoped.append(updated)
-            continue
-        child = child_by_region.get(rid)
-        child_bbox = _clip_controller_bbox(list(getattr(child, "bbox", []) or []) if child is not None else [], None)
-        if child_bbox:
-            group_area = max(1, int(group_bbox[2]) * int(group_bbox[3]))
-            child_area = max(1, int(child_bbox[2]) * int(child_bbox[3]))
-            if (
-                visual_group_child_ids
-                and rid
-                and rid not in candidate_region_ids
-                and child_area > group_area * 3
-            ):
-                updated = dict(item)
-                updated["status"] = "outside_visual_parent_group"
-                updated["parent_visual_group_id"] = visual_group_id
-                updated["outside_visual_parent_group_reason"] = "overbroad_sibling_child_bbox"
-                scoped.append(updated)
-                continue
-            inside_group = _bbox_inside_ratio_controller(child_bbox, group_bbox)
-            group_inside = _bbox_inside_ratio_controller(group_bbox, child_bbox)
-            overlap = _overlap_ratio(child_bbox, group_bbox)
-            if inside_group < 0.18 and group_inside < 0.12 and overlap < 0.12:
-                updated = dict(item)
-                updated["status"] = "outside_visual_parent_group"
-                updated["parent_visual_group_id"] = visual_group_id
-                updated["outside_visual_parent_group_reason"] = "spatially_outside_visual_parent_group"
-                scoped.append(updated)
-                continue
-        scoped.append(item)
-    return scoped
-
-
-def _root_graph_source_rejection_reasons(text: str, selected: list[dict[str, Any]]) -> list[str]:
-    reasons: list[str] = []
-    bodies = [_root_reconstruction_source_body(str(candidate.get("ocr_text") or "")) for candidate in selected]
-    bodies = [body for body in bodies if body]
-    if not bodies:
-        return ["empty_graph_parent_source"]
-    short_count = sum(1 for body in bodies if len(body) <= 2)
-    long_anchor_count = sum(1 for body in bodies if len(body) >= 8)
-    if len(bodies) >= 4 and short_count >= 2 and long_anchor_count == 0:
-        reasons.append("fragmented_short_segment_chain_without_complete_anchor")
-    elif len(bodies) >= 4 and short_count >= 3:
-        reasons.append("fragmented_many_short_segments")
-    if _source_has_unbalanced_orphan_quote(text):
-        reasons.append("unbalanced_quote_in_root_parent_source")
-    return sorted(set(reasons))
-
-
-def _root_parent_candidate_drops_graph_segments(
-    parent_candidate: dict[str, Any],
-    graph: dict[str, Any],
-) -> bool:
-    child_ids = {str(item) for item in parent_candidate.get("child_candidate_ids", []) if str(item)}
-    parent_visual_group_id = str(parent_candidate.get("parent_visual_group_id") or "")
-    assembly_records = [
-        record for record in graph.get("candidate_graph_records") or []
-        if record.get("candidate_graph_state") == "assembly_candidate"
-    ]
-    if parent_visual_group_id and not parent_visual_group_id.startswith("overmerged:"):
-        assembly_records = [
-            record for record in assembly_records
-            if str(record.get("parent_visual_group_id") or "") == parent_visual_group_id
-        ]
-    if len(child_ids) != 1 or len(assembly_records) <= 1:
-        return False
-    selected_id = next(iter(child_ids))
-    selected_record = next((record for record in assembly_records if str(record.get("candidate_id") or "") == selected_id), None)
-    if not selected_record:
-        return False
-    selected_body = _root_reconstruction_source_body(str(selected_record.get("ocr_text") or ""))
-    if not selected_body:
-        return True
-    for record in assembly_records:
-        candidate_id = str(record.get("candidate_id") or "")
-        if candidate_id == selected_id:
-            continue
-        body = _root_reconstruction_source_body(str(record.get("ocr_text") or ""))
-        if not body:
-            continue
-        return True
-    return False
-
-
-def _root_incomplete_source_visually_complete(
-    root,
-    parent_candidate: dict[str, Any],
-    child_status: list[dict[str, Any]],
-    base_reasons: list[str],
-    ocr_conf: float,
-) -> bool:
-    root_type = str(getattr(root, "root_type", "") or "")
-    if root_type != "speech_bubble":
-        return False
-    reasons = set(str(reason) for reason in (base_reasons or []))
-    if not reasons.intersection({"speech_recovered_source_quality_blocked", "incomplete_trailing_grammar"}):
-        return False
-    if reasons - {"speech_recovered_source_quality_blocked", "incomplete_trailing_grammar"}:
-        return False
-    if float(ocr_conf or 0.0) < 0.65:
-        return False
-    if any(item.get("status") == "missing_meaningful_child_fragment" for item in child_status):
-        return False
-    selected = list(parent_candidate.get("child_candidates") or [])
-    if len(selected) != 1:
-        return False
-    candidate = selected[0]
-    source_scope = str(candidate.get("source_scope") or "")
-    if source_scope not in {"full_page_ctd_evidence", "tight_root_crop", "padded_root_crop", "expanded_root_crop", "existing_scoped_root_child"}:
-        return False
-    if float(candidate.get("target_root_overlap_ratio") or 0.0) < 0.92:
-        return False
-    body = _root_reconstruction_source_body(str(parent_candidate.get("source_text") or ""))
-    return len(body) >= 3
-
-
-def _source_has_unbalanced_orphan_quote(text: str) -> bool:
-    cleaned = str(text or "")
-    if cleaned.count("「") != cleaned.count("」") or cleaned.count("『") != cleaned.count("』"):
-        return True
-    return False
-
-
-def _root_reconstruction_child_fragment_status_v2(
-    recovered_text: str,
-    children: list[Any],
-    graph: dict[str, Any],
-) -> list[dict[str, Any]]:
-    recovered_body = _root_reconstruction_source_body(recovered_text)
-    records: list[dict[str, Any]] = []
-    graph_by_region = {
-        str(record.get("source_region_id") or ""): record
-        for record in graph.get("candidate_graph_records") or []
-        if str(record.get("source_region_id") or "")
-    }
-    for child in children:
-        rid = str(getattr(child, "source_region_id", "") or "")
-        source = str(getattr(child, "ocr_text", "") or "")
-        body = _root_reconstruction_source_body(source)
-        if not body:
-            records.append({"region_id": rid, "source_text": source, "status": "punctuation_or_empty_child"})
-            continue
-        graph_record = graph_by_region.get(rid)
-        graph_state = str((graph_record or {}).get("candidate_graph_state") or "")
-        if graph_state in {"duplicate_fragment", "support_fragment", "punctuation_fragment", "noise_fragment"}:
-            records.append(
-                {
-                    "region_id": rid,
-                    "source_text": source,
-                    "status": f"represented_by_graph_{graph_state}",
-                    "candidate_graph_reason": (graph_record or {}).get("candidate_graph_reason"),
-                    "parent_candidate_id": (graph_record or {}).get("parent_candidate_id"),
-                }
-            )
-            continue
-        if _root_child_fragment_is_rejectable_noise(source):
-            records.append({"region_id": rid, "source_text": source, "status": "deliberately_rejected_child_fragment"})
-            continue
-        records.append({"region_id": rid, "source_text": source, "status": "missing_meaningful_child_fragment"})
-    return records
-
-
-def _evaluate_multiscope_ctd_assembly(
-    root,
-    parents: list[Any],
-    children: list[Any],
-    candidates: list[dict[str, Any]],
-    quality_func,
-) -> dict[str, Any]:
-    if not candidates:
-        return {"accepted": False, "reasons": ["no_admitted_candidates"]}
-    ordered = _sort_root_internal_candidates(candidates)
-    assembled = _assemble_root_internal_source(ordered, children)
-    text = str(assembled.get("source_text") or "")
-    conf = _root_internal_aggregate_confidence(ordered)
-    accepted, reasons, score, child_status = _root_reconstruction_candidate_acceptance(
-        root,
-        parents,
-        children,
-        text,
-        conf,
-        quality_func,
-        represented_child_region_ids=[
-            str(candidate.get("source_region_id") or "")
-            for candidate in ordered
-            if str(candidate.get("source_region_id") or "")
-        ],
-    )
-    return {
-        "accepted": accepted,
-        "reasons": reasons,
-        "score": score,
-        "child_fragment_status": child_status,
-        "assembled_source_text": text,
-    }
-
-
-def _dedupe_root_internal_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for candidate in candidates:
-        bbox = candidate.get("bbox") or []
-        text = str(candidate.get("ocr_text") or "")
-        if not bbox or not text:
-            continue
-        if _is_punctuation_or_ellipsis_only_controller(text):
-            continue
-        duplicate = False
-        for existing in result:
-            if _overlap_ratio(bbox, existing.get("bbox") or bbox) >= 0.82:
-                duplicate = True
-                if float(candidate.get("ocr_confidence") or 0.0) > float(existing.get("ocr_confidence") or 0.0):
-                    existing.update(candidate)
-                break
-        if not duplicate:
-            result.append(candidate)
-    return result
-
-
-def _sort_root_internal_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not candidates:
-        return []
-    heights = [float((candidate.get("bbox") or [0, 0, 0, 0])[3] or 0.0) for candidate in candidates if candidate.get("bbox")]
-    band = max(48.0, (sum(heights) / len(heights) * 0.45) if heights else 48.0)
-
-    def sort_key(candidate: dict[str, Any]) -> tuple[int, float, float]:
-        x, y, w, h = [float(v or 0.0) for v in (candidate.get("bbox") or [0, 0, 0, 0])[:4]]
-        cy = y + h / 2.0
-        right = x + w
-        return (int(cy / band), -right, y)
-
-    return sorted(candidates, key=sort_key)
-
-
-def _assemble_root_internal_source(
-    candidates: list[dict[str, Any]],
-    existing_children: list[Any],
-) -> dict[str, Any]:
-    parts: list[str] = []
-    for candidate in candidates:
-        text = _clean_ocr_text(str(candidate.get("ocr_text") or ""))
-        if not text or _is_punctuation_or_ellipsis_only_controller(text):
-            continue
-        parts.append(text)
-    source = "".join(parts)
-    merged: list[dict[str, Any]] = []
-    for child in existing_children:
-        rid = str(getattr(child, "source_region_id", "") or "")
-        text = _clean_ocr_text(str(getattr(child, "ocr_text", "") or ""))
-        body = _root_reconstruction_source_body(text)
-        if not body or _root_child_fragment_is_rejectable_noise(text):
-            continue
-        source_body = _root_reconstruction_source_body(source)
-        if len(body) <= 2 and len(source_body) >= 6:
-            source = f"{source}{text}"
-            merged.append({"region_id": rid, "source_text": text, "reason": "short_existing_child_fragment_merged"})
-    return {
-        "source_text": source,
-        "source_parts": parts,
-        "merged_existing_child_fragments": merged,
-    }
-
-
-def _root_internal_aggregate_confidence(candidates: list[dict[str, Any]]) -> float:
-    values = [float(candidate.get("ocr_confidence") or 0.0) for candidate in candidates if candidate.get("ocr_text")]
-    if not values:
-        return 0.0
-    return sum(values) / len(values)
-
-
-def _root_reconstruction_authorization_allows(root: Any) -> bool:
-    if bool(getattr(root, "must_not_mutate", False)):
-        return False
-    auth = str(
-        getattr(root, "semantic_authorization_state", "")
-        or getattr(root, "cleanup_authorization", "")
-        or ""
-    ).strip()
-    if auth in {
-        "cleanup_translate_speech",
-        "cleanup_translate_background",
-        "cleanup_translate_caption",
-    }:
-        return bool(getattr(root, "authorization_explicit", False))
-    if auth in {
-        "review_unknown_not_cleanup",
-        "outside_cleanup_scope",
-        "ambiguous_component_owner",
-        "protect_sfx_decorative",
-        "protect_art_or_non_text",
-    }:
-        return False
-    if auth:
-        return False
-    if bool(getattr(root, "human_review_required", False)):
-        return False
-    return True
-
-
-def _root_reconstruction_should_attempt(root, parents: list[Any], children: list[Any]) -> bool:
-    root_type = str(getattr(root, "root_type", "") or "")
-    route = str(getattr(root, "route_policy", "") or "")
-    if root_type not in {"speech_bubble", "caption_background"}:
-        return False
-    if route not in {"translate_speech", "translate_caption"}:
-        return False
-    if not _root_reconstruction_authorization_allows(root):
-        return False
-    if str(getattr(root, "root_source_coherence_status", "") or "") in {"blocked_preserve"}:
-        return False
-    if bool(getattr(root, "root_requires_reconstruction", False)):
-        return True
-    if root_type == "caption_background":
-        if not parents:
-            return True
-        return any(not _is_meaningful_background_caption_source(str(getattr(parent, "source_text", "") or "")) for parent in parents)
-    active_speech_parents = [
-        parent
-        for parent in parents
-        if bool(getattr(parent, "translation_unit", False))
-        and str(getattr(parent, "source_text", "") or "").strip()
-        and str(getattr(parent, "source_coherence_status", "") or "") != "rejected"
-        and str(getattr(parent, "source_coherence_action", "") or "") not in {
-            "repair_required",
-            "block_review_only",
-            "source_quality_blocked",
-            "block_auto_translation",
-            "split_required",
-            "unresolved_review",
-        }
-    ]
-    if not active_speech_parents:
-        has_meaningful_child_source = any(
-            _root_reconstruction_source_body(str(getattr(child, "ocr_text", "") or ""))
-            and not _is_punctuation_or_ellipsis_only_controller(str(getattr(child, "ocr_text", "") or ""))
-            for child in children
-        )
-        has_blocked_parent_source = any(
-            _root_reconstruction_source_body(str(getattr(parent, "source_text", "") or ""))
-            for parent in parents
-        )
-        if has_meaningful_child_source or has_blocked_parent_source:
-            return True
-    if any(
-        str(getattr(parent, "source_coherence_action", "") or "") in {"repair_required", "block_review_only"}
-        for parent in parents
-    ):
-        return True
-    return False
-
-
-def _root_reconstruction_crop_variants(
-    bbox: list[int],
-    image_size: tuple[int, int] | None,
-    root_type: str,
-) -> list[tuple[str, list[int]]]:
-    base = _clip_controller_bbox(list(bbox or []), image_size)
-    if not base:
-        return []
-    x, y, w, h = base
-    max_dim = max(w, h)
-    pads = [0, 4, 8, 16]
-    if root_type == "caption_background":
-        pads = [0, 4, 8, 16]
-    variants: list[tuple[str, list[int]]] = []
-    for pad in pads:
-        scaled = max(pad, int(round(max_dim * 0.025))) if pad else 0
-        if root_type == "caption_background" and pad:
-            scaled = max(pad, int(round(max_dim * 0.018)))
-        candidate = _clip_controller_bbox([x - scaled, y - scaled, w + scaled * 2, h + scaled * 2], image_size)
-        if candidate and candidate not in [existing for _name, existing in variants]:
-            variants.append((f"pad{pad}", candidate))
-    return variants
-
-
-def _select_stable_root_crop_candidate(
-    candidates: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    if not candidates:
-        return None
-    normalized_texts = [
-        re.sub(
-            r"\s+",
-            "",
-            _clean_ocr_text(str(candidate.get("recovered_source_text") or "")),
-        )
-        for candidate in candidates
-    ]
-    agreement_counts = {
-        text: normalized_texts.count(text)
-        for text in set(normalized_texts)
-        if text
-    }
-    ranked: list[dict[str, Any]] = []
-    for candidate, normalized_text in zip(candidates, normalized_texts):
-        enriched = dict(candidate)
-        enriched["crop_agreement_count"] = int(agreement_counts.get(normalized_text, 0))
-        enriched["crop_agreement_source"] = normalized_text
-        ranked.append(enriched)
-    best_rank = max(
-        (
-            int(candidate.get("crop_agreement_count") or 0),
-            round(float(candidate.get("score") or 0.0), 6),
-            round(float(candidate.get("ocr_confidence") or 0.0), 6),
-        )
-        for candidate in ranked
-    )
-    finalists = [
-        candidate
-        for candidate in ranked
-        if (
-            int(candidate.get("crop_agreement_count") or 0),
-            round(float(candidate.get("score") or 0.0), 6),
-            round(float(candidate.get("ocr_confidence") or 0.0), 6),
-        )
-        == best_rank
-    ]
-    if len(
-        {
-            str(candidate.get("crop_agreement_source") or "")
-            for candidate in finalists
-        }
-    ) != 1:
-        return None
-    return sorted(finalists, key=lambda candidate: str(candidate.get("variant") or ""))[0]
-
-
-def _derive_exact_represented_child_scope_for_root_reconstruction(
-    recovered_text: str,
-    children: list[Any],
-) -> list[str]:
-    recovered = re.sub(r"\s+", "", _clean_ocr_text(str(recovered_text or "")))
-    if not recovered or not children:
-        return []
-    ordered_ids: list[str] = []
-    ordered_sources: list[str] = []
-    for child in children:
-        region_id = str(getattr(child, "source_region_id", "") or "").strip()
-        source = re.sub(
-            r"\s+",
-            "",
-            _clean_ocr_text(str(getattr(child, "ocr_text", "") or "")),
-        )
-        if not region_id or not source:
-            return []
-        ordered_ids.append(region_id)
-        ordered_sources.append(source)
-    if recovered != "".join(ordered_sources):
-        return []
-    return list(dict.fromkeys(ordered_ids))
-
-
-def _root_reconstruction_candidate_acceptance(
-    root,
-    parents: list[Any],
-    children: list[Any],
-    recovered_text: str,
-    ocr_conf: float,
-    quality_func,
-    *,
-    represented_child_region_ids: Iterable[str] | None = None,
-) -> tuple[bool, list[str], float, list[dict[str, Any]]]:
-    root_type = str(getattr(root, "root_type", "") or "")
-    raw_text = str(recovered_text or "")
-    text = _clean_ocr_text(raw_text)
-    scope_ids = list(
-        dict.fromkeys(
-            str(region_id or "").strip()
-            for region_id in (represented_child_region_ids or [])
-            if str(region_id or "").strip()
-        )
-    )
-    if not scope_ids:
-        return False, ["unscoped_root_reconstruction_candidate"], 0.0, []
-    children_by_region = {
-        str(getattr(child, "source_region_id", "") or "").strip(): child
-        for child in children
-        if str(getattr(child, "source_region_id", "") or "").strip()
-    }
-    if any(region_id not in children_by_region for region_id in scope_ids):
-        return False, ["unrelated_child_scope"], 0.0, []
-    scoped_children = [children_by_region[region_id] for region_id in scope_ids]
-    parent_ids_by_child: dict[str, set[str]] = {}
-    for parent in parents:
-        parent_id = str(getattr(parent, "parent_id", "") or "").strip()
-        for child_id in getattr(parent, "child_segment_ids", []) or []:
-            parent_ids_by_child.setdefault(str(child_id or ""), set()).add(parent_id)
-    represented_parent_ids: set[str] = set()
-    for child in scoped_children:
-        child_id = str(getattr(child, "child_id", "") or "")
-        represented_parent_ids.update(
-            parent_id
-            for parent_id in parent_ids_by_child.get(child_id, set())
-            if parent_id
-        )
-    child_status = _root_reconstruction_child_fragment_status(recovered_text, scoped_children)
-    if len(represented_parent_ids) > 1:
-        return (
-            False,
-            ["candidate_scope_spans_multiple_parent_obligations"],
-            0.0,
-            child_status,
-        )
-    scoped_parents = [
-        parent
-        for parent in parents
-        if str(getattr(parent, "parent_id", "") or "").strip() in represented_parent_ids
-    ]
-    if not scoped_parents and len(parents) == 1:
-        scoped_parents = list(parents)
-    if "\ufffd" in raw_text:
-        return False, ["malformed_recovered_source"], 0.0, child_status
-    body = _root_reconstruction_source_body(text)
-    speech_short_source = root_type == "speech_bubble" and _is_speech_short_or_ellipsis_source(text)
-    reasons: list[str] = []
-    if not body and not speech_short_source:
-        return False, ["empty_recovered_source"], 0.0, []
-    if _is_punctuation_or_ellipsis_only_controller(text) and not speech_short_source:
-        return False, ["punctuation_only_recovered_source"], 0.0, []
-    if _is_valid_japanese(text) < 0.55 and not speech_short_source:
-        return False, ["low_japanese_source_ratio"], 0.0, []
-    if root_type == "caption_background":
-        if not _is_meaningful_background_caption_source(text):
-            return False, ["not_meaningful_caption_background_source"], 0.0, []
-        if ocr_conf < 0.70:
-            return False, ["caption_recovered_source_low_confidence"], 0.0, []
-    else:
-        if not speech_short_source:
-            status, quality_reasons, action = quality_func(text, [])
-            if action in {"source_quality_blocked", "block_auto_translation", "split_required", "unresolved_review"}:
-                return False, ["speech_recovered_source_quality_blocked"] + list(quality_reasons or []), 0.0, []
-            if len(body) < 5 and not _is_short_reaction_source(text):
-                return False, ["speech_recovered_source_too_short"], 0.0, []
-
-    missing_meaningful = [
-        item for item in child_status
-        if item.get("status") == "missing_meaningful_child_fragment"
-    ]
-    existing_sources = [
-        str(getattr(parent, "source_text", "") or "")
-        for parent in scoped_parents
-        if str(getattr(parent, "source_text", "") or "").strip()
-    ]
-    existing_body_max = max([len(_root_reconstruction_source_body(source)) for source in existing_sources] or [0])
-    conserves_active = _root_reconstruction_conserves_existing_sources(text, scoped_parents)
-    quality_gain = max(0, len(body) - existing_body_max)
-    score = float(ocr_conf or 0.0) * 100.0 + quality_gain
-    score += max(0, len(child_status) - len(missing_meaningful)) * 4.0
-    if conserves_active:
-        score += 20.0
-    if missing_meaningful and ocr_conf < 0.95:
-        return False, ["recovered_source_missing_meaningful_child_fragment"], score, child_status
-    if speech_short_source and ocr_conf >= 0.50 and not missing_meaningful:
-        reasons.append("speech_short_source_root_reocr")
-        return True, reasons, score, child_status
-    if ocr_conf >= 0.90:
-        reasons.append("high_confidence_root_reocr")
-        return True, reasons, score, child_status
-    if conserves_active and ocr_conf >= 0.50 and not missing_meaningful and len(body) >= existing_body_max:
-        reasons.append("moderate_confidence_root_reocr_conserves_active_parent")
-        return True, reasons, score, child_status
-    return False, ["recovered_source_confidence_or_conservation_gate_failed"], score, child_status
-
-
-def _root_reconstruction_conserves_existing_sources(recovered_text: str, parents: list[Any]) -> bool:
-    active_sources = [
-        str(getattr(parent, "source_text", "") or "")
-        for parent in parents
-        if bool(getattr(parent, "translation_unit", False))
-        and str(getattr(parent, "source_text", "") or "").strip()
-    ]
-    if not active_sources:
-        return True
-    # Root-wide OCR must never replace already finalized parent sources.
-    return False
-
-
-def _root_reconstruction_child_fragment_status(recovered_text: str, children: list[Any]) -> list[dict[str, Any]]:
-    recovered_body = _root_reconstruction_source_body(recovered_text)
-    records: list[dict[str, Any]] = []
-    for child in children:
-        rid = str(getattr(child, "source_region_id", "") or "")
-        source = str(getattr(child, "ocr_text", "") or "")
-        body = _root_reconstruction_source_body(source)
-        if not body:
-            records.append({"region_id": rid, "source_text": source, "status": "punctuation_or_empty_child"})
-            continue
-        if _root_child_fragment_is_rejectable_noise(source):
-            records.append({"region_id": rid, "source_text": source, "status": "deliberately_rejected_child_fragment"})
-            continue
-        records.append({"region_id": rid, "source_text": source, "status": "missing_meaningful_child_fragment"})
-    return records
-
-
-def _root_reconstruction_candidate_from_visual_parent(
-    root,
-    root_children: list[Any],
-    parent_record: dict[str, Any],
-    *,
-    default_crop_bbox: list[int],
-) -> dict[str, Any]:
-    group_bbox = _clip_controller_bbox(list(parent_record.get("parent_visual_group_bbox") or []), None)
-    crop_bbox = group_bbox or list(default_crop_bbox or getattr(root, "bbox", []) or [])
-    source_text = str(parent_record.get("source_text") or "").strip()
-    child_region_ids = _represented_child_region_ids_for_visual_parent(parent_record, root_children)
-    return {
-        "variant": "bubble_owned_multiscope_ctd_ocr_visual_parent_split",
-        "crop_bbox": crop_bbox,
-        "recovered_source_text": source_text,
-        "ocr_confidence": float(parent_record.get("ocr_confidence") or 0.0),
-        "reasons": ["root_visual_parent_group_split"] + list(parent_record.get("acceptance_reasons") or []),
-        "score": float(parent_record.get("score") or parent_record.get("source_quality_score") or 0.0),
-        "child_fragment_status": list(parent_record.get("child_fragment_status") or []),
-        "root_internal_child_candidates": list(parent_record.get("child_candidates") or []),
-        "represented_child_region_ids": child_region_ids,
-        "parent_candidate_id": str(parent_record.get("parent_candidate_id") or ""),
-        "parent_visual_group_id": str(parent_record.get("parent_visual_group_id") or ""),
-        "parent_visual_group_bbox": list(parent_record.get("parent_visual_group_bbox") or []),
-        "parent_visual_group_child_ids": list(parent_record.get("parent_visual_group_child_ids") or []),
-        "root_visual_separation_status": "visual_parent_split",
-        "root_overmerge_rejection_reason": "overmerged_root_reconstructed_as_visual_parent_groups",
-    }
-
-
-def _represented_child_region_ids_for_visual_parent(
-    parent_record: dict[str, Any],
-    root_children: list[Any],
-) -> list[str]:
-    ids: list[str] = []
-    for candidate in parent_record.get("child_candidates") or []:
-        rid = str(candidate.get("source_region_id") or "")
-        if rid and rid not in ids:
-            ids.append(rid)
-    for rid in parent_record.get("included_child_region_ids") or []:
-        rid = str(rid or "")
-        if rid and rid not in ids:
-            ids.append(rid)
-    return ids
-
-
-def _root_child_fragment_is_rejectable_noise(source: str) -> bool:
-    text = _clean_ocr_text(source)
-    body = _root_reconstruction_source_body(text)
-    if not body:
-        return True
-    if len(body) <= 1:
-        return True
-    if _is_punctuation_or_ellipsis_only_controller(text):
-        return True
-    if _source_has_unbalanced_orphan_quote(text):
-        return True
-    compact = _root_reconstruction_source_body(text)
-    if len(compact) <= 2 and any(_is_han_char(ch) for ch in compact) and not all(_is_kana(ch) for ch in compact):
-        return True
-    kana = sum(1 for ch in text if _is_kana(ch))
-    cjk = sum(1 for ch in text if _is_cjk_char(ch))
-    isolated_katakana = sum(
-        1
-        for ch in text
-        if 0x30A0 <= ord(ch) <= 0x30FF and ch not in {"ー", "・"}
-    )
-    if isolated_katakana == 1 and kana >= 3 and cjk >= 1:
-        return True
-    return False
-
-
-def _root_reconstruction_source_body(text: str) -> str:
-    return "".join(_non_punct_chars(str(text or "")))
-
-
-def _apply_root_reconstruction_candidate(
-    regions: list[dict],
-    logical_block_result,
-    *,
-    page_id: str,
-    root,
-    root_parents: list[Any],
-    root_children: list[Any],
-    candidate: dict[str, Any],
-    font_name: str,
-) -> dict[str, Any] | None:
-    if logical_block_result is None:
-        return None
-    try:
-        from app.pipeline.logical_text_blocks import LogicalTextBlock
-    except Exception:
-        return None
-    root_id = str(getattr(root, "root_id", "") or "")
-    root_type = str(getattr(root, "root_type", "") or "")
-    crop_bbox = list(candidate.get("crop_bbox") or [])
-    recovered_text = str(candidate.get("recovered_source_text") or "").strip()
-    if not root_id or not crop_bbox or not recovered_text:
-        return None
-    represented_child_ids = {
-        str(rid)
-        for rid in candidate.get("represented_child_region_ids") or []
-        if str(rid)
-    }
-    if not represented_child_ids:
-        return None
-    child_id_to_region = {
-        str(getattr(child, "child_id", "") or ""): str(
-            getattr(child, "source_region_id", "") or ""
-        )
-        for child in root_children
-        if str(getattr(child, "child_id", "") or "")
-        and str(getattr(child, "source_region_id", "") or "")
-    }
-    matching_parents: list[Any] = []
-    for parent in root_parents:
-        parent_region_ids = {
-            child_id_to_region.get(str(child_id or ""), "")
-            for child_id in getattr(parent, "child_segment_ids", []) or []
-        }
-        parent_region_ids.discard("")
-        if represented_child_ids and represented_child_ids <= parent_region_ids:
-            matching_parents.append(parent)
-    if root_parents and len(matching_parents) != 1:
-        return None
-    if matching_parents:
-        target_parent_id = str(getattr(matching_parents[0], "parent_id", "") or "")
-        target_block = next(
-            (
-                block
-                for block in getattr(logical_block_result, "blocks", []) or []
-                if str(getattr(block, "block_id", "") or "") == target_parent_id
-            ),
-            None,
-        )
-        if target_block is None:
-            return None
-        before_text = str(getattr(target_block, "source_text", "") or "")
-        target_block.source_text = recovered_text
-        target_block.source_quality_status = "root_reconstructed"
-        target_block.source_quality_action = "reocr_recovered"
-        target_block.source_reconstruction_status = "applied"
-        target_block.source_reconstruction_applied = True
-        target_block.source_reconstruction_before_text = before_text
-        target_block.source_reconstruction_after_text = recovered_text
-        target_block.source_reconstruction_crop_bbox = list(crop_bbox)
-        target_block.source_reconstruction_included_child_region_ids = sorted(
-            represented_child_ids
-        )
-        target_block.source_reconstruction_rejected_child_region_ids = []
-        target_block.source_reconstruction_reason_codes = list(
-            candidate.get("reasons") or []
-        )
-        region_by_id = {
-            str(region.get("region_id") or ""): region
-            for region in regions
-            if str(region.get("region_id") or "")
-        }
-        anchor = region_by_id.get(str(getattr(target_block, "anchor_region_id", "") or ""))
-        if anchor is not None:
-            anchor["ocr_text"] = recovered_text
-            anchor["translation"] = ""
-            anchor["translated_text"] = ""
-            anchor["logical_text_block_source_text"] = recovered_text
-            anchor["logical_text_source_quality_status"] = "root_reconstructed"
-            anchor["logical_text_source_quality_action"] = "reocr_recovered"
-            anchor["logical_text_source_reconstruction_status"] = "applied"
-            anchor["logical_text_source_reconstruction_before_text"] = before_text
-            anchor["logical_text_source_reconstruction_after_text"] = recovered_text
-            anchor["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-            render = anchor.setdefault("render", {})
-            render["logical_text_block_source_text"] = recovered_text
-            render["logical_text_source_quality_action"] = "reocr_recovered"
-            render["logical_text_source_reconstruction_status"] = "applied"
-        return {
-            "repaired_block_id": target_parent_id,
-            "new_region_id": "",
-            "new_block_id": target_parent_id,
-        }
-    old_parent_ids = {str(getattr(parent, "parent_id", "") or "") for parent in root_parents if str(getattr(parent, "parent_id", "") or "")}
-    try:
-        logical_block_result.blocks = [
-            block for block in getattr(logical_block_result, "blocks", []) or []
-            if str(getattr(block, "block_id", "") or "") not in old_parent_ids
-        ]
-    except Exception:
-        pass
-
-    new_region_id = _next_region_id(regions)
-    idx = int(new_region_id[1:]) if new_region_id.startswith("r") and new_region_id[1:].isdigit() else len(regions)
-    is_caption = root_type == "caption_background"
-    region_type = "background_text" if is_caption else "speech_bubble"
-    route_intent = "translate_caption_background" if is_caption else "translate_speech"
-    block_role = "caption_background" if is_caption else "speech_bubble"
-    visual_group_id = str(candidate.get("parent_visual_group_id") or "")
-    block_suffix = f"_root_reconstruction_{_safe_id_token(visual_group_id)}" if visual_group_id else "_root_reconstruction"
-    block_id = f"ltb_{page_id}_{_safe_id_token(root_id)}{block_suffix}"
-    root_internal_child_bboxes = [
-        list(item.get("bbox") or [])
-        for item in (candidate.get("root_internal_child_candidates") or [])
-        if isinstance(item, dict) and isinstance(item.get("bbox"), (list, tuple)) and len(item.get("bbox") or []) >= 4
-    ]
-    render_updates = {
-        "classification_reason": "root_reconstruction_applied",
-        "cleanup_mode": "local_text_mask" if is_caption else "bubble",
-        "root_reconstruction_applied": True,
-        "root_reconstruction_crop_bbox": list(crop_bbox),
-        "logical_text_source_quality_status": "root_reconstructed",
-        "logical_text_source_quality_action": "reocr_recovered",
-        "logical_text_source_quality_reason_codes": list(candidate.get("reasons") or []),
-        "logical_text_source_reconstruction_status": "root_reconstruction_applied",
-        "logical_text_source_reconstruction_applied": True,
-        "logical_text_source_reconstruction_crop_bbox": list(crop_bbox),
-        "logical_text_source_reconstruction_root_internal_child_bboxes": list(root_internal_child_bboxes),
-    }
-    new_region = _region_record(
-        idx,
-        _bbox_to_polygon(crop_bbox),
-        list(crop_bbox),
-        recovered_text,
-        "",
-        0.5,
-        bg_text=is_caption,
-        needs_review=False,
-        ignore=False,
-        region_type=region_type,
-        ocr_conf=float(candidate.get("ocr_confidence") or 0.0),
-        render_updates=render_updates,
-    )
-    new_region["region_id"] = new_region_id
-    container_ids = [str(cid) for cid in (getattr(root, "text_area_container_ids", []) or []) if str(cid)]
-    primary_container_id = container_ids[0] if container_ids else ""
-    new_region["text_area_container_id"] = primary_container_id
-    new_region["text_area_container_type"] = root_type
-    new_region["text_area_route_intent"] = route_intent
-    new_region["text_area_ocr_eligible"] = True
-    new_region["text_area_detection_source"] = "root_reconstruction_reocr"
-    new_region["text_area_container_bbox"] = list(getattr(root, "bbox", []) or crop_bbox)
-    new_region["text_area_confidence_tier"] = str(getattr(root, "confidence_tier", "") or "root_reconstruction")
-    new_region["text_area_reason_codes"] = list(getattr(root, "reason_codes", []) or []) + ["root_reconstruction_applied"]
-    new_region["text_area_conflict_flags"] = []
-    new_region["root_reconstruction_applied"] = True
-    new_region["root_reconstruction_status"] = "applied"
-    new_region["root_reconstruction_before_sources"] = [str(getattr(parent, "source_text", "") or "") for parent in root_parents]
-    new_region["root_reconstruction_after_source"] = recovered_text
-    new_region["root_visual_separation_status"] = str(candidate.get("root_visual_separation_status") or "")
-    new_region["root_overmerge_rejection_reason"] = str(candidate.get("root_overmerge_rejection_reason") or "")
-    new_region["parent_visual_group_id"] = visual_group_id
-    new_region["parent_visual_group_bbox"] = list(candidate.get("parent_visual_group_bbox") or [])
-    new_region["parent_visual_group_child_ids"] = list(candidate.get("parent_visual_group_child_ids") or [])
-    new_region["reconstruction_rejected_for_visual_overmerge"] = bool(candidate.get("reconstruction_rejected_for_visual_overmerge"))
-
-    child_region_ids = [
-        str(getattr(child, "source_region_id", "") or "")
-        for child in root_children
-        if str(getattr(child, "source_region_id", "") or "")
-        in represented_child_ids
-    ]
-    member_ids = [new_region_id] + [rid for rid in child_region_ids if rid != new_region_id]
-    child_member_texts: dict[str, str] = {new_region_id: recovered_text}
-    region_by_id = {str(region.get("region_id") or ""): region for region in regions if str(region.get("region_id") or "")}
-    for rid in child_region_ids:
-        child = region_by_id.get(rid)
-        if not child:
-            continue
-        child_member_texts[rid] = str(child.get("ocr_text") or "")
-        child["translation"] = ""
-        child["translated_text"] = ""
-        child["group_id"] = block_id
-        child["logical_text_ownership_status"] = "transferred_child"
-        child["logical_text_block_id"] = block_id
-        child["logical_text_block_anchor_region_id"] = new_region_id
-        child["logical_text_block_source_text"] = recovered_text
-        child["root_reconstruction_child_state"] = "represented_by_reconstructed_root"
-        child["root_reconstruction_applied"] = True
-        flags = child.setdefault("flags", {})
-        flags["ignore"] = True
-        flags["bg_text"] = is_caption
-        flags["needs_review"] = False
-        render = child.setdefault("render", {})
-        render["cleanup_mode"] = "transferred_to_root_reconstruction_anchor"
-        render["classification_reason"] = "root_reconstruction_transferred_child"
-        render["root_reconstruction_applied"] = True
-        render["root_reconstruction_anchor_region_id"] = new_region_id
-        render.pop("final_render_bbox", None)
-        render.pop("wrapped_lines", None)
-        child.pop("final_render_bbox", None)
-        child.pop("wrapped_lines", None)
-    new_region["logical_text_block_id"] = block_id
-    new_region["logical_text_block_container_id"] = primary_container_id
-    new_region["logical_text_block_role"] = block_role
-    new_region["logical_text_block_member_region_ids"] = list(member_ids)
-    new_region["logical_text_block_anchor_region_id"] = new_region_id
-    new_region["logical_text_block_source_text"] = recovered_text
-    new_region["logical_text_block_reason_codes"] = ["root_reconstruction_applied"] + list(candidate.get("reasons") or [])
-    new_region["logical_text_block_confidence"] = round(float(candidate.get("ocr_confidence") or 0.0), 3)
-    new_region["logical_text_block_would_change_behavior"] = True
-    new_region["logical_text_ownership_status"] = "block_anchor"
-    new_region["logical_text_source_quality_status"] = "root_reconstructed"
-    new_region["logical_text_source_quality_reason_codes"] = list(candidate.get("reasons") or [])
-    new_region["logical_text_source_quality_action"] = "reocr_recovered"
-    new_region["logical_text_source_reconstruction_status"] = "root_reconstruction_applied"
-    new_region["logical_text_source_reconstruction_applied"] = True
-    new_region["logical_text_source_reconstruction_before_text"] = " / ".join(str(getattr(parent, "source_text", "") or "") for parent in root_parents)
-    new_region["logical_text_source_reconstruction_after_text"] = recovered_text
-    new_region["logical_text_source_reconstruction_ocr_confidence"] = float(candidate.get("ocr_confidence") or 0.0)
-    new_region["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-    new_region["logical_text_source_reconstruction_included_child_region_ids"] = list(child_region_ids)
-    new_region["logical_text_source_reconstruction_rejected_child_region_ids"] = []
-    new_region["logical_text_source_reconstruction_reason_codes"] = ["root_reconstruction_applied"] + list(candidate.get("reasons") or [])
-    new_region["logical_text_source_reconstruction_child_fragment_status"] = list(candidate.get("child_fragment_status") or [])
-    new_region["logical_text_source_reconstruction_root_internal_child_bboxes"] = list(root_internal_child_bboxes)
-    new_region["logical_text_parent_visual_group_id"] = visual_group_id
-    new_region["logical_text_parent_visual_group_bbox"] = list(candidate.get("parent_visual_group_bbox") or [])
-    new_region["logical_text_parent_visual_group_child_ids"] = list(candidate.get("parent_visual_group_child_ids") or [])
-    new_region["logical_text_reconstruction_rejected_for_visual_overmerge"] = bool(candidate.get("reconstruction_rejected_for_visual_overmerge"))
-    new_region["logical_text_block_source_reconstruction_required"] = True
-    new_region["logical_text_block_source_reconstruction_status"] = "root_reconstruction_applied"
-    new_region["logical_text_block_source_reconstruction_crop_bbox"] = list(crop_bbox)
-    new_region["logical_text_block_included_child_region_ids"] = list(child_region_ids)
-    regions.append(new_region)
-
-    block = LogicalTextBlock(
-        block_id=block_id,
-        page_id=page_id,
-        container_id=primary_container_id,
-        role=block_role,
-        member_region_ids=list(member_ids),
-        anchor_region_id=new_region_id,
-        transferred_region_ids=list(child_region_ids),
-        source_text=recovered_text,
-        reason_codes=["logical_text_block_v3", "root_reconstruction_applied"] + list(candidate.get("reasons") or []),
-        confidence=round(float(candidate.get("ocr_confidence") or 0.0), 3),
-        would_change_behavior=True,
-        member_source_texts=child_member_texts,
-        anchor_original_text="",
-        bbox=list(crop_bbox),
-        allowed_bbox=list(getattr(root, "bbox", []) or crop_bbox),
-        text_conservation_status="complete",
-        ownership_status_by_region={
-            new_region_id: "block_anchor",
-            **{rid: "transferred_child" for rid in child_region_ids},
-        },
-        physical_bubble_id=str(getattr(root, "physical_bubble_id", "") or root_id),
-        physical_bubble_member_container_ids=container_ids,
-        physical_bubble_source="TextAreaPlan",
-        physical_bubble_reason_codes=list(getattr(root, "reason_codes", []) or []),
-        source_quality_status="root_reconstructed",
-        source_quality_reason_codes=list(candidate.get("reasons") or []),
-        source_quality_action="reocr_recovered",
-        source_reconstruction_status="root_reconstruction_applied",
-        source_reconstruction_applied=True,
-        source_reconstruction_before_text=" / ".join(str(getattr(parent, "source_text", "") or "") for parent in root_parents),
-        source_reconstruction_after_text=recovered_text,
-        source_reconstruction_ocr_confidence=float(candidate.get("ocr_confidence") or 0.0),
-        source_reconstruction_crop_bbox=list(crop_bbox),
-        source_reconstruction_included_child_region_ids=list(child_region_ids),
-        source_reconstruction_rejected_child_region_ids=[],
-        source_reconstruction_reason_codes=["root_reconstruction_applied"] + list(candidate.get("reasons") or []),
-        source_reconstruction_child_fragment_status=list(candidate.get("child_fragment_status") or []),
-        source_reconstruction_required=True,
-    )
-    setattr(block, "parent_visual_group_id", visual_group_id)
-    setattr(block, "parent_visual_group_bbox", list(candidate.get("parent_visual_group_bbox") or []))
-    setattr(block, "parent_visual_group_child_ids", list(candidate.get("parent_visual_group_child_ids") or []))
-    setattr(block, "reconstruction_rejected_for_visual_overmerge", bool(candidate.get("reconstruction_rejected_for_visual_overmerge")))
-    logical_block_result.blocks.append(block)
-    try:
-        logical_block_result.applied_count += 1
-        logical_block_result.owned_region_count += len(member_ids)
-    except Exception:
-        pass
-    return {"new_region_id": new_region_id, "new_block_id": block_id}
-
-
-def _safe_id_token(value: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(value or "root"))
-
-
-def _next_region_id(regions: list[dict]) -> str:
-    max_idx = -1
-    for region in regions:
-        rid = str(region.get("region_id") or "")
-        if len(rid) > 1 and rid[0].lower() == "r" and rid[1:].isdigit():
-            max_idx = max(max_idx, int(rid[1:]))
-    return f"r{max_idx + 1:03d}"
-
-
-def _stamp_punctuation_recovery_region(
-    region: dict,
-    page_id: str,
-    group,
-    container_id: str,
-    recovered_text: str,
-    crop_bbox: list[int],
-    recovered_conf: float,
-    quality_reasons: list[str],
-) -> None:
-    group_id = str(getattr(group, "physical_bubble_id", "") or "")
-    block_id = f"ltb_{page_id}_{group_id}_punctuation_reocr"
-    region["text_area_container_id"] = container_id
-    region["text_area_container_type"] = "speech_bubble"
-    region["text_area_route_intent"] = "translate_speech"
-    region["text_area_ocr_eligible"] = True
-    region["text_area_detection_source"] = "physical_bubble_reocr"
-    region["text_area_fallback_reason"] = "punctuation_only_speech_recovery_required"
-    region["text_area_confidence_tier"] = "mask_primary_container"
-    region["text_area_reason_codes"] = ["punctuation_only_speech_recovery_required", "physical_bubble_crop_reocr"]
-    region["text_area_conflict_flags"] = []
-    region["logical_text_block_id"] = block_id
-    region["logical_text_block_container_id"] = container_id
-    region["logical_text_block_role"] = "speech_bubble"
-    region["logical_text_block_member_region_ids"] = [str(region.get("region_id") or "")]
-    region["logical_text_block_anchor_region_id"] = str(region.get("region_id") or "")
-    region["logical_text_block_source_text"] = recovered_text
-    region["logical_text_block_reason_codes"] = ["punctuation_only_speech_recovery_required", "physical_bubble_crop_reocr"]
-    region["logical_text_block_confidence"] = round(float(recovered_conf or 0.0), 3)
-    region["logical_text_block_would_change_behavior"] = True
-    region["logical_text_ownership_status"] = "block_anchor"
-    region["logical_text_block_text_conservation_status"] = "complete"
-    region["logical_text_block_allowed_bbox"] = list(crop_bbox)
-    region["logical_text_physical_bubble_id"] = group_id
-    region["logical_text_physical_bubble_member_container_ids"] = list(getattr(group, "member_container_ids", []) or [])
-    region["logical_text_physical_bubble_source"] = "TextAreaPlan"
-    region["logical_text_physical_bubble_reason_codes"] = list(getattr(group, "reason_codes", []) or [])
-    region["logical_text_source_quality_status"] = "recovered"
-    region["logical_text_source_quality_reason_codes"] = ["punctuation_only_speech_recovered_from_physical_bubble"] + list(quality_reasons or [])
-    region["logical_text_source_quality_action"] = "reocr_recovered"
-    region["logical_text_blocked_fragment_resolution"] = "represented_in_anchor"
-    region["logical_text_source_reconstruction_status"] = "applied"
-    region["logical_text_source_reconstruction_applied"] = True
-    region["logical_text_source_reconstruction_after_text"] = recovered_text
-    region["logical_text_source_reconstruction_ocr_confidence"] = recovered_conf
-    region["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-    region["logical_text_source_reconstruction_reason_codes"] = ["punctuation_only_speech_recovery_required", "physical_bubble_crop_reocr"]
-    render = region.setdefault("render", {})
-    for key in [
-        "logical_text_block_id",
-        "logical_text_block_source_text",
-        "logical_text_ownership_status",
-        "logical_text_block_text_conservation_status",
-        "logical_text_physical_bubble_id",
-        "logical_text_source_quality_status",
-        "logical_text_source_quality_reason_codes",
-        "logical_text_source_quality_action",
-        "logical_text_source_reconstruction_status",
-        "logical_text_source_reconstruction_applied",
-        "logical_text_source_reconstruction_after_text",
-        "logical_text_source_reconstruction_ocr_confidence",
-        "logical_text_source_reconstruction_crop_bbox",
-        "logical_text_source_reconstruction_reason_codes",
-    ]:
-        render[key] = region.get(key)
-
-
-def _stamp_punctuation_recovery_child(
-    region: dict,
-    page_id: str,
-    group,
-    container_id: str,
-    anchor_region_id: str,
-    recovered_text: str,
-    crop_bbox: list[int],
-) -> None:
-    group_id = str(getattr(group, "physical_bubble_id", "") or "")
-    block_id = f"ltb_{page_id}_{group_id}_punctuation_reocr"
-    region["punctuation_only_speech_recovery_required"] = True
-    region["logical_text_block_id"] = block_id
-    region["logical_text_block_container_id"] = container_id
-    region["logical_text_block_role"] = "speech_bubble"
-    region["logical_text_block_anchor_region_id"] = anchor_region_id
-    region["logical_text_block_source_text"] = recovered_text
-    region["logical_text_ownership_status"] = "punctuation_child"
-    region["logical_text_blocked_fragment_resolution"] = "punctuation_child"
-    region["logical_text_source_reconstruction_status"] = "applied"
-    region["logical_text_source_reconstruction_applied"] = True
-    region["logical_text_source_reconstruction_after_text"] = recovered_text
-    region["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-    region["translation"] = ""
-    region["translated_text"] = ""
-    region["skip_reason"] = "ignored_by_pipeline"
-    flags = region.setdefault("flags", {})
-    flags["ignore"] = True
-    flags["bg_text"] = False
-    flags["needs_review"] = False
-    render = region.setdefault("render", {})
-    render["classification_reason"] = "punctuation_child_transferred_to_recovered_logical_text_block"
-    render["logical_text_block_id"] = block_id
-    render["logical_text_ownership_status"] = "punctuation_child"
-    render["logical_text_blocked_fragment_resolution"] = "punctuation_child"
-    render["logical_text_source_reconstruction_status"] = "applied"
-    render["logical_text_source_reconstruction_applied"] = True
-    render["logical_text_source_reconstruction_after_text"] = recovered_text
-    render["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-    render.pop("final_render_bbox", None)
-    render.pop("wrapped_lines", None)
-
-
-def _logical_block_needs_physical_reocr(block, region_by_id: dict[str, dict]) -> bool:
-    if str(getattr(block, "role", "") or "") != "speech_bubble":
-        return False
-    if not str(getattr(block, "physical_bubble_id", "") or ""):
-        return False
-    if str(getattr(block, "source_quality_status", "") or "") in {"contaminated", "fragmented", "empty"}:
-        return True
-    if str(getattr(block, "source_quality_action", "") or "") in {"source_quality_blocked", "split_required", "unresolved_review", "block_auto_translation"}:
-        return True
-    if _logical_source_fragmentation_score(str(getattr(block, "source_text", "") or "")) >= 4:
-        return True
-    if _logical_block_has_incomplete_standalone_fragment(block, region_by_id):
-        return True
-    if len(getattr(block, "physical_bubble_member_container_ids", []) or []) > 1 and (
-        len(getattr(block, "transferred_region_ids", []) or []) >= 2
-        or len(getattr(block, "noise_child_ids", []) or []) >= 1
-    ):
-        return True
-    for rid in list(getattr(block, "member_region_ids", []) or []):
-        region = region_by_id.get(str(rid))
-        if region and str(region.get("logical_text_blocked_fragment_resolution") or "") == "unresolved_meaningful_speech":
-            return True
-    return False
-
-
-def _logical_block_reocr_candidate_reasons(block, region_by_id: dict[str, dict]) -> list[str]:
-    reasons: list[str] = []
-    status = str(getattr(block, "source_quality_status", "") or "")
-    action = str(getattr(block, "source_quality_action", "") or "")
-    if status and status != "clean":
-        reasons.append(f"source_quality:{status}")
-    if action in {"source_quality_blocked", "split_required", "unresolved_review", "block_auto_translation"}:
-        reasons.append(f"source_quality_action:{action}")
-    if _logical_source_fragmentation_score(str(getattr(block, "source_text", "") or "")) >= 4:
-        reasons.append("fragmented_block_source")
-    if _logical_block_has_incomplete_standalone_fragment(block, region_by_id):
-        reasons.append("incomplete_standalone_source_inside_large_physical_bubble")
-    if len(getattr(block, "physical_bubble_member_container_ids", []) or []) > 1:
-        reasons.append("split_text_area_physical_bubble")
-    if getattr(block, "noise_child_ids", None):
-        reasons.append("has_rejected_child_fragments")
-    if not reasons:
-        reasons.append("physical_bubble_source_reconstruction_candidate")
-    return sorted(set(reasons))
-
-
-def _logical_block_physical_reocr_bbox(block, group_bboxes: dict[str, list[int]], image_size: tuple[int, int] | None) -> list[int]:
-    group_bbox = group_bboxes.get(str(getattr(block, "physical_bubble_id", "") or ""))
-    block_bbox = getattr(block, "allowed_bbox", None) or getattr(block, "bbox", None)
-    bbox = group_bbox or block_bbox
-    if not bbox:
-        return []
-    if group_bbox and _logical_block_should_use_full_physical_reocr_crop(block):
-        return _clip_controller_bbox(list(group_bbox), image_size)
-    if group_bbox and block_bbox:
-        try:
-            gx, gy, gw, gh = [float(v or 0) for v in group_bbox[:4]]
-            bx, by, bw, bh = [float(v or 0) for v in block_bbox[:4]]
-            group_area = max(1.0, gw * gh)
-            block_area = max(1.0, bw * bh)
-            if group_area > block_area * 4.0:
-                bbox = _expand_box(list(block_bbox), 28, image_size or (0, 0))
-        except Exception:
-            bbox = group_bbox or block_bbox
-    return _clip_controller_bbox(list(bbox), image_size)
-
-
-def _mark_logical_block_reocr_unresolved(block, reason: str) -> None:
-    try:
-        block.source_reconstruction_required = True
-        block.source_reconstruction_status = "not_applied"
-        block.source_reconstruction_unresolved_reason = str(reason or "physical_bubble_reocr_not_applied")
-        existing = list(getattr(block, "source_reconstruction_reason_codes", []) or [])
-        block.source_reconstruction_reason_codes = sorted(set(existing + [block.source_reconstruction_unresolved_reason]))
-    except Exception:
-        pass
-
-
-def _logical_block_has_incomplete_standalone_fragment(block, region_by_id: dict[str, dict]) -> bool:
-    if str(getattr(block, "role", "") or "") != "speech_bubble":
-        return False
-    if str(getattr(block, "source_quality_action", "") or "") not in {"translate", "reocr_recovered"}:
-        return False
-    if len(getattr(block, "member_region_ids", []) or []) != 1:
-        return False
-    source = _clean_ocr_text(str(getattr(block, "source_text", "") or ""))
-    if not _logical_source_looks_incomplete_standalone_fragment(source):
-        return False
-    rid = str((getattr(block, "member_region_ids", []) or [""])[0])
-    region = region_by_id.get(rid) or {}
-    if _controller_text_area_preserve_or_conflict_like(region):
-        return False
-    tier = str(region.get("text_area_confidence_tier") or (region.get("render") or {}).get("text_area_confidence_tier") or "").strip()
-    if tier not in {"strong_model_container", "mask_primary_container"}:
-        return False
-    region_bbox = _controller_bbox(region.get("bbox"))
-    container_bbox = _controller_bbox(region.get("text_area_container_bbox") or (region.get("render") or {}).get("text_area_container_bbox"))
-    if not region_bbox or not container_bbox:
-        return False
-    region_area = max(1, region_bbox[2] * region_bbox[3])
-    container_area = max(1, container_bbox[2] * container_bbox[3])
-    return container_area >= region_area * 4.5
-
-
-def _logical_block_should_use_full_physical_reocr_crop(block) -> bool:
-    source = _clean_ocr_text(str(getattr(block, "source_text", "") or ""))
-    if _logical_source_looks_incomplete_standalone_fragment(source):
-        return True
-    reasons = set(str(reason) for reason in getattr(block, "source_reconstruction_reason_codes", []) or [])
-    return "incomplete_standalone_source_inside_large_physical_bubble" in reasons
-
-
-def _logical_source_looks_incomplete_standalone_fragment(source_text: str) -> bool:
-    text = _clean_ocr_text(str(source_text or ""))
-    body = _source_body_for_ownership(text)
-    if not body or len(body) > 7:
-        return False
-    if _is_punctuation_or_ellipsis_only_controller(text):
-        return False
-    if text.endswith(("。", "？", "?", "！", "!", "・・・", "...", "…")):
-        return False
-    if body.endswith("っ"):
-        return True
-    if any(particle in body for particle in ("を", "で", "に", "は", "が", "の", "と")) and len(body) <= 6:
-        return True
-    if any("\u4e00" <= ch <= "\u9fff" for ch in body) and len(body) <= 4:
-        return True
-    return False
-
-
-def _controller_text_area_preserve_or_conflict_like(region: dict) -> bool:
-    if not isinstance(region, dict):
-        return False
-    render = region.get("render") or {}
-    flags = region.get("text_area_conflict_flags") or render.get("text_area_conflict_flags") or []
-    if any(str(flag).strip() for flag in flags):
-        return True
-    container_type = str(region.get("text_area_container_type") or render.get("text_area_container_type") or "").strip()
-    route_intent = str(region.get("text_area_route_intent") or render.get("text_area_route_intent") or "").strip()
-    if container_type == "sfx_decorative_art" or route_intent == "preserve_sfx_decorative":
-        return True
-    reason_text = " ".join(str(v) for v in (region.get("text_area_reason_codes") or render.get("text_area_reason_codes") or [])).lower()
-    return any(token in reason_text for token in ("sfx", "decorative", "nonbubble", "review_only", "preserve_sfx"))
-
-
-def _controller_bbox(value) -> list[int]:
-    if not isinstance(value, (list, tuple)) or len(value) < 4:
-        return []
-    try:
-        x, y, w, h = [int(round(float(v or 0))) for v in value[:4]]
-    except Exception:
-        return []
-    if w <= 0 or h <= 0:
-        return []
-    return [x, y, w, h]
-
-
-def _logical_block_recovered_source_is_better(
-    before_text: str,
-    recovered_text: str,
-    block,
-    region_by_id: dict[str, dict],
-    quality_func,
-    recovered_conf: float = 0.0,
-) -> tuple[bool, str]:
-    before = _clean_ocr_text(str(before_text or ""))
-    recovered = _clean_ocr_text(str(recovered_text or ""))
-    recovered_body = _source_body_for_ownership(recovered)
-    speech_short_source = _is_speech_short_or_ellipsis_source(recovered)
-    if len(recovered_body) < 4 and not speech_short_source:
-        return False, "recovered_source_too_short"
-    if _is_valid_japanese(recovered) < 0.55 and not speech_short_source:
-        return False, "recovered_source_low_japanese_ratio"
-    status, reasons, action = quality_func(recovered, [_region_for_block_member(rid, region_by_id) for rid in getattr(block, "member_region_ids", []) or []])
-    if action in {"source_quality_blocked", "split_required", "unresolved_review", "block_auto_translation"} and not speech_short_source:
-        return False, "recovered_source_quality_blocked"
-    original_blocking_action = str(getattr(block, "source_quality_action", "") or "") in {"source_quality_blocked", "block_auto_translation"}
-    if original_blocking_action and float(recovered_conf or 0.0) < 0.72:
-        return False, "contaminated_source_recovery_low_confidence"
-    member_bodies = [
-        _source_body_for_ownership(str((region_by_id.get(str(rid)) or {}).get("ocr_text") or ""))
-        for rid in getattr(block, "member_region_ids", []) or []
-    ]
-    useful_member_bodies = [body for body in member_bodies if len(body) >= 2]
-    before_score = _logical_source_quality_score(before, block, quality_func)
-    recovered_score = _logical_source_quality_score(recovered, block, quality_func)
-    if original_blocking_action and recovered_score >= before_score and float(recovered_conf or 0.0) >= 0.72:
-        return True, "contaminated_source_recovered_by_physical_bubble_reocr"
-    if recovered_score >= before_score + 4.0:
-        if status != "clean" and reasons:
-            return True, "physical_bubble_reocr_improved_low_quality_source"
-        return True, "physical_bubble_reocr_improved_source"
-    if str(getattr(block, "source_quality_status", "") or "") != "clean" and recovered_score >= before_score:
-        return True, "physical_bubble_reocr_recovered_nonclean_source"
-    return False, "recovered_source_not_materially_better"
-
-
-def _merge_recovered_source_child_fragments(
-    recovered_text: str,
-    block,
-    region_by_id: dict[str, dict],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Conservatively merge source fragments proven to belong to the recovered speech block."""
-    merged = _clean_ocr_text(str(recovered_text or ""))
-    statuses: list[dict[str, Any]] = []
-    if not merged:
-        return merged, statuses
-
-    member_texts = dict(getattr(block, "member_source_texts", {}) or {})
-    for rid in getattr(block, "member_region_ids", []) or []:
-        rid = str(rid)
-        text = str(member_texts.get(rid) or (region_by_id.get(rid) or {}).get("ocr_text") or "")
-        text = _clean_ocr_text(text)
-        body = _source_body_for_ownership(text)
-        if len(body) < 2 or _is_punctuation_or_ellipsis_only_controller(text):
-            continue
-        merged_body = _source_body_for_ownership(merged)
-        if body and body in merged_body:
-            statuses.append({"region_id": rid, "source_text": text, "status": "represented"})
-            continue
-        if rid in set(getattr(block, "noise_child_ids", []) or []):
-            statuses.append({"region_id": rid, "source_text": text, "status": "rejected_noise_child"})
-            continue
-        updated = _insert_missing_prefix_before_overlap(merged, text)
-        if updated != merged:
-            merged = updated
-            statuses.append({"region_id": rid, "source_text": text, "status": "recovered_source_child_fragment_merged"})
-            continue
-        # Do not append unrelated fragments blindly; they need a safer block split/re-OCR proof.
-        statuses.append({"region_id": rid, "source_text": text, "status": "recovered_source_child_fragment_missing"})
-    return merged, statuses
-
-
-def _insert_missing_prefix_before_overlap(recovered_text: str, fragment_text: str) -> str:
-    recovered = _clean_ocr_text(str(recovered_text or ""))
-    fragment = _clean_ocr_text(str(fragment_text or ""))
-    if not recovered or not fragment:
-        return recovered
-    fragment_body = _source_body_for_ownership(fragment)
-    recovered_body = _source_body_for_ownership(recovered)
-    if not fragment_body or fragment_body in recovered_body:
-        return recovered
-    best = ""
-    for size in range(min(len(fragment), 8), 1, -1):
-        for start in range(0, max(1, len(fragment) - size + 1)):
-            piece = fragment[start : start + size]
-            piece_body = _source_body_for_ownership(piece)
-            if len(piece_body) < 2:
-                continue
-            if piece in recovered or piece_body in recovered_body:
-                if len(piece_body) > len(_source_body_for_ownership(best)):
-                    best = piece
-        if best:
-            break
-    if not best:
-        return recovered
-    missing_prefix = fragment.split(best, 1)[0]
-    if not missing_prefix or len(_source_body_for_ownership(missing_prefix)) > 2:
-        return recovered
-    if _source_body_for_ownership(missing_prefix) in recovered_body:
-        return recovered
-    idx = recovered.find(best)
-    if idx < 0:
-        # Fall back to the first raw character of the overlap when OCR punctuation differs.
-        first = best[0]
-        idx = recovered.find(first)
-    if idx < 0:
-        return recovered
-    return recovered[:idx] + missing_prefix + recovered[idx:]
-
-
-def _is_punctuation_or_ellipsis_only_controller(text: str) -> bool:
-    body = _source_body_for_ownership(text)
-    return not body and bool(str(text or "").strip())
-
-
-def _region_for_block_member(region_id: str, region_by_id: dict[str, dict]) -> dict:
-    return region_by_id.get(str(region_id)) or {}
-
-
-def _logical_source_quality_score(source_text: str, block, quality_func) -> float:
-    text = _clean_ocr_text(str(source_text or ""))
-    body = _source_body_for_ownership(text)
-    status, reasons, action = quality_func(text, [])
-    score = len(body) * 1.5 + _is_valid_japanese(text) * 12.0
-    score -= _logical_source_fragmentation_score(text) * 3.0
-    if action in {"source_quality_blocked", "split_required", "unresolved_review", "block_auto_translation"}:
-        score -= 25.0
-    if status != "clean":
-        score -= 5.0
-    if any(reason in {"suspect_ocr_substitution_surface", "malformed_ocr_anchor_surface"} for reason in reasons):
-        score -= 8.0
-    return score
-
-
-def _logical_source_fragmentation_score(source_text: str) -> int:
-    text = _clean_ocr_text(str(source_text or ""))
-    if not text:
-        return 0
-    body = _source_body_for_ownership(text)
-    score = 0
-    separator_count = text.count("、") + text.count("，") + text.count(",")
-    if separator_count >= 3:
-        score += separator_count
-    fragments = [
-        _source_body_for_ownership(part)
-        for part in re.split(r"[、，,]+", text)
-        if _source_body_for_ownership(part)
-    ]
-    score += sum(1 for part in fragments if len(part) <= 2)
-    if len(body) >= 8 and separator_count >= 4:
-        score += 2
-    return score
-
-
-def _apply_logical_text_source_reconstruction(
-    block,
-    region_by_id: dict[str, dict],
-    recovered_text: str,
-    recovered_conf: float,
-    crop_bbox: list[int],
-    reason_codes: list[str],
-    quality_func,
-    child_fragment_status: list[dict[str, Any]] | None = None,
-) -> None:
-    before_text = str(getattr(block, "source_text", "") or "")
-    status, quality_reasons, _action = quality_func(recovered_text, [_region_for_block_member(rid, region_by_id) for rid in getattr(block, "member_region_ids", []) or []])
-    original_quality_action = str(getattr(block, "source_quality_action", "") or "")
-    original_quality_status = str(getattr(block, "source_quality_status", "") or "")
-    original_incomplete_standalone = _logical_source_looks_incomplete_standalone_fragment(before_text)
-    use_physical_bbox_for_anchor = (
-        original_quality_action in {"source_quality_blocked", "block_auto_translation"}
-        or original_quality_status == "contaminated"
-        or original_incomplete_standalone
-    ) and bool(crop_bbox)
-    try:
-        block.source_reconstruction_required = True
-    except Exception:
-        pass
-    block.source_reconstruction_status = "applied"
-    block.source_reconstruction_applied = True
-    block.source_reconstruction_before_text = before_text
-    block.source_reconstruction_after_text = recovered_text
-    block.source_reconstruction_ocr_confidence = recovered_conf
-    block.source_reconstruction_crop_bbox = list(crop_bbox)
-    block.source_reconstruction_included_child_region_ids = [
-        rid for rid in list(getattr(block, "transferred_region_ids", []) or []) + list(getattr(block, "duplicate_region_ids", []) or [])
-    ]
-    block.source_reconstruction_rejected_child_region_ids = list(getattr(block, "noise_child_ids", []) or [])
-    merged_reason_codes = [
-        str(item.get("status") or "")
-        for item in (child_fragment_status or [])
-        if str(item.get("status") or "") == "recovered_source_child_fragment_merged"
-    ]
-    block.source_reconstruction_child_fragment_status = list(child_fragment_status or [])
-    block.source_reconstruction_reason_codes = sorted(set(reason_codes + quality_reasons + merged_reason_codes + ["physical_bubble_crop_reocr"]))
-    block.source_text = recovered_text
-    block.source_quality_status = "recovered" if status == "clean" else f"recovered_{status}"
-    block.source_quality_reason_codes = sorted(set(["physical_bubble_reocr_recovered_source"] + quality_reasons))
-    block.source_quality_action = "reocr_recovered"
-    block.would_change_behavior = True
-    if str(getattr(block, "anchor_region_id", "") or ""):
-        block.ownership_status_by_region[str(getattr(block, "anchor_region_id", "") or "")] = "block_anchor"
-    block.reason_codes = sorted(set(list(getattr(block, "reason_codes", []) or []) + block.source_reconstruction_reason_codes))
-    block.reason_codes = sorted(set(block.reason_codes + ["logical_text_block_v3", "translation_unit:physical_bubble_reconstructed_block"]))
-    if use_physical_bbox_for_anchor:
-        block.bbox = list(crop_bbox)
-        block.allowed_bbox = list(crop_bbox)
-        block.reason_codes = sorted(set(block.reason_codes + ["source_quality_repair_uses_physical_bubble_bbox"]))
-    anchor = region_by_id.get(str(getattr(block, "anchor_region_id", "") or ""))
-    block_role = str(getattr(block, "role", "") or "").strip()
-    anchor_render = anchor.get("render", {}) if isinstance(anchor, dict) and isinstance(anchor.get("render"), dict) else {}
-    anchor_route = str(anchor_render.get("text_area_route_intent") or (anchor or {}).get("text_area_route_intent") or "").strip()
-    anchor_container_type = str(anchor_render.get("text_area_container_type") or (anchor or {}).get("text_area_container_type") or "").strip()
-    reconstruct_as_caption = (
-        block_role == "caption_background"
-        or anchor_route in {"translate_caption", "translate_caption_background"}
-        or anchor_container_type == "caption_background"
-        or str((anchor or {}).get("type") or "").strip() in {"background_text", "narration_box"}
-    )
-    child_status_by_id = {
-        str(item.get("region_id") or ""): str(item.get("status") or "")
-        for item in (child_fragment_status or [])
-        if str(item.get("region_id") or "")
-    }
-    if anchor is not None:
-        original_anchor_bbox = list(anchor.get("bbox") or [])
-        anchor["ocr_text"] = recovered_text
-        anchor["translation"] = ""
-        anchor["translated_text"] = ""
-        anchor["semantic_class"] = "caption_background" if reconstruct_as_caption else "speech_bubble"
-        anchor["type"] = "background_text" if reconstruct_as_caption else "speech_bubble"
-        anchor["skip_reason"] = None
-        flags = anchor.setdefault("flags", {})
-        flags["ignore"] = False
-        flags["bg_text"] = bool(reconstruct_as_caption)
-        flags["needs_review"] = False
-        anchor["logical_text_ownership_status"] = "block_anchor"
-        anchor["logical_text_blocked_fragment_resolution"] = "represented_in_anchor"
-        anchor_render = anchor.setdefault("render", {})
-        if not any(str(flag).strip() for flag in anchor.get("text_area_conflict_flags") or []):
-            anchor_render["cleanup_mode"] = "local_text_mask" if reconstruct_as_caption else "bubble"
-            anchor_render["logical_text_recovered_anchor_cleanup_required"] = True
-            anchor_render["logical_text_recovered_anchor_cleanup_reason"] = "physical_bubble_reocr_source_represented"
-        if reconstruct_as_caption:
-            anchor_render["caption_background_ownership_status"] = "accepted_caption_background"
-            anchor_render["caption_background_ownership_reason"] = "logical_text_caption_reconstruction_preserved_route"
-        if use_physical_bbox_for_anchor:
-            anchor["bbox"] = list(crop_bbox)
-            anchor["polygon"] = _bbox_to_polygon(crop_bbox)
-            anchor["logical_text_source_reconstruction_original_anchor_bbox"] = original_anchor_bbox
-    for rid in getattr(block, "member_region_ids", []) or []:
-        region = region_by_id.get(str(rid))
-        if region is None:
-            continue
-        region["logical_text_block_source_text"] = recovered_text
-        region["logical_text_source_quality_status"] = block.source_quality_status
-        region["logical_text_source_quality_reason_codes"] = list(block.source_quality_reason_codes)
-        region["logical_text_source_quality_action"] = block.source_quality_action
-        region["logical_text_source_reconstruction_status"] = block.source_reconstruction_status
-        region["logical_text_source_reconstruction_applied"] = True
-        region["logical_text_source_reconstruction_before_text"] = before_text
-        region["logical_text_source_reconstruction_after_text"] = recovered_text
-        region["logical_text_source_reconstruction_ocr_confidence"] = recovered_conf
-        region["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-        region["logical_text_source_reconstruction_included_child_region_ids"] = list(block.source_reconstruction_included_child_region_ids)
-        region["logical_text_source_reconstruction_rejected_child_region_ids"] = list(block.source_reconstruction_rejected_child_region_ids)
-        region["logical_text_source_reconstruction_reason_codes"] = list(block.source_reconstruction_reason_codes)
-        region["logical_text_source_reconstruction_child_fragment_status"] = list(block.source_reconstruction_child_fragment_status)
-        fragment_status = child_status_by_id.get(str(rid), "")
-        if fragment_status == "rejected_noise_child":
-            region["logical_text_blocked_fragment_resolution"] = "noise_review_only"
-            region["speech_source_repair_required"] = False
-            region["source_quality_blocked_visual_fail"] = False
-        elif not any(str(flag).strip() for flag in region.get("text_area_conflict_flags") or []):
-            region["logical_text_blocked_fragment_resolution"] = "represented_in_anchor"
-            region["speech_source_repair_required"] = False
-            region["source_quality_blocked_visual_fail"] = False
-        ownership_status = "block_anchor" if str(rid) == str(getattr(block, "anchor_region_id", "") or "") else str(region.get("logical_text_ownership_status") or "")
-        _stamp_controller_v3_logical_fields(region, block, ownership_status)
-        render = region.setdefault("render", {})
-        render["logical_text_block_source_text"] = recovered_text
-        render["logical_text_source_quality_status"] = block.source_quality_status
-        render["logical_text_source_quality_reason_codes"] = list(block.source_quality_reason_codes)
-        render["logical_text_source_quality_action"] = block.source_quality_action
-        render["logical_text_source_reconstruction_status"] = block.source_reconstruction_status
-        render["logical_text_source_reconstruction_applied"] = True
-        render["logical_text_source_reconstruction_before_text"] = before_text
-        render["logical_text_source_reconstruction_after_text"] = recovered_text
-        render["logical_text_source_reconstruction_ocr_confidence"] = recovered_conf
-        render["logical_text_source_reconstruction_crop_bbox"] = list(crop_bbox)
-        render["logical_text_source_reconstruction_included_child_region_ids"] = list(block.source_reconstruction_included_child_region_ids)
-        render["logical_text_source_reconstruction_rejected_child_region_ids"] = list(block.source_reconstruction_rejected_child_region_ids)
-        render["logical_text_source_reconstruction_reason_codes"] = list(block.source_reconstruction_reason_codes)
-        render["logical_text_source_reconstruction_child_fragment_status"] = list(block.source_reconstruction_child_fragment_status)
-        render["logical_text_blocked_fragment_resolution"] = region.get("logical_text_blocked_fragment_resolution")
-        render["speech_source_repair_required"] = region.get("speech_source_repair_required")
-        render["source_quality_blocked_visual_fail"] = region.get("source_quality_blocked_visual_fail")
-        if use_physical_bbox_for_anchor and str(rid) == str(getattr(block, "anchor_region_id", "") or ""):
-            render["logical_text_source_reconstruction_original_anchor_bbox"] = region.get("logical_text_source_reconstruction_original_anchor_bbox")
-            render["logical_text_source_reconstruction_bbox_applied_to_anchor"] = list(crop_bbox)
-    if anchor is not None:
-        anchor.setdefault("render", {})["classification_reason"] = "logical_text_physical_bubble_source_reocr_recovered"
-
-
-def _stamp_controller_v3_logical_fields(region: dict, block, ownership_status: str) -> None:
-    ownership = str(ownership_status or "").strip()
-    if not ownership:
-        ownership = str(region.get("logical_text_ownership_status") or "").strip()
-    if ownership == "standalone_block":
-        final_state = "standalone_utterance"
-    elif ownership == "transferred_child":
-        final_state = "dependent_child"
-    elif ownership in {"block_anchor", "duplicate_child", "punctuation_child", "noise_review_only"}:
-        final_state = ownership
-    else:
-        final_state = "review_only_unresolved"
-    if _controller_text_area_preserve_or_conflict_like(region):
-        final_state = "blocked_sfx_or_decorative"
-    is_translation_unit = ownership in {"block_anchor", "standalone_block", "standalone_utterance"} and str(getattr(block, "source_quality_action", "") or "") not in {
-        "source_quality_blocked",
-        "block_auto_translation",
-        "split_required",
-        "unresolved_review",
-    }
-    block_id = str(getattr(block, "block_id", "") or "") or None
-    region["physical_bubble_graph_id"] = str(getattr(block, "physical_bubble_id", "") or "") or region.get("logical_text_physical_bubble_id")
-    region["logical_text_block_v3_status"] = final_state
-    region["logical_text_block_translation_unit"] = is_translation_unit
-    region["logical_text_block_source_reconstruction_required"] = bool(getattr(block, "source_reconstruction_required", False))
-    region["logical_text_block_source_reconstruction_status"] = str(getattr(block, "source_reconstruction_status", "") or "")
-    region["logical_text_block_source_reconstruction_crop_bbox"] = list(getattr(block, "source_reconstruction_crop_bbox", []) or [])
-    region["logical_text_block_included_child_region_ids"] = list(getattr(block, "source_reconstruction_included_child_region_ids", []) or [])
-    region["logical_text_block_rejected_child_region_ids"] = list(getattr(block, "source_reconstruction_rejected_child_region_ids", []) or [])
-    region["logical_text_block_unresolved_reason"] = getattr(block, "source_reconstruction_unresolved_reason", None)
-    region["ocr_fragment_ownership_status"] = ownership
-    region["ocr_fragment_final_state"] = final_state
-    region["active_translation_unit_id"] = block_id if is_translation_unit else None
-    region["source_text_represented_by_block_id"] = block_id if final_state in {
-        "block_anchor",
-        "standalone_utterance",
-        "dependent_child",
-        "duplicate_child",
-        "punctuation_child",
-    } else None
-    region["source_conservation_status"] = str(getattr(block, "text_conservation_status", "") or "")
-    region["source_conservation_failure_reason"] = getattr(block, "source_reconstruction_unresolved_reason", None)
-    render = region.setdefault("render", {})
-    for key in (
-        "physical_bubble_graph_id",
-        "logical_text_block_v3_status",
-        "logical_text_block_translation_unit",
-        "logical_text_block_source_reconstruction_required",
-        "logical_text_block_source_reconstruction_status",
-        "logical_text_block_source_reconstruction_crop_bbox",
-        "logical_text_block_included_child_region_ids",
-        "logical_text_block_rejected_child_region_ids",
-        "logical_text_block_unresolved_reason",
-        "ocr_fragment_ownership_status",
-        "ocr_fragment_final_state",
-        "active_translation_unit_id",
-        "source_text_represented_by_block_id",
-        "source_conservation_status",
-        "source_conservation_failure_reason",
-    ):
-        render[key] = region.get(key)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _clip_controller_bbox(bbox: list[int], image_size: tuple[int, int] | None) -> list[int]:
@@ -11026,11 +7658,6 @@ def _process_page(
 ) -> PageProcessingResult:
     from app.pipeline.debug_artifacts import add_count, add_timing, mark_render_region, mark_translation_plan, set_count
     from app.pipeline.bubble_detection import BubbleDetectionInput, run_bubble_detection
-    from app.pipeline.logical_text_blocks import (
-        LOGICAL_TEXT_BLOCK_VERSION,
-        LogicalTextBlockAssemblyResult,
-        enforce_logical_text_render_eligibility,
-    )
     from app.pipeline.text_block_hierarchy import build_text_block_hierarchy
     from app.pipeline.text_area_plan import (
         DETECTION_COMPATIBILITY_FALLBACK,
@@ -11946,23 +8573,6 @@ def _process_page(
             if debug_context is not None:
                 debug_context["text_area_plan_logical_assignment_error"] = f"{type(exc).__name__}: {exc}"
 
-    route_assist_status = {
-        "route_assist_version": "text_area_route_assist_disabled_by_topology_contract",
-        "route_assist_enabled": False,
-        "route_assist_generated": False,
-        "route_assist_error": None,
-        "route_assist_suggestions_considered": 0,
-        "route_assist_eligible_count": 0,
-        "route_assist_applied_count": 0,
-        "route_assist_applied": [],
-        "route_assist_runtime_sec": 0.0,
-    }
-    if debug_context is not None:
-        debug_context["route_assist"] = route_assist_status
-        add_timing(debug_context, "route_assist_time", float(route_assist_status.get("route_assist_runtime_sec") or 0.0))
-        set_count(debug_context, "route_assist_suggestions_considered", int(route_assist_status.get("route_assist_suggestions_considered") or 0))
-        set_count(debug_context, "route_assist_eligible_suggestions", int(route_assist_status.get("route_assist_eligible_count") or 0))
-        set_count(debug_context, "route_assist_applied_regions", int(route_assist_status.get("route_assist_applied_count") or 0))
     logical_text_area_plan = text_area_plan
     if text_area_plan is not None:
         try:
@@ -11976,53 +8586,6 @@ def _process_page(
             if debug_context is not None:
                 debug_context["text_area_plan_enrichment_error"] = f"{type(exc).__name__}: {exc}"
 
-    logical_block_start = time.time()
-    speech_fragment_restore_status = {
-        "logical_text_speech_container_override_count": 0,
-        "logical_text_speech_container_override_region_ids": [],
-        "status": "disabled_text_area_graph_is_semantic_authority",
-    }
-    if debug_context is not None:
-        debug_context["logical_text_speech_container_override"] = speech_fragment_restore_status
-        set_count(
-            debug_context,
-            "logical_text_speech_container_overrides",
-            int(speech_fragment_restore_status.get("logical_text_speech_container_override_count") or 0),
-        )
-    logical_block_result = LogicalTextBlockAssemblyResult(
-        version=LOGICAL_TEXT_BLOCK_VERSION,
-        page_id=page_id,
-        generated=True,
-        applied_count=0,
-        blocks=[],
-    )
-    source_reconstruction_status = {
-        "attempt_count": 0,
-        "applied_count": 0,
-        "attempts": [],
-        "status": "disabled_parent_source_attaches_to_text_area_graph",
-    }
-    punctuation_recovery_status = {
-        "attempt_count": 0,
-        "applied_count": 0,
-        "attempts": [],
-        "status": "disabled_punctuation_identity_is_graph_owned",
-    }
-    add_timing(debug_context, "logical_text_block_time", time.time() - logical_block_start)
-    if debug_context is not None:
-        debug_context["logical_text_source_reconstruction"] = source_reconstruction_status
-        debug_context["logical_text_punctuation_only_speech_recovery"] = punctuation_recovery_status
-        set_count(debug_context, "logical_text_source_reconstruction_attempts", int(source_reconstruction_status.get("attempt_count") or 0))
-        set_count(debug_context, "logical_text_source_reconstruction_applied", int(source_reconstruction_status.get("applied_count") or 0))
-        set_count(debug_context, "logical_text_punctuation_only_speech_recovery_attempts", int(punctuation_recovery_status.get("attempt_count") or 0))
-        set_count(debug_context, "logical_text_punctuation_only_speech_recovery_applied", int(punctuation_recovery_status.get("applied_count") or 0))
-        debug_context["pipeline_logical_text_block_result"] = logical_block_result.to_dict()
-        debug_context["pipeline_logical_text_blocks"] = [
-            block.to_dict() for block in logical_block_result.blocks
-        ]
-        set_count(debug_context, "logical_text_blocks", len(logical_block_result.blocks))
-        set_count(debug_context, "logical_text_block_applied", logical_block_result.applied_count)
-        set_count(debug_context, "logical_text_block_skipped_containers", logical_block_result.skipped_container_count)
     hierarchy_start = time.time()
     initial_hierarchy_start = time.perf_counter()
     ocr_diagnostics = [
@@ -12052,33 +8615,23 @@ def _process_page(
         page_id=page_id,
         regions=regions,
         text_area_plan=logical_text_area_plan,
-        logical_block_result=logical_block_result,
         mutate_regions=False,
     )
+    if not initial_text_block_hierarchy.generated:
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.HIERARCHY,
+            code="root_parent_child_plan_required",
+            message="TextAreaPlan did not provide a canonical root-parent-child graph.",
+            detail=str(initial_text_block_hierarchy.error or "hierarchy_generation_failed"),
+            page_id=str(page_id or ""),
+            operation="build_initial_text_block_hierarchy",
+            artifact_summary=initial_text_block_hierarchy.to_audit_dict(),
+        )
     add_timing(
         debug_context,
         "hierarchy_initial_build_time",
         time.perf_counter() - initial_hierarchy_start,
     )
-    root_reconstruction_start = time.perf_counter()
-    root_reconstruction_status = {
-        "attempt_count": 0,
-        "applied_count": 0,
-        "failed_count": 0,
-        "attempts": [],
-        "roots": {},
-        "status": "disabled_text_area_graph_is_sole_topology_owner",
-    }
-    add_timing(
-        debug_context,
-        "root_reconstruction_time",
-        time.perf_counter() - root_reconstruction_start,
-    )
-    if debug_context is not None and root_reconstruction_status.get("applied_count"):
-        debug_context["pipeline_logical_text_block_result"] = logical_block_result.to_dict()
-        debug_context["pipeline_logical_text_blocks"] = [
-            block.to_dict() for block in logical_block_result.blocks
-        ]
     parent_ocr_start = time.perf_counter()
     parent_ocr_source_status = _append_parent_boundary_ocr_source_regions(
         regions=regions,
@@ -12101,10 +8654,18 @@ def _process_page(
         page_id=page_id,
         regions=regions,
         text_area_plan=logical_text_area_plan,
-        logical_block_result=logical_block_result,
         mutate_regions=True,
-        root_reconstruction_status=root_reconstruction_status,
     )
+    if not text_block_hierarchy.generated:
+        raise PipelineStageTechnicalError(
+            stage=PipelineStage.HIERARCHY,
+            code="root_parent_child_plan_required",
+            message="TextAreaPlan did not provide a canonical root-parent-child graph.",
+            detail=str(text_block_hierarchy.error or "hierarchy_generation_failed"),
+            page_id=str(page_id or ""),
+            operation="build_final_text_block_hierarchy",
+            artifact_summary=text_block_hierarchy.to_audit_dict(),
+        )
     add_timing(
         debug_context,
         "hierarchy_final_build_time",
@@ -12114,11 +8675,7 @@ def _process_page(
     if debug_context is not None:
         hierarchy_payload = text_block_hierarchy.to_audit_dict()
         debug_context["text_block_hierarchy"] = hierarchy_payload
-        debug_context["root_reconstruction_executor"] = root_reconstruction_status
         debug_context["parent_boundary_ocr_source_contract"] = parent_ocr_source_status
-        set_count(debug_context, "root_reconstruction_attempts", int(root_reconstruction_status.get("attempt_count") or 0))
-        set_count(debug_context, "root_reconstruction_applied", int(root_reconstruction_status.get("applied_count") or 0))
-        set_count(debug_context, "root_reconstruction_failed", int(root_reconstruction_status.get("failed_count") or 0))
         set_count(debug_context, "text_block_hierarchy_roots", len(text_block_hierarchy.roots))
         set_count(debug_context, "text_block_hierarchy_parent_units", len(text_block_hierarchy.parent_units))
         set_count(debug_context, "text_block_hierarchy_child_segments", len(text_block_hierarchy.child_segments))
@@ -12177,20 +8734,11 @@ def _process_page(
             ],
         },
     )
-    if (
-        parent_execution_bundles
-        or logical_block_result.applied_count
-        or logical_block_result.render_eligibility_repairs
-        or source_reconstruction_status.get("applied_count")
-        or punctuation_recovery_status.get("applied_count")
-        or root_reconstruction_status.get("applied_count")
-        or text_block_hierarchy.generated
-    ):
-        if parent_execution_bundles:
-            parent_translation_plan, glossary_texts = _rebuild_translation_inputs_from_parent_execution_bundles(
-                parent_execution_bundles
-            )
-            pending_texts = {}
+    if parent_execution_bundles:
+        parent_translation_plan, glossary_texts = _rebuild_translation_inputs_from_parent_execution_bundles(
+            parent_execution_bundles
+        )
+        pending_texts = {}
 
     active_style_guide = style_guide
     use_context_lines = bool(
@@ -12254,43 +8802,10 @@ def _process_page(
         execution_regions,
         parent_translation_plan if parent_execution_bundles else pending_texts,
     )
-    post_plan_logical_repairs = {}
-    if not parent_execution_bundles:
-        post_plan_logical_repairs = enforce_logical_text_render_eligibility(execution_regions)
-        if post_plan_logical_repairs.get("logical_text_render_eligibility_repair_count"):
-            pending_texts, glossary_texts = _rebuild_translation_inputs_from_regions(execution_regions)
-            mark_translation_plan(debug_context, execution_regions, pending_texts)
-        duplicate_caption_repairs = _suppress_duplicate_caption_background_regions(execution_regions, debug_context)
-        if duplicate_caption_repairs.get("duplicate_caption_background_suppressed_count"):
-            pending_texts, glossary_texts = _rebuild_translation_inputs_from_regions(execution_regions)
-            mark_translation_plan(debug_context, execution_regions, pending_texts)
-    if debug_context is not None:
-        result_payload = debug_context.get("pipeline_logical_text_block_result")
-        if isinstance(result_payload, dict):
-            existing_repairs = list(result_payload.get("logical_text_render_eligibility_repairs") or [])
-            extra_repairs = list(post_plan_logical_repairs.get("logical_text_render_eligibility_repairs") or [])
-            if extra_repairs:
-                result_payload["logical_text_render_eligibility_repairs"] = existing_repairs + extra_repairs
-                result_payload["logical_text_render_eligibility_repair_count"] = len(existing_repairs) + len(extra_repairs)
-            result_payload["logical_text_block_unowned_meaningful_region_ids"] = post_plan_logical_repairs.get("logical_text_block_unowned_meaningful_region_ids") or []
-            result_payload["logical_text_block_unowned_meaningful_region_count"] = int(post_plan_logical_repairs.get("logical_text_block_unowned_meaningful_region_count") or 0)
-            result_payload["logical_text_block_conservation_status"] = post_plan_logical_repairs.get("logical_text_block_conservation_status") or result_payload.get("logical_text_block_conservation_status")
-            result_payload["speech_container_meaningful_fragment_count"] = int(post_plan_logical_repairs.get("speech_container_meaningful_fragment_count") or 0)
-            result_payload["speech_container_blocked_meaningful_fragment_count"] = int(post_plan_logical_repairs.get("speech_container_blocked_meaningful_fragment_count") or 0)
-            result_payload["speech_container_blocked_meaningful_region_ids"] = post_plan_logical_repairs.get("speech_container_blocked_meaningful_region_ids") or []
-            result_payload["speech_container_source_survivor_region_ids"] = post_plan_logical_repairs.get("speech_container_source_survivor_region_ids") or []
-        if post_plan_logical_repairs.get("logical_text_render_eligibility_repair_count"):
-            set_count(
-                debug_context,
-                "logical_text_render_eligibility_repairs",
-                int(post_plan_logical_repairs.get("logical_text_render_eligibility_repair_count") or 0),
-            )
     translation_start = time.time()
     notify_stage(PipelineStage.TRANSLATION, "Translating parent assignments")
-    translation_assignments = (
-        _translation_assignments_from_parent_execution_bundles(parent_execution_bundles)
-        if parent_execution_bundles
-        else _translation_assignments_from_regions(execution_regions, pending_texts)
+    translation_assignments = _translation_assignments_from_parent_execution_bundles(
+        parent_execution_bundles
     )
     translation_touched = bool(translation_assignments)
     if translation_assignments:
@@ -12560,32 +9075,6 @@ def _process_page(
                 )
                 unit_record = translation_perf_records.get(assignment_id)
                 _translation_perf_set_final(unit_record, translation=translation)
-                bubble_local_ids = []
-                for candidate in execution_regions:
-                    if candidate.get("region_id") not in region_ids:
-                        continue
-                    render = candidate.get("render", {}) or {}
-                    if str(render.get("classification_reason", "") or "") == _BUBBLE_LOCAL_NESTED_SPEECH_FRAGMENT_REASON:
-                        bubble_local_ids.append(str(candidate.get("region_id", "") or ""))
-                if bubble_local_ids:
-                    repaired_translation, repair_reasons = _repair_bubble_local_nested_speech_translation(
-                        text,
-                        translation,
-                        target_lang,
-                    )
-                    if repair_reasons:
-                        translation = repaired_translation
-                        for rid in bubble_local_ids:
-                            mark_render_region(
-                                debug_context,
-                                rid,
-                                bubble_local_translation_repair_reasons=repair_reasons,
-                            )
-                        _translation_perf_set_final(
-                            unit_record,
-                            translation=translation,
-                            status="bubble_local_translation_repair",
-                        )
                 translation, terminal_symbol_evidence = _preserve_repeated_terminal_emphasis_symbols(
                     text,
                     translation,
@@ -12656,47 +9145,6 @@ def _process_page(
                     if not lang_ok or _translation_is_unsafe_for_output(final_translation, text):
                         region["flags"]["needs_review"] = True
 
-    # Update context window
-    # Collect confident translations to add to context
-    for region in execution_regions:
-        if region.get("flags", {}).get("ignore"):
-            region["translation"] = ""
-            continue
-        if region.get("ignore"):
-            continue
-        if _logical_text_region_blocks_independent_render(region):
-            region["translation"] = ""
-            region["translated_text"] = ""
-            continue
-        if (
-            region.get("type") == "speech_bubble"
-            and not str(region.get("translation", "") or "").strip()
-            and _is_short_reaction_source(region.get("ocr_text", ""))
-        ):
-            region["translation"] = _translate_short_reaction_fallback(region.get("ocr_text", ""), target_lang)
-
-    final_logical_repairs = {}
-    if debug_context is not None:
-        result_payload = debug_context.get("pipeline_logical_text_block_result")
-        if isinstance(result_payload, dict):
-            existing_repairs = list(result_payload.get("logical_text_render_eligibility_repairs") or [])
-            extra_repairs = list(final_logical_repairs.get("logical_text_render_eligibility_repairs") or [])
-            if extra_repairs:
-                result_payload["logical_text_render_eligibility_repairs"] = existing_repairs + extra_repairs
-                result_payload["logical_text_render_eligibility_repair_count"] = len(existing_repairs) + len(extra_repairs)
-            result_payload["logical_text_block_unowned_meaningful_region_ids"] = final_logical_repairs.get("logical_text_block_unowned_meaningful_region_ids") or []
-            result_payload["logical_text_block_unowned_meaningful_region_count"] = int(final_logical_repairs.get("logical_text_block_unowned_meaningful_region_count") or 0)
-            result_payload["logical_text_block_conservation_status"] = final_logical_repairs.get("logical_text_block_conservation_status") or result_payload.get("logical_text_block_conservation_status")
-            result_payload["speech_container_meaningful_fragment_count"] = int(final_logical_repairs.get("speech_container_meaningful_fragment_count") or 0)
-            result_payload["speech_container_blocked_meaningful_fragment_count"] = int(final_logical_repairs.get("speech_container_blocked_meaningful_fragment_count") or 0)
-            result_payload["speech_container_blocked_meaningful_region_ids"] = final_logical_repairs.get("speech_container_blocked_meaningful_region_ids") or []
-            result_payload["speech_container_source_survivor_region_ids"] = final_logical_repairs.get("speech_container_source_survivor_region_ids") or []
-        if final_logical_repairs.get("logical_text_render_eligibility_repair_count"):
-            set_count(
-                debug_context,
-                "logical_text_final_render_eligibility_repairs",
-                int(final_logical_repairs.get("logical_text_render_eligibility_repair_count") or 0),
-            )
     if translation_touched:
         add_timing(debug_context, "translation_time", time.time() - translation_start)
     _summarize_translation_requests(debug_context)
@@ -12835,18 +9283,9 @@ def _write_no_layer_render_output(
 
 
 def _logical_text_region_blocks_independent_render(region: dict) -> bool:
-    if _logical_text_region_failed_closed(region):
-        return True
-    status = str(region.get("logical_text_ownership_status") or "").strip()
-    if status in {
-        "transferred_child",
-        "duplicate_child",
-        "punctuation_child",
-        "noise_review_only",
-    }:
-        return True
-    if str(region.get("skip_reason") or "") == "ignored_by_pipeline":
-        return True
+    """Compatibility probe; finalized parent regions can never be vetoed here."""
+
+    _ = region
     return False
 
 
@@ -13279,63 +9718,8 @@ def _logical_text_region_failed_closed(region: dict) -> bool:
     return any(marker in combined for marker in failed_closed_markers)
 
 
-def _apply_experimental_text_area_route_assist(
-    *,
-    image_path: str,
-    page_class: str,
-    regions: list[dict],
-) -> dict:
-    page_id = os.path.splitext(os.path.basename(image_path))[0]
-    try:
-        from app.pipeline.text_area_route_advisor import apply_route_assist_to_regions
-
-        return apply_route_assist_to_regions(
-            page_id=page_id,
-            source_path=image_path,
-            output_path=None,
-            page_class=page_class,
-            regions=regions,
-        )
-    except Exception as exc:  # pragma: no cover - experimental route assist fails closed
-        return {
-            "route_assist_version": "text_area_route_assist_phase2c_v1",
-            "route_assist_enabled": os.getenv("MT_TEXT_AREA_ROUTE_ASSIST") == "1",
-            "route_assist_generated": False,
-            "route_assist_error": str(exc),
-            "route_assist_suggestions_considered": 0,
-            "route_assist_eligible_count": 0,
-            "route_assist_applied_count": 0,
-            "route_assist_applied": [],
-            "route_assist_runtime_sec": 0.0,
-        }
 
 
-def _refresh_translation_inputs_after_route_assist(
-    regions: list[dict],
-    translation_cache: dict[str, str],
-) -> tuple[dict[str, list[str]], list[str]]:
-    pending_texts: dict[str, list[str]] = {}
-    glossary_texts: list[str] = []
-    for region in regions:
-        ocr_text = str(region.get("ocr_text", "") or "").strip()
-        if not ocr_text:
-            continue
-        flags = region.get("flags", {}) or {}
-        if flags.get("ignore"):
-            region["translation"] = ""
-            continue
-        if _region_translation_blocked_by_ocr_transaction(region):
-            region["translation"] = ""
-            continue
-        glossary_texts.append(ocr_text)
-        cached = translation_cache.get(ocr_text)
-        if cached is not None:
-            region["translation"] = cached
-            continue
-        if str(region.get("translation", "") or "").strip():
-            continue
-        pending_texts.setdefault(ocr_text, []).append(str(region.get("region_id", "") or ""))
-    return pending_texts, glossary_texts
 
 
 def _resolve_model(model: str) -> str:
@@ -13557,9 +9941,6 @@ _LARGE_LOW_CONFIDENCE_NONBUBBLE_SFX_REASON = "large_low_confidence_nonbubble_sfx
 _BUBBLE_CONTAINED_SHORT_LAUGH_SPEECH_REASON = "bubble_contained_short_laugh_speech"
 _TOP_ROW_BACKGROUND_CAPTION_REASON = "top_row_background_caption_candidate"
 _TOP_ROW_CAPTION_FRAGMENT_REASON = "top_row_caption_fragment_candidate"
-_SPEECH_BUBBLE_MISSED_TEXT_RECOVERY_REASON = "speech_bubble_missed_text_recovery"
-_BUBBLE_LOCAL_NESTED_SPEECH_FRAGMENT_REASON = "bubble_local_nested_speech_fragment_ownership"
-_ADJACENT_VERTICAL_SPEECH_TEXT_CONSERVATION_REASON = "adjacent_vertical_speech_text_conservation_recovery"
 
 
 def _nonbubble_short_kana_art_text_reason(
@@ -13765,353 +10146,22 @@ def _nonbubble_breath_sfx_art_text_reason(
     return _NONBUBBLE_BREATH_SFX_ART_TEXT_REASON
 
 
-def _low_conf_dark_short_art_sfx_reason(
-    text: str,
-    bbox: list,
-    image_size: tuple[int, int],
-    det_conf: float,
-    ocr_conf: float,
-    image_obj,
-) -> str:
-    cleaned = str(text or "").strip()
-    if not cleaned or any(ch.isdigit() for ch in cleaned):
-        return ""
-    body = _non_punct_chars(cleaned)
-    punct_or_ellipsis = _is_punct_only(cleaned) or _is_ellipsis_like(cleaned)
-    if (not body and not punct_or_ellipsis) or len(body) > 6:
-        return ""
-    stats = _box_luma_stats_pil(image_obj, bbox)
-    stats_mean = float(stats[0]) if stats else None
-    if stats_mean is None:
-        return ""
-    try:
-        _, _, w, h = bbox
-        page_area = max(1, int(image_size[0]) * int(image_size[1]))
-        area_ratio = (max(1, int(w)) * max(1, int(h))) / page_area
-    except Exception:
-        return ""
-    nonbubble_short_kana_art = _nonbubble_short_kana_art_text_reason(
-        cleaned,
-        bbox,
-        image_size,
-        det_conf,
-        ocr_conf,
-        image_obj,
-        stats_mean=stats_mean,
-    )
-    if nonbubble_short_kana_art:
-        return nonbubble_short_kana_art
-    nonbubble_short_reaction_art = _nonbubble_short_reaction_art_text_reason(
-        cleaned,
-        bbox,
-        image_size,
-        det_conf,
-        ocr_conf,
-        image_obj,
-        stats_mean=stats_mean,
-    )
-    if nonbubble_short_reaction_art:
-        return nonbubble_short_reaction_art
-    meaningful_caption_source = _is_meaningful_background_caption_source(cleaned)
-    body_text = "".join(body)
-    try:
-        surround_stats = _box_luma_stats_pil(
-            image_obj,
-            [
-                int(bbox[0]) - 45,
-                int(bbox[1]) - 45,
-                max(1, int(w)) + 90,
-                max(1, int(h)) + 90,
-            ],
-        )
-        surround_mean = float(surround_stats[0]) if surround_stats else None
-    except Exception:
-        surround_mean = None
-    center_y = int(bbox[1]) + (max(1, int(h)) / 2.0)
-    probable_short_vertical_dialogue = _is_probable_short_vertical_dialogue_box(
-        cleaned,
-        bbox,
-        stats_mean=stats_mean,
-        image_size=image_size,
-    )
-    short_reaction_key = _short_reaction_key(cleaned)
-    narrow_short_reaction = (
-        _is_short_reaction_source(cleaned)
-        and (short_reaction_key in {"あ", "い"} or len(body) <= 1)
-    )
-    bright_confident_dialogue = (
-        probable_short_vertical_dialogue
-        or (stats_mean >= 220.0 and det_conf >= 0.80)
-        or (surround_mean is not None and surround_mean >= 205.0)
-    )
-    dark_surrounding_art = surround_mean is not None and surround_mean < 200.0
-    large_or_tall_art_box = (
-        area_ratio >= 0.003
-        or max(1, int(h)) >= 70 and max(1, int(h)) >= max(1, int(w)) * 1.2
-        or min(max(1, int(w)), max(1, int(h))) >= 90
-    )
-    tiny_low_det_punct = (
-        punct_or_ellipsis
-        and det_conf <= 0.60
-        and area_ratio <= 0.00012
-        and stats_mean < 235.0
-        and dark_surrounding_art
-    )
-    small_dark_punct = punct_or_ellipsis and stats_mean < 150.0 and area_ratio >= 0.00020
-    low_det_art_reaction = (
-        det_conf <= 0.60
-        and stats_mean < 170.0
-        and dark_surrounding_art
-        and (large_or_tall_art_box or area_ratio >= 0.001)
-    )
-    low_det_nonbubble_punct = (
-        punct_or_ellipsis
-        and det_conf <= 0.60
-        and dark_surrounding_art
-        and (large_or_tall_art_box or area_ratio >= 0.001)
-    )
-    if (
-        not meaningful_caption_source
-        and not any(ch.isdigit() for ch in cleaned)
-        and not any(0x4E00 <= ord(ch) <= 0x9FFF for ch in body)
-        and (punct_or_ellipsis or narrow_short_reaction)
-        and not bright_confident_dialogue
-        and (small_dark_punct or tiny_low_det_punct or low_det_art_reaction or low_det_nonbubble_punct)
-    ):
-        return _NONBUBBLE_SHORT_REACTION_ART_SFX_REASON
-    if det_conf >= 0.88:
-        return ""
-    if area_ratio < 0.0035:
-        return ""
-    medium_large_area = 0.012 <= area_ratio < 0.020
-    large_glyph_box = min(max(1, int(w)), max(1, int(h))) >= 90 and max(1, int(h)) >= max(1, int(w)) * 1.2
-    if (
-        _is_pure_katakana(body_text)
-        and 2 <= len(body) <= 4
-        and _is_short_reaction_source(cleaned)
-        and medium_large_area
-        and large_glyph_box
-        and center_y >= int(image_size[1]) * 0.50
-        and det_conf <= 0.60
-        and ocr_conf < 0.90
-        and 170.0 <= stats_mean < 215.0
-        and not meaningful_caption_source
-        and not any(ch in cleaned for ch in "。！？!?…")
-    ):
-        return _MEDIUM_LARGE_KATAKANA_SFX_REASON
-    if ocr_conf >= 0.80 or stats_mean >= 170.0:
-        return ""
-    if meaningful_caption_source and ocr_conf >= 0.75:
-        return ""
-    contains_kanji = any(0x4E00 <= ord(ch) <= 0x9FFF for ch in cleaned)
-    contains_kana = any(_is_kana(ch) for ch in cleaned)
-    if ocr_conf < 0.50:
-        return _LOW_CONF_DARK_SHORT_ART_SFX_REASON
-    if len(body) <= 1 and not probable_short_vertical_dialogue:
-        return _LOW_CONF_DARK_SHORT_ART_SFX_REASON
-    if (
-        contains_kanji
-        and contains_kana
-        and len(body) <= 4
-        and not probable_short_vertical_dialogue
-        and ocr_conf < 0.75
-        and det_conf < 0.80
-        and not _is_short_reaction_source(cleaned)
-    ):
-        return _LOW_CONF_DARK_SHORT_ART_SFX_REASON
-    return ""
 
 
-def _is_top_row_caption_rescue_candidate(region: dict, image_size: tuple[int, int]) -> bool:
-    render = region.get("render", {}) or {}
-    reason = str(render.get("classification_reason", "") or "").strip().lower()
-    if reason not in {_TOP_ROW_BACKGROUND_CAPTION_REASON, _TOP_ROW_CAPTION_FRAGMENT_REASON}:
-        return False
-    flags = region.get("flags", {}) or {}
-    if not flags.get("bg_text") or region.get("bubble_id"):
-        return False
-    if str(region.get("type", "") or "").strip().lower() == "speech_bubble":
-        return False
-    try:
-        _x, y, w, h = [int(v) for v in (region.get("bbox") or [0, 0, 0, 0])[:4]]
-        img_h = max(1, int(image_size[1] or 1))
-    except Exception:
-        return False
-    w = max(1, w)
-    h = max(1, h)
-    topish = (y + (h / 2.0)) <= img_h * 0.28
-    return topish and h >= max(80, w * 1.9)
 
 
-def _top_row_caption_horizontal_gap(a: list, b: list) -> int:
-    ax, _ay, aw, _ah = [int(v) for v in a[:4]]
-    bx, _by, bw, _bh = [int(v) for v in b[:4]]
-    ax2 = ax + max(1, aw)
-    bx2 = bx + max(1, bw)
-    if ax <= bx2 and bx <= ax2:
-        return 0
-    return min(abs(bx - ax2), abs(ax - bx2))
 
 
-def _top_row_caption_y_overlap_ratio(a: list, b: list) -> float:
-    _ax, ay, _aw, ah = [int(v) for v in a[:4]]
-    _bx, by, _bw, bh = [int(v) for v in b[:4]]
-    ay2 = ay + max(1, ah)
-    by2 = by + max(1, bh)
-    overlap = max(0, min(ay2, by2) - max(ay, by))
-    return overlap / max(1, min(max(1, ah), max(1, bh)))
 
 
-def _find_adjacent_top_row_background_caption(
-    region: dict,
-    regions: list[dict],
-    image_size: tuple[int, int],
-) -> dict | None:
-    bbox = region.get("bbox") or [0, 0, 0, 0]
-    best: tuple[int, dict] | None = None
-    for other in regions:
-        if other is region:
-            continue
-        if not _is_top_row_caption_rescue_candidate(other, image_size):
-            continue
-        other_render = other.get("render", {}) or {}
-        if str(other_render.get("classification_reason", "") or "") != _TOP_ROW_BACKGROUND_CAPTION_REASON:
-            continue
-        other_bbox = other.get("bbox") or [0, 0, 0, 0]
-        if _top_row_caption_y_overlap_ratio(bbox, other_bbox) < 0.45:
-            continue
-        gap = _top_row_caption_horizontal_gap(bbox, other_bbox)
-        try:
-            min_w = min(max(1, int(bbox[2])), max(1, int(other_bbox[2])))
-        except Exception:
-            min_w = 1
-        if gap > max(14, int(min_w * 0.45)):
-            continue
-        if best is None or gap < best[0]:
-            best = (gap, other)
-    return best[1] if best else None
 
 
-def _caption_rescue_box(
-    region: dict,
-    image_size: tuple[int, int],
-    neighbor: dict | None = None,
-) -> list[int]:
-    x, y, w, h = [int(v) for v in (region.get("bbox") or [0, 0, 0, 0])[:4]]
-    w = max(1, w)
-    h = max(1, h)
-    if neighbor is not None:
-        nx, ny, nw, nh = [int(v) for v in (neighbor.get("bbox") or [0, 0, 0, 0])[:4]]
-        vertical_pad = max(24, min(42, int(max(h, nh) * 0.12)))
-        horizontal_pad = max(8, min(14, int(w * 0.25)))
-        x0 = x - horizontal_pad
-        x1 = x + w + horizontal_pad
-        y0 = min(y, ny) - vertical_pad
-        y1 = max(y + h, ny + nh) + min(4, max(0, vertical_pad // 12))
-    else:
-        vertical_pad = max(20, min(36, int(h * 0.10)))
-        horizontal_pad = max(18, min(48, int(w * 0.45)))
-        x0 = x - horizontal_pad
-        x1 = x + w + horizontal_pad
-        y0 = y - vertical_pad
-        y1 = y + h + vertical_pad
-    img_w = max(1, int(image_size[0] or 1))
-    img_h = max(1, int(image_size[1] or 1))
-    x0 = max(0, min(img_w - 1, x0))
-    y0 = max(0, min(img_h - 1, y0))
-    x1 = max(x0 + 1, min(img_w, x1))
-    y1 = max(y0 + 1, min(img_h, y1))
-    return [x0, y0, x1 - x0, y1 - y0]
 
 
-def _recognize_caption_rescue_crop(
-    ocr_engine,
-    image_obj,
-    bbox: list[int],
-    settings,
-    debug_context: dict | None = None,
-) -> tuple[str, float, str]:
-    if image_obj is None:
-        return "", 0.0, ""
-    x, y, w, h = [int(v) for v in bbox[:4]]
-    crop = image_obj.crop((x, y, x + max(1, w), y + max(1, h)))
-    variants = [("expanded_crop", crop)]
-    try:
-        from PIL import ImageOps
-
-        variants.append(("expanded_crop_white_pad", ImageOps.expand(crop, border=12, fill="white")))
-    except Exception:
-        pass
-    best = ("", 0.0, "")
-    for label, variant in variants:
-        text, conf = _recognize_with_fallback(
-            ocr_engine,
-            variant,
-            settings,
-            bbox,
-            debug_context=debug_context,
-            trace_context={
-                "page_id": debug_context.get("page_id") if debug_context else "",
-                "attempt_kind": f"caption_rescue_{label}",
-                "route_intent": "translate_caption_background",
-                "ocr_eligible": True,
-                "source_bbox": list(bbox or []),
-                "actual_crop_bbox": list(bbox or []),
-                "container_bbox": list(bbox or []),
-            },
-        )
-        text = _clean_ocr_text(text)
-        if conf > best[1]:
-            best = (text, float(conf or 0.0), label)
-    return best
 
 
-def _caption_rescue_text_quality(text: str) -> tuple[float, int, bool, bool]:
-    cleaned = _clean_ocr_text(text)
-    body = _non_punct_chars(cleaned)
-    valid = 0
-    for ch in cleaned:
-        if (
-            ch.isdigit()
-            or _is_cjk_char(ch)
-            or ch in ".:…・、。!?！？"
-        ):
-            valid += 1
-    jp_ratio = valid / max(1, len(cleaned))
-    meaningful = _is_meaningful_background_caption_source(cleaned)
-    has_digit = any(ch.isdigit() for ch in cleaned)
-    return jp_ratio, len(body), meaningful, has_digit
 
 
-def _is_better_top_row_caption_ocr(
-    original_text: str,
-    original_conf: float,
-    rescued_text: str,
-    rescued_conf: float,
-    *,
-    fragment: bool,
-) -> bool:
-    original = _clean_ocr_text(original_text)
-    rescued = _clean_ocr_text(rescued_text)
-    if not rescued or rescued == original:
-        return False
-    orig_jp, orig_len, orig_meaningful, orig_digit = _caption_rescue_text_quality(original)
-    new_jp, new_len, new_meaningful, new_digit = _caption_rescue_text_quality(rescued)
-    if new_jp < 0.65 or new_len < 2:
-        return False
-    if any(marker in rescued for marker in ("<|", "###", "Instruction:", "System:", "User:")):
-        return False
-    if fragment:
-        if not new_meaningful:
-            return False
-        content_gain = new_len > orig_len or (new_digit and not orig_digit) or (new_meaningful and not orig_meaningful)
-        confidence_gain = rescued_conf >= float(original_conf or 0.0) + 0.03
-        return rescued_conf >= 0.70 and (content_gain or confidence_gain)
-    if not new_meaningful:
-        return False
-    confidence_gain = rescued_conf >= float(original_conf or 0.0) + 0.025
-    content_preserved = new_len >= max(2, orig_len - 1) and new_jp >= max(0.65, orig_jp - 0.05)
-    return confidence_gain and content_preserved
 
 
 def _rebuild_translation_inputs_from_parent_execution_bundles(
@@ -14176,1296 +10226,78 @@ def _parent_execution_bundle_is_translatable(bundle: ParentExecutionBundle) -> b
     return bool(bundle.translation_required)
 
 
-def _rebuild_translation_inputs_from_regions(regions: list[dict]) -> tuple[dict[str, list[str]], list[str]]:
-    pending: dict[str, list[str]] = {}
-    glossary: list[str] = []
-    for region in regions:
-        if _region_is_active_graph_parent_anchor(region):
-            text = _region_parent_source_text(region)
-            rid = str(region.get("region_id", "") or "")
-            if not rid or not text or str(region.get("translation", "") or "").strip():
-                continue
-            glossary.append(text)
-            pending.setdefault(text, []).append(rid)
-            continue
-        flags = region.get("flags", {}) or {}
-        if flags.get("ignore"):
-            continue
-        if _region_translation_blocked_by_ocr_transaction(region):
-            continue
-        if _region_requires_logical_translation_unit(region):
-            child_state = str(
-                region.get("child_final_state")
-                or (region.get("render") or {}).get("child_final_state")
-                or ""
-            ).strip()
-            parent_unit_id = str(
-                region.get("parent_logical_text_unit_id")
-                or (region.get("render") or {}).get("parent_logical_text_unit_id")
-                or ""
-            ).strip()
-            if child_state:
-                if child_state not in {"parent_anchor", "standalone_parent"}:
-                    continue
-                if not parent_unit_id:
-                    continue
-            status = str(region.get("logical_text_ownership_status") or (region.get("render") or {}).get("logical_text_ownership_status") or "").strip()
-            action = str(region.get("logical_text_source_quality_action") or (region.get("render") or {}).get("logical_text_source_quality_action") or "").strip()
-            if status not in {"block_anchor", "standalone_block", "standalone_utterance"}:
-                continue
-        text = str(region.get("ocr_text", "") or "").strip()
-        if not text:
-            continue
-        glossary.append(text)
-        if not str(region.get("translation", "") or "").strip():
-            pending.setdefault(text, []).append(str(region.get("region_id", "") or ""))
-    return pending, glossary
-
-
-def _translation_assignments_from_regions(
-    regions: list[dict],
-    pending_texts: dict[str, list[str]],
-) -> dict[str, TranslationAssignment]:
-    region_by_id = {
-        str(region.get("region_id") or ""): region
-        for region in regions
-        if str(region.get("region_id") or "")
-    }
-    pending_region_ids = {
-        str(rid)
-        for region_ids in pending_texts.values()
-        for rid in (region_ids or [])
-        if str(rid)
-    }
-    assignments: dict[str, TranslationAssignment] = {}
-    consumed_region_ids: set[str] = set()
-    for region in regions:
-        rid = str(region.get("region_id") or "")
-        if not rid or rid not in pending_region_ids:
-            continue
-        if not _region_is_active_graph_parent_anchor(region):
-            continue
-        parent_id = _region_parent_id(region)
-        source_text = _region_parent_source_text(region)
-        if not parent_id or not source_text:
-            continue
-        parent_region_ids: list[str] = []
-        for candidate_id in pending_region_ids:
-            candidate = region_by_id.get(candidate_id)
-            if not candidate:
-                continue
-            if _region_parent_id(candidate) != parent_id:
-                continue
-            if _region_parent_source_text(candidate) != source_text:
-                continue
-            if not _region_is_active_graph_parent_anchor(candidate):
-                continue
-            parent_region_ids.append(candidate_id)
-        parent_region_ids.sort(key=lambda item: _region_order_index(region_by_id.get(item)))
-        if not parent_region_ids:
-            parent_region_ids = [rid]
-        assignments[parent_id] = TranslationAssignment(
-            assignment_id=parent_id,
-            parent_id=parent_id,
-            source_text=source_text,
-            cache_key=source_text,
-            region_ids=parent_region_ids,
-        )
-        consumed_region_ids.update(parent_region_ids)
-
-    for text, region_ids in pending_texts.items():
-        legacy_ids = [str(rid) for rid in (region_ids or []) if str(rid) and str(rid) not in consumed_region_ids]
-        if not legacy_ids:
-            continue
-        assignment_id = str(text or "")
-        if not assignment_id:
-            continue
-        suffix = 1
-        base_assignment_id = assignment_id
-        while assignment_id in assignments:
-            suffix += 1
-            assignment_id = f"{base_assignment_id}#{suffix}"
-        assignments[assignment_id] = TranslationAssignment(
-            assignment_id=assignment_id,
-            parent_id="",
-            source_text=str(text or ""),
-            cache_key=str(text or ""),
-            region_ids=legacy_ids,
-        )
-    return assignments
-
-
-def _translation_units_from_pending_texts(
-    pending_texts: Mapping[str, Iterable[str]],
-    regions: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return parent-keyed work units without deduplicating equal source text."""
-
-    region_by_id = {
-        str(region.get("region_id") or ""): region
-        for region in regions or []
-        if isinstance(region, Mapping) and str(region.get("region_id") or "")
-    }
-    units: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for source_text, region_ids in (pending_texts or {}).items():
-        for region_id in region_ids or []:
-            region = region_by_id.get(str(region_id or ""), {})
-            render = region.get("render") if isinstance(region.get("render"), Mapping) else {}
-            unit_id = str(
-                region.get("parent_logical_text_unit_id")
-                or region.get("active_translation_unit_id")
-                or render.get("parent_logical_text_unit_id")
-                or region_id
-                or ""
-            )
-            if not unit_id or unit_id in seen:
-                continue
-            seen.add(unit_id)
-            units.append(
-                {
-                    "unit_id": unit_id,
-                    "source_text": str(source_text or ""),
-                    "region_ids": [str(region_id or "")],
-                }
-            )
-    return units
-
-
-def _region_order_index(region: dict | None) -> int:
-    if not isinstance(region, dict):
-        return 0
-    try:
-        return int(region.get("order_index"))
-    except Exception:
-        return 0
-
-
-def _region_parent_id(region: dict) -> str:
-    render = region.get("render") or {}
-    return str(
-        region.get("parent_logical_text_unit_id")
-        or render.get("parent_logical_text_unit_id")
-        or region.get("active_translation_unit_id")
-        or render.get("active_translation_unit_id")
-        or ""
-    ).strip()
-
-
-def _region_parent_source_text(region: dict) -> str:
-    render = region.get("render") or {}
-    return str(
-        region.get("logical_text_block_source_text")
-        or render.get("logical_text_block_source_text")
-        or region.get("parent_logical_text_unit_source_text")
-        or render.get("parent_logical_text_unit_source_text")
-        or ""
-    ).strip()
-
-
-def _region_child_final_state(region: dict) -> str:
-    render = region.get("render") or {}
-    return str(region.get("child_final_state") or render.get("child_final_state") or "").strip()
-
-
-def _region_parent_source_action(region: dict) -> str:
-    render = region.get("render") or {}
-    return str(
-        region.get("parent_source_coherence_action")
-        or render.get("parent_source_coherence_action")
-        or region.get("logical_text_source_quality_action")
-        or render.get("logical_text_source_quality_action")
-        or ""
-    ).strip()
-
-
-def _region_is_active_graph_parent_anchor(region: dict) -> bool:
-    if not isinstance(region, dict):
-        return False
-    parent_id = _region_parent_id(region)
-    if not parent_id:
-        return False
-    state = _region_child_final_state(region)
-    if state not in {"parent_anchor", "standalone_parent"}:
-        return False
-    if str(region.get("active_translation_unit_id") or (region.get("render") or {}).get("active_translation_unit_id") or parent_id).strip() != parent_id:
-        return False
-    return bool(_region_parent_source_text(region))
-
-
-def _region_requires_logical_translation_unit(region: dict) -> bool:
-    if not isinstance(region, dict):
-        return False
-    if _region_parent_id(region):
-        return True
-    render = region.get("render") or {}
-    container_type = str(region.get("text_area_container_type") or render.get("text_area_container_type") or "").strip()
-    route_intent = str(region.get("text_area_route_intent") or render.get("text_area_route_intent") or "").strip()
-    return container_type == "speech_bubble" and route_intent == "translate_speech"
-
-
-def _replace_region_with_rescued_ocr(
-    region: dict,
-    rescued_text: str,
-    rescued_conf: float,
-    image_obj,
-    image_size: tuple[int, int],
-    text_filter: TextFilter,
-    rescue_reason: str,
-    rescue_variant: str,
-    rescue_bbox: list[int],
-) -> None:
-    bbox = region.get("bbox") or [0, 0, 0, 0]
-    confidence = region.get("confidence", {}) or {}
-    det_conf = float(confidence.get("det", 0.0) or 0.0) if isinstance(confidence, dict) else float(confidence or 0.0)
-    region_type, semantic_bg, semantic_ignore, semantic_review, render_updates = _classify_semantic_region(
-        rescued_text,
-        bbox,
-        image_size,
-        det_conf,
-        rescued_conf,
-        image_obj,
-        text_filter,
-        initial_bg=False,
-        text_area_assignment=_region_text_area_assignment(region),
-    )
-    rid = str(region.get("region_id", "") or "")
-    try:
-        idx = int(rid[1:]) if rid.startswith("r") else 0
-    except Exception:
-        idx = 0
-    replacement = _region_record(
-        idx,
-        region.get("polygon", []),
-        bbox,
-        rescued_text,
-        "",
-        det_conf,
-        bg_text=semantic_bg,
-        needs_review=semantic_review,
-        ignore=semantic_ignore,
-        region_type=region_type,
-        ocr_conf=rescued_conf,
-        render_updates=render_updates,
-    )
-    replacement["region_id"] = rid or replacement.get("region_id")
-    render = replacement.setdefault("render", {})
-    render["ocr_rescue_reason"] = rescue_reason
-    render["ocr_rescue_variant"] = rescue_variant
-    render["ocr_rescue_bbox"] = rescue_bbox
-    render["ocr_rescue_original_text"] = region.get("ocr_text", "")
-    render["ocr_rescue_original_confidence"] = confidence.get("ocr") if isinstance(confidence, dict) else None
-    region.update(replacement)
-
-
-def _rescue_top_row_caption_ocr_regions(
-    regions: list[dict],
-    image_obj,
-    image_size: tuple[int, int],
-    ocr_engine,
-    settings,
-    text_filter: TextFilter,
-    pending_texts: dict[str, list[str]],
-    glossary_texts: list[str],
-    page_class: str = "normal",
-    debug_context: dict | None = None,
-) -> tuple[dict[str, list[str]], list[str]]:
-    if str(page_class or "").strip().lower() in {"cover", "contents", "chapter_title"}:
-        return pending_texts, glossary_texts
-    if image_obj is None:
-        return pending_texts, glossary_texts
-    try:
-        from app.pipeline.debug_artifacts import add_count, add_timing
-    except Exception:
-        add_count = None
-        add_timing = None
-    changed = False
-    for region in list(regions):
-        if not _is_top_row_caption_rescue_candidate(region, image_size):
-            continue
-        render = region.get("render", {}) or {}
-        reason = str(render.get("classification_reason", "") or "").strip().lower()
-        original_text = str(region.get("ocr_text", "") or "")
-        confidence = region.get("confidence", {}) or {}
-        original_conf = float(confidence.get("ocr", 0.0) or 0.0) if isinstance(confidence, dict) else 0.0
-        neighbor = None
-        fragment = reason == _TOP_ROW_CAPTION_FRAGMENT_REASON
-        if fragment:
-            neighbor = _find_adjacent_top_row_background_caption(region, regions, image_size)
-            if neighbor is None:
-                continue
-        rescue_box = _caption_rescue_box(region, image_size, neighbor=neighbor)
-        ocr_start = time.time()
-        rescued_text, rescued_conf, variant = _recognize_caption_rescue_crop(
-            ocr_engine,
-            image_obj,
-            rescue_box,
-            settings,
-            debug_context,
-        )
-        if add_timing is not None:
-            add_timing(debug_context, "ocr_time", time.time() - ocr_start)
-        if add_count is not None:
-            add_count(debug_context, "caption_ocr_rescue_calls")
-        if not _is_better_top_row_caption_ocr(
-            original_text,
-            original_conf,
-            rescued_text,
-            rescued_conf,
-            fragment=fragment,
-        ):
-            continue
-        _replace_region_with_rescued_ocr(
-            region,
-            rescued_text,
-            rescued_conf,
-            image_obj,
-            image_size,
-            text_filter,
-            "top_row_caption_expanded_crop",
-            variant,
-            rescue_box,
-        )
-        changed = True
-    if not changed:
-        return pending_texts, glossary_texts
-    return _rebuild_translation_inputs_from_regions(regions)
-
-
-def _luma_area_profile(image_obj, bbox: list[int]) -> tuple[float, float, float] | None:
-    if image_obj is None or not bbox:
-        return None
-    try:
-        img_w, img_h = image_obj.size
-        x, y, w, h = [int(v) for v in bbox[:4]]
-        x0 = max(0, min(x, img_w - 1))
-        y0 = max(0, min(y, img_h - 1))
-        x1 = max(x0 + 1, min(x + max(1, w), img_w))
-        y1 = max(y0 + 1, min(y + max(1, h), img_h))
-        crop = image_obj.crop((x0, y0, x1, y1)).convert("L")
-        hist = crop.histogram()
-        total = max(1, sum(hist))
-        mean = sum(idx * count for idx, count in enumerate(hist)) / total
-        dark_ratio = sum(hist[:150]) / total
-        bright_ratio = sum(hist[230:]) / total
-        return float(mean), float(dark_ratio), float(bright_ratio)
-    except Exception:
-        return None
-
-
-def _is_clear_white_text_area(image_obj, bbox: list[int]) -> bool:
-    profile = _luma_area_profile(image_obj, bbox)
-    if profile is None:
-        return False
-    mean, dark_ratio, bright_ratio = profile
-    return mean >= 220.0 and bright_ratio >= 0.74 and 0.015 <= dark_ratio <= 0.18
-
-
-def _speech_recovery_text_quality(text: str, conf: float) -> bool:
-    cleaned = _clean_ocr_text(text)
-    if not cleaned or _is_ellipsis_like(cleaned) or _is_punct_only(cleaned):
-        return False
-    if any(marker in cleaned for marker in ("<|", "###", "Instruction:", "System:", "User:")):
-        return False
-    total, kana_ratio, kanji_ratio = _source_script_mix(cleaned)
-    if total < 4 or (kana_ratio + kanji_ratio) < 0.70:
-        return False
-    if not _is_meaningful_speech_source(cleaned):
-        return False
-    return float(conf or 0.0) >= 0.78
-
-
-def _is_speech_text_area_recovery_anchor(region: dict) -> bool:
-    region_type = str(region.get("type", "") or "").strip().lower()
-    text = str(region.get("ocr_text", "") or "").strip()
-    render = region.get("render", {}) or {}
-    reason = str(render.get("classification_reason", "") or "").strip().lower()
-    flags = region.get("flags", {}) or {}
-    if region_type == "speech_bubble":
-        body = _non_punct_chars(text)
-        return _is_ellipsis_like(text) or _is_punct_only(text) or len(body) <= 4
-    return (
-        region_type == "background_text"
-        and reason == _TOP_ROW_BACKGROUND_CAPTION_REASON
-        and bool(flags.get("bg_text"))
-        and not region.get("bubble_id")
-        and _is_meaningful_background_caption_source(text)
-    )
-
-
-def _speech_text_area_recovery_box(
-    raw_bbox: list[int],
-    anchor_bbox: list[int],
-    image_size: tuple[int, int],
-) -> list[int] | None:
-    rx, ry, rw, rh = [int(v) for v in raw_bbox[:4]]
-    ax, ay, aw, ah = [int(v) for v in anchor_bbox[:4]]
-    rw = max(1, rw)
-    rh = max(1, rh)
-    aw = max(1, aw)
-    ah = max(1, ah)
-    raw_bottom = ry + rh
-    anchor_bottom = ay + ah
-    if raw_bottom - anchor_bottom < max(90, int(ah * 0.65)):
-        return None
-    y0 = max(ry, anchor_bottom + max(36, min(56, int(ah * 0.23))))
-    y1 = raw_bottom
-    if y1 - y0 < 90:
-        return None
-    # CTD often returns a narrow right-side column for these misses. Expand left
-    # within the same white text area to capture the adjacent vertical column.
-    left_pad = max(45, min(72, int(rw * 0.90)))
-    right_pad = max(8, min(20, int(rw * 0.20)))
-    x0 = rx - left_pad
-    x1 = rx + rw + right_pad
-    img_w = max(1, int(image_size[0] or 1))
-    img_h = max(1, int(image_size[1] or 1))
-    x0 = max(0, min(img_w - 1, x0))
-    y0 = max(0, min(img_h - 1, y0))
-    x1 = max(x0 + 1, min(img_w, x1))
-    y1 = max(y0 + 1, min(img_h, y1))
-    return [x0, y0, x1 - x0, y1 - y0]
-
-
-def _recognize_speech_recovery_crop(
-    ocr_engine,
-    image_obj,
-    bbox: list[int],
-    settings,
-    debug_context: dict | None = None,
-) -> tuple[str, float, str]:
-    if image_obj is None:
-        return "", 0.0, ""
-    x, y, w, h = [int(v) for v in bbox[:4]]
-    crop = image_obj.crop((x, y, x + max(1, w), y + max(1, h)))
-    variants = [("recovery_crop", crop)]
-    try:
-        from PIL import ImageOps
-
-        variants.append(("recovery_crop_white_pad_12", ImageOps.expand(crop, border=12, fill="white")))
-    except Exception:
-        pass
-    best = ("", 0.0, "")
-    for label, variant in variants:
-        text, conf = _recognize_with_fallback(
-            ocr_engine,
-            variant,
-            settings,
-            bbox,
-            debug_context=debug_context,
-            trace_context={
-                "page_id": debug_context.get("page_id") if debug_context else "",
-                "attempt_kind": f"speech_recovery_{label}",
-                "route_intent": "translate_speech",
-                "ocr_eligible": True,
-                "source_bbox": list(bbox or []),
-                "actual_crop_bbox": list(bbox or []),
-                "container_bbox": list(bbox or []),
-            },
-        )
-        text = _clean_ocr_text(text)
-        if _speech_recovery_text_quality(text, conf):
-            if conf > best[1] or len(_non_punct_chars(text)) > len(_non_punct_chars(best[0])):
-                best = (text, float(conf or 0.0), label)
-    return best
-
-
-def _recover_missed_speech_text_area_regions(
-    regions: list[dict],
-    raw_detections: list,
-    image_obj,
-    image_size: tuple[int, int],
-    ocr_engine,
-    settings,
-    font_name: str,
-    pending_texts: dict[str, list[str]],
-    glossary_texts: list[str],
-    page_class: str = "normal",
-    debug_context: dict | None = None,
-) -> tuple[dict[str, list[str]], list[str]]:
-    if str(page_class or "").strip().lower() in {"cover", "contents", "chapter_title"}:
-        return pending_texts, glossary_texts
-    if image_obj is None or not raw_detections:
-        return pending_texts, glossary_texts
-    try:
-        from app.pipeline.debug_artifacts import add_count, add_timing
-    except Exception:
-        add_count = None
-        add_timing = None
-    changed = False
-    existing = [r for r in regions if r.get("bbox")]
-    next_idx = 0
-    for region in regions:
-        rid = str(region.get("region_id", "") or "")
-        if rid.startswith("r"):
-            try:
-                next_idx = max(next_idx, int(rid[1:]) + 1)
-            except Exception:
-                pass
-    for polygon, raw_conf in raw_detections:
-        try:
-            raw_bbox = _polygon_to_bbox(polygon)
-        except Exception:
-            continue
-        rx, ry, rw, rh = [int(v) for v in raw_bbox[:4]]
-        rw = max(1, rw)
-        rh = max(1, rh)
-        if rh < 180 or rw > max(140, int(image_size[0] * 0.12)) or rh < rw * 2.8:
-            continue
-        if not _is_clear_white_text_area(image_obj, raw_bbox):
-            continue
-        anchors = [
-            region
-            for region in existing
-            if _is_speech_text_area_recovery_anchor(region)
-            and _overlap_ratio(region.get("bbox") or [0, 0, 0, 0], raw_bbox) >= 0.85
-            and (rw * rh) >= max(1, int(region.get("bbox", [0, 0, 1, 1])[2]) * int(region.get("bbox", [0, 0, 1, 1])[3]) * 2.0)
-        ]
-        if not anchors:
-            continue
-        anchor = max(anchors, key=lambda r: int((r.get("bbox") or [0, 0, 0, 0])[1]) + int((r.get("bbox") or [0, 0, 0, 0])[3]))
-        rescue_box = _speech_text_area_recovery_box(raw_bbox, anchor.get("bbox") or raw_bbox, image_size)
-        if rescue_box is None:
-            continue
-        if not _is_clear_white_text_area(image_obj, rescue_box):
-            continue
-        if any(_overlap_ratio(rescue_box, r.get("bbox") or [0, 0, 0, 0]) > 0.35 for r in existing if r is not anchor):
-            continue
-        ocr_start = time.time()
-        rescued_text, rescued_conf, variant = _recognize_speech_recovery_crop(
-            ocr_engine,
-            image_obj,
-            rescue_box,
-            settings,
-            debug_context,
-        )
-        if add_timing is not None:
-            add_timing(debug_context, "ocr_time", time.time() - ocr_start)
-        if add_count is not None:
-            add_count(debug_context, "speech_missed_text_recovery_calls")
-        if not rescued_text:
-            continue
-        if str(rescued_text).strip() == str(anchor.get("ocr_text", "") or "").strip():
-            continue
-        new_region = _region_record(
-            next_idx,
-            _bbox_to_polygon(rescue_box),
-            rescue_box,
-            rescued_text,
-            "",
-            float(raw_conf or 0.0),
-            bg_text=False,
-            needs_review=False,
-            ignore=False,
-            region_type="speech_bubble",
-            ocr_conf=rescued_conf,
-            render_updates={
-                "cleanup_mode": "bubble",
-                "classification_reason": _SPEECH_BUBBLE_MISSED_TEXT_RECOVERY_REASON,
-                "ocr_rescue_reason": _SPEECH_BUBBLE_MISSED_TEXT_RECOVERY_REASON,
-                "ocr_rescue_variant": variant,
-                "ocr_rescue_raw_bbox": raw_bbox,
-                "ocr_rescue_anchor_region_id": anchor.get("region_id"),
-            },
-        )
-        next_idx += 1
-        try:
-            anchor_index = regions.index(anchor)
-        except ValueError:
-            anchor_index = len(regions) - 1
-        regions.insert(anchor_index + 1, new_region)
-        existing.append(new_region)
-        changed = True
-        if add_count is not None:
-            add_count(debug_context, "speech_missed_text_recovered_regions")
-    if not changed:
-        return pending_texts, glossary_texts
-    return _rebuild_translation_inputs_from_regions(regions)
-
-
-def _source_body_for_ownership(text: str) -> str:
-    return "".join(_non_punct_chars(_clean_ocr_text(text)))
-
-
-def _vertical_overlap_fraction(a: list[int], b: list[int]) -> float:
-    try:
-        _ax, ay, _aw, ah = [int(v) for v in a[:4]]
-        _bx, by, _bw, bh = [int(v) for v in b[:4]]
-    except Exception:
-        return 0.0
-    ah = max(1, ah)
-    bh = max(1, bh)
-    y0 = max(ay, by)
-    y1 = min(ay + ah, by + bh)
-    if y1 <= y0:
-        return 0.0
-    return (y1 - y0) / max(1, min(ah, bh))
-
-
-def _horizontal_gap_between_vertical_columns(right_bbox: list[int], left_bbox: list[int]) -> int:
-    try:
-        rx, _ry, rw, _rh = [int(v) for v in right_bbox[:4]]
-        lx, _ly, lw, _lh = [int(v) for v in left_bbox[:4]]
-    except Exception:
-        return -1
-    if lx > rx:
-        rx, rw, lx, lw = lx, lw, rx, rw
-    return rx - (lx + max(1, lw))
-
-
-def _is_adjacent_vertical_speech_conservation_fragment(region: dict) -> bool:
-    if str(region.get("type", "") or "").strip().lower() != "speech_bubble":
-        return False
-    flags = region.get("flags", {}) or {}
-    if flags.get("ignore") or flags.get("bg_text"):
-        return False
-    render = region.get("render", {}) or {}
-    if str(render.get("classification_reason", "") or "").strip():
-        return False
-    text = _clean_ocr_text(str(region.get("ocr_text", "") or ""))
-    body = _source_body_for_ownership(text)
-    if len(body) < 2 or len(body) > 6:
-        return False
-    if not _is_meaningful_speech_source(text):
-        return False
-    bbox = region.get("bbox") or [0, 0, 0, 0]
-    try:
-        _x, _y, w, h = [int(v) for v in bbox[:4]]
-    except Exception:
-        return False
-    w = max(1, w)
-    h = max(1, h)
-    if w > 72 or h < 80 or h < w * 2.0:
-        return False
-    confidence = region.get("confidence", {}) or {}
-    det_conf = float(confidence.get("det", 0.0) or 0.0) if isinstance(confidence, dict) else 0.0
-    ocr_conf = float(confidence.get("ocr", 0.0) or 0.0) if isinstance(confidence, dict) else 0.0
-    if det_conf > 0.78 or ocr_conf < 0.78:
-        return False
-    source_orientation = str(render.get("source_orientation", "") or "").strip().lower()
-    wrap_mode = str(render.get("wrap_mode", "") or "").strip().lower()
-    return source_orientation == "vertical" or wrap_mode == "vertical"
-
-
-def _adjacent_vertical_speech_conservation_crop(
-    right_region: dict,
-    left_region: dict,
-    image_size: tuple[int, int],
-) -> list[int] | None:
-    right_bbox = right_region.get("bbox") or [0, 0, 0, 0]
-    left_bbox = left_region.get("bbox") or [0, 0, 0, 0]
-    if _vertical_overlap_fraction(right_bbox, left_bbox) < 0.78:
-        return None
-    gap = _horizontal_gap_between_vertical_columns(right_bbox, left_bbox)
-    if gap < 22 or gap > 120:
-        return None
-    try:
-        rx, ry, rw, rh = [int(v) for v in right_bbox[:4]]
-        lx, ly, lw, lh = [int(v) for v in left_bbox[:4]]
-        img_w = max(1, int(image_size[0] or 1))
-        img_h = max(1, int(image_size[1] or 1))
-    except Exception:
-        return None
-    widths = [max(1, rw), max(1, lw)]
-    heights = [max(1, rh), max(1, lh)]
-    if min(heights) / max(heights) < 0.72:
-        return None
-    x0 = min(rx, lx) - max(34, min(70, int(sum(widths) / len(widths) * 1.20)))
-    y0 = min(ry, ly) - max(12, min(24, int(sum(heights) / len(heights) * 0.12)))
-    x1 = max(rx + max(1, rw), lx + max(1, lw)) + max(8, min(22, int(sum(widths) / len(widths) * 0.40)))
-    y1 = max(ry + max(1, rh), ly + max(1, lh)) + max(24, min(42, int(sum(heights) / len(heights) * 0.25)))
-    x0 = max(0, min(img_w - 1, x0))
-    y0 = max(0, min(img_h - 1, y0))
-    x1 = max(x0 + 1, min(img_w, x1))
-    y1 = max(y0 + 1, min(img_h, y1))
-    if x1 - x0 < 90 or y1 - y0 < 110:
-        return None
-    return [x0, y0, x1 - x0, y1 - y0]
-
-
-def _is_better_adjacent_vertical_speech_conservation_ocr(
-    rescued_text: str,
-    rescued_conf: float,
-    fragment_texts: list[str],
-) -> bool:
-    rescued = _clean_ocr_text(rescued_text)
-    if not _speech_recovery_text_quality(rescued, rescued_conf):
-        return False
-    rescued_body = _source_body_for_ownership(rescued)
-    fragment_bodies = [_source_body_for_ownership(text) for text in fragment_texts]
-    fragment_bodies = [body for body in fragment_bodies if body]
-    if len(fragment_bodies) < 2:
-        return False
-    if any(body not in rescued_body for body in fragment_bodies):
-        return False
-    existing_len = sum(len(body) for body in fragment_bodies)
-    if len(rescued_body) < existing_len + 4:
-        return False
-    if len(rescued_body) > existing_len + 18:
-        return False
-    if not _is_meaningful_speech_source(rescued):
-        return False
-    return True
-
-
-def _recover_adjacent_vertical_speech_text_conservation_regions(
-    regions: list[dict],
-    image_obj,
-    image_size: tuple[int, int],
-    ocr_engine,
-    settings,
-    font_name: str,
-    pending_texts: dict[str, list[str]],
-    glossary_texts: list[str],
-    page_class: str = "normal",
-    debug_context: dict | None = None,
-) -> tuple[dict[str, list[str]], list[str]]:
-    if str(page_class or "").strip().lower() in {"cover", "contents", "chapter_title"}:
-        return pending_texts, glossary_texts
-    if image_obj is None:
-        return pending_texts, glossary_texts
-    try:
-        from app.pipeline.debug_artifacts import add_count, add_timing
-    except Exception:
-        add_count = None
-        add_timing = None
-    fragments = [
-        region
-        for region in regions
-        if _is_adjacent_vertical_speech_conservation_fragment(region)
-    ]
-    if len(fragments) < 2:
-        return pending_texts, glossary_texts
-    changed = False
-    claimed_ids: set[str] = set()
-    fragments.sort(
-        key=lambda region: (
-            int((region.get("bbox") or [0, 0, 0, 0])[1]),
-            -int((region.get("bbox") or [0, 0, 0, 0])[0]),
-        )
-    )
-    for idx, right_region in enumerate(fragments):
-        right_id = str(right_region.get("region_id", "") or "")
-        if right_id in claimed_ids:
-            continue
-        right_bbox = right_region.get("bbox") or [0, 0, 0, 0]
-        try:
-            right_x = int(right_bbox[0])
-        except Exception:
-            continue
-        for left_region in fragments[idx + 1:]:
-            left_id = str(left_region.get("region_id", "") or "")
-            if left_id in claimed_ids:
-                continue
-            left_bbox = left_region.get("bbox") or [0, 0, 0, 0]
-            try:
-                left_x = int(left_bbox[0])
-            except Exception:
-                continue
-            if left_x >= right_x:
-                continue
-            crop_bbox = _adjacent_vertical_speech_conservation_crop(
-                right_region,
-                left_region,
-                image_size,
-            )
-            if crop_bbox is None:
-                continue
-            if not _is_clear_white_text_area(image_obj, crop_bbox):
-                continue
-            if any(
-                other is not right_region
-                and other is not left_region
-                and not (other.get("flags", {}) or {}).get("ignore")
-                and _overlap_ratio(crop_bbox, other.get("bbox") or [0, 0, 0, 0]) > 0.25
-                for other in regions
-            ):
-                continue
-            ocr_start = time.time()
-            rescued_text, rescued_conf, variant = _recognize_speech_recovery_crop(
-                ocr_engine,
-                image_obj,
-                crop_bbox,
-                settings,
-                debug_context,
-            )
-            if add_timing is not None:
-                add_timing(debug_context, "ocr_time", time.time() - ocr_start)
-            if add_count is not None:
-                add_count(debug_context, "speech_text_conservation_recovery_calls")
-            fragment_texts = [
-                str(right_region.get("ocr_text", "") or ""),
-                str(left_region.get("ocr_text", "") or ""),
-            ]
-            if not _is_better_adjacent_vertical_speech_conservation_ocr(
-                rescued_text,
-                rescued_conf,
-                fragment_texts,
-            ):
-                continue
-            confidence = right_region.get("confidence", {}) or {}
-            right_det_conf = float(confidence.get("det", 0.0) or 0.0) if isinstance(confidence, dict) else 0.0
-            left_confidence = left_region.get("confidence", {}) or {}
-            left_det_conf = float(left_confidence.get("det", 0.0) or 0.0) if isinstance(left_confidence, dict) else 0.0
-            try:
-                anchor_idx = int(right_id[1:]) if right_id.startswith("r") else 0
-            except Exception:
-                anchor_idx = 0
-            original_right_bbox = list(right_region.get("bbox") or [])
-            original_left_bbox = list(left_region.get("bbox") or [])
-            replacement = _region_record(
-                anchor_idx,
-                _bbox_to_polygon(crop_bbox),
-                crop_bbox,
-                _clean_ocr_text(rescued_text),
-                "",
-                max(right_det_conf, left_det_conf),
-                bg_text=False,
-                needs_review=False,
-                ignore=False,
-                region_type="speech_bubble",
-                ocr_conf=rescued_conf,
-                render_updates={
-                    "cleanup_mode": "bubble",
-                    "classification_reason": _ADJACENT_VERTICAL_SPEECH_TEXT_CONSERVATION_REASON,
-                    "ocr_rescue_reason": _ADJACENT_VERTICAL_SPEECH_TEXT_CONSERVATION_REASON,
-                    "ocr_rescue_variant": variant,
-                    "ocr_rescue_bbox": crop_bbox,
-                    "speech_text_conservation_original_region_ids": [right_id, left_id],
-                    "speech_text_conservation_original_texts": fragment_texts,
-                    "speech_text_conservation_original_bboxes": [original_right_bbox, original_left_bbox],
-                    "speech_text_conservation_transferred_region_ids": [left_id],
-                },
-            )
-            replacement["region_id"] = right_id or replacement.get("region_id")
-            right_region.clear()
-            right_region.update(replacement)
-
-            left_region["type"] = "speech_bubble"
-            left_region["translation"] = ""
-            flags = left_region.setdefault("flags", {})
-            flags["ignore"] = True
-            flags["bg_text"] = False
-            flags["needs_review"] = False
-            child_render = left_region.setdefault("render", {})
-            child_render["cleanup_mode"] = "transferred_to_speech_text_conservation_anchor"
-            child_render["classification_reason"] = _ADJACENT_VERTICAL_SPEECH_TEXT_CONSERVATION_REASON
-            child_render["speech_text_conservation_transfer_to_region_id"] = right_id
-            child_render["speech_text_conservation_transfer_text"] = str(left_region.get("ocr_text", "") or "")
-            child_render["speech_text_conservation_original_bbox"] = original_left_bbox
-            claimed_ids.update({right_id, left_id})
-            changed = True
-            if add_count is not None:
-                add_count(debug_context, "speech_text_conservation_recovered_regions")
-                add_count(debug_context, "speech_text_conservation_transferred_regions")
-            break
-    if not changed:
-        return pending_texts, glossary_texts
-    return _rebuild_translation_inputs_from_regions(regions)
-
-
-def _is_duplicate_owned_fragment(parent_text: str, child_text: str) -> bool:
-    # Duplicate ownership is established by graph identity, never source text.
-    return False
-
-
-def _union_bbox_xywh(a: list[int], b: list[int], image_size: tuple[int, int]) -> list[int]:
-    ax, ay, aw, ah = [int(v) for v in a[:4]]
-    bx, by, bw, bh = [int(v) for v in b[:4]]
-    x0 = min(ax, bx)
-    y0 = min(ay, by)
-    x1 = max(ax + max(1, aw), bx + max(1, bw))
-    y1 = max(ay + max(1, ah), by + max(1, bh))
-    img_w = max(1, int(image_size[0] or 1))
-    img_h = max(1, int(image_size[1] or 1))
-    x0 = max(0, min(x0, img_w - 1))
-    y0 = max(0, min(y0, img_h - 1))
-    x1 = max(x0 + 1, min(x1, img_w))
-    y1 = max(y0 + 1, min(y1, img_h))
-    return [x0, y0, x1 - x0, y1 - y0]
-
-
-def _intersection_bbox_xywh(a: list[int], b: list[int]) -> list[int] | None:
-    ax, ay, aw, ah = [int(v) for v in a[:4]]
-    bx, by, bw, bh = [int(v) for v in b[:4]]
-    x0 = max(ax, bx)
-    y0 = max(ay, by)
-    x1 = min(ax + max(1, aw), bx + max(1, bw))
-    y1 = min(ay + max(1, ah), by + max(1, bh))
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return [x0, y0, x1 - x0, y1 - y0]
-
-
-def _is_bubble_local_nested_caption_child(region: dict, image_size: tuple[int, int]) -> bool:
-    render = region.get("render", {}) or {}
-    reason = str(render.get("classification_reason", "") or "").strip().lower()
-    if reason != _TOP_ROW_BACKGROUND_CAPTION_REASON:
-        return False
-    if str(render.get("cleanup_mode", "") or "").strip().lower() == "preserve":
-        return False
-    if str(region.get("type", "") or "").strip().lower() != "background_text":
-        return False
-    flags = region.get("flags", {}) or {}
-    if flags.get("ignore") or not flags.get("bg_text"):
-        return False
-    text = str(region.get("ocr_text", "") or "").strip()
-    if not _is_meaningful_background_caption_source(text):
-        return False
-    try:
-        _x, y, w, h = [int(v) for v in (region.get("bbox") or [0, 0, 0, 0])[:4]]
-        img_h = max(1, int(image_size[1] or 1))
-    except Exception:
-        return False
-    w = max(1, w)
-    h = max(1, h)
-    topish = (y + (h / 2.0)) <= img_h * 0.28
-    return topish and h >= max(80, w * 1.9)
-
-
-def _is_bubble_local_anchor_region(region: dict) -> bool:
-    if str(region.get("type", "") or "").strip().lower() != "speech_bubble":
-        return False
-    flags = region.get("flags", {}) or {}
-    if flags.get("ignore") or flags.get("bg_text"):
-        return False
-    render = region.get("render", {}) or {}
-    reason = str(render.get("classification_reason", "") or "").strip().lower()
-    if reason in {
-        _NONBUBBLE_SHORT_KANA_ART_TEXT_REASON,
-        _NONBUBBLE_SHORT_REACTION_ART_TEXT_REASON,
-        _SHORT_REACTION_WITHOUT_VISUAL_SPEECH_OWNERSHIP_REASON,
-        _NONBUBBLE_SHORT_REACTION_ART_SFX_REASON,
-        _NONBUBBLE_BREATH_SFX_ART_TEXT_REASON,
-        _LARGE_LOW_CONFIDENCE_NONBUBBLE_SFX_REASON,
-        "large_short_decorative_sfx_candidate",
-        "low_conf_dark_short_art_sfx_candidate",
-    }:
-        return False
-    return _is_meaningful_speech_source(str(region.get("ocr_text", "") or ""))
-
-
-def _find_bubble_local_anchor_for_child(
-    child: dict,
-    regions: list[dict],
-    image_obj,
-    image_size: tuple[int, int],
-) -> tuple[dict | None, list[int] | None, float]:
-    child_bbox = child.get("bbox") or [0, 0, 0, 0]
-    best: tuple[float, dict, list[int]] | None = None
-    for parent in regions:
-        if parent is child or not _is_bubble_local_anchor_region(parent):
-            continue
-        parent_bbox = parent.get("bbox") or [0, 0, 0, 0]
-        overlap = _overlap_ratio(parent_bbox, child_bbox)
-        if overlap < 0.55:
-            continue
-        if _is_duplicate_owned_fragment(parent.get("ocr_text", ""), child.get("ocr_text", "")):
-            continue
-        union_bbox = _union_bbox_xywh(parent_bbox, child_bbox, image_size)
-        stats = _box_luma_stats_pil(image_obj, union_bbox)
-        if not stats or float(stats[0]) < 215.0:
-            continue
-        if not _has_bright_bubble_context_pil(image_obj, union_bbox):
-            continue
-        if best is None or overlap > best[0]:
-            best = (overlap, parent, union_bbox)
-    if best is None:
-        return None, None, 0.0
-    return best[1], best[2], best[0]
-
-
-def _recognize_anchor_with_child_overlap_removed(
-    anchor: dict,
-    child: dict,
-    image_obj,
-    ocr_engine,
-    settings,
-    debug_context: dict | None = None,
-) -> tuple[str, float, str]:
-    if image_obj is None:
-        return "", 0.0, ""
-    anchor_bbox = anchor.get("bbox") or [0, 0, 0, 0]
-    child_bbox = child.get("bbox") or [0, 0, 0, 0]
-    intersection = _intersection_bbox_xywh(anchor_bbox, child_bbox)
-    if intersection is None:
-        return "", 0.0, ""
-    try:
-        from PIL import ImageDraw
-
-        ax, ay, aw, ah = [int(v) for v in anchor_bbox[:4]]
-        crop = image_obj.crop((ax, ay, ax + max(1, aw), ay + max(1, ah))).convert("RGB")
-        ix, iy, iw, ih = intersection
-        local_box = [ix - ax, iy - ay, ix - ax + iw, iy - ay + ih]
-        draw = ImageDraw.Draw(crop)
-        draw.rectangle(local_box, fill=(255, 255, 255))
-        text, conf = _recognize_with_fallback(
-            ocr_engine,
-            crop,
-            settings,
-            anchor_bbox,
-            debug_context=debug_context,
-            trace_context={
-                "page_id": debug_context.get("page_id") if debug_context else "",
-                "attempt_kind": "bubble_local_anchor_deoverlap",
-                "region_id": anchor.get("region_id"),
-                "route_intent": anchor.get("text_area_route_intent") or "translate_speech",
-                "ocr_eligible": True,
-                "source_bbox": list(anchor_bbox or []),
-                "actual_crop_bbox": list(anchor_bbox or []),
-                "container_bbox": anchor.get("text_area_container_bbox") or list(anchor_bbox or []),
-            },
-        )
-        return _clean_ocr_text(text), float(conf or 0.0), "anchor_crop_child_overlap_removed"
-    except Exception:
-        return "", 0.0, ""
-
-
-def _is_better_bubble_local_anchor_ocr(
-    original_text: str,
-    original_conf: float,
-    rescued_text: str,
-    rescued_conf: float,
-) -> bool:
-    original = _clean_ocr_text(original_text)
-    rescued = _clean_ocr_text(rescued_text)
-    if not rescued or rescued == original:
-        return False
-    if any(marker in rescued for marker in ("<|", "###", "Instruction:", "System:", "User:")):
-        return False
-    original_body = _source_body_for_ownership(original)
-    rescued_body = _source_body_for_ownership(rescued)
-    if len(rescued_body) < max(2, len(original_body)):
-        return False
-    total, kana_ratio, kanji_ratio = _source_script_mix(rescued)
-    if total < 4 or (kana_ratio + kanji_ratio) < 0.70:
-        return False
-    return float(rescued_conf or 0.0) >= max(0.60, float(original_conf or 0.0) - 0.20)
-
-
-def _merge_bubble_local_owned_speech_source(anchor_text: str, child_text: str) -> str:
-    pieces: list[str] = []
-    for text in (anchor_text, child_text):
-        piece = str(text or "").replace("\\n", " ").replace("/n", " ")
-        piece = piece.replace("\r", " ").replace("\n", " ")
-        piece = re.sub(r"\s+", " ", piece).strip()
-        if not piece:
-            continue
-        piece = _clean_ocr_text(piece)
-        piece = re.sub(r"[\r\n]+", "", piece).strip()
-        if piece:
-            pieces.append(piece)
-    return "、".join(pieces)
-
-
-def _apply_bubble_local_nested_speech_ownership(
-    regions: list[dict],
-    image_obj,
-    image_size: tuple[int, int],
-    ocr_engine,
-    settings,
-    font_name: str,
-    pending_texts: dict[str, list[str]],
-    glossary_texts: list[str],
-    page_class: str = "normal",
-    debug_context: dict | None = None,
-) -> tuple[dict[str, list[str]], list[str]]:
-    if str(page_class or "").strip().lower() in {"cover", "contents", "chapter_title"}:
-        return pending_texts, glossary_texts
-    if image_obj is None:
-        return pending_texts, glossary_texts
-    try:
-        from app.pipeline.debug_artifacts import add_count, add_timing
-    except Exception:
-        add_count = None
-        add_timing = None
-    changed = False
-    claimed_children: set[str] = set()
-    for child in list(regions):
-        child_id = str(child.get("region_id", "") or "")
-        if not child_id or child_id in claimed_children:
-            continue
-        if not _is_bubble_local_nested_caption_child(child, image_size):
-            continue
-        anchor, union_bbox, overlap = _find_bubble_local_anchor_for_child(
-            child,
-            regions,
-            image_obj,
-            image_size,
-        )
-        if anchor is None or union_bbox is None:
-            continue
-        anchor_id = str(anchor.get("region_id", "") or "")
-        child_text = _clean_ocr_text(str(child.get("ocr_text", "") or ""))
-        anchor_text = _clean_ocr_text(str(anchor.get("ocr_text", "") or ""))
-        if not child_text or _is_duplicate_owned_fragment(anchor_text, child_text):
-            continue
-        confidence = anchor.get("confidence", {}) or {}
-        original_anchor_conf = float(confidence.get("ocr", 0.0) or 0.0) if isinstance(confidence, dict) else 0.0
-        ocr_start = time.time()
-        rescued_anchor_text, rescued_anchor_conf, rescue_variant = _recognize_anchor_with_child_overlap_removed(
-            anchor,
-            child,
-            image_obj,
-            ocr_engine,
-            settings,
-            debug_context,
-        )
-        if add_timing is not None:
-            add_timing(debug_context, "ocr_time", time.time() - ocr_start)
-        if add_count is not None:
-            add_count(debug_context, "bubble_local_deoverlap_ocr_calls")
-        if _is_better_bubble_local_anchor_ocr(
-            anchor_text,
-            original_anchor_conf,
-            rescued_anchor_text,
-            rescued_anchor_conf,
-        ):
-            anchor_source_text = rescued_anchor_text
-            anchor_source_conf = rescued_anchor_conf
-        else:
-            anchor_source_text = anchor_text
-            anchor_source_conf = original_anchor_conf
-            rescue_variant = ""
-            rescued_anchor_text = ""
-            rescued_anchor_conf = 0.0
-        if _is_duplicate_owned_fragment(anchor_source_text, child_text):
-            continue
-        combined_text = _merge_bubble_local_owned_speech_source(anchor_source_text, child_text)
-        if not combined_text:
-            continue
-        try:
-            anchor_idx = int(anchor_id[1:]) if anchor_id.startswith("r") else 0
-        except Exception:
-            anchor_idx = 0
-        det_conf = 0.0
-        if isinstance(confidence, dict):
-            det_conf = float(confidence.get("det", 0.0) or 0.0)
-        child_conf = child.get("confidence", {}) or {}
-        child_ocr_conf = float(child_conf.get("ocr", 0.0) or 0.0) if isinstance(child_conf, dict) else 0.0
-        combined_ocr_conf = min(
-            value
-            for value in (anchor_source_conf, child_ocr_conf)
-            if value is not None
-        )
-        group_id = f"bubble_local_{anchor_id or child_id}"
-        original_anchor_bbox = list(anchor.get("bbox") or [])
-        original_anchor_text = str(anchor.get("ocr_text", "") or "")
-        replacement = _region_record(
-            anchor_idx,
-            _bbox_to_polygon(union_bbox),
-            union_bbox,
-            combined_text,
-            "",
-            det_conf,
-            bg_text=False,
-            needs_review=False,
-            ignore=False,
-            region_type="speech_bubble",
-            ocr_conf=combined_ocr_conf,
-            render_updates={
-                "cleanup_mode": "bubble",
-                "classification_reason": _BUBBLE_LOCAL_NESTED_SPEECH_FRAGMENT_REASON,
-                "bubble_local_original_bbox": original_anchor_bbox,
-                "bubble_local_original_text": original_anchor_text,
-                "bubble_local_deoverlap_ocr_text": rescued_anchor_text,
-                "bubble_local_deoverlap_ocr_confidence": rescued_anchor_conf,
-                "bubble_local_deoverlap_ocr_variant": rescue_variant,
-                "bubble_local_owned_fragment_ids": [child_id],
-                "bubble_local_owned_fragment_texts": [child_text],
-                "bubble_local_child_overlap_ratio": overlap,
-                "bubble_local_source_separator": "inline_comma",
-            },
-        )
-        replacement["region_id"] = anchor_id or replacement.get("region_id")
-        replacement["group_id"] = group_id
-        anchor.clear()
-        anchor.update(replacement)
-
-        child["type"] = "speech_bubble"
-        child["translation"] = ""
-        child["group_id"] = group_id
-        flags = child.setdefault("flags", {})
-        flags["ignore"] = True
-        flags["bg_text"] = False
-        flags["needs_review"] = False
-        child_render = child.setdefault("render", {})
-        child_render["cleanup_mode"] = "transferred_to_bubble_local_anchor"
-        child_render["classification_reason"] = _BUBBLE_LOCAL_NESTED_SPEECH_FRAGMENT_REASON
-        child_render["bubble_local_transfer_to_region_id"] = anchor.get("region_id")
-        child_render["bubble_local_transfer_text"] = child_text
-        child_render["bubble_local_original_classification_reason"] = _TOP_ROW_BACKGROUND_CAPTION_REASON
-        claimed_children.add(child_id)
-        changed = True
-    if not changed:
-        return pending_texts, glossary_texts
-    return _rebuild_translation_inputs_from_regions(regions)
-
-
-def _route_low_conf_dark_short_art_sfx_regions(
-    regions: list[dict],
-    image_obj,
-    image_size: tuple[int, int],
-    pending_texts: dict[str, list[str]],
-    glossary_texts: list[str],
-) -> tuple[dict[str, list[str]], list[str]]:
-    guarded_ids: set[str] = set()
-    for region in regions:
-        if _region_has_translatable_text_area_route(region):
-            render = region.setdefault("render", {})
-            render.setdefault("text_area_route_authority_low_conf_sfx_guard", True)
-            continue
-        confidence = region.get("confidence", {}) or {}
-        if isinstance(confidence, dict):
-            det_conf = float(confidence.get("det", 0.0) or 0.0)
-            ocr_conf = float(confidence.get("ocr", 0.0) or 0.0)
-        else:
-            det_conf = float(confidence or 0.0)
-            ocr_conf = float(region.get("ocr_confidence", 0.0) or 0.0)
-        render = region.setdefault("render", {})
-        existing_reason = str(render.get("classification_reason", "") or "").strip().lower()
-        reason = (
-            _LARGE_LOW_CONFIDENCE_NONBUBBLE_SFX_REASON
-            if existing_reason == _LARGE_LOW_CONFIDENCE_NONBUBBLE_SFX_REASON
-            else _low_conf_dark_short_art_sfx_reason(
-                str(region.get("ocr_text", "") or ""),
-                region.get("bbox", [0, 0, 0, 0]) or [0, 0, 0, 0],
-                image_size,
-                det_conf,
-                ocr_conf,
-                image_obj,
-            )
-        )
-        if not reason:
-            continue
-        if _should_restore_text_area_speech_assignment(_region_text_area_assignment(region), region, str(region.get("ocr_text", "") or "")):
-            continue
-        region_id = str(region.get("region_id", "") or "")
-        if region_id:
-            guarded_ids.add(region_id)
-        if str(region.get("type", "") or "").strip().lower() != "sfx":
-            region["type"] = "decorative_text"
-        region["translation"] = ""
-        flags = region.setdefault("flags", {})
-        flags["ignore"] = True
-        flags["bg_text"] = True
-        flags["needs_review"] = False
-        flags.pop("hard_fail", None)
-        render["cleanup_mode"] = "preserve"
-        render["classification_reason"] = reason
-    if not guarded_ids:
-        return pending_texts, glossary_texts
-    pending_texts = {
-        text: [rid for rid in region_ids if rid not in guarded_ids]
-        for text, region_ids in pending_texts.items()
-    }
-    pending_texts = {text: ids for text, ids in pending_texts.items() if ids}
-    glossary_texts = [
-        str(region.get("ocr_text", "") or "").strip()
-        for region in regions
-        if not region.get("flags", {}).get("ignore")
-    ]
-    return pending_texts, glossary_texts
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _looks_like_recoverable_speech_region(region: dict, page_class: str = "normal") -> bool:
@@ -16366,161 +11198,14 @@ def _is_short_reaction_source(text: str) -> bool:
     return False
 
 
-def _is_speech_short_or_ellipsis_source(text: str) -> bool:
-    cleaned = _clean_ocr_text(text)
-    if not cleaned:
-        return False
-    if _is_short_reaction_source(cleaned):
-        return True
-    body = _non_punct_chars(cleaned)
-    if not body or len(body) > 10:
-        return False
-    if not any(_is_kana(ch) or _is_cjk_char(ch) for ch in body):
-        return False
-    return any(ch in cleaned for ch in ".．…‥・･〜～ー-—―－")
 
 
-def _suppress_duplicate_caption_background_regions(
-    regions: list[dict],
-    debug_context: dict | None = None,
-) -> dict[str, object]:
-    """Fail closed duplicate/partial caption roots before translation/render.
-
-    TextAreaPlan owns the caption/background scope; this only removes duplicate
-    OCR/render candidates inside that owned flow when one caption source is a
-    strict textual subset of a nearby caption candidate.
-    """
-    candidates: list[dict[str, object]] = []
-    for region in regions:
-        if not isinstance(region, dict):
-            continue
-        flags = region.get("flags", {}) or {}
-        if flags.get("ignore"):
-            continue
-        text = str(region.get("ocr_text") or "").strip()
-        body = _caption_duplicate_body(text)
-        if not body:
-            continue
-        render = region.get("render", {}) if isinstance(region.get("render"), dict) else {}
-        route = str(render.get("text_area_route_intent") or region.get("text_area_route_intent") or "").strip()
-        container_type = str(render.get("text_area_container_type") or region.get("text_area_container_type") or "").strip()
-        region_type = str(region.get("type") or "").strip()
-        if (
-            route not in {"translate_caption", "translate_caption_background"}
-            and container_type != "caption_background"
-            and region_type not in {"background_text", "narration_box"}
-        ):
-            continue
-        if _region_is_sfx_or_decorative_preserve(region):
-            continue
-        bbox = _clip_controller_bbox(list(region.get("bbox") or []), None)
-        if not bbox:
-            continue
-        candidates.append(
-            {
-                "region": region,
-                "region_id": str(region.get("region_id") or ""),
-                "body": body,
-                "bbox": bbox,
-                "area": max(1, int(bbox[2]) * int(bbox[3])),
-                "text": text,
-            }
-        )
-    suppressed: list[dict[str, object]] = []
-    for candidate in sorted(candidates, key=lambda item: (-len(str(item["body"])), int(item["area"]))):
-        keeper_body = str(candidate["body"])
-        if len(keeper_body) < 3:
-            continue
-        keeper_region = candidate["region"]
-        if not isinstance(keeper_region, dict) or keeper_region.get("flags", {}).get("ignore"):
-            continue
-        for other in candidates:
-            other_region = other["region"]
-            if other_region is keeper_region or not isinstance(other_region, dict):
-                continue
-            if other_region.get("flags", {}).get("ignore"):
-                continue
-            other_body = str(other["body"])
-            if not other_body:
-                continue
-            same_text = other_body == keeper_body
-            strict_subset = other_body in keeper_body and len(keeper_body) >= len(other_body) + 2
-            if not same_text and not strict_subset:
-                continue
-            if not _caption_duplicate_geometry_related(list(other["bbox"]), list(candidate["bbox"])):
-                continue
-            # For identical OCR, keep the tighter candidate; for textual subset,
-            # keep the fuller source text.
-            if same_text and int(other["area"]) <= int(candidate["area"]):
-                continue
-            _suppress_caption_duplicate_region(
-                other_region,
-                keeper_region,
-                reason="duplicate_caption_same_text" if same_text else "duplicate_caption_text_contained_in_fuller_caption",
-            )
-            suppressed.append(
-                {
-                    "region_id": str(other.get("region_id") or ""),
-                    "kept_region_id": str(candidate.get("region_id") or ""),
-                    "source_text": str(other.get("text") or ""),
-                    "kept_source_text": str(candidate.get("text") or ""),
-                    "reason": "duplicate_caption_same_text" if same_text else "duplicate_caption_text_contained_in_fuller_caption",
-                }
-            )
-    if debug_context is not None and suppressed:
-        debug_context.setdefault("duplicate_caption_background_suppression_records", []).extend(suppressed)
-        debug_context.setdefault("counts", {})["duplicate_caption_background_suppressed"] = len(
-            debug_context.get("duplicate_caption_background_suppression_records") or []
-        )
-    return {
-        "duplicate_caption_background_suppressed_count": len(suppressed),
-        "duplicate_caption_background_suppression_records": suppressed,
-    }
 
 
-def _caption_duplicate_body(text: str) -> str:
-    return "".join(_non_punct_chars(str(text or "")))
 
 
-def _caption_duplicate_geometry_related(a: list[int], b: list[int]) -> bool:
-    if not a or not b:
-        return False
-    overlap = _overlap_ratio(a, b)
-    if overlap >= 0.16:
-        return True
-    ax, ay, aw, ah = [int(v) for v in a[:4]]
-    bx, by, bw, bh = [int(v) for v in b[:4]]
-    a_y1 = ay + max(1, ah)
-    b_y1 = by + max(1, bh)
-    vertical_overlap = max(0, min(a_y1, b_y1) - max(ay, by)) / max(1, min(ah, bh))
-    if vertical_overlap < 0.35:
-        return False
-    acx = ax + aw / 2.0
-    bcx = bx + bw / 2.0
-    horizontal_gap = max(0.0, max(ax, bx) - min(ax + aw, bx + bw))
-    return horizontal_gap <= max(48, min(max(aw, bw), 180)) or abs(acx - bcx) <= max(90, aw, bw)
 
 
-def _suppress_caption_duplicate_region(region: dict, kept_region: dict, reason: str) -> None:
-    region["translation"] = ""
-    region["translated_text"] = ""
-    region["skip_reason"] = reason
-    region["duplicate_caption_background_suppressed"] = True
-    region["duplicate_caption_background_suppressed_by_region_id"] = str(kept_region.get("region_id") or "")
-    region["type"] = "background_text"
-    flags = region.setdefault("flags", {})
-    flags["ignore"] = True
-    flags["bg_text"] = True
-    flags["needs_review"] = True
-    render = region.setdefault("render", {})
-    render["cleanup_mode"] = "preserve"
-    render["classification_reason"] = reason
-    render["duplicate_caption_background_suppressed"] = True
-    render["duplicate_caption_background_suppressed_by_region_id"] = str(kept_region.get("region_id") or "")
-    render.pop("final_render_bbox", None)
-    render.pop("wrapped_lines", None)
-    region.pop("final_render_bbox", None)
-    region.pop("wrapped_lines", None)
 
 
 def _region_is_sfx_or_decorative_preserve(region: dict) -> bool:
@@ -16815,20 +11500,10 @@ def _repair_bubble_local_nested_speech_translation(
     translation: str,
     target_lang: str,
 ) -> tuple[str, list[str]]:
-    source = str(source_text or "").strip()
-    result = str(translation or "").strip()
-    if not source or not result:
-        return result, []
-    reasons: list[str] = []
-    cleaned = re.sub(r"(?:\\+n|/+n|\\+r|/+r)", "，", result, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("\r\n", "，").replace("\n", "，").replace("\r", "，")
-    cleaned = re.sub(r"，{2,}", "，", cleaned)
-    cleaned = re.sub(r"([，。！？；：、])\1+", r"\1", cleaned).strip()
-    if cleaned != result:
-        reasons.append("escaped_newline_removed")
-        result = cleaned
-    _ = source, target_lang
-    return result, reasons
+    """Compatibility probe with no authority to rewrite parent translation."""
+
+    _ = source_text, target_lang
+    return str(translation or "").strip(), []
 
 
 def _should_preserve_decorative_fragment_translation(
@@ -21211,9 +15886,6 @@ def _is_cjk_char(ch: str) -> bool:
     )
 
 
-def _is_han_char(ch: str) -> bool:
-    code = ord(ch)
-    return 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF
 
 
 def _is_japanese(ch: str) -> bool:
@@ -21229,14 +15901,6 @@ def _is_kana(ch: str) -> bool:
     return 0x3040 <= code <= 0x30FF
 
 
-def _source_script_mix(text: str) -> tuple[int, float, float]:
-    body = _non_punct_chars(text)
-    if not body:
-        return 0, 0.0, 0.0
-    total = len(body)
-    kana = sum(1 for ch in body if (0x3040 <= ord(ch) <= 0x30FF))
-    kanji = sum(1 for ch in body if 0x4E00 <= ord(ch) <= 0x9FFF)
-    return total, kana / max(1, total), kanji / max(1, total)
 
 
 def _region_record(

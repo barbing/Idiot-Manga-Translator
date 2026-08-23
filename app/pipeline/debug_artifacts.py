@@ -716,7 +716,6 @@ def write_page_artifacts(context: dict[str, Any] | None, regions: list[dict]) ->
     audit = _build_audit(context, regions)
     audit = _add_rollback_forbidden_marker_scan(audit, regions)
     audit = _maybe_add_text_area_diagnostics(audit, regions, audit_path=os.path.join(page_dir, f"{page_id}_region_audit.json"))
-    audit = _maybe_add_model_fusion_assist(audit, page_dir)
     audit = _maybe_add_route_advisor(audit)
     audit = _maybe_add_render_planner(audit)
     audit = _maybe_write_text_area_overlays(context, audit, page_dir)
@@ -2460,53 +2459,6 @@ def _maybe_add_render_planner(audit: dict[str, Any]) -> dict[str, Any]:
         return enriched
 
 
-def _maybe_add_model_fusion_assist(audit: dict[str, Any], page_dir: str) -> dict[str, Any]:
-    try:
-        from app.pipeline.model_fusion_assist import (
-            HIGH_ACCURACY_BUBBLE_MODE_VERSION,
-            MODEL_FUSION_ASSIST_VERSION,
-            effective_model_fusion_assist_enabled,
-            high_accuracy_bubble_mode_enabled,
-            enrich_audit_with_model_fusion_assist,
-        )
-
-        if not effective_model_fusion_assist_enabled():
-            return audit
-        return enrich_audit_with_model_fusion_assist(audit, page_dir=page_dir)
-    except Exception as exc:  # pragma: no cover - diagnostic isolation
-        enriched = dict(audit)
-        enriched["regions"] = [dict(region) for region in audit.get("regions", []) or []]
-        legacy_enabled = os.environ.get("MT_LEGACY_PAGE_SPECIFIC_ASSIST", "").strip().lower() in {"1", "true", "yes", "on"}
-        assist_enabled = legacy_enabled and os.environ.get("MT_MODEL_FUSION_ASSIST", "").strip().lower() in {"1", "true", "yes", "on"}
-        high_accuracy_enabled = legacy_enabled and os.environ.get("MT_HIGH_ACCURACY_BUBBLE_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
-        enriched["model_fusion_assist_version"] = globals().get("MODEL_FUSION_ASSIST_VERSION", "phase4b6_model_fusion_assist_v1")
-        enriched["model_fusion_assist_enabled"] = assist_enabled or high_accuracy_enabled
-        enriched["model_fusion_assist_generated"] = False
-        enriched["model_fusion_assist_error"] = f"{type(exc).__name__}: {exc}"
-        enriched["model_fusion_assist_runtime_sec"] = 0.0
-        enriched["model_fusion_evidence"] = {}
-        enriched["model_fusion_assist_candidates"] = []
-        enriched["model_fusion_conflicts"] = []
-        enriched["bubble_detection_cache_enabled"] = False
-        enriched["bubble_detection_cache_key"] = None
-        enriched["bubble_detection_cache_hit"] = False
-        enriched["bubble_detection_cache_read_path"] = None
-        enriched["bubble_detection_cache_write_path"] = None
-        enriched["bubble_detection_cache_error"] = enriched["model_fusion_assist_error"]
-        enriched["bubble_detection_cache_invalidation_reason"] = "debug_model_fusion_exception"
-        enriched["high_accuracy_bubble_mode_enabled"] = high_accuracy_enabled
-        enriched["high_accuracy_bubble_mode_version"] = globals().get("HIGH_ACCURACY_BUBBLE_MODE_VERSION", "phase4b14_high_accuracy_bubble_mode_v1")
-        enriched["high_accuracy_bubble_mode_generated"] = False
-        enriched["high_accuracy_bubble_mode_error"] = f"{type(exc).__name__}: {exc}" if high_accuracy_enabled else None
-        enriched["high_accuracy_bubble_mode_runtime_sec"] = 0.0
-        enriched["high_accuracy_bubble_mode_mutation_allowed"] = False
-        enriched["high_accuracy_bubble_mode_components"] = {}
-        enriched["high_accuracy_bubble_mode_candidate_counts"] = {}
-        enriched["high_accuracy_bubble_mode_conflict_counts"] = {}
-        enriched["high_accuracy_bubble_mode_fallback_used"] = True if high_accuracy_enabled else False
-        return enriched
-
-
 def _audit_value(meta: dict[str, Any], region: dict[str, Any], render: dict[str, Any], key: str, default: Any = None) -> Any:
     for source in (meta, region, render):
         if isinstance(source, dict) and key in source and source.get(key) is not None:
@@ -2848,11 +2800,6 @@ def _build_audit(context: dict[str, Any], regions: list[dict]) -> dict[str, Any]
                 "render_constraint_font_wrap_recomputed": meta.get("render_constraint_font_wrap_recomputed") or render.get("render_constraint_font_wrap_recomputed"),
                 "render_constraint_text_completeness_policy": meta.get("render_constraint_text_completeness_policy") or render.get("render_constraint_text_completeness_policy"),
                 "render_constraint_previous_outside_container_ratio": meta.get("render_constraint_previous_outside_container_ratio") or render.get("render_constraint_previous_outside_container_ratio"),
-                "model_fusion_mutation_proof_enabled": _meta_or_render(meta, render, "model_fusion_mutation_proof_enabled"),
-                "model_fusion_mutation_proof_applied": _meta_or_render(meta, render, "model_fusion_mutation_proof_applied"),
-                "model_fusion_mutation_proof_version": _meta_or_render(meta, render, "model_fusion_mutation_proof_version"),
-                "model_fusion_mutation_proof_candidate_id": _meta_or_render(meta, render, "model_fusion_mutation_proof_candidate_id"),
-                "model_fusion_source_container_id": _meta_or_render(meta, render, "model_fusion_source_container_id"),
                 "previous_final_render_bbox": _meta_or_render(meta, render, "previous_final_render_bbox"),
                 "new_final_render_bbox": _meta_or_render(meta, render, "new_final_render_bbox"),
                 "wrapped_lines_before": _meta_or_render(meta, render, "wrapped_lines_before"),
@@ -3060,12 +3007,6 @@ def _build_audit(context: dict[str, Any], regions: list[dict]) -> dict[str, Any]
         and region.get("source_child_cleanup_covered") is not True
     )
     set_count(context, "uncleaned_source_child_count", uncleaned_source_child_count)
-    legacy_page_specific_enabled = os.environ.get("MT_LEGACY_PAGE_SPECIFIC_ASSIST", "").strip().lower() in {"1", "true", "yes", "on"}
-    model_fusion_proof_enabled = (
-        legacy_page_specific_enabled
-        and os.environ.get("MT_MODEL_FUSION_MUTATION_PROOF", "").strip().lower() in {"1", "true", "yes", "on"}
-    )
-    model_fusion_proof_applied = any(bool(region.get("model_fusion_mutation_proof_applied")) for region in audit_regions)
     return {
         "page_id": context.get("page_id"),
         "page_class": context.get("page_class"),
@@ -3082,10 +3023,6 @@ def _build_audit(context: dict[str, Any], regions: list[dict]) -> dict[str, Any]
         "source_child_cleanup_records": source_child_cleanup_records,
         "uncleaned_source_child_count": uncleaned_source_child_count,
         "route_assist": context.get("route_assist"),
-        "model_fusion_mutation_proof_enabled": model_fusion_proof_enabled,
-        "model_fusion_mutation_proof_applied": model_fusion_proof_applied,
-        "pipeline_logical_text_block_result": context.get("pipeline_logical_text_block_result"),
-        "pipeline_logical_text_blocks": context.get("pipeline_logical_text_blocks") or [],
         "text_block_hierarchy": hierarchy,
         "text_block_hierarchy_version": hierarchy.get("text_block_hierarchy_version"),
         "text_block_hierarchy_generated": bool(hierarchy.get("text_block_hierarchy_generated")),

@@ -17,7 +17,11 @@ from functools import lru_cache
 
 from app.config.defaults import CLEANUP_INPAINT_MODEL_FILE, IOPAINT_ANIME_MANGA_BIG_LAMA
 from app.inpaint.torchscript_lama_runner import TorchScriptLamaRunner, resolve_lama_device_name
-from app.pipeline.debug_runtime import diagnostic_enabled, write_diagnostic_checkpoint
+from app.pipeline.debug_runtime import (
+    diagnostic_enabled,
+    pipeline_diagnostic_checkpoint,
+    write_diagnostic_checkpoint,
+)
 
 try:
     from PIL import Image
@@ -36,10 +40,6 @@ FIXED_CLEANUP_INPAINT_MODEL_RELATIVE_PATH = (
 FIXED_CLEANUP_INPAINT_SELECTION_POLICY = "fixed_cleanup_iopaint_model"
 _WARMED_LAMA_MODEL_KEYS: set[tuple[str, str]] = set()
 _WARMUP_LOCK = threading.Lock()
-
-
-def _page014_timeout_diag_enabled() -> bool:
-    return diagnostic_enabled("MT_PAGE014_TIMEOUT_DIAGNOSTIC")
 
 
 def _cleanup_perf_contract_diag_enabled() -> bool:
@@ -74,21 +74,14 @@ def _cleanup_perf_contract_checkpoint(stage: str, event: str, **fields) -> None:
         return
 
 
-def _page014_timeout_checkpoint(stage: str, event: str, **fields) -> None:
+def _pipeline_runtime_checkpoint(stage: str, event: str, **fields) -> None:
     _cleanup_perf_contract_checkpoint(stage, event, **fields)
-    if not _page014_timeout_diag_enabled():
-        return
-    try:
-        write_diagnostic_checkpoint(
-            "page014_timeout_checkpoints.jsonl",
-            module="app.inpaint.simple_lama_engine",
-            stage=stage,
-            event=event,
-            fields=fields,
-            include_monotonic=False,
-        )
-    except Exception:
-        return
+    pipeline_diagnostic_checkpoint(
+        module="app.inpaint.simple_lama_engine",
+        stage=stage,
+        event=event,
+        fields=fields,
+    )
 
 
 def clear_model_cache() -> None:
@@ -137,10 +130,10 @@ def _load_lama_model(device: str, model_path: str = ""):
         raise RuntimeError(f"fixed cleanup inpaint model missing: {model_path}")
 
     print(f"[Cleanup Inpaint] Loading TorchScript LaMA model on {effective_device}: {model_path}")
-    _page014_timeout_checkpoint("cleanup_inpaint_model", "load_start", device=effective_device, model_path=model_path)
+    _pipeline_runtime_checkpoint("cleanup_inpaint_model", "load_start", device=effective_device, model_path=model_path)
     runner = TorchScriptLamaRunner(model_path=model_path, device=effective_device)
     print("[Cleanup Inpaint] TorchScript LaMA model loaded successfully")
-    _page014_timeout_checkpoint("cleanup_inpaint_model", "load_end", device=effective_device, model_path=model_path)
+    _pipeline_runtime_checkpoint("cleanup_inpaint_model", "load_end", device=effective_device, model_path=model_path)
     return runner
 
 
@@ -191,7 +184,7 @@ def warm_cleanup_inpaint_model(
         lama = _load_lama_model(device, actual_model_path)
     except Exception as exc:
         elapsed_ms = round((time.time() - started) * 1000.0, 3)
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_inpaint_model_warmup",
             "error",
             device=device,
@@ -223,7 +216,7 @@ def warm_cleanup_inpaint_model(
                 pass
     except Exception as exc:
         elapsed_ms = round((time.time() - started) * 1000.0, 3)
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_inpaint_model_warmup",
             "error",
             device=device,
@@ -242,7 +235,7 @@ def warm_cleanup_inpaint_model(
     elapsed_ms = round((time.time() - started) * 1000.0, 3)
     with _WARMUP_LOCK:
         _WARMED_LAMA_MODEL_KEYS.add(key)
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_inpaint_model_warmup",
         "end",
         device=device,
@@ -339,7 +332,7 @@ def ai_inpaint_cleanup_crop(
     load_elapsed_ms = round((time.time() - load_started) * 1000.0, 3)
 
     print(f"[Cleanup Inpaint] Processing local crop: {crop_w}x{crop_h}")
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint_crop_local",
         "start",
         device=device,
@@ -373,7 +366,7 @@ def ai_inpaint_cleanup_crop(
     out_crop.paste(inner_out, (cx0, cy0))
     elapsed_ms = round((time.time() - started) * 1000.0, 3)
     print("[Cleanup Inpaint] Local crop success")
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint_crop_local",
         "end",
         backend="simple_lama",
@@ -444,7 +437,7 @@ def ai_inpaint_cleanup(
 
     started = time.time()
     perf_started = time.perf_counter() if perf_timings is not None else 0.0
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint",
         "start",
         use_gpu=use_gpu,
@@ -497,7 +490,7 @@ def ai_inpaint_cleanup(
     mask_image = Image.fromarray(dilated_mask).convert("L")
     bbox = mask_image.getbbox()
     if not bbox:
-        _page014_timeout_checkpoint(
+        _pipeline_runtime_checkpoint(
             "cleanup_ai_inpaint",
             "end",
             backend="none",
@@ -528,7 +521,7 @@ def ai_inpaint_cleanup(
         perf_timings["crop_height"] = crop_h
 
     print(f"[Cleanup Inpaint] Processing region: {crop_w}x{crop_h}")
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint",
         "crop",
         device=device,
@@ -562,7 +555,7 @@ def ai_inpaint_cleanup(
         perf_timings["engine_total_ms"] = _perf_elapsed_ms(perf_started)
 
     print("[Cleanup Inpaint] Success")
-    _page014_timeout_checkpoint(
+    _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint",
         "end",
         backend="simple_lama",
