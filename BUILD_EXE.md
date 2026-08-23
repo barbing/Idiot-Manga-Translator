@@ -48,6 +48,12 @@ pyinstaller manga_translator.spec
 *   The built application will be in `dist/YomiFrame`.
 *   Run `YomiFrame.exe` inside that folder.
 
+Both PyInstaller specifications embed `app/assets/branding/yomiframe.ico` in
+the executable and collect the same canonical icon plus the reviewed 1024 px
+raster master for Qt runtime use. Keep the executable resource and runtime
+brand assets together; replacing only one of them causes Windows shell and
+in-app branding to diverge.
+
 The onedir specification fails closed at build time when the pinned PyICU
 package, its wheel-adjacent `_icu_*.pyd`, exact `icudt78.dll`, `icuin78.dll`,
 `icuuc78.dll`, or the required license notices are absent. It collects that

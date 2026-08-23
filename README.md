@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/assets/branding/yomiframe-1024.png" alt="YomiFrame application icon" width="128">
+</p>
+
 # YomiFrame
 
 YomiFrame is a Windows desktop application for local manga and comic translation. It combines page analysis, OCR, glossary memory, local LLM translation, source-text cleanup, and final text rendering into one local-first workflow.

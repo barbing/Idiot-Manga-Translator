@@ -39,6 +39,7 @@ from app.pipeline.status_contracts import (
 )
 from app.ui.design_system.components import HybridComboBox
 from app.ui.design_system.dialogs import HybridConfirmDialog, HybridDialog
+from app.ui.design_system.geometry import MODULE_POLICY_GEOMETRY
 from app.ui.design_system.icons import hybrid_icon
 from app.ui.presentation import provider_lifecycle_summary
 from app.ui.viewmodels.settings_model import (
@@ -107,6 +108,8 @@ class SettingsView(QtWidgets.QWidget):
         self._profile_refreshing = False
         self._runtime_checking = False
         self._runtime_downloading_asset_id = ""
+        self._module_policy_reflow = False
+        self._module_policy_compact_identity = False
         self._effective_run_summary: EffectiveRunSummary | None = None
         self._pipeline_lifecycle: PipelineLifecycleEvent | None = None
         self._pipeline_stage: PipelineStageEvent | None = None
@@ -1245,6 +1248,9 @@ class SettingsView(QtWidgets.QWidget):
             horizontal_margin,
             24,
         )
+        self._module_policy_reflow = reflow
+        self._module_policy_compact_identity = mode.width_tier == "narrow"
+        self._sync_module_policy_geometry()
 
     def bind_glossary_model(
         self,
@@ -1278,11 +1284,19 @@ class SettingsView(QtWidgets.QWidget):
         self.modules_scroll = QtWidgets.QScrollArea()
         self.modules_scroll.setWidgetResizable(True)
         self.modules_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.modules_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.modules_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         self.modules_content = QtWidgets.QWidget()
         self.modules_layout = QtWidgets.QVBoxLayout(self.modules_content)
         self.modules_layout.setContentsMargins(0, 0, 8, 0)
         self.modules_layout.setSpacing(10)
         self._module_policy_rows: list[QtWidgets.QFrame] = []
+        self._module_policy_layouts: dict[str, QtWidgets.QGridLayout] = {}
+        self._module_policy_indices: dict[str, QtWidgets.QLabel] = {}
         self._module_policy_forms: dict[str, QtWidgets.QFormLayout] = {}
         self._module_policy_identity_hosts: dict[str, QtWidgets.QWidget] = {}
         self._module_policy_descriptions: dict[str, QtWidgets.QLabel] = {}
@@ -1308,17 +1322,20 @@ class SettingsView(QtWidgets.QWidget):
             row.setProperty("moduleStage", stage_id)
             row.setProperty("role", "panel-raised")
             row.setProperty("searchText", f"{stage_id} {title} {detail}".casefold())
-            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout = QtWidgets.QGridLayout(row)
             row_layout.setContentsMargins(12, 10, 12, 10)
-            row_layout.setSpacing(12)
+            row_layout.setHorizontalSpacing(MODULE_POLICY_GEOMETRY.row_gap)
+            row_layout.setVerticalSpacing(MODULE_POLICY_GEOMETRY.row_gap)
             number = QtWidgets.QLabel(str(index))
             number.setObjectName("modulePolicyIndex")
-            number.setFixedSize(24, 24)
+            number.setFixedSize(
+                MODULE_POLICY_GEOMETRY.index_width,
+                MODULE_POLICY_GEOMETRY.index_width,
+            )
             number.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             identity = QtWidgets.QWidget()
             identity.setObjectName("modulePolicyIdentity")
-            identity.setMinimumWidth(170)
-            identity.setMaximumWidth(280)
+            identity.setFixedWidth(MODULE_POLICY_GEOMETRY.expanded_identity_width)
             identity.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Preferred,
                 QtWidgets.QSizePolicy.Policy.Maximum,
@@ -1328,6 +1345,7 @@ class SettingsView(QtWidgets.QWidget):
             copy.setSpacing(3)
             name = QtWidgets.QLabel(title)
             name.setProperty("role", "section")
+            name.setWordWrap(True)
             description = QtWidgets.QLabel(detail)
             description.setProperty("role", "secondary")
             description.setWordWrap(True)
@@ -1335,6 +1353,17 @@ class SettingsView(QtWidgets.QWidget):
             copy.addWidget(description)
             form = QtWidgets.QFormLayout()
             form.setContentsMargins(0, 0, 0, 0)
+            form.setHorizontalSpacing(
+                MODULE_POLICY_GEOMETRY.form_horizontal_spacing
+            )
+            form.setVerticalSpacing(MODULE_POLICY_GEOMETRY.form_vertical_spacing)
+            form.setLabelAlignment(
+                QtCore.Qt.AlignmentFlag.AlignLeft
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            form.setRowWrapPolicy(
+                QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows
+            )
             form.setFieldGrowthPolicy(
                 QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
             )
@@ -1342,24 +1371,31 @@ class SettingsView(QtWidgets.QWidget):
             state.setObjectName("modulePolicyState")
             state.setProperty("role", "status-pill")
             state.setProperty("tone", "ready")
+            state.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             row_layout.addWidget(
                 number,
+                0,
                 0,
                 QtCore.Qt.AlignmentFlag.AlignTop,
             )
             row_layout.addWidget(
                 identity,
                 0,
+                1,
                 QtCore.Qt.AlignmentFlag.AlignTop,
             )
-            row_layout.addLayout(form, 1)
+            row_layout.addLayout(form, 0, 2)
             row_layout.addWidget(
                 state,
                 0,
+                3,
                 QtCore.Qt.AlignmentFlag.AlignTop,
             )
+            row_layout.setColumnStretch(2, 1)
             self.modules_layout.addWidget(row)
             self._module_policy_rows.append(row)
+            self._module_policy_layouts[stage_id] = row_layout
+            self._module_policy_indices[stage_id] = number
             self._module_policy_forms[stage_id] = form
             self._module_policy_identity_hosts[stage_id] = identity
             self._module_policy_descriptions[stage_id] = description
@@ -1888,6 +1924,7 @@ class SettingsView(QtWidgets.QWidget):
             status.setAccessibleName(f"{stage_id} module {state.casefold()}")
             status.style().unpolish(status)
             status.style().polish(status)
+        self._sync_module_policy_geometry()
 
     def apply_changes(self) -> None:
         if self._view_model is None:
@@ -2749,6 +2786,121 @@ class SettingsView(QtWidgets.QWidget):
         if profile is not None:
             self.credential_link_requested.emit(profile.profile_id)
 
+    def _sync_module_policy_geometry(self) -> None:
+        """Apply one shared native column contract to every module card."""
+
+        if not hasattr(self, "_module_policy_forms"):
+            return
+        geometry = MODULE_POLICY_GEOMETRY
+        identity_width = geometry.identity_width(
+            compact=self._module_policy_compact_identity
+        )
+        for identity in self._module_policy_identity_hosts.values():
+            identity.setFixedWidth(identity_width)
+
+        for stage_id, layout in self._module_policy_layouts.items():
+            number = self._module_policy_indices[stage_id]
+            identity = self._module_policy_identity_hosts[stage_id]
+            form = self._module_policy_forms[stage_id]
+            state = self._module_policy_states[stage_id]
+            layout.removeWidget(number)
+            layout.removeWidget(identity)
+            layout.removeItem(form)
+            layout.removeWidget(state)
+            for column in range(4):
+                layout.setColumnStretch(column, 0)
+            if self._module_policy_reflow:
+                # Keep stage identity and state in one readable header, then
+                # give the controls the full remaining card width. This is a
+                # real reflow, not a clipped horizontal desktop row.
+                layout.addWidget(
+                    number,
+                    0,
+                    0,
+                    2,
+                    1,
+                    QtCore.Qt.AlignmentFlag.AlignTop,
+                )
+                layout.addWidget(
+                    identity,
+                    0,
+                    1,
+                    QtCore.Qt.AlignmentFlag.AlignTop,
+                )
+                layout.addWidget(
+                    state,
+                    0,
+                    2,
+                    QtCore.Qt.AlignmentFlag.AlignTop
+                    | QtCore.Qt.AlignmentFlag.AlignRight,
+                )
+                layout.addLayout(form, 1, 1, 1, 2)
+                layout.setColumnStretch(1, 1)
+            else:
+                layout.addWidget(
+                    number,
+                    0,
+                    0,
+                    QtCore.Qt.AlignmentFlag.AlignTop,
+                )
+                layout.addWidget(
+                    identity,
+                    0,
+                    1,
+                    QtCore.Qt.AlignmentFlag.AlignTop,
+                )
+                layout.addLayout(form, 0, 2)
+                layout.addWidget(
+                    state,
+                    0,
+                    3,
+                    QtCore.Qt.AlignmentFlag.AlignTop,
+                )
+                layout.setColumnStretch(2, 1)
+
+        labels: list[QtWidgets.QWidget] = []
+        for form in self._module_policy_forms.values():
+            form.setHorizontalSpacing(geometry.form_horizontal_spacing)
+            form.setVerticalSpacing(geometry.form_vertical_spacing)
+            form.setRowWrapPolicy(
+                QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows
+                if self._module_policy_reflow
+                else QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows
+            )
+            for row in range(form.rowCount()):
+                item = form.itemAt(
+                    row,
+                    QtWidgets.QFormLayout.ItemRole.LabelRole,
+                )
+                if item is None or item.widget() is None:
+                    continue
+                label = item.widget()
+                label.setMinimumWidth(0)
+                label.setMaximumWidth(16_777_215)
+                labels.append(label)
+
+        if labels and not self._module_policy_reflow:
+            label_width = max(
+                geometry.minimum_label_width,
+                *(label.sizeHint().width() for label in labels),
+            )
+            for label in labels:
+                label.setFixedWidth(label_width)
+
+        states = tuple(self._module_policy_states.values())
+        for state in states:
+            state.setMinimumWidth(0)
+            state.setMaximumWidth(16_777_215)
+        if states:
+            status_width = max(
+                geometry.minimum_status_width,
+                *(state.sizeHint().width() for state in states),
+            )
+            for state in states:
+                state.setFixedWidth(status_width)
+        self.modules_layout.invalidate()
+        self.modules_content.updateGeometry()
+
     def _render_module_controls(self) -> None:
         for form in self._module_policy_forms.values():
             while form.rowCount():
@@ -2882,6 +3034,7 @@ class SettingsView(QtWidgets.QWidget):
             self._module_controls["rendering.pipeline"] = rendering
             self._filter_visible_controls(self.search.text())
             self._refresh_module_stage_presentations()
+            self._sync_module_policy_geometry()
             return
         visible = self._registry.visible_settings(advanced=self._advanced)
         stage_for_module = {
@@ -2946,6 +3099,7 @@ class SettingsView(QtWidgets.QWidget):
                 self._module_controls[definition.qualified_id] = control
         self._filter_visible_controls(self.search.text())
         self._refresh_module_stage_presentations()
+        self._sync_module_policy_geometry()
 
     def _validate_module_policies(self) -> None:
         if self._view_model is None:

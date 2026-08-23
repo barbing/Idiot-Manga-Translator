@@ -80,7 +80,8 @@ from app.pipeline.hierarchy_revision_contracts import (
     RevisionStage,
     RevisionStageState,
 )
-from app.ui.design_system.icons import hybrid_icon
+from app.ui.design_system.geometry import PRODUCT_NAVIGATION_GEOMETRY
+from app.ui.design_system.icons import brand_icon, hybrid_icon
 from app.ui.design_system.theme import ThemeOptions, apply_application_theme
 from app.ui.presentation import workspace_next_action
 from app.ui.project_hub.new_project_dialog import named_project_display_name
@@ -816,6 +817,56 @@ def _windows_resize_hit_test(
     return 0
 
 
+class _ProductNavigationButton(QtWidgets.QPushButton):
+    """Centered native button with the shell's responsive icon-only contract."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        self._navigation_text = ""
+        self._tool_button_style = (
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        super().__init__(parent)
+        self.setAutoDefault(False)
+        self.setDefault(False)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._navigation_text = str(text)
+        self._apply_navigation_text()
+
+    def text(self) -> str:
+        return self._navigation_text
+
+    def setToolButtonStyle(  # noqa: N802
+        self,
+        style: QtCore.Qt.ToolButtonStyle,
+    ) -> None:
+        if style not in {
+            QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly,
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon,
+        }:
+            raise ValueError(f"Unsupported product-navigation style: {style!r}")
+        self._tool_button_style = style
+        self._apply_navigation_text()
+
+    def toolButtonStyle(self) -> QtCore.Qt.ToolButtonStyle:  # noqa: N802
+        return self._tool_button_style
+
+    def _apply_navigation_text(self) -> None:
+        icon_only = (
+            self._tool_button_style
+            == QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly
+        )
+        presentation = "icon-only" if icon_only else "labeled"
+        if self.property("navigationPresentation") != presentation:
+            self.setProperty("navigationPresentation", presentation)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        visible_text = "" if icon_only else self._navigation_text
+        QtWidgets.QPushButton.setText(self, visible_text)
+        self.updateGeometry()
+        self.update()
+
+
 class YomiFrameMainWindow(QtWidgets.QMainWindow):
     """Four-route native shell matching the accepted Hybrid Pro prototype."""
 
@@ -850,6 +901,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         )
         self.setObjectName("yomiframeMainWindow")
         self.setWindowTitle("YomiFrame Manga Translator")
+        self.setWindowIcon(brand_icon())
         self.setMinimumSize(960, 640)
         self.resize(1440, 900)
 
@@ -1227,6 +1279,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         return tuple(result)
 
     def _build_shell(self) -> None:
+        navigation_geometry = PRODUCT_NAVIGATION_GEOMETRY
         shell = QtWidgets.QWidget()
         shell.setProperty("role", "shell")
         layout = QtWidgets.QVBoxLayout(shell)
@@ -1236,7 +1289,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         header = QtWidgets.QFrame()
         header.setObjectName("applicationHeader")
         header.setProperty("role", "header")
-        header.setFixedHeight(54)
+        header.setFixedHeight(navigation_geometry.header_height)
         header_layout = QtWidgets.QGridLayout(header)
         header_layout.setContentsMargins(14, 0, 14, 0)
         header_layout.setHorizontalSpacing(0)
@@ -1273,28 +1326,39 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
 
         navigation = QtWidgets.QFrame()
         navigation.setObjectName("productNavigation")
-        navigation.setFixedWidth(480)
+        navigation.setFixedWidth(navigation_geometry.outer_width(compact=False))
+        navigation.setFixedHeight(navigation_geometry.header_height)
         navigation_layout = QtWidgets.QHBoxLayout(navigation)
         navigation_layout.setContentsMargins(0, 0, 0, 0)
-        navigation_layout.setSpacing(8)
+        navigation_layout.setSpacing(navigation_geometry.route_gap)
         self._navigation = QtWidgets.QButtonGroup(self)
         self._navigation.setExclusive(True)
-        self._navigation_buttons: dict[str, QtWidgets.QToolButton] = {}
+        self._navigation_buttons: dict[str, _ProductNavigationButton] = {}
         labels = {
             "hub": "Project Hub",
             "workspace": "Workspace",
             "editor": "Editor",
             "settings": "Settings",
         }
+        self._navigation_labels = labels
         for index, navigation_id in enumerate(NAVIGATION_IDS):
-            button = QtWidgets.QToolButton()
+            button = _ProductNavigationButton()
             button.setObjectName(f"navigation_{navigation_id}")
             button.setProperty("role", "navigation")
             button.setText(labels[navigation_id])
             button.setToolButtonStyle(
                 QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
             )
-            button.setIconSize(QtCore.QSize(17, 17))
+            button.setIconSize(
+                QtCore.QSize(
+                    navigation_geometry.icon_size,
+                    navigation_geometry.icon_size,
+                )
+            )
+            button.setFixedSize(
+                navigation_geometry.nominal_route_width,
+                navigation_geometry.header_height,
+            )
             button.setCheckable(True)
             button.setAccessibleName(
                 "Page Editor" if navigation_id == "editor" else labels[navigation_id]
@@ -1304,11 +1368,11 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             self._navigation.addButton(button, index)
             self._navigation_buttons[navigation_id] = button
-            navigation_layout.addWidget(button, 1)
+            navigation_layout.addWidget(button)
         header_layout.addWidget(
             navigation,
             0,
-            0,
+            1,
             QtCore.Qt.AlignmentFlag.AlignHCenter
             | QtCore.Qt.AlignmentFlag.AlignVCenter,
         )
@@ -1359,10 +1423,22 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         header_layout.addWidget(
             actions,
             0,
-            0,
+            2,
             QtCore.Qt.AlignmentFlag.AlignRight
             | QtCore.Qt.AlignmentFlag.AlignVCenter,
         )
+        header_layout.setColumnMinimumWidth(
+            0, navigation_geometry.side_column_minimum
+        )
+        header_layout.setColumnMinimumWidth(
+            2, navigation_geometry.side_column_minimum
+        )
+        header_layout.setColumnStretch(0, 1)
+        header_layout.setColumnStretch(1, 0)
+        header_layout.setColumnStretch(2, 1)
+        self._header_identity = identity
+        self._product_navigation = navigation
+        self._header_actions = actions
         self._window_drag_surfaces = {
             header,
             identity,
@@ -1427,7 +1503,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
 
     def _refresh_header_icons(self, theme: str) -> None:
         self._brand_mark.setPixmap(
-            hybrid_icon("brand", theme, active=True).pixmap(QtCore.QSize(18, 18))
+            brand_icon().pixmap(QtCore.QSize(24, 24))
         )
         for navigation_id, button in self._navigation_buttons.items():
             button.setIcon(
@@ -24297,15 +24373,47 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         )
         self.workspace.set_layout_mode(mode)
         self.settings.set_layout_mode(mode)
-        icon_only = bool(mode.accessible_reflow or mode.width_tier == "narrow")
-        for button in self._navigation_buttons.values():
+        navigation_geometry = PRODUCT_NAVIGATION_GEOMETRY
+        enlarged_navigation = bool(
+            mode.scrollable_toolbar and not mode.accessible_reflow
+        )
+        icon_only = bool(
+            mode.accessible_reflow
+            or mode.width
+            < navigation_geometry.minimum_shell_width(
+                enlarged=enlarged_navigation
+            )
+        )
+        route_width = navigation_geometry.route_width(
+            compact=icon_only,
+            enlarged=enlarged_navigation,
+        )
+        self._product_navigation.setFixedWidth(
+            navigation_geometry.outer_width(
+                compact=icon_only,
+                enlarged=enlarged_navigation,
+            )
+        )
+        for navigation_id, button in self._navigation_buttons.items():
+            label = self._navigation_labels[navigation_id]
+            button.setText(
+                "Hub"
+                if (
+                    navigation_id == "hub"
+                    and mode.scrollable_toolbar
+                    and not icon_only
+                )
+                else label
+            )
+            button.setToolTip(label)
+            button.setFixedSize(route_width, navigation_geometry.header_height)
             button.setToolButtonStyle(
                 QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly
                 if icon_only
                 else QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
             )
         self._brand.setVisible(not mode.maximum_reflow)
-        self._route_context.setVisible(not mode.accessible_reflow)
+        self._route_context.setVisible(not icon_only)
         self._header_notice.setVisible(False)
         self._run_pill.setVisible(False)
 

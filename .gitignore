@@ -31,6 +31,9 @@ logs/
 # Local test data (not for repo)
 Test Manga/
 
+# Local design files
+design/
+
 # Models (kept local; not tracked)
 models/
 dist/

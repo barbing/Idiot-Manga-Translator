@@ -1,9 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas = []
 binaries = []
 hiddenimports = []
+
+brand_asset_dir = Path(SPECPATH).resolve() / 'app' / 'assets' / 'branding'
+brand_asset_names = ('yomiframe.ico', 'yomiframe-1024.png')
+missing_brand_assets = [
+    name for name in brand_asset_names if not (brand_asset_dir / name).is_file()
+]
+if missing_brand_assets:
+    raise RuntimeError(
+        'Missing required YomiFrame brand assets: '
+        + ', '.join(missing_brand_assets)
+    )
+for asset_name in brand_asset_names:
+    datas.append((str(brand_asset_dir / asset_name), 'app/assets/branding'))
+
+brand_icon_path = brand_asset_dir / 'yomiframe.ico'
 
 # Collect packages that might be missed
 packages = [
@@ -65,6 +82,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
+    icon=str(brand_icon_path),
     codesign_identity=None,
     entitlements_file=None,
 )

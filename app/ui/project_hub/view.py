@@ -69,17 +69,15 @@ class _ProjectFilterProxy(QtCore.QSortFilterProxyModel):
         query = str(value or "").strip().casefold()
         if query == self._query:
             return
-        self.beginFilterChange()
         self._query = query
-        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
+        self.invalidateRowsFilter()
 
     def set_attention_only(self, value: bool) -> None:
         active = bool(value)
         if active == self._attention_only:
             return
-        self.beginFilterChange()
         self._attention_only = active
-        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
+        self.invalidateRowsFilter()
 
     def set_excluded_path(self, value: str) -> None:
         """Hide the featured project from the secondary recent-project grid."""
@@ -87,9 +85,8 @@ class _ProjectFilterProxy(QtCore.QSortFilterProxyModel):
         path = str(value or "").strip().casefold()
         if path == self._excluded_path:
             return
-        self.beginFilterChange()
         self._excluded_path = path
-        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
+        self.invalidateRowsFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QtCore.QModelIndex) -> bool:
         model = self.sourceModel()

@@ -5,6 +5,27 @@ import sys
 from pathlib import Path
 
 
+APP_USER_MODEL_ID = "YomiFrame.MangaTranslator"
+
+
+def _configure_windows_app_identity() -> None:
+    """Give Windows one stable identity for taskbar and shortcut grouping."""
+
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        setter = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        setter.argtypes = [ctypes.c_wchar_p]
+        setter.restype = ctypes.c_long
+        setter(APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        # Source launches on stripped-down Windows environments still retain
+        # the Qt application icon even if shell identity registration fails.
+        pass
+
+
 def _configure_dll_paths() -> None:
     if not hasattr(os, "add_dll_directory"):
         return
@@ -73,11 +94,17 @@ def main() -> int:
             mp.freeze_support()
         except Exception:
             pass
+    _configure_windows_app_identity()
     _configure_dll_paths()
     _configure_paddle_env()
     from PySide6 import QtWidgets, QtGui
     from app.ui.application_coordinator import create_gui_application_window
+    from app.ui.design_system.icons import brand_icon
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("YomiFrame")
+    app.setApplicationDisplayName("YomiFrame Manga Translator")
+    app.setOrganizationName("YomiFrame")
+    app.setWindowIcon(brand_icon())
     
     # Set global default font to prevent "Point size <= 0" errors
     font = QtGui.QFont("Microsoft YaHei", 10)

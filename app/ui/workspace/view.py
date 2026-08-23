@@ -28,17 +28,15 @@ class _PageFilterProxy(QtCore.QSortFilterProxyModel):
         query = str(value or "").strip().casefold()
         if query == self._query:
             return
-        self.beginFilterChange()
         self._query = query
-        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
+        self.invalidateRowsFilter()
 
     def set_state(self, value: str) -> None:
         state = str(value or "all").strip().casefold()
         if state == self._state:
             return
-        self.beginFilterChange()
         self._state = state
-        self.endFilterChange(QtCore.QSortFilterProxyModel.Direction.Rows)
+        self.invalidateRowsFilter()
 
     def filterAcceptsRow(
         self,

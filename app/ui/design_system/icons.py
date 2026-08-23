@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Hybrid Pro icon adapter backed by the installed QtAwesome asset library."""
+"""Hybrid Pro action icons and the canonical YomiFrame application mark."""
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from PySide6 import QtGui
 import qtawesome as qta
@@ -11,7 +12,6 @@ from .tokens import theme_token
 
 
 _ICON_NAMES = {
-    "brand": "fa5s.copy",
     "hub": "fa5s.home",
     "workspace": "fa5s.briefcase",
     "editor": "fa5s.pen",
@@ -76,6 +76,27 @@ _ICON_NAMES = {
     "eye": "fa5s.eye",
 }
 
+_BRAND_ASSET_DIR = Path(__file__).resolve().parents[2] / "assets" / "branding"
+_BRAND_ICON_PATH = _BRAND_ASSET_DIR / "yomiframe.ico"
+
+
+def brand_icon_path() -> Path:
+    """Return the source and frozen-runtime path to the canonical Windows icon."""
+
+    return _BRAND_ICON_PATH
+
+
+@lru_cache(maxsize=1)
+def brand_icon() -> QtGui.QIcon:
+    """Load the reviewed multi-size YomiFrame icon without recoloring it."""
+
+    icon = QtGui.QIcon(str(brand_icon_path()))
+    if icon.isNull():
+        raise RuntimeError(
+            f"Missing or unreadable YomiFrame application icon: {brand_icon_path()}"
+        )
+    return icon
+
 
 @lru_cache(maxsize=64)
 def hybrid_icon(
@@ -88,6 +109,8 @@ def hybrid_icon(
 ) -> QtGui.QIcon:
     """Return one real library icon tinted from the Hybrid Pro palette."""
 
+    if str(name) == "brand":
+        return brand_icon()
     icon_name = _ICON_NAMES.get(str(name))
     if icon_name is None:
         raise ValueError(f"Unknown Hybrid Pro icon: {name!r}")
@@ -115,4 +138,4 @@ def hybrid_icon(
     return qta.icon(icon_name, color=color, color_disabled=disabled)
 
 
-__all__ = ["hybrid_icon"]
+__all__ = ["brand_icon", "brand_icon_path", "hybrid_icon"]

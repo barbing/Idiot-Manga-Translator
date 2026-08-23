@@ -9,6 +9,7 @@ from typing import Any
 
 from app.ui.ui_contract import DENSITY_IDS
 
+from .geometry import PRODUCT_NAVIGATION_GEOMETRY
 from .tokens import metric_pixels, metric_token, resolve_theme, theme_token
 
 
@@ -121,6 +122,7 @@ def build_application_stylesheet(options: ThemeOptions) -> str:
     type_label = _scaled_type_metric("type-label", options.font_scale)
     type_body = _scaled_type_metric("type-body", options.font_scale)
     type_title = _scaled_type_metric("type-title", options.font_scale)
+    navigation_height = PRODUCT_NAVIGATION_GEOMETRY.header_height
     c = lambda role: theme_token(theme, role)
     workspace_run_background = (
         "#17253a" if theme == "dark" else c("accent-primary-surface")
@@ -242,15 +244,16 @@ QPushButton#projectActionCard {{ min-height: 84px; border-radius: {radius_lg}px;
 #workspaceRunTitle {{ color: {c('content-primary')}; font-size: {type_title}; font-weight: 700; }}
 #workspaceStageNote {{ background: {c('accent-primary-surface')}; border: 1px solid {c('accent-primary-border')}; border-radius: {radius_sm}px; }}
 QToolTip {{ background: {c('surface-panel-raised')}; color: {c('content-primary')}; border: 1px solid {c('border-strong')}; padding: {space_2}px; }}
-#applicationHeader {{ min-height: 54px; max-height: 54px; background: {c('surface-header')}; }}
+#applicationHeader {{ min-height: {navigation_height}px; max-height: {navigation_height}px; background: {c('surface-header')}; }}
 #applicationIdentity {{ background: transparent; }}
-#applicationMark {{ background: {c('accent-primary')}; border: 0; border-radius: 4px; }}
+#applicationMark {{ background: transparent; border: 0; border-radius: 0; }}
 #applicationBrand {{ color: {c('content-primary')}; font-size: 19px; font-weight: 720; }}
 #applicationRouteContext {{ color: {c('content-muted')}; font-size: {type_label}; padding-left: 14px; border-left: 1px solid {c('border-subtle')}; }}
-#productNavigation {{ min-height: 54px; max-height: 54px; background: transparent; border: 0; border-radius: 0; }}
-#productNavigation QToolButton {{ min-width: 110px; min-height: 54px; max-height: 54px; padding: 0 8px; border: 0; border-radius: 0; background: transparent; color: {c('content-secondary')}; font-size: {type_label}; font-weight: 650; }}
-#productNavigation QToolButton:hover {{ color: {c('content-primary')}; background: {c('surface-panel')}; }}
-#productNavigation QToolButton:checked {{ color: {c('content-primary')}; background: transparent; border-bottom: 3px solid {c('accent-primary')}; }}
+#productNavigation {{ min-height: {navigation_height}px; max-height: {navigation_height}px; background: transparent; border: 0; border-radius: 0; }}
+#productNavigation QPushButton {{ min-height: {navigation_height}px; max-height: {navigation_height}px; padding: 0; border: 0; border-radius: 0; background: transparent; color: {c('content-secondary')}; font-size: {type_label}; font-weight: 650; }}
+#productNavigation QPushButton[navigationPresentation="labeled"] {{ padding-left: 2px; }}
+#productNavigation QPushButton:hover {{ color: {c('content-primary')}; background: {c('surface-panel')}; }}
+#productNavigation QPushButton:checked {{ color: {c('content-primary')}; background: transparent; border-bottom: 3px solid {c('accent-primary')}; }}
 #headerActions {{ background: transparent; }}
 #headerActions > QToolButton {{ min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0; border: 1px solid {c('border-default')}; border-radius: 5px; background: {c('surface-panel')}; }}
 #headerActions > QToolButton:hover {{ background: {c('surface-hover')}; border-color: {c('border-strong')}; }}
