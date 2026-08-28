@@ -16,7 +16,11 @@ import time
 from functools import lru_cache
 
 from app.config.defaults import CLEANUP_INPAINT_MODEL_FILE, IOPAINT_ANIME_MANGA_BIG_LAMA
-from app.inpaint.torchscript_lama_runner import TorchScriptLamaRunner, resolve_lama_device_name
+from app.inpaint.torchscript_lama_runner import (
+    TorchScriptLamaRunner,
+    cleanup_fallback,
+    resolve_lama_device_name,
+)
 from app.pipeline.debug_runtime import (
     diagnostic_enabled,
     pipeline_diagnostic_checkpoint,
@@ -40,6 +44,7 @@ FIXED_CLEANUP_INPAINT_MODEL_RELATIVE_PATH = (
 FIXED_CLEANUP_INPAINT_SELECTION_POLICY = "fixed_cleanup_iopaint_model"
 _WARMED_LAMA_MODEL_KEYS: set[tuple[str, str]] = set()
 _WARMUP_LOCK = threading.Lock()
+_CLEANUP_DEVICE_FALLBACK = None
 
 
 def _cleanup_perf_contract_diag_enabled() -> bool:
@@ -87,9 +92,32 @@ def _pipeline_runtime_checkpoint(stage: str, event: str, **fields) -> None:
 def clear_model_cache() -> None:
     """Clear the cleanup inpainting model cache."""
 
+    global _CLEANUP_DEVICE_FALLBACK
     _load_lama_model.cache_clear()
     with _WARMUP_LOCK:
         _WARMED_LAMA_MODEL_KEYS.clear()
+        _CLEANUP_DEVICE_FALLBACK = None
+
+
+def _effective_cleanup_device(use_gpu: bool) -> tuple[str, str, str]:
+    requested = resolve_lama_device_name(use_gpu=use_gpu)
+    with _WARMUP_LOCK:
+        fallback = _CLEANUP_DEVICE_FALLBACK
+    if requested == "mps" and fallback is not None:
+        return fallback.device, requested, fallback.fallback_reason
+    return requested, requested, ""
+
+
+def _synchronize_device(device: str) -> None:
+    try:
+        import torch
+
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif device == "mps" and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+    except Exception:
+        return
 
 
 def _repo_root() -> str:
@@ -150,8 +178,8 @@ def warm_cleanup_inpaint_model(
     """Load and warm the cleanup-owned LaMa model once per process.
 
     The warmup is deliberately model-local. It does not alter cleanup masks,
-    proof, commit policy, or backend selection; it only pays the first CUDA/JIT
-    setup cost on a tiny synthetic crop instead of a real parent cleanup crop.
+    proof, or commit policy. It validates the selected accelerator on a tiny
+    synthetic crop and records one durable MPS-to-CPU fallback when required.
     """
 
     started = time.time()
@@ -167,7 +195,8 @@ def warm_cleanup_inpaint_model(
             "elapsed_ms": 0.0,
         }
 
-    device = resolve_lama_device_name(use_gpu=use_gpu)
+    global _CLEANUP_DEVICE_FALLBACK
+    device, requested_device, fallback_reason = _effective_cleanup_device(use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = str(model_info.get("actual_model_path") or "")
     key = (device, actual_model_path)
@@ -176,69 +205,75 @@ def warm_cleanup_inpaint_model(
             return {
                 "status": "already_warmed",
                 "device": device,
+                "requested_device": requested_device,
+                "fallback_reason": fallback_reason,
                 "elapsed_ms": 0.0,
             }
 
-    load_started = time.time()
-    try:
-        lama = _load_lama_model(device, actual_model_path)
-    except Exception as exc:
-        elapsed_ms = round((time.time() - started) * 1000.0, 3)
-        _pipeline_runtime_checkpoint(
-            "cleanup_inpaint_model_warmup",
-            "error",
-            device=device,
-            model_id=model_id,
-            error=f"{type(exc).__name__}: {exc}",
-            elapsed_ms=elapsed_ms,
-        )
-        return {
-            "status": "error",
-            "device": device,
-            "error": f"{type(exc).__name__}: {exc}",
-            "elapsed_ms": elapsed_ms,
-        }
-    load_elapsed_ms = round((time.time() - load_started) * 1000.0, 3)
-
-    infer_started = time.time()
-    try:
+    def load_and_warm(candidate_device: str) -> tuple[float, float]:
+        load_started = time.time()
+        lama = _load_lama_model(candidate_device, actual_model_path)
+        load_elapsed = round((time.time() - load_started) * 1000.0, 3)
+        infer_started = time.time()
         warm_image = Image.new("RGB", (256, 256), (255, 255, 255))
         warm_mask = Image.new("L", (256, 256), 0)
         warm_mask.paste(255, (96, 96, 160, 160))
         _ = lama(warm_image, warm_mask)
-        if device == "cuda":
-            try:
-                import torch
+        _synchronize_device(candidate_device)
+        return load_elapsed, round((time.time() - infer_started) * 1000.0, 3)
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-            except Exception:
-                pass
+    warm_succeeded = False
+    try:
+        load_elapsed_ms, infer_elapsed_ms = load_and_warm(device)
+        warm_succeeded = True
     except Exception as exc:
-        elapsed_ms = round((time.time() - started) * 1000.0, 3)
-        _pipeline_runtime_checkpoint(
-            "cleanup_inpaint_model_warmup",
-            "error",
-            device=device,
-            model_id=model_id,
-            error=f"{type(exc).__name__}: {exc}",
-            elapsed_ms=elapsed_ms,
-        )
-        return {
-            "status": "error",
-            "device": device,
-            "error": f"{type(exc).__name__}: {exc}",
-            "elapsed_ms": elapsed_ms,
-        }
+        original_error = f"{type(exc).__name__}: {exc}"
+        if device == "mps":
+            fallback = cleanup_fallback(exc)
+            with _WARMUP_LOCK:
+                _CLEANUP_DEVICE_FALLBACK = fallback
+            _load_lama_model.cache_clear()
+            device = fallback.device
+            fallback_reason = fallback.fallback_reason
+            try:
+                load_elapsed_ms, infer_elapsed_ms = load_and_warm(device)
+                warm_succeeded = True
+            except Exception as fallback_exc:
+                original_error = (
+                    f"{original_error}; cpu_retry={type(fallback_exc).__name__}: "
+                    f"{fallback_exc}"
+                )
+        if not warm_succeeded:
+            elapsed_ms = round((time.time() - started) * 1000.0, 3)
+            _pipeline_runtime_checkpoint(
+                "cleanup_inpaint_model_warmup",
+                "error",
+                requested_device=requested_device,
+                device=device,
+                fallback_reason=fallback_reason,
+                model_id=model_id,
+                error=original_error,
+                elapsed_ms=elapsed_ms,
+            )
+            return {
+                "status": "error",
+                "requested_device": requested_device,
+                "device": device,
+                "fallback_reason": fallback_reason,
+                "error": original_error,
+                "elapsed_ms": elapsed_ms,
+            }
 
-    infer_elapsed_ms = round((time.time() - infer_started) * 1000.0, 3)
     elapsed_ms = round((time.time() - started) * 1000.0, 3)
+    key = (device, actual_model_path)
     with _WARMUP_LOCK:
         _WARMED_LAMA_MODEL_KEYS.add(key)
     _pipeline_runtime_checkpoint(
         "cleanup_inpaint_model_warmup",
         "end",
+        requested_device=requested_device,
         device=device,
+        fallback_reason=fallback_reason,
         model_id=model_id,
         load_elapsed_ms=load_elapsed_ms,
         inference_elapsed_ms=infer_elapsed_ms,
@@ -246,7 +281,9 @@ def warm_cleanup_inpaint_model(
     )
     return {
         "status": "warmed",
+        "requested_device": requested_device,
         "device": device,
+        "fallback_reason": fallback_reason,
         "load_elapsed_ms": load_elapsed_ms,
         "inference_elapsed_ms": infer_elapsed_ms,
         "elapsed_ms": elapsed_ms,
@@ -323,7 +360,7 @@ def ai_inpaint_cleanup_crop(
     model_input_img = crop_img.crop((cx0, cy0, cx1, cy1))
     model_input_mask = mask_image.crop((cx0, cy0, cx1, cy1))
 
-    device = resolve_lama_device_name(use_gpu=use_gpu)
+    device, requested_device, fallback_reason = _effective_cleanup_device(use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = model_info.get("actual_model_path", "")
 
@@ -335,7 +372,9 @@ def ai_inpaint_cleanup_crop(
     _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint_crop_local",
         "start",
+        requested_device=requested_device,
         device=device,
+        fallback_reason=fallback_reason,
         parent_crop_width=parent_crop_w,
         parent_crop_height=parent_crop_h,
         inner_crop_bbox=[cx0, cy0, cx1, cy1],
@@ -345,14 +384,7 @@ def ai_inpaint_cleanup_crop(
     )
     infer_started = time.time()
     result = lama(model_input_img, model_input_mask)
-    if device == "cuda":
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        except Exception:
-            pass
+    _synchronize_device(device)
     model_call_elapsed_ms = round((time.time() - infer_started) * 1000.0, 3)
 
     if result.size != (crop_w, crop_h):
@@ -370,7 +402,9 @@ def ai_inpaint_cleanup_crop(
         "cleanup_ai_inpaint_crop_local",
         "end",
         backend="simple_lama",
+        requested_device=requested_device,
         device=device,
+        fallback_reason=fallback_reason,
         parent_crop_width=parent_crop_w,
         parent_crop_height=parent_crop_h,
         inner_crop_bbox=[cx0, cy0, cx1, cy1],
@@ -383,7 +417,9 @@ def ai_inpaint_cleanup_crop(
     )
     return out_crop, {
         "backend": "simple_lama",
+        "requested_device": requested_device,
         "device": device,
+        "fallback_reason": fallback_reason,
         "parent_crop_width": parent_crop_w,
         "parent_crop_height": parent_crop_h,
         "inner_crop_bbox": [cx0, cy0, cx1, cy1],
@@ -411,17 +447,12 @@ def run_simple_lama_model_crop(
     the cleanup convenience wrappers above.
     """
 
-    device = resolve_lama_device_name(use_gpu=use_gpu)
+    device, _requested_device, _fallback_reason = _effective_cleanup_device(use_gpu)
     load_started = time.time()
     lama = _load_lama_model(device, str(model_path or ""))
     load_time_ms = round((time.time() - load_started) * 1000.0, 3)
     result = lama(crop_img.convert("RGB"), crop_mask.convert("L"))
-    if device == "cuda":
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        except Exception:
-            pass
+    _synchronize_device(device)
     return result.convert("RGB"), load_time_ms
 
 
@@ -469,12 +500,14 @@ def ai_inpaint_cleanup(
         perf_timings["mask_prepare_ms"] = _perf_elapsed_ms(mask_prepare_started)
 
     resolve_started = time.perf_counter() if perf_timings is not None else 0.0
-    device = resolve_lama_device_name(use_gpu=use_gpu)
+    device, requested_device, fallback_reason = _effective_cleanup_device(use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = model_info.get("actual_model_path", "")
     if perf_timings is not None:
         perf_timings["device_model_resolve_ms"] = _perf_elapsed_ms(resolve_started)
         perf_timings["device"] = device
+        perf_timings["requested_device"] = requested_device
+        perf_timings["device_fallback_reason"] = fallback_reason
         perf_timings["requested_use_gpu"] = bool(use_gpu)
 
     model_lookup_started = time.perf_counter() if perf_timings is not None else 0.0

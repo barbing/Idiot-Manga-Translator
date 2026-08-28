@@ -1,0 +1,11 @@
+name: manga-llm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pyicu=2.16.2
+  - icu=78.3
+  - llama.cpp
+  - pip:
+      - -r requirements.txt

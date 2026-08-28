@@ -818,7 +818,7 @@ class SettingsViewModel:
             provider = f"{profile.display_name} ({provider_kind_label(profile.kind)})"
             model = profile.model_id or profile.local_model_path or "Default model"
             model = str(model).replace("\\", "/").rsplit("/", 1)[-1]
-        runtime = "GPU when available" if values.get("use_gpu") else "CPU"
+        runtime = "Acceleration allowed" if values.get("use_gpu") else "CPU"
         return EffectiveRunSummary(
             ready=result.ready,
             pending_changes=self.dirty,

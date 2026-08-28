@@ -26,6 +26,7 @@ from app.models.resolution import (
     resolve_yuzumarker_font_labels_file,
     resolve_yuzumarker_font_onnx_file,
 )
+from app.platform_services.compute import select_onnx_providers
 from app.pipeline.parent_execution_bundle import (
     PARENT_RENDER_STYLE_VERSION,
     PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY,
@@ -10520,41 +10521,43 @@ def _heuristic_detection(image: Any) -> dict[str, Any]:
     }
 
 
+def yuzu_provider_chain(
+    use_gpu: bool,
+    available: Sequence[str],
+) -> tuple[str, ...]:
+    return select_onnx_providers(use_gpu, tuple(available)).providers
+
+
 def _load_onnx_session(model_path: str, *, use_gpu: bool) -> Any:
     key = (os.path.abspath(model_path), bool(use_gpu))
     if key in _SESSION_CACHE:
         return _SESSION_CACHE[key]
     import onnxruntime as ort
 
+    available = [str(provider) for provider in ort.get_available_providers()]
+    selection = select_onnx_providers(use_gpu, available)
+    providers = list(selection.providers)
     preload_error = ""
-    if use_gpu:
+    if providers and providers[0] == "CUDAExecutionProvider":
         preload_dlls = getattr(ort, "preload_dlls", None)
         if callable(preload_dlls):
             try:
                 preload_dlls()
             except Exception as exc:
                 preload_error = f"{type(exc).__name__}:{exc}"
-    available = [str(provider) for provider in ort.get_available_providers()]
-    providers = ["CPUExecutionProvider"]
-    if use_gpu and "CUDAExecutionProvider" in available:
-        providers.insert(0, "CUDAExecutionProvider")
     initialization_error = ""
     try:
         session = ort.InferenceSession(model_path, providers=providers)
     except Exception as exc:
-        if not use_gpu or providers == ["CPUExecutionProvider"]:
+        if providers == ["CPUExecutionProvider"]:
             raise
         initialization_error = f"{type(exc).__name__}:{exc}"
         session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     active = [str(provider) for provider in session.get_providers()]
-    requested = "CUDAExecutionProvider" if use_gpu else "CPUExecutionProvider"
-    fallback_reason = ""
-    if use_gpu and "CUDAExecutionProvider" not in active:
-        fallback_reason = (
-            "cuda_execution_provider_not_available"
-            if "CUDAExecutionProvider" not in available
-            else "cuda_execution_provider_initialization_failed"
-        )
+    requested = providers[0] if providers else "CPUExecutionProvider"
+    fallback_reason = selection.fallback_reason
+    if active and active[0] != requested:
+        fallback_reason = f"{requested.casefold()}_initialization_failed"
     _SESSION_PROVIDER_METADATA[key] = {
         "gpu_requested": bool(use_gpu),
         "requested_execution_provider": requested,
@@ -10577,11 +10580,15 @@ def _onnx_session_provider_metadata(model_path: str, *, use_gpu: bool, session: 
     active = [str(provider) for provider in session.get_providers()]
     return {
         "gpu_requested": bool(use_gpu),
-        "requested_execution_provider": "CUDAExecutionProvider" if use_gpu else "CPUExecutionProvider",
+        "requested_execution_provider": "CPUExecutionProvider",
         "available_execution_providers": [],
         "active_execution_providers": active,
         "primary_execution_provider": active[0] if active else "",
-        "provider_fallback_reason": "cuda_execution_provider_initialization_failed" if use_gpu and "CUDAExecutionProvider" not in active else "",
+        "provider_fallback_reason": (
+            "requested_execution_provider_initialization_failed"
+            if use_gpu and active and active[0] == "CPUExecutionProvider"
+            else ""
+        ),
         "provider_preload_error": "",
     }
 

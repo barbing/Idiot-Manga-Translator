@@ -1,6 +1,43 @@
 # -*- coding: utf-8 -*-
-"""Simple light/dark palette helpers."""
+"""Simple light/dark palette helpers and platform-specific UI copy."""
+from dataclasses import dataclass
+
 from PySide6 import QtGui
+
+from app.platform_services.contracts import OperatingSystem, PlatformIdentity
+from app.platform_services.credentials import credential_store_label
+from app.platform_services.paths import PlatformPaths, qt_platform_paths
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformPresentation:
+    credential_store_label: str
+    runtime_root_label: str
+    shortcut_modifier: str
+    accelerator_label: str
+
+
+def platform_presentation(
+    identity: PlatformIdentity | None = None,
+    paths: PlatformPaths | None = None,
+) -> PlatformPresentation:
+    selected = identity or PlatformIdentity.detect()
+    selected_paths = paths or qt_platform_paths()
+    if selected.os is OperatingSystem.MACOS:
+        modifier = "Meta"
+        accelerator = "MPS/CoreML/Metal"
+    elif selected.os is OperatingSystem.WINDOWS:
+        modifier = "Ctrl"
+        accelerator = "CUDA"
+    else:
+        modifier = "Ctrl"
+        accelerator = "CPU"
+    return PlatformPresentation(
+        credential_store_label=credential_store_label(selected),
+        runtime_root_label=str(selected_paths.runtime_root),
+        shortcut_modifier=modifier,
+        accelerator_label=accelerator,
+    )
 
 
 def apply_dark_palette(app) -> None:
@@ -45,7 +82,6 @@ def _dark_stylesheet() -> str:
     return """
 * { 
   font-size: 13px; 
-  font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
 }
 QMainWindow {
   background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -191,14 +227,12 @@ QPushButton[nav="true"], QToolButton[nav="true"] {
   padding: 10px 16px;
   text-align: left;
   color: #94a3b8;
-  font-family: "Segoe UI";
   font-size: 14px;
 }
 QPushButton[nav="true"]:hover, QToolButton[nav="true"]:hover {
   color: #e2e8f0;
   background: rgba(51, 65, 85, 0.3);
   font-size: 14px;
-  font-family: "Microsoft YaHei", "Segoe UI";
 }
 QPushButton[nav="true"]:checked, QToolButton[nav="true"]:checked {
   color: #38bdf8;
@@ -207,7 +241,6 @@ QPushButton[nav="true"]:checked, QToolButton[nav="true"]:checked {
   background-color: rgba(15, 23, 42, 0.5); /* Fallback */
   font-weight: 600;
   font-size: 14px;
-  font-family: "Microsoft YaHei", "Segoe UI";
 }
 QProgressBar {
   border: 1px solid #334155;
@@ -261,7 +294,6 @@ QToolTip {
   color: #e2e8f0;
   border: 1px solid #334155;
   font-size: 12px;
-  font-family: "Microsoft YaHei", "Segoe UI";
 }
 """
 
@@ -270,7 +302,6 @@ def _light_stylesheet() -> str:
     return """
 * { 
   font-size: 13px; 
-  font-family: "Segoe UI", sans-serif;
 }
 QMainWindow {
   background-color: #f8fafc;
@@ -405,14 +436,12 @@ QPushButton[nav="true"], QToolButton[nav="true"] {
 QPushButton[nav="true"]:hover, QToolButton[nav="true"]:hover {
   background-color: #e2e8f0;
   font-size: 14px;
-  font-family: "Segoe UI";
 }
 QPushButton[nav="true"]:checked, QToolButton[nav="true"]:checked {
   background-color: #e2e8f0;
   color: #0ea5e9;
   font-weight: 600;
   font-size: 14px;
-  font-family: "Segoe UI";
 }
 QProgressBar {
   border: 1px solid #cbd5e1;

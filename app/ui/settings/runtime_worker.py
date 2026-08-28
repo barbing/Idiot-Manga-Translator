@@ -3,18 +3,45 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from PySide6 import QtCore
 
 from app.config.settings_contracts import DownloadState, ProviderHealth, RuntimeStatus
 from app.models.downloader import ModelDownloader
-from app.models.resolution import has_noto_cjk_sc_font_pack, models_root
+from app.models.resolution import models_root
+from app.platform_services.contracts import PlatformIdentity
+from app.platform_services.runtime_assets import (
+    RuntimeAssetSpec,
+    runtime_asset_catalog,
+    runtime_asset_spec,
+)
 from app.ui.runtime_resource_admission import (
     RuntimeResourceAdmissionReport,
     RuntimeResourceAdmissionService,
     RuntimeResourceMonitorService,
 )
+
+
+def runtime_assets_ready(
+    status: RuntimeStatus | None,
+    identity: PlatformIdentity | None = None,
+) -> tuple[bool, tuple[str, ...]]:
+    selected = identity or PlatformIdentity.detect()
+    installed = status.installed_assets if status is not None else {}
+    missing: list[str] = []
+    for spec in runtime_asset_catalog(selected):
+        raw = installed.get(spec.asset_id)
+        ready = (
+            bool(raw.get("ready") or raw.get("installed"))
+            if isinstance(raw, Mapping)
+            else raw is True
+            or str(raw).strip().casefold()
+            in {"ready", "installed", "available", "valid"}
+        )
+        if not ready:
+            missing.append(spec.asset_id)
+    return not missing, tuple(missing)
 
 
 class RuntimeAssetProbeWorker(QtCore.QObject):
@@ -29,63 +56,52 @@ class RuntimeAssetProbeWorker(QtCore.QObject):
         *,
         models_directory: str | None = None,
         downloader_factory: Callable[[], ModelDownloader] = ModelDownloader,
+        identity: PlatformIdentity | None = None,
     ) -> None:
         super().__init__()
         self._models_directory = str(
             Path(models_directory or models_root()).resolve()
         )
         self._downloader_factory = downloader_factory
+        self._identity = identity or PlatformIdentity.detect()
+
+    def _check_asset(
+        self,
+        downloader: ModelDownloader,
+        spec: RuntimeAssetSpec,
+    ) -> bool:
+        checker = getattr(downloader, spec.checker, None)
+        if not callable(checker):
+            raise AttributeError(f"runtime checker is unavailable: {spec.checker}")
+        if spec.asset_id == "pyicu":
+            return bool(checker())
+        return bool(checker(self._models_directory))
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
             downloader = self._downloader_factory()
             assets: dict[str, dict[str, object]] = {}
-
-            detector_ready = bool(
-                downloader.check_comic_text_detector(self._models_directory)
-            )
-            assets["comic_text_detector"] = {
-                "ready": detector_ready,
-                "detail": (
-                    "CPU and CUDA model files present"
-                    if detector_ready
-                    else "Required detector model files are missing"
-                ),
-            }
-
-            ocr_ready = bool(
-                downloader.check_paddle_ocr_vl(self._models_directory)
-            )
-            assets["ocr"] = {
-                "ready": ocr_ready,
-                "detail": (
-                    "PaddleOCR-VL model and local runtime present"
-                    if ocr_ready
-                    else "PaddleOCR-VL model or local runtime is missing"
-                ),
-            }
-
-            pyicu_ready = bool(downloader.check_pyicu_runtime())
-            assets["pyicu"] = {
-                "ready": pyicu_ready,
-                "detail": (
-                    "Pinned PyICU and ICU runtime verified"
-                    if pyicu_ready
-                    else downloader.pyicu_runtime_error
-                    or "Pinned PyICU runtime is unavailable"
-                ),
-            }
-
-            font_ready = bool(has_noto_cjk_sc_font_pack(self._models_directory))
-            assets["font_pack"] = {
-                "ready": font_ready,
-                "detail": (
-                    "Noto CJK core font pack present"
-                    if font_ready
-                    else "Optional Noto CJK core font pack is not installed"
-                ),
-            }
+            for spec in runtime_asset_catalog(self._identity):
+                ready = self._check_asset(downloader, spec)
+                error = (
+                    str(getattr(downloader, "pyicu_runtime_error", "") or "")
+                    if spec.asset_id == "pyicu"
+                    else str(
+                        getattr(downloader, "paddle_runtime_error", "") or ""
+                    )
+                    if spec.asset_id == "paddle_ocr_vl"
+                    else ""
+                )
+                assets[spec.asset_id] = {
+                    "ready": ready,
+                    "detail": (
+                        f"{spec.detail} verified."
+                        if ready
+                        else error or spec.remediation_for(self._identity)
+                    ),
+                    "managed_download": spec.preparer is not None,
+                }
 
             self.status_ready.emit(
                 RuntimeStatus(
@@ -119,22 +135,25 @@ class RuntimeAssetDownloadWorker(QtCore.QObject):
     completed = QtCore.Signal(bool, str)
     finished = QtCore.Signal()
 
-    _SUPPORTED_ASSETS = frozenset(
-        {"comic_text_detector", "ocr", "pyicu", "font_pack"}
-    )
-
     def __init__(
         self,
         asset_id: str,
         *,
         models_directory: str | None = None,
         downloader_factory: Callable[[], ModelDownloader] = ModelDownloader,
+        identity: PlatformIdentity | None = None,
     ) -> None:
         super().__init__()
         normalized = str(asset_id or "").strip()
-        if normalized not in self._SUPPORTED_ASSETS:
+        self._identity = identity or PlatformIdentity.detect()
+        try:
+            spec = runtime_asset_spec(normalized, self._identity)
+        except KeyError as exc:
+            raise ValueError("unsupported runtime asset") from exc
+        if spec.preparer is None:
             raise ValueError("unsupported runtime asset")
         self._asset_id = normalized
+        self._spec = spec
         self._models_directory = str(
             Path(models_directory or models_root()).resolve()
         )
@@ -150,16 +169,15 @@ class RuntimeAssetDownloadWorker(QtCore.QObject):
         return True
 
     def _prepare(self, downloader: ModelDownloader) -> None:
-        if self._asset_id == "comic_text_detector":
-            downloader.prepare_comic_text_detector(self._models_directory)
-        elif self._asset_id == "ocr":
-            downloader.prepare_paddle_ocr_vl(self._models_directory)
-        elif self._asset_id == "pyicu":
-            downloader.prepare_pyicu_runtime()
-        elif self._asset_id == "font_pack":
-            downloader.prepare_noto_cjk_sc_font_pack(self._models_directory)
-        else:  # pragma: no cover - constructor validates the closed set
-            raise ValueError("unsupported runtime asset")
+        preparer = getattr(downloader, str(self._spec.preparer), None)
+        if not callable(preparer):
+            raise AttributeError(
+                f"runtime preparer is unavailable: {self._spec.preparer}"
+            )
+        if self._asset_id == "pyicu":
+            preparer()
+        else:
+            preparer(self._models_directory)
 
     @QtCore.Slot()
     def run(self) -> None:

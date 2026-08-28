@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.pipeline.status_contracts import PipelineStage, PipelineStageTechnicalError
+from app.platform_services.compute import select_onnx_providers
 
 
 BUBBLE_DETECTION_VERSION = "phase4b23_bubble_detection_semantic_authority_contract_v6"
@@ -40,7 +41,11 @@ KITSUMED_MODEL_ROLE = "speech_bubble_mask"
 OGKALU_MODEL_ROLE = "text_area_detector"
 # Cache identity must change if the OGKALU ONNX target-size contract changes.
 OGKALU_TARGET_SIZE_ORDER = "width_height"
-PROVIDER_PREFERENCE = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+PROVIDER_PREFERENCE = [
+    "CUDAExecutionProvider",
+    "CoreMLExecutionProvider",
+    "CPUExecutionProvider",
+]
 KITSUMED_CONFIDENCE_THRESHOLD = 0.30
 KITSUMED_NMS_IOU_THRESHOLD = 0.50
 KITSUMED_MASK_THRESHOLD = 0.50
@@ -92,6 +97,7 @@ class BubbleDetectionInput:
     debug_page_dir: Optional[Path | str] = None
     mode: str = "diagnostic"
     requested_models: Sequence[str] = field(default_factory=lambda: ["kitsumed_speech_bubble", "ogkalu_text_bubble"])
+    allow_acceleration: bool = True
 
 
 @dataclass
@@ -268,9 +274,11 @@ class _BubbleDetectionRuntime:
     ogkalu_providers: List[str]
     kitsumed_model_hash: str
     ogkalu_model_hash: str
+    kitsumed_fallback_reason: str
+    ogkalu_fallback_reason: str
 
 
-_RUNTIME_CACHE: Optional[_BubbleDetectionRuntime] = None
+_RUNTIME_CACHE: dict[bool, _BubbleDetectionRuntime] = {}
 
 
 def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> BubbleDetectionResult:
@@ -290,7 +298,7 @@ def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> B
     fallback_result.cache_enabled = cache_enabled
 
     try:
-        runtime = _get_runtime()
+        runtime = _get_runtime(req.allow_acceleration)
         image = runtime.fusion_module.cv2.imread(str(image_path), runtime.fusion_module.cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError(f"failed to read source image: {image_path}")
@@ -307,7 +315,16 @@ def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> B
 
         kitsumed_provider = _primary_provider(runtime.kitsumed_providers)
         ogkalu_provider = _primary_provider(runtime.ogkalu_providers)
-        provider_fallback = kitsumed_provider != "CUDAExecutionProvider" or ogkalu_provider != "CUDAExecutionProvider"
+        provider_fallback = (
+            _provider_fallback_used(
+                kitsumed_provider,
+                runtime.providers_requested,
+            )
+            or _provider_fallback_used(
+                ogkalu_provider,
+                runtime.providers_requested,
+            )
+        )
 
         bubble_evidence = _serialize_kitsumed(page_id, kitsumed_raw, kitsumed_provider, kitsumed_latency, runtime)
         text_area_evidence = _serialize_ogkalu(
@@ -328,7 +345,7 @@ def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> B
         conflicts = _build_service_conflicts(fused_containers)
 
         runtime_payload = {
-            "provider_preference": list(PROVIDER_PREFERENCE),
+            "provider_preference": runtime.providers_requested,
             "providers_available": runtime.providers_available,
             "providers_requested": runtime.providers_requested,
             "providers_used": {
@@ -336,6 +353,10 @@ def run_bubble_detection(request: BubbleDetectionInput | Mapping[str, Any]) -> B
                 "ogkalu": runtime.ogkalu_providers,
             },
             "provider_fallback_used": provider_fallback,
+            "provider_fallback_reasons": {
+                "kitsumed": runtime.kitsumed_fallback_reason,
+                "ogkalu": runtime.ogkalu_fallback_reason,
+            },
             "latency_sec": {
                 "kitsumed": kitsumed_latency,
                 "ogkalu": ogkalu_latency,
@@ -569,6 +590,7 @@ def _coerce_input(request: BubbleDetectionInput | Mapping[str, Any]) -> BubbleDe
         debug_page_dir=request.get("debug_page_dir"),
         mode=str(request.get("mode") or "diagnostic"),
         requested_models=request.get("requested_models", ["kitsumed_speech_bubble", "ogkalu_text_bubble"]) or [],
+        allow_acceleration=bool(request.get("allow_acceleration", True)),
     )
 
 
@@ -646,7 +668,7 @@ def _build_cache_state(
         "image_size": [int(image_size[0]), int(image_size[1])],
         "model_paths": {"kitsumed": str(KITSUMED_MODEL.resolve()), "ogkalu": str(OGKALU_MODEL.resolve())},
         "model_hashes": {"kitsumed": runtime.kitsumed_model_hash, "ogkalu": runtime.ogkalu_model_hash},
-        "provider_preference": list(PROVIDER_PREFERENCE),
+        "provider_preference": list(runtime.providers_requested),
         "providers_requested": list(runtime.providers_requested),
         "providers_used": {"kitsumed": list(runtime.kitsumed_providers), "ogkalu": list(runtime.ogkalu_providers)},
         "model_config": {
@@ -855,21 +877,82 @@ def _stable_json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
 
-def _get_runtime() -> _BubbleDetectionRuntime:
-    global _RUNTIME_CACHE
-    if _RUNTIME_CACHE is not None:
-        return _RUNTIME_CACHE
+def _provider_preference(
+    allow_acceleration: bool,
+    available: Sequence[str],
+) -> tuple[str, ...]:
+    return select_onnx_providers(
+        allow_acceleration,
+        tuple(available),
+    ).providers
+
+
+def _provider_fallback_used(
+    active_provider: str,
+    requested_providers: Sequence[str],
+) -> bool:
+    requested = _primary_provider(requested_providers)
+    return bool(requested and str(active_provider or "") != requested)
+
+
+def _create_onnx_session(
+    ort_runtime: Any,
+    model_path: str,
+    providers: Sequence[str],
+) -> tuple[Any, str]:
+    """Construct one session and retry CPU once with a typed reason."""
+
+    requested = tuple(str(item) for item in providers if str(item)) or (
+        "CPUExecutionProvider",
+    )
+    primary = requested[0]
+    try:
+        session = ort_runtime.InferenceSession(
+            str(model_path),
+            providers=list(requested),
+        )
+        active = [str(item) for item in session.get_providers()]
+        reason = (
+            f"{primary.casefold()}_activation_fallback:"
+            f"{_primary_provider(active) or 'unknown'}"
+            if _provider_fallback_used(_primary_provider(active), requested)
+            else ""
+        )
+        return session, reason
+    except Exception as exc:
+        if primary == "CPUExecutionProvider":
+            raise
+        session = ort_runtime.InferenceSession(
+            str(model_path),
+            providers=["CPUExecutionProvider"],
+        )
+        return (
+            session,
+            f"{primary.casefold()}_initialization_failed:{type(exc).__name__}",
+        )
+
+
+def _get_runtime(allow_acceleration: bool = True) -> _BubbleDetectionRuntime:
+    cache_key = bool(allow_acceleration)
+    if cache_key in _RUNTIME_CACHE:
+        return _RUNTIME_CACHE[cache_key]
 
     from app.pipeline import bubble_detection_runtime
 
     fusion_module = bubble_detection_runtime
     available = list(fusion_module.ort.get_available_providers())
-    requested = [provider for provider in PROVIDER_PREFERENCE if provider in available]
-    if not requested:
-        requested = available or ["CPUExecutionProvider"]
+    requested = list(_provider_preference(cache_key, available))
 
-    kitsumed_session = fusion_module.ort.InferenceSession(str(KITSUMED_MODEL), providers=requested)
-    ogkalu_session = fusion_module.ort.InferenceSession(str(OGKALU_MODEL), providers=requested)
+    kitsumed_session, kitsumed_fallback_reason = _create_onnx_session(
+        fusion_module.ort,
+        str(KITSUMED_MODEL),
+        requested,
+    )
+    ogkalu_session, ogkalu_fallback_reason = _create_onnx_session(
+        fusion_module.ort,
+        str(OGKALU_MODEL),
+        requested,
+    )
 
     metadata = kitsumed_session.get_modelmeta().custom_metadata_map
     input_size = _parse_input_size(metadata.get("imgsz"))
@@ -878,7 +961,7 @@ def _get_runtime() -> _BubbleDetectionRuntime:
     kitsumed_hash = fusion_module.kit.sha256(KITSUMED_MODEL)
     ogkalu_hash = fusion_module.kit.sha256(OGKALU_MODEL)
 
-    _RUNTIME_CACHE = _BubbleDetectionRuntime(
+    runtime = _BubbleDetectionRuntime(
         fusion_module=fusion_module,
         kitsumed_session=kitsumed_session,
         ogkalu_session=ogkalu_session,
@@ -891,8 +974,11 @@ def _get_runtime() -> _BubbleDetectionRuntime:
         ogkalu_providers=list(ogkalu_session.get_providers()),
         kitsumed_model_hash=kitsumed_hash,
         ogkalu_model_hash=ogkalu_hash,
+        kitsumed_fallback_reason=kitsumed_fallback_reason,
+        ogkalu_fallback_reason=ogkalu_fallback_reason,
     )
-    return _RUNTIME_CACHE
+    _RUNTIME_CACHE[cache_key] = runtime
+    return runtime
 
 def _parse_input_size(value: Optional[str]) -> int:
     if not value:
@@ -990,7 +1076,10 @@ def _serialize_kitsumed(
     latency: Mapping[str, Any],
     runtime: _BubbleDetectionRuntime,
 ) -> List[Dict[str, Any]]:
-    fallback_used = provider != "CUDAExecutionProvider"
+    fallback_used = _provider_fallback_used(
+        provider,
+        runtime.providers_requested,
+    )
     records: List[Dict[str, Any]] = []
     for detection in detections:
         record = BubbleModelEvidence(
@@ -1099,7 +1188,10 @@ def _serialize_ogkalu(
     *,
     image_size: Tuple[int, int] | None = None,
 ) -> List[Dict[str, Any]]:
-    fallback_used = provider != "CUDAExecutionProvider"
+    fallback_used = _provider_fallback_used(
+        provider,
+        runtime.providers_requested,
+    )
     records: List[Dict[str, Any]] = []
     for detection in detections:
         linked_masks = _linked_kitsumed_mask_ids(detection, kitsumed_raw, runtime)

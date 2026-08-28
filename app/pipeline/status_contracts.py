@@ -128,6 +128,27 @@ class PipelineStageEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeBackendEvent:
+    run_id: str
+    module_id: str
+    requested_backend: str
+    selected_backend: str
+    fallback_reason: str = ""
+    timestamp: str = field(default_factory=utc_timestamp)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "run_id",
+            "module_id",
+            "requested_backend",
+            "selected_backend",
+        ):
+            _require_text(getattr(self, field_name), field_name)
+        _require_optional_text(self.fallback_reason, "fallback_reason")
+        _require_text(self.timestamp, "timestamp")
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineStageOutcome:
     """Durable owner-stage result for one page barrier.
 
@@ -356,6 +377,7 @@ __all__ = [
     "PipelineStageOutcome",
     "PipelineStageOutcomeState",
     "PipelineStageTechnicalError",
+    "RuntimeBackendEvent",
     "new_error_id",
     "new_run_id",
     "new_stage_outcome_id",

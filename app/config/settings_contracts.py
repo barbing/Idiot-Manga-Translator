@@ -36,6 +36,7 @@ class SettingsScope(str, Enum):
 class CredentialReferenceKind(str, Enum):
     WINDOWS_CREDENTIAL = "windows_credential"
     ENVIRONMENT_VARIABLE = "environment_variable"
+    SYSTEM_KEYRING = "system_keyring"
 
 
 class ProviderHealth(str, Enum):
@@ -85,6 +86,15 @@ DEFAULT_SHORTCUT_BINDINGS = MappingProxyType(
         "exit_focus": "Esc",
     }
 )
+MACOS_DEFAULT_SHORTCUT_BINDINGS = MappingProxyType(
+    {
+        **DEFAULT_SHORTCUT_BINDINGS,
+        "undo": "Meta+Z",
+        "redo": "Meta+Shift+Z",
+        "preview": "Meta+Enter",
+    }
+)
+HISTORICAL_WINDOWS_PROJECT_LOCATION = "D:/Manga Projects"
 _ALLOWED_CANVAS_MODES = frozenset(
     {"original", "cleaned", "final", "compare", "difference"}
 )
@@ -333,7 +343,7 @@ class ApplicationPreferences:
     font_scale: int = 100
     reduced_motion: bool = True
     ui_language: str = "system"
-    new_project_location: str = "D:/Manga Projects"
+    new_project_location: str = HISTORICAL_WINDOWS_PROJECT_LOCATION
     autosave_interval_seconds: int = 30
     open_last_project: str = "ask"
     shortcut_bindings: Mapping[str, str] = field(

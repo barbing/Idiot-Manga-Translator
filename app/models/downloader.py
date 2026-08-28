@@ -30,9 +30,6 @@ from app.config.defaults import (
     OGKALU_TEXT_BUBBLE_CONFIG_FILE,
     OGKALU_TEXT_BUBBLE_MODEL_FILE,
     OGKALU_TEXT_BUBBLE_REPO_ID,
-    PADDLE_OCR_VL_MMPROJ_FILE,
-    PADDLE_OCR_VL_MODEL_FILE,
-    PADDLE_OCR_VL_REPO_ID,
     QWEN_GGUF,
     SAKURA_GGUF,
     SIL_OFL_TEXT_URL,
@@ -45,7 +42,7 @@ from app.config.defaults import (
 
 import hashlib
 from dataclasses import dataclass
-from typing import Iterator, List
+from typing import Callable, Iterator, List, Mapping
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import tarfile
@@ -60,6 +57,15 @@ from app.models.resolution import (
     resolve_manga_ocr_system_ref,
     resolve_ner_local_dir,
     resolve_ner_system_snapshot,
+    resolve_llama_server_executable,
+    resolve_paddle_ocr_vl_mmproj_file,
+    resolve_paddle_ocr_vl_model_file,
+)
+from app.platform_services.paths import qt_platform_paths
+from app.platform_services.contracts import OperatingSystem, PlatformIdentity
+from app.platform_services.runtime_assets import (
+    paddle_targets,
+    runtime_asset_spec,
 )
 
 
@@ -110,6 +116,8 @@ class ModelDownloader(QtCore.QObject):
         pyicu_runtime_url: str | None = None,
         pyicu_runtime_sha256: str | None = None,
         pyicu_runtime_root: str | os.PathLike[str] | None = None,
+        platform_identity: PlatformIdentity | None = None,
+        paddle_runtime_verifier: Callable[[bool], None] | None = None,
     ):
         super().__init__(parent)
         self._cancel_requested = False
@@ -127,6 +135,12 @@ class ModelDownloader(QtCore.QObject):
         self._pyicu_install_requested = False
         self._pyicu_wheel_path: Path | None = None
         self._pyicu_last_error = ""
+        self._platform_identity = platform_identity or PlatformIdentity.detect()
+        if not isinstance(self._platform_identity, PlatformIdentity):
+            raise TypeError("platform_identity must be PlatformIdentity")
+        self._paddle_runtime_verification_required = False
+        self._paddle_runtime_verifier = paddle_runtime_verifier
+        self._paddle_runtime_error = ""
 
     def _create_session(self) -> requests.Session:
         """Create a robust requests session with retries."""
@@ -149,6 +163,10 @@ class ModelDownloader(QtCore.QObject):
     def pyicu_runtime_error(self) -> str:
         return self._pyicu_last_error
 
+    @property
+    def paddle_runtime_error(self) -> str:
+        return self._paddle_runtime_error
+
     @staticmethod
     def is_frozen_application() -> bool:
         return bool(getattr(sys, "frozen", False))
@@ -167,10 +185,7 @@ class ModelDownloader(QtCore.QObject):
     def _pyicu_runtime_root(self) -> Path:
         if self._pyicu_runtime_root_override is not None:
             return self._pyicu_runtime_root_override
-        local_app_data = str(os.environ.get("LOCALAPPDATA", "")).strip()
-        if not local_app_data:
-            raise PyICURuntimeError("LOCALAPPDATA is unavailable")
-        return (Path(local_app_data) / "YomiFrame" / "runtime").resolve()
+        return qt_platform_paths().runtime_root.resolve()
 
     def _pyicu_install_dir(self) -> Path:
         return self._pyicu_runtime_root() / PYICU_RUNTIME_ID
@@ -329,21 +344,30 @@ class ModelDownloader(QtCore.QObject):
                 self._probe_pyicu_module(module)
                 return True
 
-            runtime_dir = self._pyicu_install_dir()
-            if self._managed_runtime_layout_valid(runtime_dir):
-                self._activate_managed_pyicu(runtime_dir)
-                return True
-
             if self._activate_environment_pyicu_if_exact():
                 return True
 
-            self._pyicu_last_error = (
-                f"PyICU {PYICU_RUNTIME_PYICU_VERSION} with ICU "
-                f"{PYICU_RUNTIME_ICU_VERSION} is not installed"
-            )
+            if self._platform_identity.os is OperatingSystem.WINDOWS:
+                runtime_dir = self._pyicu_install_dir()
+                if self._managed_runtime_layout_valid(runtime_dir):
+                    self._activate_managed_pyicu(runtime_dir)
+                    return True
+
+            self._pyicu_last_error = runtime_asset_spec(
+                "pyicu",
+                self._platform_identity,
+            ).remediation_for(self._platform_identity)
             return False
         except Exception as exc:
-            self._pyicu_last_error = str(exc)
+            message = str(exc)
+            if self._platform_identity.os is OperatingSystem.MACOS:
+                remediation = runtime_asset_spec(
+                    "pyicu",
+                    self._platform_identity,
+                ).remediation_for(self._platform_identity)
+                if remediation not in message:
+                    message = f"{message}. {remediation}"
+            self._pyicu_last_error = message
             return False
 
     def prepare_pyicu_runtime(self) -> None:
@@ -660,12 +684,137 @@ class ModelDownloader(QtCore.QObject):
         return bool(resolve_ner_system_snapshot() or resolve_ner_local_dir(os.path.join(models_dir, "ner")))
 
     def check_paddle_ocr_vl(self, models_dir: str = "models") -> bool:
-        """Check if PaddleOCR-VL GGUF model and native runtime are installed."""
-        return has_paddle_ocr_vl_runtime(base_dir=models_dir)
+        """Verify files plus one cached health/model-identity server receipt."""
+
+        self._paddle_runtime_error = ""
+        if not has_paddle_ocr_vl_runtime(
+            base_dir=models_dir,
+            identity=self._platform_identity,
+        ):
+            return False
+        try:
+            identity = self._paddle_readiness_identity(models_dir)
+            if self._paddle_readiness_receipt_valid(models_dir, identity):
+                return True
+            self._verify_paddle_runtime(use_gpu=True)
+            self._write_paddle_readiness_receipt(models_dir, identity)
+            return True
+        except Exception as exc:
+            self._paddle_runtime_error = (
+                "PaddleOCR-VL representative runtime verification failed "
+                f"({type(exc).__name__})."
+            )
+            return False
+
+    @staticmethod
+    def _runtime_file_identity(path: str | os.PathLike[str]) -> dict[str, object]:
+        resolved = Path(path).expanduser().resolve()
+        stat_result = resolved.stat()
+        return {
+            "path": str(resolved),
+            "size": int(stat_result.st_size),
+            "mtime_ns": int(stat_result.st_mtime_ns),
+        }
+
+    def _paddle_readiness_identity(self, models_dir: str) -> dict[str, object]:
+        model = resolve_paddle_ocr_vl_model_file(models_dir)
+        projector = resolve_paddle_ocr_vl_mmproj_file(models_dir)
+        executable = resolve_llama_server_executable(
+            models_dir,
+            identity=self._platform_identity,
+        )
+        if not model or not projector or not executable:
+            raise RuntimeError("PaddleOCR-VL runtime identity is incomplete")
+        return {
+            "schema": 2,
+            "platform": self._platform_identity.os.value,
+            "architecture": self._platform_identity.architecture,
+            "model": self._runtime_file_identity(model),
+            "projector": self._runtime_file_identity(projector),
+            "executable": self._runtime_file_identity(executable),
+        }
+
+    @staticmethod
+    def _paddle_readiness_path(models_dir: str) -> Path:
+        return (
+            Path(models_dir)
+            / "paddleocr-vl-1.6-gguf"
+            / "runtime-readiness.json"
+        )
+
+    def _paddle_readiness_receipt_valid(
+        self,
+        models_dir: str,
+        identity: Mapping[str, object],
+    ) -> bool:
+        try:
+            payload = json.loads(
+                self._paddle_readiness_path(models_dir).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("verified") is True
+            and payload.get("identity") == dict(identity)
+        )
+
+    def _verify_paddle_runtime(self, *, use_gpu: bool) -> None:
+        if self._paddle_runtime_verifier is not None:
+            self._paddle_runtime_verifier(bool(use_gpu))
+            return
+        from app.ocr.paddle_ocr_vl_engine import PaddleOcrVlEngine
+
+        engine = PaddleOcrVlEngine(use_gpu=use_gpu)
+        engine.close()
+
+    def _write_paddle_readiness_receipt(
+        self,
+        models_dir: str,
+        identity: Mapping[str, object],
+    ) -> None:
+        path = self._paddle_readiness_path(models_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary_path = tempfile.mkstemp(
+            prefix=".runtime-readiness.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(
+                    {"verified": True, "identity": dict(identity)},
+                    stream,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, path)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     def check_font_detection(self, models_dir: str = "models") -> bool:
         """Check if YuzuMarker font detection and local CJK fallback fonts exist."""
         return has_font_style_runtime(base_dir=models_dir)
+
+    def check_yuzumarker_font_detection(self, models_dir: str = "models") -> bool:
+        """Check only the YuzuMarker ONNX model and label metadata."""
+        from app.models.resolution import has_yuzumarker_font_detection_runtime
+
+        return has_yuzumarker_font_detection_runtime(base_dir=models_dir)
+
+    def check_noto_cjk_sc_font_pack(self, models_dir: str = "models") -> bool:
+        """Check only the local Noto CJK fallback font pack."""
+        from app.models.resolution import has_noto_cjk_sc_font_pack
+
+        return has_noto_cjk_sc_font_pack(base_dir=models_dir)
 
     def prepare_ner(self, models_dir: str):
         """Queue NER model download."""
@@ -673,32 +822,18 @@ class ModelDownloader(QtCore.QObject):
         self._download_ner = True
 
     def prepare_paddle_ocr_vl(self, models_dir: str):
-        """Queue PaddleOCR-VL GGUF model and native llama.cpp runtime assets."""
-        model_dir = os.path.join(models_dir, "paddleocr-vl-1.6-gguf")
-        llama_dir = os.path.join(models_dir, "llama.cpp")
-        repo_url = f"https://huggingface.co/{PADDLE_OCR_VL_REPO_ID}/resolve/main"
+        """Queue model files and only the runtime archives for this platform."""
         targets = [
             DownloadTarget(
-                url=f"{repo_url}/{PADDLE_OCR_VL_MODEL_FILE}",
-                save_path=os.path.join(model_dir, PADDLE_OCR_VL_MODEL_FILE),
-                label="Downloading PaddleOCR-VL GGUF model...",
-            ),
-            DownloadTarget(
-                url=f"{repo_url}/{PADDLE_OCR_VL_MMPROJ_FILE}",
-                save_path=os.path.join(model_dir, PADDLE_OCR_VL_MMPROJ_FILE),
-                label="Downloading PaddleOCR-VL multimodal projector...",
-            ),
-            DownloadTarget(
-                url="https://github.com/ggml-org/llama.cpp/releases/download/b9842/llama-b9842-bin-win-cuda-12.4-x64.zip",
-                save_path=os.path.join(llama_dir, "llama-b9842-bin-win-cuda-12.4-x64.zip"),
-                label="Downloading llama.cpp Windows CUDA runtime...",
-            ),
-            DownloadTarget(
-                url="https://github.com/ggml-org/llama.cpp/releases/download/b9842/cudart-llama-bin-win-cuda-12.4-x64.zip",
-                save_path=os.path.join(llama_dir, "cudart-llama-bin-win-cuda-12.4-x64.zip"),
-                label="Downloading llama.cpp CUDA support DLLs...",
-            ),
+                url=item.url,
+                save_path=os.path.join(models_dir, item.relative_path),
+                label=item.label,
+                sha256=item.sha256,
+            )
+            for item in paddle_targets(self._platform_identity)
         ]
+        self._paddle_models_dir = str(models_dir)
+        self._paddle_runtime_verification_required = True
         self.queue_targets(targets)
 
     def prepare_bubble_detection(self, models_dir: str):
@@ -726,8 +861,8 @@ class ModelDownloader(QtCore.QObject):
         ]
         self.queue_targets(targets)
 
-    def prepare_font_detection(self, models_dir: str):
-        """Queue YuzuMarker font detection and local CJK fallback font assets."""
+    def prepare_yuzumarker_font_detection(self, models_dir: str):
+        """Queue only the YuzuMarker font-detection model and labels."""
         onnx_dir = os.path.join(models_dir, "YuzuMarker", "onnx")
         labels_dir = os.path.join(models_dir, "YuzuMarker", "safetensors")
         onnx_url = f"https://huggingface.co/{YUZUMARKER_FONT_ONNX_REPO_ID}/resolve/main"
@@ -751,6 +886,10 @@ class ModelDownloader(QtCore.QObject):
             ),
         ]
         self.queue_targets(targets)
+
+    def prepare_font_detection(self, models_dir: str):
+        """Queue YuzuMarker detection and local CJK fallback font assets."""
+        self.prepare_yuzumarker_font_detection(models_dir)
         self.prepare_noto_cjk_sc_font_pack(models_dir)
 
     def prepare_noto_cjk_sc_font_pack(self, models_dir: str):
@@ -820,6 +959,16 @@ class ModelDownloader(QtCore.QObject):
             success = self._perform_ner_download()
             self._download_ner = False
             if not success:
+                return
+
+        if self._paddle_runtime_verification_required:
+            self._paddle_runtime_verification_required = False
+            if not self.check_paddle_ocr_vl(str(getattr(self, "_paddle_models_dir", "models"))):
+                remediation = runtime_asset_spec(
+                    "paddle_ocr_vl",
+                    self._platform_identity,
+                ).remediation_for(self._platform_identity)
+                self.finished.emit(False, f"PaddleOCR-VL runtime is incomplete. {remediation}")
                 return
 
         if self._cancel_requested:

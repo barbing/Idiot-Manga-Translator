@@ -21,10 +21,10 @@ class FontDetection:
 class _HeuristicFontDetector:
     def __init__(self) -> None:
         self._fonts = {
-            "thin": "SimSun",
-            "normal": "Noto Sans CJK",
-            "bold": "Microsoft YaHei",
-            "vertical": "Microsoft YaHei",
+            "thin": "Noto Sans CJK SC",
+            "normal": "Noto Sans CJK SC",
+            "bold": "Noto Sans CJK SC",
+            "vertical": "Noto Sans CJK SC",
         }
 
     def detect(self, image) -> Optional[str]:

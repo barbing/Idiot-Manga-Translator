@@ -37,6 +37,7 @@ from app.pipeline.status_contracts import (
     PipelineStage,
     PipelineStageEvent,
 )
+from app.platform_services.runtime_assets import runtime_asset_catalog
 from app.ui.design_system.components import (
     HybridComboBox,
     WheelSafeDoubleSpinBox,
@@ -46,6 +47,7 @@ from app.ui.design_system.dialogs import HybridConfirmDialog, HybridDialog
 from app.ui.design_system.geometry import MODULE_POLICY_GEOMETRY
 from app.ui.design_system.icons import hybrid_icon
 from app.ui.presentation import provider_lifecycle_summary
+from app.ui.theme import platform_presentation
 from app.ui.viewmodels.settings_model import (
     EffectiveRunSummary,
     SettingsViewModel,
@@ -107,6 +109,7 @@ class SettingsView(QtWidgets.QWidget):
         self.setAccessibleName("Settings")
         self._view_model = view_model
         self._registry = registry
+        self._platform_copy = platform_presentation()
         self._advanced = False
         self._module_controls: dict[str, QtWidgets.QWidget] = {}
         self._profile_refreshing = False
@@ -1063,7 +1066,7 @@ class SettingsView(QtWidgets.QWidget):
         self.provider_gpu_layers.setAccessibleName("GGUF GPU layers")
         self.provider_gpu_layers.setAccessibleDescription(
             "Automatic fits the highest safe layer count when Start checks the "
-            "current GPU memory budget. Explicit values remain exact."
+            "current accelerator memory budget. Explicit values remain exact."
         )
         self.provider_gpu_layers.setToolTip(
             "Automatic fits this run to current VRAM without changing the model, "
@@ -1145,7 +1148,7 @@ class SettingsView(QtWidgets.QWidget):
         )
         self.provider_safety_title.setProperty("role", "section")
         self.provider_safety_detail = QtWidgets.QLabel(
-            "Only an opaque Windows credential reference is stored with this profile."
+            f"Only an opaque {self._platform_copy.credential_store_label} reference is stored with this profile."
         )
         self.provider_safety_detail.setWordWrap(True)
         self.provider_safety_detail.setProperty("role", "secondary")
@@ -1427,12 +1430,12 @@ class SettingsView(QtWidgets.QWidget):
         self.runtime_asset_rows: dict[
             str, tuple[QtWidgets.QLabel, QtWidgets.QLabel, QtWidgets.QPushButton]
         ] = {}
-        for asset_id, name, detail in (
-            ("comic_text_detector", "ComicTextDetector", "Detection model"),
-            ("ocr", "Manga OCR", "Japanese recognition"),
-            ("pyicu", "PyICU line breaking", "Managed Windows runtime"),
-            ("font_pack", "Optional font pack", "Noto CJK extended"),
-        ):
+        self._runtime_asset_specs = {
+            item.asset_id: item for item in runtime_asset_catalog()
+        }
+        for asset_id, spec in self._runtime_asset_specs.items():
+            name = spec.name
+            detail = spec.detail
             row = QtWidgets.QFrame()
             row.setObjectName("runtimeAssetRow")
             row.setProperty("role", "panel-raised")
@@ -1478,7 +1481,9 @@ class SettingsView(QtWidgets.QWidget):
         location_copy = QtWidgets.QVBoxLayout()
         location_title = QtWidgets.QLabel("Managed runtime root")
         location_title.setProperty("role", "section")
-        self.runtime_root_value = QtWidgets.QLabel("%LOCALAPPDATA%/YomiFrame/runtime")
+        self.runtime_root_value = QtWidgets.QLabel(
+            self._platform_copy.runtime_root_label
+        )
         self.runtime_root_value.setProperty("role", "secondary")
         location_copy.addWidget(location_title)
         location_copy.addWidget(self.runtime_root_value)
@@ -2309,7 +2314,7 @@ class SettingsView(QtWidgets.QWidget):
                         "Secret stays outside project.json"
                     )
                     self.provider_safety_detail.setText(
-                        "Only an opaque Windows credential reference is saved with this profile."
+                        f"Only an opaque {self._platform_copy.credential_store_label} reference is saved with this profile."
                     )
             elif is_api:
                 self.profile_endpoint.setPlaceholderText("OpenAI-compatible API endpoint")
@@ -2329,7 +2334,7 @@ class SettingsView(QtWidgets.QWidget):
                         "Secret stays outside project.json"
                     )
                     self.provider_safety_detail.setText(
-                        "Only an opaque Windows credential reference is saved with this profile."
+                        f"Only an opaque {self._platform_copy.credential_store_label} reference is saved with this profile."
                     )
             self.profile_endpoint_field.setVisible(not is_gguf)
             self.profile_model_field.setVisible(not is_gguf)
@@ -2443,7 +2448,7 @@ class SettingsView(QtWidgets.QWidget):
             self.link_credential.setToolTip(
                 (
                     "Enter an API key for one test, then optionally save it in "
-                    "Windows Credential Manager"
+                    f"{self._platform_copy.credential_store_label}"
                 )
                 if supports_credentials
                 else "This provider does not use a stored credential"
@@ -2460,7 +2465,7 @@ class SettingsView(QtWidgets.QWidget):
             if issues == ("credential_reference_required",) and supports_test:
                 self.test_provider.setToolTip(
                     "Enter an API key, test the connection, and optionally save it "
-                    "in Windows Credential Manager"
+                    f"in {self._platform_copy.credential_store_label}"
                 )
             elif test_blocking_issues:
                 self.test_provider.setToolTip(
@@ -2741,14 +2746,18 @@ class SettingsView(QtWidgets.QWidget):
         credential = profile.credential_ref
         if (
             credential is not None
-            and credential.kind is CredentialReferenceKind.WINDOWS_CREDENTIAL
+            and credential.kind
+            in {
+                CredentialReferenceKind.WINDOWS_CREDENTIAL,
+                CredentialReferenceKind.SYSTEM_KEYRING,
+            }
         ):
             delete_credential = HybridConfirmDialog.ask(
                 self,
                 title="Delete stored credential too?",
                 message=(
-                    "Also delete this profile's saved API credential from Windows "
-                    "Credential Manager? Keep it to remove only the profile."
+                    f"Also delete this profile's saved API credential from "
+                    f"{self._platform_copy.credential_store_label}? Keep it to remove only the profile."
                 ),
                 confirm_text="Delete credential",
                 cancel_text="Keep credential",
@@ -3132,7 +3141,7 @@ class SettingsView(QtWidgets.QWidget):
                         "GGUF Cross-Page Context"
                     ),
                     "cleanup.inpaint_model_id": "Inpaint Model ID",
-                    "runtime.use_gpu": "Use GPU",
+                    "runtime.use_gpu": "Allow acceleration",
                 }.get(
                     definition.qualified_id,
                     definition.setting_id.replace("_", " ").title(),
@@ -3312,12 +3321,6 @@ class SettingsView(QtWidgets.QWidget):
             return
         status = self._view_model.runtime_status if self._view_model is not None else None
         installed = status.installed_assets if status is not None else {}
-        aliases = {
-            "comic_text_detector": ("comic_text_detector", "detection"),
-            "ocr": ("ocr", "manga_ocr", "paddle_ocr_vl"),
-            "pyicu": ("pyicu", "line_breaking"),
-            "font_pack": ("font_pack", "noto_cjk", "fonts"),
-        }
         for asset_id, (description, state, action) in self.runtime_asset_rows.items():
             if self._runtime_downloading_asset_id:
                 active = asset_id == self._runtime_downloading_asset_id
@@ -3336,17 +3339,20 @@ class SettingsView(QtWidgets.QWidget):
                 state.style().unpolish(state)
                 state.style().polish(state)
                 continue
-            raw = next(
-                (installed[key] for key in aliases[asset_id] if key in installed),
-                None,
-            )
+            raw = installed.get(asset_id)
             ready = False
+            managed_download = bool(
+                self._runtime_asset_specs[asset_id].preparer is not None
+            )
             detail = description.text()
             if isinstance(raw, bool):
                 ready = raw
             elif isinstance(raw, Mapping):
                 ready = bool(raw.get("ready") or raw.get("installed"))
                 detail = str(raw.get("detail") or raw.get("version") or detail)
+                managed_download = bool(
+                    raw.get("managed_download", managed_download)
+                )
             elif raw is not None:
                 ready = str(raw).casefold() in {"ready", "installed", "true"}
                 detail = str(raw)
@@ -3356,7 +3362,11 @@ class SettingsView(QtWidgets.QWidget):
             state.setText(label)
             state.setProperty("tone", tone)
             state.setAccessibleName(f"{asset_id} runtime asset: {label}")
-            action.setText("Details" if ready or raw is None else "Download")
+            action.setText(
+                "Details"
+                if ready or raw is None
+                else "Download" if managed_download else "Instructions"
+            )
             action.setEnabled(True)
             state.style().unpolish(state)
             state.style().polish(state)

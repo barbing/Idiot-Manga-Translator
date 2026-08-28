@@ -8,6 +8,13 @@ from dataclasses import dataclass, field
 from typing import Any, List, Tuple
 import logging
 
+from app.platform_services.compute import (
+    TorchDeviceSelection,
+    release_torch_memory,
+    select_torch_device,
+)
+from app.platform_services.contracts import ComputeBackend
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,14 +50,22 @@ def _default_model_dir() -> str:
     return os.path.join(_repo_root(), "models", "comic-text-detector")
 
 
-def _select_model_path(model_dir: str, use_gpu: bool) -> str:
+def _select_model_path(
+    model_dir: str,
+    use_gpu: bool,
+    *,
+    selection: TorchDeviceSelection | None = None,
+) -> str:
     # This model is user-downloaded and resides in the models/ folder.
     # We do NOT check system paths to avoid conflict.
     
     # 1. Portable Model Check
     portable_model_root = None
     local_model_path = os.path.join(os.getcwd(), "models", "comic-text-detector")
-    if os.path.exists(os.path.join(local_model_path, "comictextdetector.pt")):
+    if (
+        os.path.abspath(model_dir) == os.path.abspath(_default_model_dir())
+        and os.path.exists(os.path.join(local_model_path, "comictextdetector.pt"))
+    ):
         portable_model_root = local_model_path
 
     # Determine effective root (Allow override, then portable, then default arg)
@@ -63,7 +78,8 @@ def _select_model_path(model_dir: str, use_gpu: bool) -> str:
     onnx_path = os.path.join(effective_model_root, "comictextdetector.pt.onnx")
     pt_path = os.path.join(effective_model_root, "comictextdetector.pt")
 
-    if use_gpu and os.path.isfile(pt_path):
+    selected = selection or select_torch_device(use_gpu)
+    if selected.backend is ComputeBackend.CUDA and os.path.isfile(pt_path):
         logger.info(f"Selected GPU model: {pt_path}")
         return pt_path
     if os.path.isfile(onnx_path):
@@ -115,7 +131,12 @@ class ComicTextDetector:
             torch = None
 
         model_root = model_dir or os.environ.get("MT_COMICTEXT_MODEL_DIR", "").strip() or _default_model_dir()
-        self._model_path = _select_model_path(model_root, use_gpu)
+        selection = select_torch_device(use_gpu)
+        self._model_path = _select_model_path(
+            model_root,
+            use_gpu,
+            selection=selection,
+        )
         if not os.path.isfile(self._model_path):
             raise RuntimeError(
                 "ComicTextDetector model not found. Download comictextdetector.pt.onnx (CPU) or "
@@ -123,14 +144,24 @@ class ComicTextDetector:
                 f"and place it under {model_root}."
             )
 
-        device = "cpu"
-        if (
-            use_gpu
+        device = (
+            selection.device
+            if selection.backend is ComputeBackend.CUDA
             and torch is not None
-            and torch.cuda.is_available()
             and self._model_path.endswith(".pt")
-        ):
-            device = "cuda"
+            else "cpu"
+        )
+        self.requested_acceleration = bool(use_gpu)
+        self.selected_backend = (
+            selection.backend.value if device != "cpu" else ComputeBackend.CPU.value
+        )
+        self.provider_fallback_reason = (
+            selection.fallback_reason
+            if device == selection.device
+            else "portable_onnx_cpu_selected"
+            if use_gpu
+            else ""
+        )
 
         from inference import TextDetector
         from utils.textmask import REFINEMASK_INPAINT
@@ -152,12 +183,11 @@ class ComicTextDetector:
         if hasattr(self, "_detector"):
             del self._detector
         
+        release_torch_memory()
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                import gc
-                gc.collect()
+            import gc
+
+            gc.collect()
         except Exception:
             pass
 

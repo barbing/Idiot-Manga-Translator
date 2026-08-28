@@ -5,10 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping
 
 from app.config.credential_store import (
-    CompositeCredentialResolver,
     CredentialResolver,
-    EnvironmentCredentialResolver,
-    WindowsCredentialStore,
 )
 from app.config.provider_profiles import ProviderKind
 from app.config.run_settings_compiler import (
@@ -17,6 +14,7 @@ from app.config.run_settings_compiler import (
     materialize_pipeline_settings_snapshot,
 )
 from app.config.settings_contracts import thaw_json
+from app.platform_services.credentials import build_credential_resolver
 
 from .translation_revision_contracts import (
     CancellationProbe,
@@ -47,10 +45,7 @@ def resolve_translation_runtime_binding(
         )
     resolved_credential: str | None = None
     if binding.credential_reference is not None:
-        resolver = credential_resolver or CompositeCredentialResolver(
-            environment=EnvironmentCredentialResolver(),
-            windows=WindowsCredentialStore(),
-        )
+        resolver = credential_resolver or build_credential_resolver()
         resolved_credential = resolver.resolve(binding.credential_reference)
         if not resolved_credential:
             raise TranslationRevisionError(

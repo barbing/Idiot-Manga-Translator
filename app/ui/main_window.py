@@ -66,6 +66,7 @@ from app.io.project import (
 from app.ui.style_guide_editor import StyleGuideEditor
 from app.ui.region_review import RegionReviewDialog
 from app.models.downloader import ModelDownloader
+from app.platform_services.paths import qt_platform_paths
 from app.ui.dialogs.download_dialog import DownloadDialog
 from app.ui.viewmodels.settings_model import (
     LegacyShellSettingsProjection,
@@ -416,8 +417,11 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             btn.setFixedHeight(40)
             
-            # Explicitly set font to prevent "Point size <= 0" error during hover transition
-            f = QtGui.QFont("Microsoft YaHei", 14)
+            # Use the platform UI family while preserving the legacy control size.
+            f = QtGui.QFontDatabase.systemFont(
+                QtGui.QFontDatabase.SystemFont.GeneralFont
+            )
+            f.setPointSize(14)
             f.setStyleStrategy(QtGui.QFont.PreferAntialias)
             btn.setFont(f)
             
@@ -1361,7 +1365,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _group_performance(self) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox("Performance")
         layout = QtWidgets.QFormLayout(group)
-        self.use_gpu = QtWidgets.QCheckBox("Enable GPU when available")
+        self.use_gpu = QtWidgets.QCheckBox("Allow acceleration when available")
         self.use_gpu.setChecked(True)
         layout.addRow("", self.use_gpu)
         return group
@@ -3330,13 +3334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return tuple(sorted(selected, key=lambda item: item.module_id))
 
     def _settings_storage_directory(self) -> Path:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return Path(local_app_data) / "YomiFrame" / "config"
-        fallback = QtCore.QStandardPaths.writableLocation(
-            QtCore.QStandardPaths.AppConfigLocation
-        )
-        return Path(fallback or os.getcwd()) / "YomiFrame"
+        return qt_platform_paths().config_root
 
     def _initialize_settings_authority(self) -> None:
         root = self._settings_storage_directory()

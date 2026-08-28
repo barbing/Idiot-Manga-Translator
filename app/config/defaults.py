@@ -56,7 +56,7 @@ class AppDefaults:
     json_path: str = ""
     import_dir: str = ""
     export_dir: str = ""
-    font_name: str = "Microsoft YaHei"
+    font_name: str = "Noto Sans CJK SC"
     font_detection: str = "yuzumarker"
     detector_input_size: int = 1024
     detector_engine: str = "ComicTextDetector"

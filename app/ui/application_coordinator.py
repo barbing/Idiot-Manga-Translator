@@ -22,9 +22,6 @@ from PySide6 import QtCore, QtWidgets
 import requests
 
 from app.config.credential_store import (
-    CompositeCredentialResolver,
-    EnvironmentCredentialResolver,
-    WindowsCredentialStore,
     resolve_legacy_deepseek_credential,
 )
 from app.config.provider_profiles import (
@@ -42,6 +39,12 @@ from app.config.run_settings_compiler import (
 )
 from app.config.settings_contracts import CredentialReference
 from app.models.resolution import models_root
+from app.platform_services.credentials import (
+    build_credential_resolver,
+    build_credential_store,
+    credential_store_label,
+)
+from app.platform_services import PlatformServices, build_platform_services
 from app.pipeline.status_contracts import PipelineLifecycleEvent, PipelineRunState
 from app.ui.page_rerender_worker import (
     PageRerenderWorker,
@@ -342,7 +345,8 @@ class GuiApplicationCoordinator(QtCore.QObject):
         provider_worker_factory: Callable[[ProviderProfile, str | None], object] = _ProviderTestWorker,
         credential_prompt: Callable[[ProviderProfile], tuple[str, bool]] | None = None,
         credential_save_prompt: Callable[[ProviderProfile], bool] | None = None,
-        credential_store_factory: Callable[[], object] = WindowsCredentialStore,
+        credential_store_factory: Callable[[], object] = build_credential_store,
+        credential_resolver_factory: Callable[[], object] = build_credential_resolver,
         legacy_credential_resolver: Callable[[ProviderProfile], str | None]
         | None = None,
         parent: QtCore.QObject | None = None,
@@ -365,6 +369,7 @@ class GuiApplicationCoordinator(QtCore.QObject):
             credential_save_prompt or self._confirm_provider_credential_save
         )
         self._credential_store_factory = credential_store_factory
+        self._credential_resolver_factory = credential_resolver_factory
         self._legacy_credential_resolver = (
             legacy_credential_resolver or self._resolve_legacy_provider_credential
         )
@@ -582,18 +587,17 @@ class GuiApplicationCoordinator(QtCore.QObject):
             return RunInvocation(import_dir="", export_dir="", json_path="")
         return fallback
 
-    @staticmethod
-    def _resolve_runtime_binding(binding: RuntimeProviderBinding) -> object | None:
+    def _resolve_runtime_binding(
+        self,
+        binding: RuntimeProviderBinding,
+    ) -> object | None:
         if not isinstance(binding, RuntimeProviderBinding):
             raise TypeError("compiled runtime binding is invalid")
         if binding.provider_kind is None:
             return None
         resolved: str | None = None
         if binding.credential_reference is not None:
-            resolver = CompositeCredentialResolver(
-                environment=EnvironmentCredentialResolver(),
-                windows=WindowsCredentialStore(),
-            )
+            resolver = self._credential_resolver_factory()
             resolved = resolver.resolve(binding.credential_reference)
             if not resolved:
                 raise RuntimeError(
@@ -842,10 +846,7 @@ class GuiApplicationCoordinator(QtCore.QObject):
         credential: str | None = None
         try:
             if profile.credential_ref is not None:
-                resolver = CompositeCredentialResolver(
-                    environment=EnvironmentCredentialResolver(),
-                    windows=WindowsCredentialStore(),
-                )
+                resolver = self._credential_resolver_factory()
                 credential = resolver.resolve(profile.credential_ref)
         except Exception:
             credential = None
@@ -981,15 +982,21 @@ class GuiApplicationCoordinator(QtCore.QObject):
                     reference,
                 )
             except Exception as exc:
-                self._notice(
-                    f"Credential could not be saved ({type(exc).__name__}).",
-                    warning=True,
+                message = f"Credential could not be saved ({type(exc).__name__})."
+                present_failure = getattr(
+                    self._shell,
+                    "accept_provider_save_failure",
+                    None,
                 )
+                if callable(present_failure):
+                    present_failure(profile.profile_id, message)
+                else:
+                    self._notice(message, warning=True)
                 return
             self._shell.accept_provider_test_result(receipt)
             self._notice(
-                "Connection succeeded and the credential was linked securely. "
-                "Choose Use for translation, then Apply Settings.",
+                "The credential was linked securely. Test the linked profile once "
+                "more, then choose Use for translation and Apply Settings.",
             )
             return
         self._shell.accept_provider_test_result(receipt)
@@ -1054,7 +1061,7 @@ class GuiApplicationCoordinator(QtCore.QObject):
             title="Save tested credential securely?",
             message=(
                 f"{profile.display_name} accepted this credential. Save it in "
-                "Windows Credential Manager and link only an opaque reference "
+                f"{credential_store_label()} and link only an opaque reference "
                 "to the provider profile?"
             ),
             confirm_text="Save securely",
@@ -1066,17 +1073,25 @@ class GuiApplicationCoordinator(QtCore.QObject):
         self._shell.accept_application_notice(text, warning=warning)
 
 
-def create_gui_application_window() -> object:
+def create_gui_application_window(
+    *,
+    platform_services: PlatformServices | None = None,
+) -> object:
     """Construct the sole production shell and retain its coordinator."""
 
     from app.pipeline.controller import PipelineController
     from app.ui.shell.main_window import YomiFrameMainWindow
 
+    services = platform_services or build_platform_services()
+    if not isinstance(services, PlatformServices):
+        raise TypeError("platform_services must be PlatformServices")
     controller = PipelineController()
-    window = YomiFrameMainWindow()
+    window = YomiFrameMainWindow(platform_services=services)
     coordinator = GuiApplicationCoordinator(
         shell=window,
         controller=controller,
+        credential_store_factory=lambda: services.credential_store,
+        credential_resolver_factory=lambda: services.credential_resolver,
         parent=window,
     )
     # PySide parent ownership is sufficient at runtime; the explicit Python

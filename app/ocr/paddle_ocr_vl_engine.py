@@ -9,7 +9,7 @@ import subprocess
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import requests
 
@@ -24,6 +24,40 @@ DEFAULT_PROMPT = (
     "Recognize all Japanese text in this manga image crop. Return only the exact "
     "Japanese text. Preserve punctuation. Do not translate or explain."
 )
+
+
+def paddle_runtime_executable(resolver=resolve_llama_server_executable) -> str:
+    return str(resolver() or "").strip()
+
+
+def _model_inventory_matches(
+    payload: object,
+    expected_model_path: str,
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    identifiers: set[str] = set()
+    for collection_name in ("models", "data"):
+        collection = payload.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, Mapping):
+                continue
+            for field_name in ("name", "model", "id"):
+                value = str(item.get(field_name) or "").strip()
+                if value:
+                    identifiers.add(value)
+            aliases = item.get("aliases")
+            if isinstance(aliases, list):
+                identifiers.update(
+                    str(value).strip() for value in aliases if str(value).strip()
+                )
+    expected = os.path.normcase(os.path.abspath(expected_model_path))
+    return any(
+        os.path.normcase(os.path.abspath(identifier)) == expected
+        for identifier in identifiers
+    )
 
 
 class PaddleOcrVlEngine:
@@ -155,7 +189,10 @@ class PaddleOcrVlEngine:
             pass
 
     def _start_server(self, host: str, port: int, *, use_gpu: bool) -> None:
-        llama_server = _required_path(resolve_llama_server_executable(), "llama-server executable")
+        llama_server = _required_path(
+            paddle_runtime_executable(),
+            "llama-server executable",
+        )
         log_dir = Path(self.model_path).parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / "paddleocr_vl_llama_server_stdout.log"
@@ -220,8 +257,8 @@ class PaddleOcrVlEngine:
         try:
             response = self._request_session().get(f"{self.endpoint}/models", timeout=5)
             response.raise_for_status()
-            body = json.dumps(response.json(), ensure_ascii=False).lower()
-            if "paddleocr" not in body and "paddleocr-vl" not in body:
+            payload = response.json()
+            if not _model_inventory_matches(payload, self.model_path):
                 raise RuntimeError(f"endpoint is running a different model: {self.endpoint}")
         except RuntimeError:
             raise

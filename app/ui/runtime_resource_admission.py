@@ -26,6 +26,7 @@ from app.models.resolution import (
     models_root,
     resolve_cleanup_inpaint_model_file,
     resolve_kitsumed_speech_bubble_model,
+    resolve_llama_server_executable,
     resolve_manga_ocr_local_dir,
     resolve_manga_ocr_system_ref,
     resolve_ogkalu_text_bubble_model,
@@ -33,6 +34,15 @@ from app.models.resolution import (
     resolve_paddle_ocr_vl_model_file,
     resolve_yuzumarker_font_onnx_file,
 )
+from app.platform_services.compute import (
+    ComputeCapabilitySnapshot,
+    probe_llama_cpp_python_backend,
+    probe_llama_server_backend,
+    probe_mps_memory,
+    select_onnx_providers,
+    select_torch_device,
+)
+from app.platform_services.contracts import ComputeBackend
 
 
 GIB = 1024**3
@@ -78,6 +88,11 @@ class RuntimeMemorySnapshot:
     gpu_devices: tuple[RuntimeGpuMemoryDevice, ...] = ()
     source: str = ""
     detail: str = ""
+    backend: ComputeBackend = ComputeBackend.CPU
+    onnx_backend: ComputeBackend = ComputeBackend.CPU
+    llama_server_backend: ComputeBackend = ComputeBackend.CPU
+    llama_cpp_backend: ComputeBackend = ComputeBackend.CPU
+    unified_memory: bool = False
 
     def __post_init__(self) -> None:
         if self.total_ram_bytes <= 0:
@@ -93,6 +108,18 @@ class RuntimeMemorySnapshot:
                 raise ValueError("available_vram_bytes is outside total VRAM")
         if any(not isinstance(item, RuntimeGpuMemoryDevice) for item in self.gpu_devices):
             raise TypeError("gpu_devices must contain RuntimeGpuMemoryDevice values")
+        if not isinstance(self.backend, ComputeBackend):
+            raise TypeError("backend must be ComputeBackend")
+        if not isinstance(self.onnx_backend, ComputeBackend):
+            raise TypeError("onnx_backend must be ComputeBackend")
+        if not isinstance(self.llama_server_backend, ComputeBackend):
+            raise TypeError("llama_server_backend must be ComputeBackend")
+        if not isinstance(self.llama_cpp_backend, ComputeBackend):
+            raise TypeError("llama_cpp_backend must be ComputeBackend")
+        if self.unified_memory and self.total_vram_bytes is None:
+            raise ValueError("unified-memory snapshots require a working-set limit")
+        if self.unified_memory and self.backend is ComputeBackend.CUDA:
+            raise ValueError("CUDA snapshots use a separate VRAM budget")
 
 
 @dataclass(frozen=True)
@@ -117,6 +144,7 @@ class RuntimeResourceAssets:
     manga_ocr_model_bytes: int = 0
     ner_model_bytes: int = 0
     detector_model_bytes: int = 0
+    bubble_model_bytes: int = 0
     cleanup_model_bytes: int = 0
     font_model_bytes: int = 0
     unresolved: tuple[str, ...] = ()
@@ -130,6 +158,7 @@ class RuntimeResourceAssets:
             "manga_ocr_model_bytes",
             "ner_model_bytes",
             "detector_model_bytes",
+            "bubble_model_bytes",
             "cleanup_model_bytes",
             "font_model_bytes",
             "translation_context_bytes",
@@ -200,12 +229,17 @@ class ResourceComponentEstimate:
     gpu_bytes: int
     ram_bytes: int
     method: str
+    backend: ComputeBackend = ComputeBackend.CPU
 
     def __post_init__(self) -> None:
         if not self.component_id.strip() or not self.label.strip():
             raise ValueError("resource component identity is required")
         if self.gpu_bytes < 0 or self.ram_bytes < 0:
             raise ValueError("resource component estimates must not be negative")
+        if not isinstance(self.backend, ComputeBackend):
+            raise TypeError("resource component backend must be ComputeBackend")
+        if self.backend is ComputeBackend.CPU and self.gpu_bytes:
+            raise ValueError("CPU components cannot reserve accelerator memory")
 
 
 @dataclass(frozen=True)
@@ -232,6 +266,47 @@ class RuntimeResourceAdmissionReport:
     runtime_overrides: tuple[tuple[str, object], ...] = ()
     warnings: tuple[str, ...] = ()
     recommended_changes: tuple[tuple[str, object], ...] = ()
+    backend: ComputeBackend = ComputeBackend.CPU
+    onnx_backend: ComputeBackend = ComputeBackend.CPU
+    llama_server_backend: ComputeBackend = ComputeBackend.CPU
+    llama_cpp_backend: ComputeBackend = ComputeBackend.CPU
+    unified_memory: bool = False
+    projected_unified_bytes: int = 0
+    unified_reserve_bytes: int = 0
+    unified_budget_bytes: int = 0
+
+    @property
+    def accelerator_backends(self) -> tuple[ComputeBackend, ...]:
+        order = {
+            ComputeBackend.CUDA: 0,
+            ComputeBackend.MPS: 1,
+            ComputeBackend.COREML: 2,
+            ComputeBackend.METAL: 3,
+            ComputeBackend.CPU: 4,
+        }
+        selected = {
+            item.backend
+            for item in self.components
+            if item.gpu_bytes and item.backend is not ComputeBackend.CPU
+        }
+        return tuple(sorted(selected, key=order.__getitem__))
+
+    @property
+    def accelerator_label(self) -> str:
+        backends = self.accelerator_backends
+        if not backends:
+            return "CPU"
+        names = "/".join(
+            {
+                ComputeBackend.CUDA: "CUDA",
+                ComputeBackend.MPS: "MPS",
+                ComputeBackend.COREML: "CoreML",
+                ComputeBackend.METAL: "Metal",
+                ComputeBackend.CPU: "CPU",
+            }[item]
+            for item in backends
+        )
+        return f"{names} unified memory" if self.unified_memory else f"{names} VRAM"
 
     @property
     def safe_to_start(self) -> bool:
@@ -276,29 +351,48 @@ class RuntimeResourceAdmissionReport:
         )
         warning_suffix = f" {self.warnings[0]}" if self.warnings else ""
         if self.status is ResourceAdmissionStatus.UNAVAILABLE:
-            reason = self.reasons[0] if self.reasons else "GPU memory could not be measured."
+            reason = (
+                self.reasons[0]
+                if self.reasons
+                else "Accelerator memory could not be measured."
+            )
             return (
                 f"{auto_prefix}{reason} Start is blocked until the local memory "
                 "budget can be verified."
             )
         ram_pressure = any(
-            "host residency" in reason or "system-memory" in reason
+            "host residency" in reason
+            or "system-memory" in reason
+            or "unified-memory" in reason
             for reason in self.reasons
         )
         if ram_pressure and self.status in {
             ResourceAdmissionStatus.BLOCKED,
             ResourceAdmissionStatus.RISK,
         }:
-            projected = _format_bytes(self.projected_ram_bytes)
+            projected = _format_bytes(
+                self.projected_unified_bytes
+                if self.unified_memory
+                else self.projected_ram_bytes
+            )
             available = _format_bytes(self.available_ram_bytes)
-            reserve = _format_bytes(self.ram_reserve_bytes)
+            reserve = _format_bytes(
+                self.unified_reserve_bytes
+                if self.unified_memory
+                else self.ram_reserve_bytes
+            )
+            memory_label = (
+                f"{self.accelerator_label} and system memory"
+                if self.unified_memory
+                else "system memory"
+            )
             if self.status is ResourceAdmissionStatus.BLOCKED:
                 return auto_prefix + (
-                    f"Needs {projected} system memory; {available} is available. "
+                    f"{memory_label}: needs {projected}; {available} is available. "
                     "Start is blocked."
                 )
             return auto_prefix + (
-                f"Needs {projected} plus {reserve} system-memory reserve; "
+                f"{memory_label}: needs {projected} plus {reserve} reserve; "
                 f"{available} is available. Start is blocked."
             )
         if self.available_vram_bytes is not None and self.projected_vram_bytes:
@@ -307,16 +401,18 @@ class RuntimeResourceAdmissionReport:
             reserve = _format_bytes(self.vram_reserve_bytes)
             if self.status is ResourceAdmissionStatus.BLOCKED:
                 return auto_prefix + (
-                    f"Needs {projected} GPU memory; {available} is available. "
+                    f"{self.accelerator_label}: needs {projected}; "
+                    f"{available} is available. "
                     "Start is blocked."
                 )
             if self.status is ResourceAdmissionStatus.RISK:
                 return auto_prefix + (
-                    f"Needs {projected} plus {reserve} reserve; {available} is "
-                    "available. Start is blocked."
+                    f"{self.accelerator_label}: needs {projected} plus {reserve} "
+                    f"reserve; {available} is available. Start is blocked."
                 )
             return auto_prefix + (
-                f"{projected} estimated · {available} available · {reserve} reserved."
+                f"{self.accelerator_label}: {projected} estimated · "
+                f"{available} available · {reserve} reserved."
                 f"{warning_suffix}"
             )
         if self.status is ResourceAdmissionStatus.BLOCKED:
@@ -339,7 +435,7 @@ class RuntimeResourceAdmissionReport:
     @property
     def facts(self) -> tuple[tuple[str, str], ...]:
         facts: list[tuple[str, str]] = []
-        if self.available_vram_bytes is not None:
+        if self.available_vram_bytes is not None and self.projected_vram_bytes:
             auto_layers = next(
                 (
                     int(value)
@@ -359,16 +455,30 @@ class RuntimeResourceAdmissionReport:
             )
             facts.append(
                 (
-                    f"GPU {_format_bytes(self.projected_vram_bytes)} estimated · "
+                    f"{self.accelerator_label} "
+                    f"{_format_bytes(self.projected_vram_bytes)} estimated · "
                     f"{_format_bytes(self.vram_budget_bytes)} budget{auto_detail}",
                     self.tone,
                 )
             )
         facts.append(
             (
-                f"RAM {_format_bytes(self.projected_ram_bytes)} estimated · "
-                f"{_format_bytes(self.ram_budget_bytes)} budget",
-                "ready" if self.projected_ram_bytes <= self.ram_budget_bytes else "error",
+                (
+                    f"Unified RAM {_format_bytes(self.projected_unified_bytes)} "
+                    f"estimated · {_format_bytes(self.unified_budget_bytes)} budget"
+                    if self.unified_memory
+                    else f"RAM {_format_bytes(self.projected_ram_bytes)} estimated · "
+                    f"{_format_bytes(self.ram_budget_bytes)} budget"
+                ),
+                (
+                    "ready"
+                    if (
+                        self.projected_unified_bytes <= self.unified_budget_bytes
+                        if self.unified_memory
+                        else self.projected_ram_bytes <= self.ram_budget_bytes
+                    )
+                    else "error"
+                ),
             )
         )
         return tuple(facts[:2])
@@ -433,23 +543,25 @@ def monitor_runtime_reserve(
         if memory.available_vram_bytes is None:
             level = ResourceMonitorLevel.UNAVAILABLE
             reasons.append(
-                "Active-run GPU reserve cannot be measured; execution continues "
-                "unchanged."
+                f"Active-run {admission.accelerator_label} reserve cannot be "
+                "measured; execution continues unchanged."
             )
         else:
             critical_vram = max(512 * MIB, admission.vram_reserve_bytes // 3)
             if memory.available_vram_bytes < critical_vram:
                 level = ResourceMonitorLevel.CRITICAL
                 reasons.append(
-                    "Critical GPU-memory pressure: less than "
-                    f"{_format_bytes(critical_vram)} remains free. Close other GPU "
-                    "applications; YomiFrame will not alter or cancel this run."
+                    f"Critical {admission.accelerator_label} pressure: less than "
+                    f"{_format_bytes(critical_vram)} remains free. Close other "
+                    "accelerator-heavy applications; YomiFrame will not alter or "
+                    "cancel this run."
                 )
             elif memory.available_vram_bytes < admission.vram_reserve_bytes:
                 level = ResourceMonitorLevel.WARNING
                 reasons.append(
-                    "GPU-memory safety reserve has been crossed. Close other GPU "
-                    "applications; YomiFrame will not alter this run."
+                    f"{admission.accelerator_label} safety reserve has been crossed. "
+                    "Close other accelerator-heavy applications; YomiFrame will not "
+                    "alter this run."
                 )
     critical_ram = max(GIB, admission.ram_reserve_bytes // 3)
     if memory.available_ram_bytes < critical_ram:
@@ -485,9 +597,12 @@ class RuntimeResourceMonitorService:
     def __init__(
         self,
         *,
-        memory_probe: Callable[[], RuntimeMemorySnapshot] = lambda: probe_runtime_memory(),
+        memory_probe: Callable[[], RuntimeMemorySnapshot] | None = None,
+        compute: ComputeCapabilitySnapshot | None = None,
     ) -> None:
-        self._memory_probe = memory_probe
+        self._memory_probe = memory_probe or (
+            lambda: probe_runtime_memory(compute=compute)
+        )
 
     def sample(
         self,
@@ -533,13 +648,17 @@ def assess_runtime_resources(
 
     values = dict(pipeline_values)
     use_gpu = bool(values.get("use_gpu", True))
+    torch_backend = _torch_component_backend(memory, use_gpu=use_gpu)
+    onnx_backend = _onnx_component_backend(memory, use_gpu=use_gpu)
+    detector_backend = _detector_component_backend(memory, use_gpu=use_gpu)
+    paddle_backend = _paddle_component_backend(memory, use_gpu=use_gpu)
     components: list[ResourceComponentEstimate] = []
     fixed_components: list[ResourceComponentEstimate] = []
 
     ocr_gpu = 0
     ocr_ram = int(assets.paddle_model_bytes + assets.paddle_mmproj_bytes)
     if str(values.get("ocr_engine") or "") == "PaddleOCR-VL" and ocr_ram:
-        if use_gpu and _paddle_gpu_layers() != 0:
+        if paddle_backend is not ComputeBackend.CPU and _paddle_gpu_layers() != 0:
             ocr_gpu = ocr_ram
         fixed_components.append(
             ResourceComponentEstimate(
@@ -548,6 +667,9 @@ def assess_runtime_resources(
                 gpu_bytes=ocr_gpu,
                 ram_bytes=ocr_ram,
                 method="measured_local_asset_size",
+                backend=(
+                    paddle_backend if ocr_gpu else ComputeBackend.CPU
+                ),
             )
         )
         ocr_context = _positive_env_int("MT_PADDLEOCR_VL_CTX_SIZE", 4096)
@@ -560,6 +682,9 @@ def assess_runtime_resources(
                 gpu_bytes=ocr_kv_bytes if ocr_gpu else 0,
                 ram_bytes=ocr_kv_bytes,
                 method="configured_context_and_slot_count",
+                backend=(
+                    paddle_backend if ocr_gpu else ComputeBackend.CPU
+                ),
             )
         )
     elif (
@@ -571,7 +696,7 @@ def assess_runtime_resources(
             component_id="ocr_model",
             label="MangaOCR runtime",
             file_bytes=assets.manga_ocr_model_bytes,
-            use_gpu=use_gpu,
+            backend=torch_backend,
             gpu_multiplier=2.0,
         )
 
@@ -580,7 +705,15 @@ def assess_runtime_resources(
         component_id="detector",
         label="ComicTextDetector runtime",
         file_bytes=assets.detector_model_bytes,
-        use_gpu=use_gpu,
+        backend=detector_backend,
+        gpu_multiplier=2.0,
+    )
+    _append_fixed_component(
+        fixed_components,
+        component_id="bubble_detection",
+        label="Bubble-detection runtimes",
+        file_bytes=assets.bubble_model_bytes,
+        backend=onnx_backend,
         gpu_multiplier=2.0,
     )
     if str(values.get("inpaint_mode") or "") == "ai":
@@ -589,7 +722,7 @@ def assess_runtime_resources(
             component_id="cleanup",
             label="Cleanup runtime",
             file_bytes=assets.cleanup_model_bytes,
-            use_gpu=use_gpu,
+            backend=torch_backend,
             gpu_multiplier=2.0,
         )
     if str(values.get("font_detection") or "").casefold() not in {"", "off", "none"}:
@@ -598,7 +731,7 @@ def assess_runtime_resources(
             component_id="font_detection",
             label="Font-detection runtime",
             file_bytes=assets.font_model_bytes,
-            use_gpu=use_gpu,
+            backend=onnx_backend,
             gpu_multiplier=1.5,
         )
     if bool(values.get("prescan_use_ner", False)) and assets.ner_model_bytes:
@@ -607,11 +740,17 @@ def assess_runtime_resources(
             component_id="prescan_ner",
             label="Japanese NER runtime",
             file_bytes=assets.ner_model_bytes,
-            use_gpu=use_gpu,
+            backend=torch_backend,
             gpu_multiplier=2.0,
         )
 
     translator_backend = str(values.get("translator_backend") or "").strip()
+    local_translation_backend = _translation_component_backend(
+        memory,
+        use_gpu=use_gpu,
+        translator_backend=translator_backend,
+        assets=assets,
+    )
     gguf_batch_workspace = (
         max(128 * MIB, max(1, int(values.get("gguf_n_batch", 256) or 256)) * MIB)
         if translator_backend == "GGUF"
@@ -622,6 +761,7 @@ def assess_runtime_resources(
     resolution_reasons: list[str] = []
     if (
         len(memory.gpu_devices) > 1
+        and local_translation_backend is ComputeBackend.CUDA
         and translator_backend in {"GGUF", "Ollama"}
         and not assets.translation_remote
         and (
@@ -639,7 +779,23 @@ def assess_runtime_resources(
         if translator_backend == "GGUF":
             configured_layers = int(values.get("gguf_n_gpu_layers", -1) or 0)
             effective_layers = configured_layers
-            if assets.translation_expert_count > 0 and configured_layers != 0:
+            if (
+                local_translation_backend is ComputeBackend.CPU
+                and configured_layers < 0
+            ):
+                effective_layers = 0
+                runtime_overrides = (("gguf_n_gpu_layers", 0),)
+                effective_values["gguf_n_gpu_layers"] = 0
+            elif (
+                local_translation_backend is ComputeBackend.CPU
+                and configured_layers > 0
+            ):
+                resolution_reasons.append(
+                    "The installed llama-cpp-python runtime cannot honor explicit "
+                    "GPU layers. Set GGUF GPU layers to 0 or install a GPU-capable "
+                    "llama-cpp-python build."
+                )
+            elif assets.translation_expert_count > 0 and configured_layers != 0:
                 resolution_reasons.append(
                     "GPU residency for this MoE GGUF layout cannot be safely "
                     "estimated. Select CPU layers (0) or another supported model."
@@ -671,6 +827,8 @@ def assess_runtime_resources(
                 effective_layers,
                 assets.translation_block_count,
             )
+            if local_translation_backend is ComputeBackend.CPU:
+                fraction = 0.0
             translation_gpu = int(round(assets.translation_model_bytes * fraction))
             # llama-cpp-python keeps ``use_mmap=True`` by default.  GPU-offloaded
             # weight pages do not require an equal committed host copy; budget
@@ -691,7 +849,10 @@ def assess_runtime_resources(
             elif assets.translation_model_already_resident:
                 translation_gpu = 0
                 translation_ram = 0
-            elif memory.available_vram_bytes is None:
+            elif (
+                local_translation_backend is ComputeBackend.CPU
+                or memory.available_vram_bytes is None
+            ):
                 translation_gpu = 0
                 translation_ram = int(assets.translation_model_bytes)
             else:
@@ -735,6 +896,11 @@ def assess_runtime_resources(
                     else assets.translation_residency_method
                     or "local_runtime_inventory"
                 ),
+                backend=(
+                    local_translation_backend
+                    if translation_gpu
+                    else ComputeBackend.CPU
+                ),
             )
         )
         if translator_backend == "GGUF":
@@ -751,6 +917,11 @@ def assess_runtime_resources(
                     gpu_bytes=kv_bytes if translation_gpu else 0,
                     ram_bytes=kv_bytes,
                     method="context_tokens_and_model_block_count",
+                    backend=(
+                        local_translation_backend
+                        if translation_gpu
+                        else ComputeBackend.CPU
+                    ),
                 )
             )
             components.append(
@@ -768,6 +939,11 @@ def assess_runtime_resources(
                         else 0
                     ),
                     method="configured_prompt_batch_safety_envelope",
+                    backend=(
+                        local_translation_backend
+                        if translation_gpu
+                        else ComputeBackend.CPU
+                    ),
                 )
             )
         elif translator_backend == "Ollama" and (
@@ -780,6 +956,7 @@ def assess_runtime_resources(
             )
             ollama_context_on_gpu = bool(
                 not assets.translation_remote
+                and local_translation_backend is not ComputeBackend.CPU
                 and memory.available_vram_bytes is not None
                 and (
                     not assets.translation_model_already_resident
@@ -802,14 +979,27 @@ def assess_runtime_resources(
                         else 0
                     ),
                     method="ollama_model_metadata_and_configured_context",
+                    backend=(
+                        local_translation_backend
+                        if ollama_context_on_gpu
+                        else ComputeBackend.CPU
+                    ),
                 )
             )
     components.extend(fixed_components)
 
+    # ``projected_vram`` is retained for receipt compatibility.  On unified-
+    # memory hosts it means the selected accelerator working set, not discrete
+    # VRAM; ``projected_unified`` adds the concurrent host residency.
     projected_vram = sum(item.gpu_bytes for item in components)
     # Host mappings, image buffers, Python/Qt state, and non-offloaded weights all
     # consume RAM even when the primary tensors are GPU-resident.
     projected_ram = sum(item.ram_bytes for item in components) + GIB
+    projected_unified = (
+        GIB + sum(_unified_component_bytes(item) for item in components)
+        if memory.unified_memory
+        else 0
+    )
     vram_reserve = (
         max(1536 * MIB, int((memory.total_vram_bytes or 0) * 0.10))
         if projected_vram
@@ -818,22 +1008,73 @@ def assess_runtime_resources(
     ram_reserve = max(4 * GIB, int(memory.total_ram_bytes * 0.10))
     vram_budget = max(0, int(memory.available_vram_bytes or 0) - vram_reserve)
     ram_budget = max(0, memory.available_ram_bytes - ram_reserve)
+    unified_reserve = ram_reserve if memory.unified_memory else 0
+    unified_budget = ram_budget if memory.unified_memory else 0
 
     reasons = [*assets.unresolved, *resolution_reasons]
     actions: tuple[str, ...] = ()
     if projected_vram and memory.available_vram_bytes is None:
         status = ResourceAdmissionStatus.UNAVAILABLE
-        reasons.insert(0, memory.detail or "GPU memory could not be measured.")
-    elif projected_vram > int(memory.available_vram_bytes or 0):
+        reasons.insert(
+            0,
+            memory.detail or "Selected accelerator memory could not be measured.",
+        )
+    elif (
+        memory.unified_memory
+        and projected_vram > int(memory.available_vram_bytes or 0)
+    ):
         status = ResourceAdmissionStatus.BLOCKED
-        reasons.append("Projected GPU residency exceeds currently available VRAM.")
-    elif projected_ram > memory.available_ram_bytes:
+        reasons.append(
+            "Projected unified accelerator residency exceeds the available "
+            "recommended Metal working set."
+        )
+    elif memory.unified_memory and projected_unified > memory.available_ram_bytes:
+        status = ResourceAdmissionStatus.BLOCKED
+        reasons.append(
+            "Projected unified-memory residency exceeds currently available "
+            "system memory."
+        )
+    elif (
+        not memory.unified_memory
+        and projected_vram > int(memory.available_vram_bytes or 0)
+    ):
+        status = ResourceAdmissionStatus.BLOCKED
+        reasons.append("Projected CUDA residency exceeds currently available VRAM.")
+    elif not memory.unified_memory and projected_ram > memory.available_ram_bytes:
         status = ResourceAdmissionStatus.BLOCKED
         reasons.append("Projected host residency exceeds currently available RAM.")
-    elif projected_vram and projected_vram + vram_reserve > int(memory.available_vram_bytes or 0):
+    elif (
+        memory.unified_memory
+        and projected_vram
+        and projected_vram + vram_reserve
+        > int(memory.available_vram_bytes or 0)
+    ):
         status = ResourceAdmissionStatus.RISK
-        reasons.append("Projected GPU residency would consume the safety reserve.")
-    elif projected_ram + ram_reserve > memory.available_ram_bytes:
+        reasons.append(
+            "Projected unified accelerator residency would consume the "
+            "recommended Metal working-set reserve."
+        )
+    elif (
+        memory.unified_memory
+        and projected_unified + unified_reserve > memory.available_ram_bytes
+    ):
+        status = ResourceAdmissionStatus.RISK
+        reasons.append(
+            "Projected unified-memory residency would consume the system-memory "
+            "safety reserve."
+        )
+    elif (
+        not memory.unified_memory
+        and projected_vram
+        and projected_vram + vram_reserve
+        > int(memory.available_vram_bytes or 0)
+    ):
+        status = ResourceAdmissionStatus.RISK
+        reasons.append("Projected CUDA residency would consume the VRAM safety reserve.")
+    elif (
+        not memory.unified_memory
+        and projected_ram + ram_reserve > memory.available_ram_bytes
+    ):
         status = ResourceAdmissionStatus.RISK
         reasons.append("Projected host residency would consume the safety reserve.")
     elif reasons:
@@ -859,6 +1100,12 @@ def assess_runtime_resources(
             actions = (
                 "Resolve the unavailable model, endpoint, shard, or metadata fact, "
                 "then re-test the provider and check memory again.",
+            )
+        elif memory.unified_memory:
+            actions = (
+                "Close other memory- or accelerator-heavy applications, then check again.",
+                "Reduce context or prompt batch without changing the model.",
+                "Disable acceleration for a CPU-only run or choose a remote provider.",
             )
         else:
             actions = (
@@ -890,6 +1137,14 @@ def assess_runtime_resources(
         runtime_overrides=runtime_overrides,
         warnings=tuple(dict.fromkeys(assets.warnings)),
         recommended_changes=(),
+        backend=memory.backend,
+        onnx_backend=memory.onnx_backend,
+        llama_server_backend=memory.llama_server_backend,
+        llama_cpp_backend=memory.llama_cpp_backend,
+        unified_memory=memory.unified_memory,
+        projected_unified_bytes=projected_unified,
+        unified_reserve_bytes=unified_reserve,
+        unified_budget_bytes=unified_budget,
     )
 
 
@@ -899,12 +1154,15 @@ class RuntimeResourceAdmissionService:
     def __init__(
         self,
         *,
-        memory_probe: Callable[[], RuntimeMemorySnapshot] = lambda: probe_runtime_memory(),
+        memory_probe: Callable[[], RuntimeMemorySnapshot] | None = None,
         asset_probe: Callable[[Mapping[str, object]], RuntimeResourceAssets] = (
             lambda values: probe_runtime_assets(values)
         ),
+        compute: ComputeCapabilitySnapshot | None = None,
     ) -> None:
-        self._memory_probe = memory_probe
+        self._memory_probe = memory_probe or (
+            lambda: probe_runtime_memory(compute=compute)
+        )
         self._asset_probe = asset_probe
 
     def evaluate(
@@ -934,26 +1192,94 @@ class RuntimeResourceAdmissionService:
         )
 
 
-def probe_runtime_memory() -> RuntimeMemorySnapshot:
+def probe_runtime_memory(
+    *,
+    compute: ComputeCapabilitySnapshot | None = None,
+) -> RuntimeMemorySnapshot:
     total_ram, available_ram = _system_memory()
     devices = _nvidia_memory()
-    if not devices:
+    torch_selection = compute.torch if compute is not None else select_torch_device(True)
+    onnx_selection = compute.onnx if compute is not None else select_onnx_providers(True)
+    llama_server_backend = (
+        compute.llama_server_backend
+        if compute is not None
+        else probe_llama_server_backend(resolve_llama_server_executable())
+    )
+    llama_cpp_backend = probe_llama_cpp_python_backend(
+        cuda_available=bool(devices),
+    )
+    if devices:
+        primary = devices[0]
         return RuntimeMemorySnapshot(
             total_ram_bytes=total_ram,
             available_ram_bytes=available_ram,
-            source="system_memory",
-            detail="GPU memory could not be measured with nvidia-smi.",
+            gpu_name=primary.name,
+            total_vram_bytes=primary.total_bytes,
+            available_vram_bytes=primary.available_bytes,
+            gpu_devices=devices,
+            source="psutil+nvidia-smi",
+            detail=(
+                "Discrete NVIDIA memory was measured; selected runtime "
+                "capabilities determine whether it is used."
+            ),
+            backend=torch_selection.backend,
+            onnx_backend=(
+                ComputeBackend.CUDA
+                if onnx_selection.backend is ComputeBackend.CUDA
+                else ComputeBackend.CPU
+            ),
+            llama_server_backend=llama_server_backend,
+            llama_cpp_backend=llama_cpp_backend,
+            unified_memory=False,
         )
-    primary = devices[0]
+
+    mps = probe_mps_memory()
+    if mps is not None and mps.recommended_max_bytes > 0 and (
+        torch_selection.backend is ComputeBackend.MPS
+        or onnx_selection.backend is ComputeBackend.COREML
+        or llama_server_backend is ComputeBackend.METAL
+        or llama_cpp_backend is ComputeBackend.METAL
+    ):
+        return RuntimeMemorySnapshot(
+            total_ram_bytes=total_ram,
+            available_ram_bytes=available_ram,
+            gpu_name="Apple Metal",
+            total_vram_bytes=mps.recommended_max_bytes,
+            available_vram_bytes=mps.available_bytes,
+            source="psutil+torch.mps",
+            detail=(
+                "MPS, CoreML, and Metal share system memory and the recommended "
+                "Metal working set."
+            ),
+            backend=(
+                ComputeBackend.MPS
+                if torch_selection.backend is ComputeBackend.MPS
+                else ComputeBackend.CPU
+            ),
+            onnx_backend=(
+                ComputeBackend.COREML
+                if onnx_selection.backend is ComputeBackend.COREML
+                else ComputeBackend.CPU
+            ),
+            llama_server_backend=llama_server_backend,
+            llama_cpp_backend=llama_cpp_backend,
+            unified_memory=True,
+        )
+
     return RuntimeMemorySnapshot(
         total_ram_bytes=total_ram,
         available_ram_bytes=available_ram,
-        gpu_name=primary.name,
-        total_vram_bytes=primary.total_bytes,
-        available_vram_bytes=primary.available_bytes,
-        gpu_devices=devices,
-        source="psutil+nvidia-smi",
-        detail="",
+        source="system_memory",
+        detail="No measurable local accelerator was selected; using system memory.",
+        backend=ComputeBackend.CPU,
+        onnx_backend=(
+            ComputeBackend.COREML
+            if onnx_selection.backend is ComputeBackend.COREML
+            else ComputeBackend.CPU
+        ),
+        llama_server_backend=llama_server_backend,
+        llama_cpp_backend=llama_cpp_backend,
+        unified_memory=False,
     )
 
 
@@ -1089,14 +1415,21 @@ def probe_runtime_assets(pipeline_values: Mapping[str, object]) -> RuntimeResour
             )
 
     model_root = Path(models_root())
-    detector = model_root / "comic-text-detector" / "comictextdetector.pt"
+    detector_root = model_root / "comic-text-detector"
+    detector_pt = detector_root / "comictextdetector.pt"
+    detector_onnx = detector_root / "comictextdetector.pt.onnx"
+    detector_selection = select_torch_device(bool(values.get("use_gpu", True)))
+    detector = (
+        detector_pt
+        if detector_selection.backend is ComputeBackend.CUDA
+        else detector_onnx if detector_onnx.is_file() else detector_pt
+    )
     manga_ocr_dir = resolve_manga_ocr_system_ref() or resolve_manga_ocr_local_dir(
         str(model_root)
     )
-    detector_bytes = sum(
+    bubble_bytes = sum(
         _path_size(item)
         for item in (
-            detector,
             resolve_kitsumed_speech_bubble_model(str(model_root)),
             resolve_ogkalu_text_bubble_model(str(model_root)),
         )
@@ -1124,12 +1457,105 @@ def probe_runtime_assets(pipeline_values: Mapping[str, object]) -> RuntimeResour
         paddle_mmproj_bytes=_path_size(resolve_paddle_ocr_vl_mmproj_file()),
         manga_ocr_model_bytes=manga_ocr_bytes,
         ner_model_bytes=(420 * MIB if bool(values.get("prescan_use_ner", False)) else 0),
-        detector_model_bytes=detector_bytes,
+        detector_model_bytes=_path_size(detector),
+        bubble_model_bytes=bubble_bytes,
         cleanup_model_bytes=_path_size(resolve_cleanup_inpaint_model_file()),
         font_model_bytes=_path_size(resolve_yuzumarker_font_onnx_file()),
         unresolved=tuple(unresolved),
         warnings=tuple(warnings),
     )
+
+
+def _torch_component_backend(
+    memory: RuntimeMemorySnapshot,
+    *,
+    use_gpu: bool,
+) -> ComputeBackend:
+    if not use_gpu:
+        return ComputeBackend.CPU
+    if memory.backend in {ComputeBackend.CUDA, ComputeBackend.MPS}:
+        return memory.backend
+    return ComputeBackend.CPU
+
+
+def _unified_component_bytes(component: ResourceComponentEstimate) -> int:
+    """Return incremental shared-pool residency without mirroring model weights.
+
+    MPS/CoreML/Metal weights and their runtime workspace occupy the same physical
+    pool represented by ``gpu_bytes``.  Their file-backed host mapping is
+    reclaimable and must not be added again.  Partially offloaded translation
+    models are the exception: their GPU and CPU values represent disjoint layer
+    sets, so both contribute to unified residency.
+    """
+
+    if component.backend is ComputeBackend.CPU or not component.gpu_bytes:
+        return component.ram_bytes
+    if component.component_id == "translation_model" and component.ram_bytes:
+        return component.gpu_bytes + component.ram_bytes
+    return max(component.gpu_bytes, component.ram_bytes)
+
+
+def _onnx_component_backend(
+    memory: RuntimeMemorySnapshot,
+    *,
+    use_gpu: bool,
+) -> ComputeBackend:
+    if not use_gpu:
+        return ComputeBackend.CPU
+    if memory.onnx_backend in {ComputeBackend.CUDA, ComputeBackend.COREML}:
+        return memory.onnx_backend
+    return ComputeBackend.CPU
+
+
+def _detector_component_backend(
+    memory: RuntimeMemorySnapshot,
+    *,
+    use_gpu: bool,
+) -> ComputeBackend:
+    # ComicTextDetector's portable ONNX adapter is OpenCV DNN, not ORT. Only
+    # the Torch `.pt` path has a validated accelerator implementation (CUDA).
+    if use_gpu and memory.backend is ComputeBackend.CUDA:
+        return ComputeBackend.CUDA
+    return ComputeBackend.CPU
+
+
+def _paddle_component_backend(
+    memory: RuntimeMemorySnapshot,
+    *,
+    use_gpu: bool,
+) -> ComputeBackend:
+    if not use_gpu:
+        return ComputeBackend.CPU
+    if memory.llama_server_backend in {ComputeBackend.CUDA, ComputeBackend.METAL}:
+        return memory.llama_server_backend
+    return ComputeBackend.CPU
+
+
+def _translation_component_backend(
+    memory: RuntimeMemorySnapshot,
+    *,
+    use_gpu: bool,
+    translator_backend: str,
+    assets: RuntimeResourceAssets,
+) -> ComputeBackend:
+    if not use_gpu:
+        return ComputeBackend.CPU
+    if translator_backend == "GGUF":
+        if memory.llama_cpp_backend in {
+            ComputeBackend.CUDA,
+            ComputeBackend.METAL,
+        }:
+            return memory.llama_cpp_backend
+        return ComputeBackend.CPU
+    if translator_backend == "Ollama" and (
+        assets.translation_resident_vram_bytes > 0
+        or int(assets.translation_incremental_gpu_bytes or 0) > 0
+    ):
+        if memory.unified_memory:
+            return ComputeBackend.METAL
+        if memory.gpu_devices:
+            return ComputeBackend.CUDA
+    return ComputeBackend.CPU
 
 
 def _append_fixed_component(
@@ -1138,7 +1564,7 @@ def _append_fixed_component(
     component_id: str,
     label: str,
     file_bytes: int,
-    use_gpu: bool,
+    backend: ComputeBackend,
     gpu_multiplier: float,
 ) -> None:
     if not file_bytes:
@@ -1147,9 +1573,14 @@ def _append_fixed_component(
         ResourceComponentEstimate(
             component_id=component_id,
             label=label,
-            gpu_bytes=int(round(file_bytes * gpu_multiplier)) if use_gpu else 0,
+            gpu_bytes=(
+                int(round(file_bytes * gpu_multiplier))
+                if backend is not ComputeBackend.CPU
+                else 0
+            ),
             ram_bytes=int(file_bytes),
             method="measured_asset_size_with_runtime_workspace_factor",
+            backend=backend,
         )
     )
 
@@ -1776,7 +2207,8 @@ def _unavailable_report(
         components=(),
         reasons=(str(detail or "Local memory could not be measured."),),
         actions=(
-            "Verify NVIDIA and system-memory reporting, then run the check again.",
+            "Verify system-memory and selected-accelerator reporting, then run the "
+            "check again.",
         ),
         runtime_overrides=(),
         warnings=(),

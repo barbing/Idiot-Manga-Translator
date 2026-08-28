@@ -351,6 +351,8 @@ def _translation_row_values(
 def build_runtime_snapshot(
     run_settings: RunSettingsSnapshot,
     runtime_status: RuntimeStatus | None = None,
+    *,
+    backend_devices: Mapping[str, str] | None = None,
 ) -> RuntimeSnapshot:
     """Capture immutable active-run backends; Settings drafts are not inputs."""
 
@@ -359,8 +361,26 @@ def build_runtime_snapshot(
     if runtime_status is not None and not isinstance(runtime_status, RuntimeStatus):
         raise TypeError("runtime_status must be RuntimeStatus or None")
     values = run_settings.pipeline_values
-    accelerated_device = "CUDA" if bool(values.get("use_gpu", False)) else "CPU"
+    devices = {
+        str(key): str(value).strip()
+        for key, value in (backend_devices or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    fallback_device = (
+        "Acceleration allowed"
+        if bool(values.get("use_gpu", False))
+        else "CPU"
+    )
+
+    def selected_device(module_id: str) -> str:
+        return devices.get(module_id, fallback_device)
+
     translation = _translation_row_values(run_settings, runtime_status)
+    translation_device = (
+        translation[2]
+        if translation[2] == "Network"
+        else devices.get("translation", translation[2])
+    )
     status, tone = _runtime_health(
         runtime_status,
         unresolved=bool(run_settings.unresolved_requirements),
@@ -372,7 +392,7 @@ def build_runtime_snapshot(
             module_name="Text detection",
             backend=str(values.get("detector_engine") or "Automatic detector"),
             detail="Text regions and foreground masks",
-            device=accelerated_device,
+            device=selected_device("text-detection"),
             status="Ready",
             tone=PresentationTone.READY,
             run_snapshot_id=snapshot_id,
@@ -382,7 +402,7 @@ def build_runtime_snapshot(
             module_name="Source style",
             backend=str(values.get("font_detection") or "Automatic source style"),
             detail="Font and style observation",
-            device=accelerated_device,
+            device=selected_device("source-style-observation"),
             status="Ready",
             tone=PresentationTone.READY,
             run_snapshot_id=snapshot_id,
@@ -392,7 +412,7 @@ def build_runtime_snapshot(
             module_name="OCR",
             backend=str(values.get("ocr_engine") or "Automatic OCR"),
             detail=str(values.get("source_lang") or "Source language"),
-            device=accelerated_device,
+            device=selected_device("ocr"),
             status="Ready",
             tone=PresentationTone.READY,
             run_snapshot_id=snapshot_id,
@@ -402,7 +422,7 @@ def build_runtime_snapshot(
             module_name="Translation",
             backend=translation[0],
             detail=translation[1],
-            device=translation[2],
+            device=translation_device,
             status=translation[3],
             tone=translation[4],
             run_snapshot_id=snapshot_id,
@@ -416,7 +436,7 @@ def build_runtime_snapshot(
                 or "Automatic cleanup"
             ),
             detail="Local inpainting",
-            device=accelerated_device,
+            device=selected_device("cleanup"),
             status="Ready",
             tone=PresentationTone.READY,
             run_snapshot_id=snapshot_id,

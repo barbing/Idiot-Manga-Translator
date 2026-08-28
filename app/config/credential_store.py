@@ -242,15 +242,19 @@ class CompositeCredentialResolver:
         *,
         environment: CredentialResolver | None = None,
         windows: CredentialResolver | None = None,
+        system: CredentialResolver | None = None,
     ) -> None:
         self._environment = environment
         self._windows = windows
+        self._system = system
 
     def resolve(self, reference: CredentialReference) -> str | None:
         if reference.kind is CredentialReferenceKind.ENVIRONMENT_VARIABLE:
             return self._environment.resolve(reference) if self._environment else None
         if reference.kind is CredentialReferenceKind.WINDOWS_CREDENTIAL:
             return self._windows.resolve(reference) if self._windows else None
+        if reference.kind is CredentialReferenceKind.SYSTEM_KEYRING:
+            return self._system.resolve(reference) if self._system else None
         return None
 
 

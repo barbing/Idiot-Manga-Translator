@@ -49,6 +49,15 @@ project, settings, run, Preview, failure, recovery, cancellation, and close
 signals exactly once. The legacy monolithic window and Page/Region Review owners
 remain compatibility modules, not production authorities.
 
+Cross-platform behavior is composed once by the production bootstrap through
+`app.platform_services` rather than inferred from a generic `use_gpu` flag.
+`PlatformServices` binds immutable
+platform identity, standard paths, credential persistence/resolution, measured
+compute capabilities, and the nine-item runtime asset catalog. Windows selects
+Credential Manager and CUDA-capable policies; macOS selects Keychain, MPS,
+CoreML, Metal/native llama.cpp, and unified-memory admission. CPU fallback is a
+reported backend decision, not evidence that acceleration succeeded.
+
 New-folder preparation has an application-owned pre-run projection: supported
 source images become naturally ordered queued page rows with thumbnails,
 selection, activity context, and a source canvas before pipeline artifacts
@@ -59,8 +68,8 @@ Provider activation is likewise application-owned. The coordinator validates a
 GGUF file, an Ollama endpoint/model, or an authenticated DeepSeek model catalog
 through a settled worker and marks the exact public profile configuration ready.
 The shell enables Start only for the selected ready profile. API credentials are
-transient during testing and portable settings retain only an opaque Windows
-credential reference. Output Defaults supplies fallback presentation; it is not
+transient during testing and portable settings retain only an opaque system
+credential reference (Windows Credential Manager or macOS Keychain). Output Defaults supplies fallback presentation; it is not
 a renderer command and cannot override effective per-parent style evidence or
 user edits.
 
@@ -316,7 +325,40 @@ Glossary enforcement must not mask upstream OCR or detection failures. If a name
 
 ## Models and Environment
 
-The project is Windows-first. For public setup, use Python 3.10 and install `requirements.txt` in an isolated virtual environment. YuzuMarker font detection uses `onnxruntime-gpu` by default, requests CUDA before CPU, and records the active provider plus any non-blocking CPU fallback reason. Conda is also acceptable when users need GPU-specific Torch, PaddlePaddle, or llama-cpp-python builds.
+Python 3.10 is the supported source interpreter on Windows and macOS. Windows
+can install `requirements.txt` in an isolated Conda environment; its platform
+marker retains `onnxruntime-gpu`. macOS uses `environments/macos.yml`, which
+installs the matching PyICU/ICU pair and native `llama-server` before installing
+the Python requirements. The Darwin requirements branch uses `onnxruntime`,
+whose available providers are inspected at runtime.
+
+Backend selection is capability-based and component-specific:
+
+- Torch prefers CUDA, then MPS, then CPU.
+- ONNX Runtime prefers CUDA, then CoreML, then CPU.
+- llama.cpp executables resolve from an explicit override, the active
+  environment/PATH, native platform names, and retained Windows `.exe` layouts.
+- Paddle's `llama-server` device listing and GGUF translation's
+  `llama-cpp-python` GPU-offload capability are measured independently. An
+  unknown or CPU-only extension forces GGUF layer 0 and host-RAM admission even
+  when NVIDIA memory is present.
+- PaddleOCR-VL uses CUDA llama.cpp assets on Windows and the Conda/native Metal
+  runtime on macOS.
+- MPS/CoreML/Metal admission uses a shared unified-memory budget constrained by
+  both available system RAM and PyTorch's recommended Metal working set.
+- CUDA retains separate VRAM and host-RAM budgets.
+
+Runtime metadata records requested and selected backends/providers and typed
+fallback reasons. A CPU-only or remote DeepSeek plan is not blocked merely
+because an accelerator probe is absent.
+
+BubbleDetection compares active providers with the requested CoreML/CUDA/CPU
+chain rather than treating every non-CUDA provider as fallback; session
+construction retries CPU once with a typed initialization reason. Torch cache
+release likewise follows CUDA or MPS through the shared compute policy. The NER
+loader requires a complete local model/tokenizer snapshot and uses
+`local_files_only=True`, avoiding a background Hub conversion thread during
+normal offline startup and shutdown.
 
 Local assets and caches are preferred over environment changes. Heavy new dependencies or mandatory extra models should not be added unless the roadmap or user explicitly authorizes them.
 
@@ -334,7 +376,28 @@ contents. The configured cleanup model id is provenance; the actual cleanup
 backend resolves to the fixed iopaint model unless a future roadmap explicitly
 changes the policy.
 
-Startup pre-download covers fixed runtime assets such as text detection, bubble evidence, PaddleOCR-VL, MangaOCR, cleanup inpainting, and NER resources. User-selected LLM translation models are not part of the startup-required fixed asset set; they are selected or downloaded through the translation model UI.
+After first paint the Settings runtime catalog automatically verifies nine
+fixed families: ComicTextDetector,
+bubble evidence, PaddleOCR-VL, MangaOCR, cleanup inpainting, NER, YuzuMarker,
+the Noto CJK pack, and PyICU. The same catalog owns row copy, checker/preparer
+method names, platform remediation, and managed-download availability. On Mac,
+Paddle downloads only its model/projector and requires the native Conda
+executable; Windows retains the two CUDA archives. User-selected LLM
+translation models are not fixed catalog assets. Start fails closed until all
+nine current catalog receipts are ready; **Verify all** repeats the same
+model-free probe explicitly.
+
+Application preferences migrate only exact untouched historical defaults on
+macOS: `D:/Manga Projects` becomes the platform Documents project root, and
+default Undo/Redo/Preview bindings become Command-based. Custom paths and
+shortcut values are preserved. Qt supplies the UI font; renderer defaults and
+heuristic fallbacks use the installed Noto CJK pack rather than Microsoft
+YaHei. Frameless macOS edges call Qt `startSystemResize`, while the guarded
+Windows `WM_NCHITTEST` path remains the Windows fallback.
+
+The checked-in PyInstaller/private-ICU packaging path is Windows-only. macOS is
+currently supported as a source/Conda execution path, not as a signed or
+notarized application bundle.
 
 Historical page-specific model-fusion/debug assists are not part of the
 default pipeline. They must remain disabled unless

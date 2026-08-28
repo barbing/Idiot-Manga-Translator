@@ -14,6 +14,7 @@ import re
 from typing import Callable, Optional, TYPE_CHECKING
 
 from PySide6 import QtCore
+from app.platform_services.compute import release_torch_memory
 
 if TYPE_CHECKING:
     from app.pipeline.controller import PipelineSettings
@@ -560,18 +561,18 @@ def prescan_for_glossary(
         except Exception as e:
             logger.warning(f"Pre-scan cleanup: Failed to close OCR engine: {e}")
     
-    # 4. Force garbage collection and clear CUDA cache
+    # 4. Force garbage collection and clear the active accelerator cache.
     try:
         import gc
         gc.collect()
-        
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            logger.info("Pre-scan cleanup: CUDA cache cleared successfully")
+
+        backend = release_torch_memory(synchronize=True)
+        logger.info(
+            "Pre-scan cleanup: %s cache cleared successfully",
+            backend.value,
+        )
     except Exception as e:
-        logger.warning(f"Pre-scan cleanup: Failed to clear CUDA cache: {e}")
+        logger.warning(f"Pre-scan cleanup: Failed to clear accelerator cache: {e}")
     
     translated_glossary_count = sum(1 for item in style_guide.get("glossary", []) if item.get("target"))
     if message_callback:

@@ -24,6 +24,9 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from app.platform_services.compute import TorchDeviceSelection, select_torch_device
+from app.platform_services.contracts import ComputeBackend
+
 
 MODEL_MODULO = 8
 
@@ -50,18 +53,35 @@ class LamaTensorMeta:
         }
 
 
-def resolve_lama_device_name(requested_device: str | None = None, *, use_gpu: bool | None = None) -> str:
+def resolve_lama_device_name(
+    requested_device: str | None = None,
+    *,
+    use_gpu: bool | None = None,
+    selection: TorchDeviceSelection | None = None,
+) -> str:
     """Return the effective torch device name for cleanup inference."""
 
-    import torch
-
     requested = str(requested_device or "").strip().lower()
-    wants_cuda = requested.startswith("cuda")
+    if selection is not None:
+        return selection.device
     if use_gpu is not None:
-        wants_cuda = bool(use_gpu)
-    if wants_cuda and torch.cuda.is_available():
+        return select_torch_device(bool(use_gpu)).device
+    detected = select_torch_device(True)
+    if requested.startswith("cuda") and detected.backend is ComputeBackend.CUDA:
         return "cuda"
+    if requested.startswith("mps") and detected.backend is ComputeBackend.MPS:
+        return "mps"
     return "cpu"
+
+
+def cleanup_fallback(error: BaseException) -> TorchDeviceSelection:
+    """Return the typed CPU selection after an MPS runtime failure."""
+
+    return TorchDeviceSelection(
+        ComputeBackend.CPU,
+        "cpu",
+        f"mps_runtime_failed:{type(error).__name__}",
+    )
 
 
 class TorchScriptLamaRunner:

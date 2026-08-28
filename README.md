@@ -4,7 +4,7 @@
 
 # YomiFrame
 
-YomiFrame is a Windows desktop application for local manga and comic translation. It combines page analysis, OCR, glossary memory, local LLM translation, source-text cleanup, and final text rendering into one local-first workflow.
+YomiFrame is a Windows and macOS source application for local manga and comic translation. It combines page analysis, OCR, glossary memory, local or API translation, source-text cleanup, and final text rendering into one local-first workflow. Packaged desktop builds currently remain Windows-only.
 
 ![Screenshot](assets/screenshot.png)
 
@@ -27,56 +27,71 @@ The project is aimed at practical local use. It favors deterministic routing, ex
 
 ## Quick Start
 
-YomiFrame currently targets Windows. The commands below use a standard Python virtual environment so the project is not tied to any developer-specific machine setup.
-
 ### Requirements
 
-- Windows 10 or newer
-- Python 3.10 recommended; newer Python versions may require dependency adjustments
-- Git
-- Enough disk space for OCR, detection, translation, and the fixed cleanup inpainting model
-- Optional NVIDIA GPU for faster OCR, detection, translation, and inpainting
+- Windows 10 or newer, or Apple Silicon macOS for the tested Mac source path
+- Git and Conda; Python 3.10 is the supported interpreter
+- Enough disk space for OCR, detection, cleanup, font, and optional local translation models
+- Optional NVIDIA CUDA on Windows; Apple acceleration uses MPS, CoreML, and Metal when each runtime supports it
 
-### Install From Source
+### Windows Source Setup
+
+`requirements.txt` retains the Windows CUDA-oriented ONNX Runtime branch and a CPU fallback for runtimes that cannot activate CUDA.
 
 ```powershell
 git clone https://github.com/barbing/YomiFrame-LLM_Manga_Translator.git
 cd YomiFrame-LLM_Manga_Translator
 
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
+conda create -n manga-llm python=3.10 -y
+conda activate manga-llm
 python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-The default dependency set is CPU-safe where possible, except that YuzuMarker font detection installs `onnxruntime-gpu` and prefers CUDA with the CPU execution provider retained as fallback. GPU users may still need CUDA-enabled builds of PyTorch and llama-cpp-python that match their local CUDA version. PaddleOCR-VL OCR uses the official GGUF model with a native `llama-server` runtime rather than the legacy PaddleOCR recognizer.
-
-If installation fails on Windows, verify the CUDA/cuDNN compatibility required by the installed ONNX Runtime GPU package. After the app runs, replace Torch or llama-cpp-python with GPU-specific builds that match the machine's CUDA toolkit and drivers when those backends need GPU acceleration. YuzuMarker reports its requested and active ONNX execution providers in debug telemetry and continues on CPU if CUDA cannot activate.
-
-### Run The App
-
-```powershell
+python -m pip install -r requirements.txt
 python -m app.main
 ```
 
-On first launch, the app checks for fixed runtime assets such as OCR and
-detection models. On Windows CPython 3.10 x64 it also verifies the exact
-PyICU 2.16.2 / ICU4C 78.3 runtime required by the renderer. If that runtime is
-not already active, the same built-in download prompt installs the
-SHA-256-pinned, self-contained runtime below `%LOCALAPPDATA%\YomiFrame` and
-activates it for the current process. Later launches reuse the validated local
-copy without another download or installation. No manual Conda, compiler, or
-`pip install PyICU` step is required for an ordinary source launch.
+Match CUDA-enabled Torch and llama.cpp builds to the installed driver/toolkit when GPU execution is required. ONNX runtimes prefer CUDA and retain the CPU execution provider as an explicit fallback.
 
-Deployment binaries used by first-run setup are published in the versioned
-`runtime-dependencies-v1` GitHub Release rather than committed to the source
-tree. This catalog can hold additional immutable deployment assets in the
-future without being confused with an application release.
+### macOS Source Setup
 
-Packaged YomiFrame builds validate their bundled private ICU runtime and never
-download a replacement at startup. Other required assets can be downloaded by
-the same prompt or placed under the local `models` folder.
+The repository-owned Mac environment installs Python 3.10, PyICU/ICU, native `llama-server`, and the direct Python dependencies. It does not download Windows CUDA archives.
+
+```bash
+git clone https://github.com/barbing/YomiFrame-LLM_Manga_Translator.git
+cd YomiFrame-LLM_Manga_Translator
+
+conda env create -f environments/macos.yml
+conda activate manga-llm
+python -m app.main
+```
+
+If the environment already exists, update it with:
+
+```bash
+conda env update -n manga-llm -f environments/macos.yml --prune
+```
+
+On Apple Silicon, Torch prefers MPS, ONNX Runtime prefers CoreML, and native llama.cpp uses Metal. Paddle's `llama-server` and GGUF translation's `llama-cpp-python` extension are probed independently because they can have different build capabilities. Unsupported runtimes fall back to CPU and record the selected backend and reason. Resource admission uses the recommended Metal working set plus available unified system memory; it does not require `nvidia-smi`.
+
+### Runtime Asset Verification
+
+The app verifies the catalog automatically after first paint, and Start stays
+blocked until every required receipt is ready. Open **Settings > Runtime
+assets** and choose **Verify all** to repeat the same model-free check manually.
+The catalog covers nine fixed families:
+
+1. ComicTextDetector
+2. bubble detection
+3. PaddleOCR-VL model/projector and platform-native llama.cpp runtime
+4. MangaOCR
+5. cleanup inpainting
+6. Japanese NER
+7. YuzuMarker font detection
+8. Noto CJK font pack
+9. PyICU/ICU
+
+Windows CPython 3.10 x64 can install the SHA-256-pinned private PyICU runtime from the versioned `runtime-dependencies-v1` release. macOS validates PyICU 2.16.2 / ICU 78.3 from the active `manga-llm` Conda environment. Runtime paths are shown using the current platform's standard application-data location.
+
+Managed model downloads remain available per catalog row. On macOS, PaddleOCR-VL downloads only the GGUF model and projector; install its native executable with `conda install -n manga-llm -c conda-forge llama.cpp` if verification reports it missing.
 
 ### Translation Provider Setup
 
@@ -115,11 +130,17 @@ For Ollama:
 
 For DeepSeek, create a DeepSeek API profile, keep the official API endpoint,
 select a currently available model, and choose **Test and link credential**.
-The API key is held transiently for the connection test and is saved to Windows
-Credential Manager only after a successful result and explicit confirmation;
-portable settings contain only an opaque credential reference.
+The API key is held transiently for the connection test and is saved only after
+a successful result and explicit confirmation. Windows uses Windows Credential
+Manager; macOS uses Keychain through the system keyring. Portable settings
+contain only an opaque credential reference, and save failures remain visible
+in the provider panel and status bar.
 
 ### Build A Windows App Folder
+
+The checked-in PyInstaller specification and bundled private ICU workflow are
+Windows-only. The macOS support described above is a source/Conda workflow; no
+signed, notarized, or packaged macOS application is currently claimed.
 
 To package the app with PyInstaller:
 
@@ -338,7 +359,7 @@ For development validation, use a real page set rather than only checking logs o
 
 ## Runtime Expectations
 
-YomiFrame is intended for local Windows use. The default workflow should remain practical on a local machine and should not require a cloud service.
+YomiFrame is intended for local Windows and macOS source use. Windows live CUDA execution still requires validation on a Windows host; the Apple Silicon source path uses the backend and fallback reporting described above. The default workflow should remain practical on a local machine and does not require a cloud service unless an API provider such as DeepSeek is selected.
 
 General expectations:
 

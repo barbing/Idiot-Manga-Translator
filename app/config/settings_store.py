@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 import os
@@ -20,12 +20,16 @@ from app.config.module_registry import (
 from app.config.settings_contracts import (
     ApplicationPreferences,
     DEFAULT_SHORTCUT_BINDINGS,
+    HISTORICAL_WINDOWS_PROJECT_LOCATION,
     ModuleConfig,
     SettingsScope,
     canonical_fingerprint,
     freeze_json,
     thaw_json,
 )
+from app.config.settings_migration import migrate_platform_defaults
+from app.platform_services.contracts import PlatformIdentity
+from app.platform_services.paths import PlatformPaths, qt_platform_paths
 
 
 APPLICATION_SETTINGS_STORE_SCHEMA_VERSION = 2
@@ -182,7 +186,7 @@ def _application_preferences_from_dict(
             reduced_motion=payload.get("reduced_motion", True),
             ui_language=payload["ui_language"],
             new_project_location=payload.get(
-                "new_project_location", "D:/Manga Projects"
+                "new_project_location", HISTORICAL_WINDOWS_PROJECT_LOCATION
             ),
             autosave_interval_seconds=payload.get(
                 "autosave_interval_seconds", 30
@@ -596,13 +600,40 @@ class ApplicationSettingsStore:
         path: str | os.PathLike[str],
         *,
         registry: ModuleSchemaRegistry = DEFAULT_MODULE_REGISTRY,
+        platform_identity: PlatformIdentity | None = None,
+        platform_paths: PlatformPaths | None = None,
     ) -> None:
         self.path = Path(path)
         self.registry = registry
+        self.platform_identity = platform_identity or PlatformIdentity.detect()
+        if not isinstance(self.platform_identity, PlatformIdentity):
+            raise TypeError("platform_identity must be PlatformIdentity")
+        if platform_paths is not None and not isinstance(platform_paths, PlatformPaths):
+            raise TypeError("platform_paths must be PlatformPaths")
+        self.platform_paths = platform_paths
+
+    def _with_platform_defaults(
+        self,
+        document: ApplicationSettingsDocument,
+    ) -> ApplicationSettingsDocument:
+        paths = self.platform_paths or qt_platform_paths()
+        preferences = migrate_platform_defaults(
+            document.application_preferences,
+            self.platform_identity,
+            paths,
+        )
+        if preferences is document.application_preferences:
+            return document
+        return replace(document, application_preferences=preferences)
+
+    def default_document(self) -> ApplicationSettingsDocument:
+        """Return platform-correct defaults without reading or writing the store."""
+
+        return self._with_platform_defaults(ApplicationSettingsDocument())
 
     def load(self) -> ApplicationSettingsDocument:
         if not self.path.exists():
-            return ApplicationSettingsDocument()
+            return self.default_document()
         try:
             raw = self.path.read_text(encoding="utf-8")
             payload = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
@@ -616,14 +647,17 @@ class ApplicationSettingsStore:
             raise ApplicationSettingsStoreError(
                 "application settings root must be an object"
             )
-        return ApplicationSettingsDocument.from_dict(
-            payload,
-            registry=self.registry,
+        return self._with_platform_defaults(
+            ApplicationSettingsDocument.from_dict(
+                payload,
+                registry=self.registry,
+            )
         )
 
     def save(self, document: ApplicationSettingsDocument) -> str:
         if not isinstance(document, ApplicationSettingsDocument):
             raise TypeError("document must be an ApplicationSettingsDocument")
+        document = self._with_platform_defaults(document)
         payload = document.to_dict()
         _assert_public_json(payload)
         # Reparse before publication so an invalid in-memory object cannot

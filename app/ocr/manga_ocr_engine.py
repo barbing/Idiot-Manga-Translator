@@ -9,6 +9,12 @@ import tempfile
 import logging
 from pathlib import Path
 from app.models.resolution import models_root, resolve_manga_ocr_local_dir, resolve_manga_ocr_system_ref
+from app.platform_services.compute import (
+    TorchDeviceSelection,
+    release_torch_memory,
+    select_torch_device,
+)
+from app.platform_services.contracts import ComputeBackend
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +26,10 @@ _MANGA_OCR_AUX_FILES = (
     "tokenizer_config.json",
     "vocab.txt",
 )
+
+
+def manga_ocr_force_cpu(selection: TorchDeviceSelection) -> bool:
+    return selection.backend is ComputeBackend.CPU
 
 
 def _add_dll_search_paths() -> None:
@@ -171,13 +181,18 @@ def create_manga_ocr_instance(use_gpu: bool):
     except Exception as exc:
         raise RuntimeError(f"Failed to import manga-ocr: {exc}") from exc
 
+    selection = select_torch_device(use_gpu)
+    force_cpu = manga_ocr_force_cpu(selection)
     model_ref = resolve_manga_ocr_model_ref()
     if model_ref and os.path.isdir(model_ref):
         model_ref = _prepare_manga_ocr_safetensors_dir(model_ref)
     if model_ref:
-        return MangaOcr(pretrained_model_name_or_path=model_ref, force_cpu=not use_gpu)
+        return MangaOcr(
+            pretrained_model_name_or_path=model_ref,
+            force_cpu=force_cpu,
+        )
     # Final fallback (library default behavior, may download)
-    return MangaOcr(force_cpu=not use_gpu)
+    return MangaOcr(force_cpu=force_cpu)
 
 
 class MangaOcrEngine:
@@ -294,6 +309,9 @@ class MangaOcrEngine:
             ensure_torch_runtime_ready()
         except Exception as exc:  # pragma: no cover - runtime dependency
             raise RuntimeError(f"Failed to load torch: {exc}") from exc
+        selection = select_torch_device(use_gpu)
+        self.selected_backend = selection.backend.value
+        self.provider_fallback_reason = selection.fallback_reason
         self._engine = create_manga_ocr_instance(use_gpu)
 
     def recognize(self, image) -> str:
@@ -310,10 +328,9 @@ class MangaOcrEngine:
             del self._engine
         
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                import gc
-                gc.collect()
+            import gc
+
+            release_torch_memory(synchronize=True)
+            gc.collect()
         except Exception:
             pass

@@ -154,9 +154,34 @@ def _available_capabilities(
     if runtime_status is None:
         return None
     capabilities: set[str] = set()
+    aliases = {
+        "comic_text_detector": ("asset:comic_text_detector",),
+        "detection": ("asset:comic_text_detector",),
+        "ocr": ("asset:paddle_ocr_vl",),
+        "paddle_ocr_vl": ("asset:paddle_ocr_vl",),
+        "manga_ocr": ("asset:manga_ocr",),
+        "cleanup_inpaint": ("asset:cleanup_inpaint",),
+        "font_detection": ("asset:yuzumarker",),
+        "yuzumarker": ("asset:yuzumarker",),
+    }
     for asset_id, status in runtime_status.installed_assets.items():
-        if status is True or str(status).strip().lower() in {"ready", "available", "installed", "valid"}:
-            capabilities.add(str(asset_id))
+        ready = (
+            bool(status.get("ready") or status.get("installed"))
+            if isinstance(status, Mapping)
+            else status is True
+            or str(status).strip().lower()
+            in {"ready", "available", "installed", "valid"}
+        )
+        if not ready:
+            continue
+        normalized = str(asset_id).strip()
+        if not normalized:
+            continue
+        capabilities.add(normalized)
+        capabilities.add(
+            normalized if normalized.startswith("asset:") else f"asset:{normalized}"
+        )
+        capabilities.update(aliases.get(normalized, ()))
     return frozenset(capabilities)
 
 

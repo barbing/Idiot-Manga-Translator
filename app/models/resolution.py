@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import sys
 from typing import Iterable, Optional
 
 from app.config.defaults import (
@@ -21,6 +23,11 @@ from app.config.defaults import (
     YUZUMARKER_FONT_ONNX_FILE,
     YUZUMARKER_FONT_ONNX_REPO_ID,
 )
+from app.platform_services.compute import (
+    llama_server_is_launchable,
+    resolve_llama_server,
+)
+from app.platform_services.contracts import PlatformIdentity
 
 
 def _app_root() -> str:
@@ -169,29 +176,37 @@ def resolve_paddle_ocr_vl_mmproj_file(base_dir: Optional[str] = None) -> Optiona
     return None
 
 
-def resolve_llama_server_executable(base_dir: Optional[str] = None) -> Optional[str]:
+def resolve_llama_server_executable(
+    base_dir: Optional[str] = None,
+    *,
+    identity: PlatformIdentity | None = None,
+) -> Optional[str]:
     override = os.environ.get("MT_PADDLEOCR_VL_LLAMA_SERVER")
-    if override and os.path.isfile(override):
-        return override
     root = os.path.join(base_dir or models_root(), "llama.cpp")
-    if not os.path.isdir(root):
-        return None
-    candidates: list[str] = []
-    for current_root, _dirs, files in os.walk(root):
-        for name in files:
-            if name.lower() == "llama-server.exe":
-                candidates.append(os.path.join(current_root, name))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda path: ("cuda" not in path.lower(), len(path), path.lower()))
-    return candidates[0]
+    resolved = resolve_llama_server(
+        identity=identity,
+        override=override,
+        search_roots=(
+            Path(sys.prefix) / "bin",
+            Path(sys.prefix) / "Library" / "bin",
+            Path(sys.prefix) / "Scripts",
+            Path(root),
+        ),
+    )
+    return str(resolved) if resolved is not None else None
 
 
-def has_paddle_ocr_vl_runtime(base_dir: Optional[str] = None) -> bool:
+def has_paddle_ocr_vl_runtime(
+    base_dir: Optional[str] = None,
+    *,
+    identity: PlatformIdentity | None = None,
+) -> bool:
+    executable = resolve_llama_server_executable(base_dir, identity=identity)
     return bool(
         resolve_paddle_ocr_vl_model_file(base_dir)
         and resolve_paddle_ocr_vl_mmproj_file(base_dir)
-        and resolve_llama_server_executable(base_dir)
+        and executable
+        and llama_server_is_launchable(executable)
     )
 
 
@@ -331,7 +346,7 @@ def has_font_style_runtime(base_dir: Optional[str] = None) -> bool:
 
 
 def resolve_ner_system_snapshot() -> Optional[str]:
-    required = ("config.json",)
+    required = ("config.json", "tokenizer_config.json", "vocab.txt")
     optional_weights = ("model.safetensors", "pytorch_model.bin")
     for snapshot in _hf_snapshot_dirs("jurabi", "bert-ner-japanese"):
         if not all(os.path.exists(os.path.join(snapshot, name)) for name in required):
@@ -351,7 +366,7 @@ def resolve_ner_local_dir(model_dir: Optional[str] = None) -> Optional[str]:
             if os.path.isdir(path):
                 candidates.append(path)
 
-    required = ("config.json",)
+    required = ("config.json", "tokenizer_config.json", "vocab.txt")
     optional_weights = ("model.safetensors", "pytorch_model.bin")
     for candidate in candidates:
         if not all(os.path.exists(os.path.join(candidate, name)) for name in required):

@@ -37,12 +37,17 @@ from app.config.provider_profiles import (
 )
 from app.config.settings_contracts import (
     ApplicationPreferences,
+    DEFAULT_SHORTCUT_BINDINGS,
+    HISTORICAL_WINDOWS_PROJECT_LOCATION,
+    MACOS_DEFAULT_SHORTCUT_BINDINGS,
     ModuleConfig,
     ProjectConfig,
     canonical_fingerprint,
     freeze_json,
     thaw_json,
 )
+from app.platform_services.contracts import OperatingSystem, PlatformIdentity
+from app.platform_services.paths import PlatformPaths
 
 
 LEGACY_QSETTINGS_ORGANIZATION = "MangaTranslator"
@@ -110,6 +115,48 @@ _PROFILE_IDS = {
     "Ollama": "legacy-translation-ollama",
     "DeepSeek": "legacy-translation-deepseek",
 }
+
+
+def migrate_platform_defaults(
+    preferences: ApplicationPreferences,
+    identity: PlatformIdentity,
+    paths: PlatformPaths,
+) -> ApplicationPreferences:
+    """Replace only untouched historical Windows defaults on macOS.
+
+    User-selected paths and shortcut values remain authoritative.  A shortcut
+    migrates independently only when it still equals that command's historical
+    default, so one customization does not freeze every other default binding.
+    """
+
+    if not isinstance(preferences, ApplicationPreferences):
+        raise TypeError("preferences must be ApplicationPreferences")
+    if not isinstance(identity, PlatformIdentity):
+        raise TypeError("identity must be PlatformIdentity")
+    if not isinstance(paths, PlatformPaths):
+        raise TypeError("paths must be PlatformPaths")
+    if identity.os is not OperatingSystem.MACOS:
+        return preferences
+
+    project_location = preferences.new_project_location
+    if project_location == HISTORICAL_WINDOWS_PROJECT_LOCATION:
+        project_location = str(paths.default_project_root)
+
+    shortcuts = dict(preferences.shortcut_bindings)
+    for command_id, historical in DEFAULT_SHORTCUT_BINDINGS.items():
+        if shortcuts.get(command_id) == historical:
+            shortcuts[command_id] = MACOS_DEFAULT_SHORTCUT_BINDINGS[command_id]
+
+    if (
+        project_location == preferences.new_project_location
+        and shortcuts == dict(preferences.shortcut_bindings)
+    ):
+        return preferences
+    return replace(
+        preferences,
+        new_project_location=project_location,
+        shortcut_bindings=shortcuts,
+    )
 
 
 @runtime_checkable

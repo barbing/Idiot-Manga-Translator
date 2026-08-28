@@ -16,11 +16,17 @@ freetype-py
 
 # OCR / detection
 manga-ocr
-onnxruntime-gpu>=1.21,<2
+onnxruntime>=1.21,<2; sys_platform == "darwin"
+onnxruntime-gpu>=1.21,<2; sys_platform != "darwin"
+torchvision>=0.21
+pyclipper>=1.4
+shapely>=2,<3
+tqdm>=4.41
 
 # Translation backends
 requests
 llama-cpp-python
+urllib3>=2,<3
 
 # Hugging Face / model download
 transformers
@@ -33,14 +39,21 @@ safetensors
 # - AI inpainting uses a vendored SimpleLaMa runtime wrapper in the repo,
 #   so no separate `simple-lama-inpainting` wheel is required.
 torch>=2.6
+psutil>=5.9
+
+# Renderer / platform services
+fonttools>=4
+keyring>=25,<26
+# Vendored ComicTextDetector and Jieba still import pkg_resources.
+setuptools>=77.0.3,<81
 
 # Japanese NLP for Auto-Glossary / Name Memory
 fugashi>=1.3.0
 unidic-lite>=1.0.8
 
 # Notes:
-# - ONNX Runtime uses the GPU package by default on Windows; its CPU execution
-#   provider remains the fallback when CUDA cannot be activated.
+# - ONNX Runtime uses the CoreML-capable package on macOS and the GPU package
+#   elsewhere; CPU remains an explicit fallback on every platform.
 # - Other dependencies keep CPU-safe defaults where possible.
 # - On Windows, GPU users should usually install CUDA-enabled torch,
 #   and a GPU-capable llama-cpp-python build via conda/pip

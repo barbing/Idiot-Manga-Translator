@@ -83,6 +83,21 @@ def _schedule_runtime_readiness(window: object) -> bool:
     return True
 
 
+def configure_application_font(app: object):
+    """Apply Qt's platform UI font without naming a Windows-only family."""
+
+    from PySide6 import QtGui
+
+    setter = getattr(app, "setFont", None)
+    if not callable(setter):
+        raise TypeError("application must provide setFont()")
+    font = QtGui.QFontDatabase.systemFont(
+        QtGui.QFontDatabase.SystemFont.GeneralFont
+    )
+    setter(font)
+    return font
+
+
 def main() -> int:
     # Initialize logging first thing
     from app.utils.logger import setup_logger
@@ -97,7 +112,8 @@ def main() -> int:
     _configure_windows_app_identity()
     _configure_dll_paths()
     _configure_paddle_env()
-    from PySide6 import QtWidgets, QtGui
+    from PySide6 import QtWidgets
+    from app.platform_services import build_platform_services
     from app.ui.application_coordinator import create_gui_application_window
     from app.ui.design_system.icons import brand_icon
     app = QtWidgets.QApplication(sys.argv)
@@ -105,13 +121,13 @@ def main() -> int:
     app.setApplicationDisplayName("YomiFrame Manga Translator")
     app.setOrganizationName("YomiFrame")
     app.setWindowIcon(brand_icon())
-    
-    # Set global default font to prevent "Point size <= 0" errors
-    font = QtGui.QFont("Microsoft YaHei", 10)
-    font.setStyleStrategy(QtGui.QFont.PreferAntialias)
-    app.setFont(font)
-    
-    window = create_gui_application_window()
+
+    configure_application_font(app)
+
+    platform_services = build_platform_services()
+    window = create_gui_application_window(
+        platform_services=platform_services,
+    )
     window.show()
     _schedule_runtime_readiness(window)
     return app.exec()

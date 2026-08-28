@@ -4,7 +4,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
-import msvcrt
 import os
 import tempfile
 from typing import TYPE_CHECKING, Any, Dict, Iterator, Mapping, Sequence
@@ -19,6 +18,32 @@ if TYPE_CHECKING:
 
 PROJECT_SCHEMA_V1 = "1.0"
 PROJECT_SCHEMA_V2 = "2.0"
+
+
+def _acquire_project_publication_lock(lock_stream: Any) -> None:
+    lock_stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_stream.fileno(), msvcrt.LK_LOCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+
+
+def _release_project_publication_lock(lock_stream: Any) -> None:
+    lock_stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_stream.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +90,11 @@ def _project_publication_lock(path: str) -> Iterator[None]:
         if lock_stream.tell() == 0:
             lock_stream.write(b"\0")
             lock_stream.flush()
-        lock_stream.seek(0)
-        msvcrt.locking(lock_stream.fileno(), msvcrt.LK_LOCK, 1)
+        _acquire_project_publication_lock(lock_stream)
         try:
             yield
         finally:
-            lock_stream.seek(0)
-            msvcrt.locking(lock_stream.fileno(), msvcrt.LK_UNLCK, 1)
+            _release_project_publication_lock(lock_stream)
 
 
 def save_project(path: str, data: Dict[str, Any]) -> None:

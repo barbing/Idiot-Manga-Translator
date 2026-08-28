@@ -15,12 +15,43 @@ import os
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from app.models.resolution import resolve_ner_local_dir, resolve_ner_system_snapshot
+from app.platform_services.compute import (
+    TorchDeviceSelection,
+    release_torch_memory,
+    select_torch_device,
+)
+from app.platform_services.contracts import ComputeBackend
 
 logger = logging.getLogger(__name__)
 
 # Model configuration
 NER_MODEL_ID = "jurabi/bert-ner-japanese"
 NER_MODEL_SIZE_MB = 420  # Approximate size for download progress
+
+
+def ner_model_source(
+    model_dir: Optional[str] = None,
+) -> tuple[str, str | None, bool]:
+    """Return a verified local snapshot before the remote Hub identifier."""
+
+    system_snapshot = resolve_ner_system_snapshot()
+    if system_snapshot:
+        return system_snapshot, None, True
+    if model_dir is None:
+        app_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        model_dir = os.path.join(app_root, "models", "ner")
+    local_snapshot = resolve_ner_local_dir(model_dir)
+    if local_snapshot:
+        return local_snapshot, None, True
+    return NER_MODEL_ID, model_dir, False
+
+
+def ner_pipeline_device(selection: TorchDeviceSelection) -> str | int:
+    if selection.backend in {ComputeBackend.CUDA, ComputeBackend.MPS}:
+        return selection.device
+    return -1
 
 
 @dataclass
@@ -66,13 +97,11 @@ class NERExtractor:
         self._available = False
         self._fallback_mecab = None
         
-        if resolve_ner_system_snapshot():
-            self._model_dir = None
-        else:
-            if model_dir is None:
-                app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                model_dir = os.path.join(app_root, "models", "ner")
-            self._model_dir = resolve_ner_local_dir(model_dir) or model_dir
+        (
+            self._model_source,
+            self._model_cache_dir,
+            self._local_files_only,
+        ) = ner_model_source(model_dir)
         self._force_cpu = force_cpu
         
         # Try to initialize
@@ -83,26 +112,31 @@ class NERExtractor:
         try:
             # Check for transformers
             from transformers import pipeline, AutoModelForTokenClassification, AutoTokenizer
-            import torch
             
             # Determine device
-            device = -1  # CPU
-            if not self._force_cpu:
-                if torch.cuda.is_available():
-                    device = 0
-                    logger.info("NER: Using CUDA GPU")
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    device = 0  # MPS uses device 0
-                    logger.info("NER: Using Apple MPS")
+            selection = select_torch_device(not self._force_cpu)
+            device = ner_pipeline_device(selection)
+            if selection.backend is ComputeBackend.CUDA:
+                logger.info("NER: Using CUDA GPU")
+            elif selection.backend is ComputeBackend.MPS:
+                logger.info("NER: Using Apple MPS")
             
             # Load model with caching
-            cache_dir = self._model_dir if (self._model_dir and os.path.exists(self._model_dir)) else None
-            
-            logger.info(f"NER: Loading model '{NER_MODEL_ID}'...")
+            cache_dir = self._model_cache_dir
+
+            logger.info("NER: Loading model '%s'...", self._model_source)
             
             # Explicitly load model and tokenizer to handle cache_dir correctly
-            tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_ID, cache_dir=cache_dir)
-            model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_ID, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                self._model_source,
+                cache_dir=cache_dir,
+                local_files_only=self._local_files_only,
+            )
+            model = AutoModelForTokenClassification.from_pretrained(
+                self._model_source,
+                cache_dir=cache_dir,
+                local_files_only=self._local_files_only,
+            )
             
             self._pipeline = pipeline(
                 "ner",
@@ -149,16 +183,15 @@ class NERExtractor:
         
         self._available = False
         
-        # Clear CUDA cache if possible
+        # Clear the selected Torch accelerator cache if possible.
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                import gc
-                gc.collect()
-                logger.info("NER: Model unloaded and CUDA cache cleared")
+            import gc
+
+            backend = release_torch_memory(synchronize=True)
+            gc.collect()
+            logger.info("NER: Model unloaded and %s cache cleared", backend.value)
         except Exception as e:
-            logger.warning(f"NER: Failed to clear cache: {e}")
+            logger.warning(f"NER: Failed to release accelerator cache: {e}")
     
     def extract_entities(self, text: str) -> List[NEREntity]:
         """

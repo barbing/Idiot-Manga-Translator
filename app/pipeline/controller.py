@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, List, Mapping
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
 from app.io.project import default_project_dict, load_project
@@ -55,11 +55,13 @@ from app.pipeline.status_contracts import (
     PipelineStageOutcome,
     PipelineStageOutcomeState,
     PipelineStageTechnicalError,
+    RuntimeBackendEvent,
     new_error_id,
     new_run_id,
 )
 from app.pipeline.steps import build_output_path, build_page_record
 from app.models.ollama import list_models
+from app.platform_services.compute import release_torch_memory
 from app.translate.prompts import build_translation_prompt, build_batch_translation_prompt, build_entity_extraction_prompt
 import tempfile
 import re
@@ -689,6 +691,23 @@ def _pipeline_runtime_checkpoint(stage: str, event: str, **fields: Any) -> None:
         debug_dir=debug_dir,
     )
 
+
+def _cleanup_runtime_backend_event(
+    run_id: str,
+    warmup_record: Mapping[str, Any],
+) -> RuntimeBackendEvent:
+    selected = str(warmup_record.get("device") or "cpu").strip()
+    requested = str(
+        warmup_record.get("requested_device") or selected
+    ).strip()
+    return RuntimeBackendEvent(
+        run_id=str(run_id),
+        module_id="cleanup",
+        requested_backend=requested,
+        selected_backend=selected,
+        fallback_reason=str(warmup_record.get("fallback_reason") or "").strip(),
+    )
+
 class PipelineStatus(QtCore.QObject):
     # GUI-5 typed status seam.  Historical signals below remain intact for the
     # compatibility shell during migration.
@@ -697,6 +716,7 @@ class PipelineStatus(QtCore.QObject):
     stage_outcome = QtCore.Signal(object)
     progress_snapshot = QtCore.Signal(object)
     structured_error = QtCore.Signal(object)
+    runtime_backend_selected = QtCore.Signal(object)
     progress_changed = QtCore.Signal(int)
     eta_changed = QtCore.Signal(str)
     page_changed = QtCore.Signal(int, int)
@@ -908,6 +928,7 @@ class PipelineWorker(QtCore.QThread):
     stage_outcome = QtCore.Signal(object)
     progress_snapshot = QtCore.Signal(object)
     structured_error = QtCore.Signal(object)
+    runtime_backend_selected = QtCore.Signal(object)
     progress_changed = QtCore.Signal(int)
     eta_changed = QtCore.Signal(str)
     page_changed = QtCore.Signal(int, int)
@@ -1600,10 +1621,23 @@ class PipelineWorker(QtCore.QThread):
                     except Exception:
                         pass
                 if cleanup_model_prewarmed:
-                    self.message.emit(
-                        "Cleanup model warmup completed before first page "
-                        f"({cleanup_model_warmup_record.get('elapsed_ms')} ms)."
+                    backend_event = _cleanup_runtime_backend_event(
+                        self._run_id,
+                        cleanup_model_warmup_record,
                     )
+                    self.runtime_backend_selected.emit(backend_event)
+                    if backend_event.fallback_reason:
+                        self.message.emit(
+                            "Cleanup selected CPU after the requested MPS backend "
+                            f"failed ({backend_event.fallback_reason})."
+                        )
+                    else:
+                        self.message.emit(
+                            "Cleanup model warmup completed on "
+                            f"{backend_event.selected_backend.upper()} before first "
+                            "page "
+                            f"({cleanup_model_warmup_record.get('elapsed_ms')} ms)."
+                        )
             if perf_telemetry_is_enabled:
                 worker_initialization["pre_page_setup_time"] = time.time() - start_time
                 worker_initialization["cleanup_model_warmup_time"] = cleanup_model_warmup_elapsed
@@ -3451,16 +3485,20 @@ class PipelineWorker(QtCore.QThread):
                     else 0.0
                 )
 
-                # Clear CUDA cache every 5 pages to balance speed vs memory
-                cuda_cache_clear_time = 0.0
+                # Clear the active Torch accelerator cache every 5 pages.
+                accelerator_cache_clear_time = 0.0
                 if self._settings.use_gpu and index % 5 == 0:
                     try:
-                        import torch
-                        if torch.cuda.is_available():
-                            cuda_cache_start = time.perf_counter() if perf_telemetry_is_enabled else 0.0
-                            torch.cuda.empty_cache()
-                            if perf_telemetry_is_enabled:
-                                cuda_cache_clear_time = time.perf_counter() - cuda_cache_start
+                        cache_clear_start = (
+                            time.perf_counter()
+                            if perf_telemetry_is_enabled
+                            else 0.0
+                        )
+                        release_torch_memory()
+                        if perf_telemetry_is_enabled:
+                            accelerator_cache_clear_time = (
+                                time.perf_counter() - cache_clear_start
+                            )
                     except Exception:
                         pass
 
@@ -3468,7 +3506,11 @@ class PipelineWorker(QtCore.QThread):
                     memory_maintenance_time = time.perf_counter() - memory_maintenance_start
                     page_cycle_time = time.time() - page_start
                     set_timing(debug_context, "python_gc_time", python_gc_time)
-                    set_timing(debug_context, "cuda_cache_clear_time", cuda_cache_clear_time)
+                    set_timing(
+                        debug_context,
+                        "accelerator_cache_clear_time",
+                        accelerator_cache_clear_time,
+                    )
                     set_timing(debug_context, "memory_maintenance_time", memory_maintenance_time)
                     set_timing(debug_context, "page_cycle_time", page_cycle_time)
                     set_timing(
@@ -3558,14 +3600,9 @@ class PipelineWorker(QtCore.QThread):
             import gc
             gc.collect()
 
-            # Flush PyTorch VRAM Cache (if used)
+            # Flush the selected PyTorch accelerator cache (if used).
             if self._settings.use_gpu:
-                 try:
-                     import torch
-                     if torch.cuda.is_available():
-                         torch.cuda.empty_cache()
-                 except Exception:
-                     pass
+                release_torch_memory()
             # --- MEMORY CLEANUP END ---
 
             total_elapsed = time.time() - start_time
@@ -3829,6 +3866,9 @@ class PipelineController(QtCore.QObject):
         self._worker.stage_outcome.connect(self.status.stage_outcome.emit)
         self._worker.progress_snapshot.connect(self.status.progress_snapshot.emit)
         self._worker.structured_error.connect(self.status.structured_error.emit)
+        self._worker.runtime_backend_selected.connect(
+            self.status.runtime_backend_selected.emit
+        )
         self._worker.progress_changed.connect(self.status.progress_changed.emit)
         self._worker.eta_changed.connect(self.status.eta_changed.emit)
         self._worker.page_changed.connect(self.status.page_changed.emit)
@@ -7631,6 +7671,13 @@ def _reuse_identical_scoped_detection_result(
     )
 
 
+def _bubble_acceleration_allowed(settings: object) -> bool:
+    value = getattr(settings, "use_gpu", None)
+    if type(value) is not bool:
+        raise TypeError("settings.use_gpu must be a boolean")
+    return value
+
+
 def _process_page(
     image_path: str,
     detector,
@@ -7742,6 +7789,7 @@ def _process_page(
                 image_size=image_size,
                 regions=[],
                 mode="default_text_area_plan",
+                allow_acceleration=_bubble_acceleration_allowed(settings),
             )
         )
         add_timing(debug_context, "bubble_detection_time", time.perf_counter() - bubble_detection_start)

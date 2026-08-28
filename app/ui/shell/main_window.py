@@ -45,6 +45,13 @@ from app.pipeline.status_contracts import (
     PipelineRunState,
     PipelineStageEvent,
     PipelineStageOutcome,
+    RuntimeBackendEvent,
+)
+from app.platform_services import PlatformServices, build_platform_services
+from app.platform_services.contracts import (
+    ComputeBackend,
+    OperatingSystem,
+    PlatformIdentity,
 )
 from app.project_edits.commands import (
     EditHistoryCommandReceipt,
@@ -163,6 +170,7 @@ from app.ui.settings.runtime_worker import (
     RuntimeAssetProbeWorker,
     RuntimeResourceAdmissionWorker,
     RuntimeResourceMonitorWorker,
+    runtime_assets_ready,
 )
 from app.ui.runtime_resource_admission import (
     ResourceMonitorLevel,
@@ -832,6 +840,88 @@ def _windows_resize_hit_test(
     return 0
 
 
+def request_platform_resize(
+    window_handle: object,
+    edge: object,
+    identity: PlatformIdentity | None = None,
+) -> bool:
+    """Request Qt-owned frameless resizing on macOS only."""
+
+    selected = identity or PlatformIdentity.detect()
+    if selected.os is not OperatingSystem.MACOS or window_handle is None:
+        return False
+    request = getattr(window_handle, "startSystemResize", None)
+    if not callable(request):
+        return False
+    try:
+        return bool(request(edge))
+    except (RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _admission_backend_devices(
+    report: RuntimeResourceAdmissionReport | None,
+) -> dict[str, str]:
+    if report is None:
+        return {}
+    labels = {
+        ComputeBackend.CUDA: "CUDA",
+        ComputeBackend.MPS: "MPS",
+        ComputeBackend.COREML: "CoreML",
+        ComputeBackend.METAL: "Metal",
+        ComputeBackend.CPU: "CPU",
+    }
+    component_to_module = {
+        "detector": "text-detection",
+        "bubble_detection": "text-detection",
+        "font_detection": "source-style-observation",
+        "ocr_model": "ocr",
+        "cleanup": "cleanup",
+        "translation_model": "translation",
+    }
+    selected: dict[str, list[str]] = {}
+    for component in report.components:
+        module_id = component_to_module.get(component.component_id)
+        if not module_id:
+            continue
+        label = labels[component.backend]
+        values = selected.setdefault(module_id, [])
+        if label not in values:
+            values.append(label)
+    return {
+        module_id: " / ".join(values)
+        for module_id, values in selected.items()
+    }
+
+
+def _admission_matches_run_settings(
+    report: RuntimeResourceAdmissionReport,
+    run_settings: RunSettingsSnapshot,
+) -> bool:
+    return bool(
+        report.settings_fingerprint == run_settings.settings_fingerprint
+        or report.effective_pipeline_values_fingerprint
+        == canonical_fingerprint(dict(run_settings.pipeline_values))
+    )
+
+
+def _qt_resize_edge_at(
+    position: QtCore.QPoint,
+    size: QtCore.QSize,
+    border: int,
+):
+    edges = QtCore.Qt.Edge(0)
+    if position.x() < border:
+        edges |= QtCore.Qt.Edge.LeftEdge
+    elif position.x() >= size.width() - border:
+        edges |= QtCore.Qt.Edge.RightEdge
+    if position.y() < border:
+        edges |= QtCore.Qt.Edge.TopEdge
+    elif position.y() >= size.height() - border:
+        edges |= QtCore.Qt.Edge.BottomEdge
+    return edges
+
+
 class _ProductNavigationButton(QtWidgets.QPushButton):
     """Centered native button with the shell's responsive icon-only contract."""
 
@@ -906,10 +996,16 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         resource_admission_service: RuntimeResourceAdmissionService | None = None,
         resource_monitor_service: RuntimeResourceMonitorService | None = None,
         layout_store: QtLayoutStore | None = None,
+        platform_services: PlatformServices | None = None,
         controller: object | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._platform_services = platform_services or build_platform_services()
+        if not isinstance(self._platform_services, PlatformServices):
+            raise TypeError("platform_services must be PlatformServices")
+        self._platform_identity = self._platform_services.identity
+        self._application_event_filter_installed = False
         self.setWindowFlags(
             QtCore.Qt.WindowType.Window
             | QtCore.Qt.WindowType.FramelessWindowHint
@@ -930,10 +1026,16 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._runtime_probe_thread: QtCore.QThread | None = None
         self._runtime_probe_worker: RuntimeAssetProbeWorker | None = None
         self._resource_admission_service = (
-            resource_admission_service or RuntimeResourceAdmissionService()
+            resource_admission_service
+            or RuntimeResourceAdmissionService(
+                compute=self._platform_services.compute,
+            )
         )
         self._resource_monitor_service = (
-            resource_monitor_service or RuntimeResourceMonitorService()
+            resource_monitor_service
+            or RuntimeResourceMonitorService(
+                compute=self._platform_services.compute,
+            )
         )
         self._resource_admission_thread: QtCore.QThread | None = None
         self._resource_admission_worker: RuntimeResourceAdmissionWorker | None = None
@@ -1130,6 +1232,13 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._layout_store = layout_store or QtLayoutStore()
         self._layout_state = self._layout_store.load()
         self._build_shell()
+        application = QtWidgets.QApplication.instance()
+        if (
+            self._platform_identity.os is OperatingSystem.MACOS
+            and application is not None
+        ):
+            application.installEventFilter(self)
+            self._application_event_filter_installed = True
         self._bind_views()
         self._apply_saved_layout()
         self._refresh_recent_projects()
@@ -1139,15 +1248,8 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         if controller is not None:
             self.attach_controller(controller)
 
-    @staticmethod
-    def _configuration_root() -> Path:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return Path(local_app_data) / "YomiFrame" / "config"
-        fallback = QtCore.QStandardPaths.writableLocation(
-            QtCore.QStandardPaths.StandardLocation.AppConfigLocation
-        )
-        return Path(fallback or os.getcwd()) / "YomiFrame"
+    def _configuration_root(self) -> Path:
+        return self._platform_services.paths.config_root
 
     def _wire_one_shot_thread(
         self,
@@ -1250,7 +1352,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         try:
             document = self._application_store.load()
         except Exception as exc:
-            document = ApplicationSettingsDocument()
+            document = self._application_store.default_document()
             self._startup_notice = (
                 "Application settings could not be loaded; defaults are shown "
                 f"without overwriting the file ({type(exc).__name__})."
@@ -1512,11 +1614,16 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         if self._startup_notice:
             self._set_notice(self._startup_notice, warning=True)
 
+        modifier = (
+            "Meta"
+            if self._platform_identity.os is OperatingSystem.MACOS
+            else "Ctrl"
+        )
         shortcuts = {
-            "Ctrl+1": "hub",
-            "Ctrl+2": "workspace",
-            "Ctrl+3": "editor",
-            "Ctrl+,": "settings",
+            f"{modifier}+1": "hub",
+            f"{modifier}+2": "workspace",
+            f"{modifier}+3": "editor",
+            f"{modifier}+,": "settings",
         }
         self._shortcuts: list[QtGui.QShortcut] = []
         for sequence, navigation_id in shortcuts.items():
@@ -1641,6 +1748,25 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         watched: QtCore.QObject,
         event: QtCore.QEvent,
     ) -> bool:  # noqa: N802
+        if (
+            self._platform_identity.os is OperatingSystem.MACOS
+            and event.type() == QtCore.QEvent.Type.MouseButtonPress
+            and not self.isMaximized()
+            and isinstance(watched, QtWidgets.QWidget)
+            and watched.window() is self
+            and isinstance(event, QtGui.QMouseEvent)
+            and event.button() == QtCore.Qt.MouseButton.LeftButton
+        ):
+            border = max(6, int(round(7 * self.devicePixelRatioF())))
+            position = self.mapFromGlobal(event.globalPosition().toPoint())
+            edge = _qt_resize_edge_at(position, self.size(), border)
+            if edge and request_platform_resize(
+                self.windowHandle(),
+                edge,
+                self._platform_identity,
+            ):
+                event.accept()
+                return True
         if watched in self._window_drag_surfaces:
             if event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
                 mouse_event = event
@@ -2068,6 +2194,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             "stage_outcome",
             "progress_snapshot",
             "structured_error",
+            "runtime_backend_selected",
         )
         if status is None or any(not hasattr(status, name) for name in required):
             raise TypeError("controller must expose the typed PipelineStatus signals")
@@ -2079,6 +2206,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         status.stage_outcome.connect(self.accept_stage_outcome)
         status.progress_snapshot.connect(self.accept_progress)
         status.structured_error.connect(self.accept_error)
+        status.runtime_backend_selected.connect(self.accept_runtime_backend)
 
     @property
     def current_project_path(self) -> str:
@@ -2726,6 +2854,17 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             for value in self._settings_model.draft.provider_profiles
         )
         self.settings.refresh_from_model()
+
+    def accept_provider_save_failure(self, profile_id: str, message: str) -> None:
+        """Keep a failed secure-save result visible beside its provider."""
+
+        detail = str(message or "").strip() or "Credential could not be saved."
+        self.settings.set_provider_test_result_message(
+            str(profile_id or ""),
+            detail,
+            warning=True,
+        )
+        self._set_notice(detail, warning=True)
 
     def navigate(self, navigation_id: str) -> None:
         if navigation_id != "settings" and self._provider_test_active:
@@ -13925,6 +14064,27 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 warning=True,
             )
             return
+        if self._runtime_probe_thread is not None:
+            self._set_notice(
+                "Wait for runtime asset verification before starting a run.",
+                warning=True,
+            )
+            return
+        assets_ready, missing_assets = runtime_assets_ready(
+            self._settings_model.runtime_status,
+            self._platform_identity,
+        )
+        if not assets_ready:
+            if self._settings_model.runtime_status is None:
+                self._start_runtime_probe()
+            else:
+                self._set_notice(
+                    "Required runtime assets are unavailable: "
+                    + ", ".join(missing_assets)
+                    + ". Open Settings > Runtime assets to repair them.",
+                    warning=True,
+                )
+            return
         if self._manual_cleanup_modal_active():
             self._set_notice(
                 "Finish or cancel cleanup coverage before starting a run.",
@@ -23041,12 +23201,88 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._refresh_run_presentation()
         self._refresh_activity()
 
+    @QtCore.Slot(object)
+    def accept_runtime_backend(self, event: object) -> None:
+        if not isinstance(event, RuntimeBackendEvent):
+            raise TypeError("runtime backend signal must carry RuntimeBackendEvent")
+        lifecycle = self._run_model.state.lifecycle
+        if lifecycle is None or event.run_id != lifecycle.run_id:
+            return
+        snapshot = self._runtime_model.snapshot
+        if snapshot is None:
+            return
+        labels = {
+            "cuda": "CUDA",
+            "mps": "MPS",
+            "coreml": "CoreML",
+            "metal": "Metal",
+            "cpu": "CPU",
+        }
+        changed = False
+        rows = []
+        for row in snapshot.rows:
+            if row.module_id != event.module_id:
+                rows.append(row)
+                continue
+            changed = True
+            rows.append(
+                replace(
+                    row,
+                    device=labels.get(
+                        event.selected_backend.casefold(),
+                        event.selected_backend,
+                    ),
+                    status=(
+                        "Fallback active" if event.fallback_reason else "Ready"
+                    ),
+                    tone=(
+                        PresentationTone.WARNING
+                        if event.fallback_reason
+                        else PresentationTone.READY
+                    ),
+                    detail=(
+                        f"Local inpainting · {event.fallback_reason}"
+                        if event.fallback_reason
+                        else row.detail
+                    ),
+                )
+            )
+        if not changed:
+            return
+        self._runtime_model.replace_snapshot(
+            replace(
+                snapshot,
+                status=(
+                    "Backend fallback active"
+                    if event.fallback_reason
+                    else snapshot.status
+                ),
+                tone=(
+                    PresentationTone.WARNING
+                    if event.fallback_reason
+                    else snapshot.tone
+                ),
+                rows=tuple(rows),
+            )
+        )
+        self._refresh_runtime()
+
     def capture_runtime_snapshot(
         self,
         run_settings: RunSettingsSnapshot,
         runtime_status: RuntimeStatus | None = None,
     ) -> None:
-        snapshot = build_runtime_snapshot(run_settings, runtime_status)
+        admission = self._resource_admission_report
+        if admission is not None and not _admission_matches_run_settings(
+            admission,
+            run_settings,
+        ):
+            admission = None
+        snapshot = build_runtime_snapshot(
+            run_settings,
+            runtime_status,
+            backend_devices=_admission_backend_devices(admission),
+        )
         self._runtime_model.replace_snapshot(snapshot)
         self.settings.set_runtime_status(runtime_status)
         self._refresh_runtime()
@@ -23056,8 +23292,10 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         if self._runtime_probe_thread is not None:
             self._set_notice("Runtime asset verification is already active.")
             return
+        self._settings_model.set_runtime_status(None)
+        self.settings.set_runtime_status(None)
         thread = QtCore.QThread(self)
-        worker = RuntimeAssetProbeWorker()
+        worker = RuntimeAssetProbeWorker(identity=self._platform_identity)
         worker.moveToThread(thread)
         self._wire_one_shot_thread(
             thread=thread,
@@ -23136,7 +23374,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._resource_admission_requested_files = ()
         self._admitted_run_files = None
         self._resource_admission_pending_report = None
-        self._set_notice("Checking the current GPU and system-memory budget…")
+        self._set_notice(
+            "Checking the current accelerator and system-memory budget…"
+        )
         self._refresh_run_presentation()
         self._refresh_runtime()
         thread.start()
@@ -23309,6 +23549,8 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _accept_runtime_probe_failure(self, message: str) -> None:
+        self._settings_model.set_runtime_status(None)
+        self.settings.set_runtime_status(None)
         self._set_notice(str(message), warning=True)
 
     def _runtime_probe_settled(self) -> None:
@@ -23325,8 +23567,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         if isinstance(raw, Mapping):
             detail = str(raw.get("detail") or "Runtime asset details unavailable.")
             ready = bool(raw.get("ready") or raw.get("installed"))
-            if ready:
-                self._set_notice(detail)
+            managed_download = bool(raw.get("managed_download", True))
+            if ready or not managed_download:
+                self._set_notice(detail, warning=not ready)
             else:
                 self._start_runtime_asset_download(str(asset_id), detail=detail)
             return
@@ -23349,13 +23592,18 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             return
         try:
-            worker = RuntimeAssetDownloadWorker(asset_id)
+            worker = RuntimeAssetDownloadWorker(
+                asset_id,
+                identity=self._platform_identity,
+            )
         except ValueError:
             self._set_notice(
                 "This runtime asset has no managed download adapter.",
                 warning=True,
             )
             return
+        self._settings_model.set_runtime_status(None)
+        self.settings.set_runtime_status(None)
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
         dialog = DownloadDialog(self, title="Downloading runtime asset")
@@ -23398,14 +23646,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _open_runtime_folder(self) -> None:
-        local_app_data = str(os.environ.get("LOCALAPPDATA", "")).strip()
-        if not local_app_data:
-            self._set_notice(
-                "The managed runtime folder is unavailable because LOCALAPPDATA is unset.",
-                warning=True,
-            )
-            return
-        runtime_root = (Path(local_app_data) / "YomiFrame" / "runtime").resolve()
+        runtime_root = self._platform_services.paths.runtime_root.resolve()
         if not runtime_root.is_dir():
             self._set_notice(
                 "The managed runtime folder does not exist yet. Verify or download a runtime asset first.",
@@ -23418,7 +23659,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._set_notice(
             "Opened the managed runtime folder."
             if opened
-            else "Windows could not open the managed runtime folder.",
+            else "The system could not open the managed runtime folder.",
             warning=not opened,
         )
 
@@ -24165,7 +24406,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             runtime_label = "Checking memory"
             runtime_tone = "info"
             runtime_detail = (
-                "Measuring current GPU and system-memory headroom before any model loads"
+                "Measuring current accelerator and system-memory headroom before any model loads"
             )
             workspace_facts = ()
         elif admission is not None and snapshot is None:
@@ -24767,6 +25008,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 "publish status. No model was loaded for first paint."
             ),
         )
+        self._start_runtime_probe()
 
     def _set_notice(self, text: str, *, warning: bool = False) -> None:
         value = str(text).strip()
@@ -25435,10 +25677,15 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             return
         self._stop_resource_monitor()
         self._save_layout()
+        if self._application_event_filter_installed:
+            application = QtWidgets.QApplication.instance()
+            if application is not None:
+                application.removeEventFilter(self)
+            self._application_event_filter_installed = False
         super().closeEvent(event)
 
 
 MainWindow = YomiFrameMainWindow
 
 
-__all__ = ["MainWindow", "YomiFrameMainWindow"]
+__all__ = ["MainWindow", "YomiFrameMainWindow", "request_platform_resize"]
