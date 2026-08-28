@@ -2076,6 +2076,14 @@ def _selected_model_translation_revision(
         return None
     value = thaw_json(dict(effective.target_revision_metadata))
     artifact = TranslationRevisionArtifact.from_record(value)
+    try:
+        source_artifact = OcrSourceRevisionArtifact.from_record(
+            thaw_json(dict(effective.source_revision_metadata))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "selected model translation source lineage is unavailable"
+        ) from exc
     lineage = effective.lineage
     if (
         lineage is None
@@ -2088,7 +2096,8 @@ def _selected_model_translation_revision(
         or artifact.source_text != effective.source_text
         or artifact.source_authority != effective.source_authority
         or artifact.source_revision_id != effective.source_revision_id
-        or artifact.source_selection_edit_id not in effective.applied_edit_ids
+        or artifact.source_revision_id != source_artifact.revision_id
+        or artifact.source_selection_edit_id != source_artifact.selection_edit_id
     ):
         raise ValueError(
             "selected model translation revision lineage is inconsistent"
@@ -2215,7 +2224,8 @@ def _projected_user_parent(effective: EffectiveParentSnapshot) -> ProjectedParen
     elif effective.target_authority == "unavailable":
         if (
             effective.target_text is not None
-            or effective.target_freshness is not TargetFreshness.UNAVAILABLE
+            or effective.target_freshness
+            not in {TargetFreshness.UNAVAILABLE, TargetFreshness.STALE}
             or selected_translation is not None
             or target_revision_base is not None
         ):

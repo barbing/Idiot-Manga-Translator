@@ -405,9 +405,9 @@ class ExplicitTranslationRevisionRequest:
             or not self.effective_source_text.strip()
         ):
             raise ValueError("effective_source_text must be non-empty")
-        if self.effective_source_authority != "ocr_revision":
+        if self.effective_source_authority not in {"ocr_revision", "user"}:
             raise ValueError(
-                "explicit translation currently requires a selected OCR revision"
+                "explicit translation requires selected OCR provenance or a user-corrected OCR source"
             )
         if not str(self.source_revision_id).startswith(
             OCR_SOURCE_REVISION_ID_PREFIX
@@ -734,7 +734,7 @@ class TranslationRevisionArtifact:
             raise ValueError("translation revision target text must be non-empty")
         if not isinstance(self.source_text, str) or not self.source_text.strip():
             raise ValueError("translation revision source text must be non-empty")
-        if self.source_authority != "ocr_revision":
+        if self.source_authority not in {"ocr_revision", "user"}:
             raise ValueError("translation revision source authority is invalid")
         if not self.source_revision_id.startswith(OCR_SOURCE_REVISION_ID_PREFIX):
             raise ValueError("translation revision source identity is invalid")

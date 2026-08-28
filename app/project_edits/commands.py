@@ -16,6 +16,7 @@ from typing import Any, Mapping
 import uuid
 
 from app.pipeline.hierarchy_revision_contracts import ParentOrigin
+from app.pipeline.ocr_revision_contracts import OcrSourceRevisionArtifact
 from app.pipeline.translation_revision_contracts import TranslationRevisionArtifact
 from app.io.project_edit_store import (
     ProjectEditCommitReceipt,
@@ -36,6 +37,7 @@ from .contracts import (
     ParentSourceEvidenceMappingV1,
     ParentStageRequirement,
     ProjectEdit,
+    SourceTextRevisionBaseV1,
     TargetTextRevisionBaseV1,
     canonical_render_fill_color,
     canonical_render_outline_color,
@@ -78,6 +80,7 @@ from .projection import (
     effective_source_fingerprint,
     field_base_fingerprint,
     project_effective_page,
+    source_text_revision_base_for_parent,
     target_text_revision_base_for_parent,
 )
 
@@ -88,6 +91,7 @@ _PATH_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 class SourceTextOperation(str, Enum):
     REPLACE = "replace"
     RESTORE_AUTOMATIC = "restore_automatic"
+    RESTORE_SELECTED_REVISION = "restore_selected_revision"
 
 
 class TargetTextOperation(str, Enum):
@@ -192,6 +196,14 @@ class SourceTextCommandErrorCode(str, Enum):
     STALE_GLOBAL_HEAD = "stale_global_head"
     SOURCE_SLOT_CONFLICT = "source_slot_conflict"
     DUPLICATE_COMMAND = "duplicate_command"
+    INVALID_OPERATION = "invalid_operation"
+    REVISION_BASE_REQUIRED = "revision_base_required"
+    REVISION_BASE_NOT_ALLOWED = "revision_base_not_allowed"
+    REVISION_ID_MISMATCH = "revision_id_mismatch"
+    REVISION_SELECTION_MISMATCH = "revision_selection_mismatch"
+    REVISION_ARTIFACT_MISMATCH = "revision_artifact_mismatch"
+    PARENT_LINEAGE_MISMATCH = "parent_lineage_mismatch"
+    NO_OP = "no_op"
     PROJECTION_REJECTED = "projection_rejected"
 
 
@@ -859,6 +871,7 @@ class SourceTextCommand:
     expected_effective_page_fingerprint: str
     expected_page_head_sha256: str
     expected_global_head_sha256: str
+    revision_base: SourceTextRevisionBaseV1 | None = None
 
     def __post_init__(self) -> None:
         command_id = _require_identity(self.command_id, "command_id")
@@ -884,8 +897,27 @@ class SourceTextCommand:
         object.__setattr__(self, "operation", operation)
         if not isinstance(self.text, str):
             raise TypeError("text must be a string")
-        if operation is SourceTextOperation.RESTORE_AUTOMATIC and self.text != "":
-            raise ValueError("restore_automatic must not carry replacement text")
+        if operation in {
+            SourceTextOperation.RESTORE_AUTOMATIC,
+            SourceTextOperation.RESTORE_SELECTED_REVISION,
+        } and self.text != "":
+            raise ValueError(f"{operation.value} must not carry replacement text")
+        revision_base = self.revision_base
+        if revision_base is not None and not isinstance(
+            revision_base,
+            SourceTextRevisionBaseV1,
+        ):
+            raise TypeError("revision_base must be a SourceTextRevisionBaseV1")
+        if (
+            operation is SourceTextOperation.RESTORE_SELECTED_REVISION
+            and revision_base is None
+        ):
+            raise ValueError("restore_selected_revision requires revision_base")
+        if (
+            operation is SourceTextOperation.RESTORE_AUTOMATIC
+            and revision_base is not None
+        ):
+            raise ValueError("restore_automatic must not carry revision_base")
         object.__setattr__(
             self,
             "expected_effective_page_fingerprint",
@@ -2377,6 +2409,126 @@ def _active_source_slot_head(
     return heads[0]
 
 
+def _source_slot_has_ancestor(
+    ledger: ProjectEditLedger,
+    *,
+    descendant: ProjectEdit,
+    ancestor_edit_id: str,
+) -> bool:
+    cursor: ProjectEdit | None = descendant
+    visited: set[str] = set()
+    while cursor is not None and cursor.edit_id not in visited:
+        visited.add(cursor.edit_id)
+        if cursor.edit_id == ancestor_edit_id:
+            return True
+        predecessor_id = cursor.supersedes_edit_id
+        if predecessor_id is None:
+            return False
+        predecessor = ledger.get(predecessor_id)
+        if (
+            predecessor is None
+            or predecessor.is_control
+            or predecessor.page_id != descendant.page_id
+            or predecessor.domain is not EditDomain.SOURCE_TEXT
+            or predecessor.target != descendant.target
+        ):
+            return False
+        cursor = predecessor
+    return False
+
+
+def _source_revision_base_artifact(
+    parent: EffectiveParentSnapshot,
+) -> OcrSourceRevisionArtifact:
+    try:
+        artifact = OcrSourceRevisionArtifact.from_record(
+            dict(parent.source_revision_metadata)
+        )
+    except (TypeError, ValueError) as exc:
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.REVISION_ARTIFACT_MISMATCH,
+            "The selected model OCR artifact is unavailable.",
+        ) from exc
+    return artifact
+
+
+def _require_revision_backed_source_state(
+    *,
+    snapshot: ProjectEditReadSnapshot,
+    parent: EffectiveParentSnapshot,
+    slot_head: ProjectEdit | None,
+    command: SourceTextCommand,
+) -> tuple[SourceTextRevisionBaseV1, OcrSourceRevisionArtifact]:
+    revision_base = command.revision_base
+    if revision_base is None:
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.REVISION_BASE_REQUIRED,
+            "The selected user parent requires its model OCR revision base.",
+        )
+    try:
+        observed_base = source_text_revision_base_for_parent(parent)
+    except (TypeError, ValueError) as exc:
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.REVISION_ARTIFACT_MISMATCH,
+            "The selected model OCR revision is inconsistent.",
+        ) from exc
+    if observed_base != revision_base:
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.REVISION_ID_MISMATCH,
+            "The selected model OCR revision changed.",
+        )
+    artifact = _source_revision_base_artifact(parent)
+    if (
+        artifact.revision_id != revision_base.source_revision_id
+        or artifact.page_id != command.page_id
+        or artifact.parent_id != command.parent_id
+        or canonical_sha256(artifact.to_record())
+        != revision_base.artifact_sha256
+        or effective_source_fingerprint(
+            artifact.parent_id,
+            artifact.source_text,
+        )
+        != revision_base.source_fingerprint
+    ):
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.REVISION_ARTIFACT_MISMATCH,
+            "The selected model OCR artifact binding changed.",
+        )
+    selection_edit = snapshot.ledger.get(revision_base.selection_edit_id)
+    if (
+        slot_head is None
+        or selection_edit is None
+        or selection_edit.domain is not EditDomain.SOURCE_TEXT
+        or selection_edit.operation != "select_revision"
+        or selection_edit.page_id != command.page_id
+        or selection_edit.target.kind is not EditTargetKind.PARENT
+        or selection_edit.target.parent_id != command.parent_id
+        or str(selection_edit.payload.get("revision_id") or "")
+        != revision_base.source_revision_id
+        or not _source_slot_has_ancestor(
+            snapshot.ledger,
+            descendant=slot_head,
+            ancestor_edit_id=revision_base.selection_edit_id,
+        )
+    ):
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.REVISION_SELECTION_MISMATCH,
+            "The selected model OCR edit lineage changed.",
+        )
+    lineage = parent.lineage
+    if (
+        parent.origin is not ParentOrigin.USER
+        or lineage is None
+        or artifact.root_id != parent.root_id
+        or artifact.parent_authored_edit_id != lineage.authored_edit_id
+    ):
+        raise SourceTextCommandError(
+            SourceTextCommandErrorCode.PARENT_LINEAGE_MISMATCH,
+            "The selected user-parent lineage changed.",
+        )
+    return revision_base, artifact
+
+
 def _project_page(
     project: Mapping[str, Any],
     page_id: str,
@@ -2550,22 +2702,18 @@ def _require_revision_backed_target_state(
         or artifact.source_selection_edit_id
         != revision_base.source_selection_edit_id
         or source_slot_head is None
-        or source_slot_head.edit_id != revision_base.source_selection_edit_id
-        or source_slot_head.domain is not EditDomain.SOURCE_TEXT
-        or source_slot_head.operation != "select_revision"
-        or str(source_slot_head.payload.get("revision_id") or "")
-        != revision_base.source_revision_id
+        or not _source_slot_has_ancestor(
+            snapshot.ledger,
+            descendant=source_slot_head,
+            ancestor_edit_id=revision_base.source_selection_edit_id,
+        )
     ):
         raise TargetTextCommandError(
             TargetTextCommandErrorCode.REVISION_SOURCE_MISMATCH,
             "The selected model translation source binding changed.",
         )
     if (
-        effective_page.hierarchy.revision_id
-        != revision_base.hierarchy_revision_id
-        or effective_page.hierarchy.fingerprint
-        != revision_base.hierarchy_fingerprint
-        or artifact.hierarchy_revision_id
+        artifact.hierarchy_revision_id
         != revision_base.hierarchy_revision_id
         or artifact.hierarchy_fingerprint
         != revision_base.hierarchy_fingerprint
@@ -4711,23 +4859,105 @@ class SourceTextCommandService:
             EditTargetKind.PARENT,
             parent_id=command.parent_id,
         )
+        revision_base: SourceTextRevisionBaseV1 | None = None
+        revision_artifact: OcrSourceRevisionArtifact | None = None
         payload: Mapping[str, Any]
-        if command.operation is SourceTextOperation.REPLACE:
-            payload = {"text": command.text}
+        if before_parent.origin is ParentOrigin.AUTOMATIC:
+            if command.revision_base is not None:
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.REVISION_BASE_NOT_ALLOWED,
+                    "Automatic parents do not accept a model-revision base.",
+                )
+            if command.operation not in {
+                SourceTextOperation.REPLACE,
+                SourceTextOperation.RESTORE_AUTOMATIC,
+            }:
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.INVALID_OPERATION,
+                    "Automatic parents support Replace or Restore Automatic only.",
+                )
+            if (
+                command.operation is SourceTextOperation.REPLACE
+                and before_parent.source_authority == "user"
+                and before_parent.source_text == command.text
+            ) or (
+                command.operation is SourceTextOperation.RESTORE_AUTOMATIC
+                and before_parent.source_authority == "automatic"
+            ):
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.NO_OP,
+                    "The requested source authority and text are already effective.",
+                )
+            payload = (
+                {"text": command.text}
+                if command.operation is SourceTextOperation.REPLACE
+                else {}
+            )
+            base_fingerprint = field_base_fingerprint(
+                project=materialized,
+                page=page,
+                target=target,
+                domain=EditDomain.SOURCE_TEXT,
+                operation=command.operation.value,
+                payload=payload,
+            )
+            if base_fingerprint is None:
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.PARENT_NOT_FOUND,
+                    "Automatic source-text evidence is unavailable for this parent.",
+                )
+            base_revision_id = before_parent.base_revision_id
+        elif before_parent.origin is ParentOrigin.USER:
+            if before_parent.source_evidence_mapping is not None:
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.INVALID_OPERATION,
+                    "Mapped user parents retain their pipeline OCR mapping; edit an explicit OCR revision instead.",
+                )
+            if command.operation not in {
+                SourceTextOperation.REPLACE,
+                SourceTextOperation.RESTORE_SELECTED_REVISION,
+            }:
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.INVALID_OPERATION,
+                    "Revision-backed user parents support Replace or Restore Selected Model OCR only.",
+                )
+            revision_base, revision_artifact = (
+                _require_revision_backed_source_state(
+                    snapshot=read_snapshot,
+                    parent=before_parent,
+                    slot_head=slot_head,
+                    command=command,
+                )
+            )
+            if (
+                command.operation is SourceTextOperation.REPLACE
+                and before_parent.source_authority == "user"
+                and before_parent.source_text == command.text
+            ) or (
+                command.operation
+                is SourceTextOperation.RESTORE_SELECTED_REVISION
+                and before_parent.source_authority == "ocr_revision"
+                and before_parent.source_revision_id
+                == revision_base.source_revision_id
+            ):
+                raise SourceTextCommandError(
+                    SourceTextCommandErrorCode.NO_OP,
+                    "The requested source authority, revision, and text are already effective.",
+                )
+            payload = (
+                {
+                    "text": command.text,
+                    "revision_base": revision_base.to_dict(),
+                }
+                if command.operation is SourceTextOperation.REPLACE
+                else {"revision_base": revision_base.to_dict()}
+            )
+            base_revision_id = revision_base.source_revision_id
+            base_fingerprint = revision_base.artifact_sha256
         else:
-            payload = {}
-        base_fingerprint = field_base_fingerprint(
-            project=materialized,
-            page=page,
-            target=target,
-            domain=EditDomain.SOURCE_TEXT,
-            operation=command.operation.value,
-            payload=payload,
-        )
-        if base_fingerprint is None:
             raise SourceTextCommandError(
-                SourceTextCommandErrorCode.PARENT_NOT_FOUND,
-                "Automatic source-text evidence is unavailable for this parent.",
+                SourceTextCommandErrorCode.PARENT_LINEAGE_MISMATCH,
+                "The selected parent origin is unsupported.",
             )
         edit = create_project_edit(
             project_id=command.project_id,
@@ -4736,7 +4966,7 @@ class SourceTextCommandService:
             domain=EditDomain.SOURCE_TEXT,
             operation=command.operation.value,
             payload=payload,
-            base_revision_id=before_parent.base_revision_id,
+            base_revision_id=base_revision_id,
             base_fingerprint=base_fingerprint,
             supersedes_edit_id=(slot_head.edit_id if slot_head is not None else None),
             edit_id=command.command_id,
@@ -4759,8 +4989,18 @@ class SourceTextCommandService:
                 after_parent.source_text == command.text
                 and after_parent.source_authority == "user"
             )
-        else:
+        elif command.operation is SourceTextOperation.RESTORE_AUTOMATIC:
             accepted = after_parent.source_authority == "automatic"
+        else:
+            assert revision_base is not None
+            assert revision_artifact is not None
+            accepted = (
+                after_parent.source_authority == "ocr_revision"
+                and after_parent.source_revision_id
+                == revision_base.source_revision_id
+                and after_parent.source_text
+                == revision_artifact.source_text
+            )
         if not accepted:
             raise SourceTextCommandError(
                 SourceTextCommandErrorCode.PROJECTION_REJECTED,
@@ -9738,6 +9978,84 @@ class RenderStyleFontRoleCommandService:
         )
 
 
+def _history_json_references_any(value: Any, identities: frozenset[str]) -> bool:
+    if isinstance(value, str):
+        return value in identities
+    if isinstance(value, Mapping):
+        return any(
+            _history_json_references_any(item, identities)
+            for item in value.values()
+        )
+    if isinstance(value, (tuple, list)):
+        return any(
+            _history_json_references_any(item, identities) for item in value
+        )
+    return False
+
+
+def _history_artifact_dependent_active_edit_ids(
+    snapshot: ProjectEditReadSnapshot,
+    target_edit: ProjectEdit,
+) -> tuple[str, ...]:
+    """Return active selection edits whose immutable artifacts reference target."""
+
+    try:
+        target_index = next(
+            index
+            for index, record in enumerate(snapshot.ledger.edits)
+            if record.edit_id == target_edit.edit_id
+        )
+    except StopIteration:
+        return ()
+    identities = {
+        target_edit.edit_id,
+        str(target_edit.payload.get("revision_id") or ""),
+    }
+    if target_edit.target.kind is EditTargetKind.PARENT:
+        identities.add(target_edit.target.parent_id)
+    if target_edit.domain is EditDomain.STRUCTURAL:
+        identities.update(
+            str(value)
+            for value in (
+                target_edit.payload.get("root_id"),
+                target_edit.payload.get("merged_root_id"),
+                *(target_edit.payload.get("child_parent_ids") or ()),
+                *(target_edit.payload.get("child_root_ids") or ()),
+            )
+            if str(value or "")
+        )
+    stable_identities = frozenset(value for value in identities if value)
+    if not stable_identities:
+        return ()
+
+    artifact_index: dict[str, Mapping[str, Any]] = {}
+    catalogs = snapshot.project.get("artifact_revisions")
+    if isinstance(catalogs, Mapping):
+        for records in catalogs.values():
+            if not isinstance(records, (tuple, list)):
+                continue
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                revision_id = str(record.get("revision_id") or "")
+                if revision_id:
+                    artifact_index[revision_id] = record
+
+    active_ids = set(snapshot.ledger.state().active_edit_ids)
+    result: list[str] = []
+    for record in snapshot.ledger.edits[target_index + 1 :]:
+        if record.is_control or record.edit_id not in active_ids:
+            continue
+        revision_id = str(record.payload.get("revision_id") or "")
+        artifact = artifact_index.get(revision_id)
+        if artifact is not None and _history_json_references_any(
+            artifact,
+            stable_identities,
+        ):
+            result.append(record.edit_id)
+    return tuple(result)
+
+
 class EditHistoryCommandService:
     """Persist one durable Revoke/Reapply control without invoking a pipeline owner."""
 
@@ -9860,8 +10178,18 @@ class EditHistoryCommandService:
                 "The selected edit is already active.",
             )
         if command.operation is EditHistoryOperation.REVOKE:
-            dependent_edit_ids = snapshot.ledger.dependent_active_edit_ids(
-                target_edit.edit_id
+            dependent_edit_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *snapshot.ledger.dependent_active_edit_ids(
+                            target_edit.edit_id
+                        ),
+                        *_history_artifact_dependent_active_edit_ids(
+                            snapshot,
+                            target_edit,
+                        ),
+                    )
+                )
             )
             if dependent_edit_ids:
                 raise EditHistoryCommandError(
@@ -10237,6 +10565,7 @@ __all__ = [
     "SourceTextCommandReceipt",
     "SourceTextCommandService",
     "SourceTextOperation",
+    "SourceTextRevisionBaseV1",
     "TargetTextCommand",
     "TargetTextCommandError",
     "TargetTextCommandErrorCode",

@@ -63,7 +63,11 @@ from app.project_edits.render_override_reset_commands import (
     RenderOverrideResetScope,
 )
 from app.project_edits.contracts import EditDomain, EditTargetKind, thaw_json
-from app.project_edits.projection import ProjectionIssueKind, TargetFreshness
+from app.project_edits.projection import (
+    ProjectionIssueKind,
+    TargetFreshness,
+    source_text_revision_base_for_parent,
+)
 from app.project_edits.translation_revision_service import (
     compile_translation_revision_policy_snapshots,
 )
@@ -85,6 +89,9 @@ from app.ui.design_system.icons import brand_icon, hybrid_icon
 from app.ui.design_system.theme import ThemeOptions, apply_application_theme
 from app.ui.presentation import workspace_next_action
 from app.ui.project_hub.new_project_dialog import named_project_display_name
+from app.ui.project_hub.recent_project_preview import (
+    recent_project_thumbnail_path,
+)
 from app.ui.editor.canvas import (
     CanvasArtifactSet,
     OverlayAvailability,
@@ -748,6 +755,14 @@ class _PreparedSourcePage:
     ordinal: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CompletedRunSettingsPublication:
+    project_path: str
+    project_config: ProjectConfig
+    module_configs: tuple[ModuleConfig, ...]
+    snapshot: RunSettingsSnapshot
+
+
 class _ProjectLoadWorker(QtCore.QObject):
     """One-shot project loader; no SQLite object crosses thread boundaries."""
 
@@ -1041,6 +1056,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._edit_history_thread: QtCore.QThread | None = None
         self._edit_history_worker: EditHistoryWorker | None = None
         self._selected_history_edit_id = ""
+        self._history_head_record_id = ""
         self._render_override_reset_model: RenderOverrideResetModel | None = None
         self._render_override_reset_thread: QtCore.QThread | None = None
         self._render_override_reset_worker: RenderOverrideResetWorker | None = None
@@ -1053,6 +1069,16 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._prepared_source_pages: dict[str, _PreparedSourcePage] = {}
         self._active_run_snapshot: RunSettingsSnapshot | None = None
         self._active_run_invocation: RunInvocation | None = None
+        self._deferred_run_settings_publication: (
+            _CompletedRunSettingsPublication | None
+        ) = None
+        self._deferred_run_settings_retry_count = 0
+        self._deferred_run_settings_retry_timer = QtCore.QTimer(self)
+        self._deferred_run_settings_retry_timer.setSingleShot(True)
+        self._deferred_run_settings_retry_timer.setInterval(100)
+        self._deferred_run_settings_retry_timer.timeout.connect(
+            self._retry_deferred_run_settings_after_project_load
+        )
         self._page_preview_active = False
         self._page_preview_page_id = ""
         self._provider_test_active = False
@@ -2039,6 +2065,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         required = (
             "lifecycle_changed",
             "stage_changed",
+            "stage_outcome",
             "progress_snapshot",
             "structured_error",
         )
@@ -2099,6 +2126,11 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
     def _pending_run_start_gate(self) -> tuple[bool, str]:
         if self._pending_run_invocation is None:
             return False, "Prepare a new translation before Start."
+        return self._compiled_run_start_gate()
+
+    def _compiled_run_start_gate(self) -> tuple[bool, str]:
+        """Apply one provider/settings readiness gate to every run candidate."""
+
         if self._settings_model.dirty:
             return False, "Apply or Cancel the pending Settings before Start."
         try:
@@ -2324,6 +2356,23 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         normalized = os.path.normcase(os.path.abspath(invocation.json_path or "project.json"))
         return f"project:gui:{canonical_fingerprint({'json_path': normalized})[:32]}"
 
+    @staticmethod
+    def _revision_run_invocation(
+        snapshot: RunSettingsSnapshot,
+        *,
+        project_path: str,
+    ) -> RunInvocation:
+        """Rebuild the exact project paths bound by one completed run."""
+
+        if not isinstance(snapshot, RunSettingsSnapshot):
+            raise TypeError("snapshot must be a RunSettingsSnapshot")
+        values = thaw_json(snapshot.pipeline_values)
+        return RunInvocation(
+            import_dir=str(values.get("import_dir") or ""),
+            export_dir=str(values.get("export_dir") or ""),
+            json_path=str(values.get("json_path") or project_path),
+        )
+
     def _current_run_invocation(
         self,
         *,
@@ -2468,34 +2517,72 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
     ) -> None:
         if not invocation.json_path or not os.path.isfile(invocation.json_path):
             return
+        publication = _CompletedRunSettingsPublication(
+            project_path=os.path.abspath(invocation.json_path),
+            project_config=self._settings_model.baseline.project,
+            module_configs=self._configs_for_scope(
+                self._settings_model.baseline.module_configs,
+                SettingsScope.PROJECT,
+            ),
+            snapshot=snapshot,
+        )
+        self._deferred_run_settings_publication = publication
+        self._deferred_run_settings_retry_count = 0
+        self._deferred_run_settings_retry_timer.stop()
         try:
-            from app.io.project import (
-                load_project_for_editing,
-                save_project_schema_v2_atomic,
-                with_project_settings,
-            )
-
-            project = load_project_for_editing(invocation.json_path)
-            updated = with_project_settings(
-                project,
-                project_config=self._settings_model.baseline.project,
-                module_configs=self._configs_for_scope(
-                    self._settings_model.baseline.module_configs,
-                    SettingsScope.PROJECT,
-                ),
-                last_run_snapshot=snapshot,
-            )
-            if not save_project_schema_v2_atomic(
-                invocation.json_path,
-                updated,
-                defer_if_checkpoint=True,
-            ):
-                raise RuntimeError("project settings publication was deferred")
+            self._retry_completed_run_settings_publication()
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._deferred_run_settings_publication = None
             self._set_notice(
                 f"The run completed, but typed run settings were not published ({type(exc).__name__}).",
                 warning=True,
             )
+
+    def _retry_completed_run_settings_publication(
+        self,
+        *,
+        loaded_project: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        publication = self._deferred_run_settings_publication
+        if publication is None:
+            return dict(loaded_project) if loaded_project is not None else None
+        from app.io.project import (
+            load_project_for_editing,
+            save_project_schema_v2_atomic,
+            with_project_settings,
+        )
+
+        project = (
+            dict(loaded_project)
+            if loaded_project is not None
+            else load_project_for_editing(publication.project_path)
+        )
+        project_id = str((project.get("project") or {}).get("project_id") or "")
+        persisted_snapshot = publication.snapshot
+        if project_id and persisted_snapshot.project_id != project_id:
+            # A new run is compiled before its canonical project exists.  Bind
+            # the immutable settings payload to the materialized project ID;
+            # clearing snapshot_id makes the typed contract recompute its
+            # semantic fingerprint without changing any run setting.
+            persisted_snapshot = replace(
+                persisted_snapshot,
+                project_id=project_id,
+                snapshot_id="",
+            )
+        updated = with_project_settings(
+            project,
+            project_config=publication.project_config,
+            module_configs=publication.module_configs,
+            last_run_snapshot=persisted_snapshot,
+        )
+        if not save_project_schema_v2_atomic(
+            publication.project_path,
+            updated,
+            defer_if_checkpoint=True,
+        ):
+            return project
+        self._deferred_run_settings_publication = None
+        return updated
 
     def retry_files_for_selected_page(self) -> tuple[str, ...]:
         if self._projection is None or not self._selected_page_id:
@@ -2694,6 +2781,30 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         elif navigation_id == "editor" and not self._selected_page_id:
             self._set_notice("Select a page before using the Editor.", warning=True)
             navigation_id = "workspace"
+        if (
+            navigation_id == "settings"
+            and self._projection is not None
+            and self._project_path
+            and self._glossary_thread is None
+            and not bool(
+                glossary_state
+                and (glossary_state.busy or glossary_state.dirty)
+            )
+        ):
+            current_selection = (
+                self._glossary_model.state.selection
+                if self._glossary_model is not None
+                else None
+            )
+            try:
+                current_projection_selection = glossary_selection_from_projection(
+                    self._project_path,
+                    self._projection,
+                )
+            except (AttributeError, KeyError, TypeError, ValueError):
+                current_projection_selection = None
+            if current_selection != current_projection_selection:
+                self._bind_glossary_projection()
         state = self._application_model.navigate(navigation_id)
         self._stack.setCurrentWidget(self._routes[state.navigation_id])
         for key, button in self._navigation_buttons.items():
@@ -3919,6 +4030,21 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 False,
             )
             return
+        pending_publication = self._deferred_run_settings_publication
+        if pending_publication is not None and os.path.normcase(
+            pending_publication.project_path
+        ) == os.path.normcase(os.path.abspath(project_path)):
+            try:
+                project = self._retry_completed_run_settings_publication(
+                    loaded_project=project
+                ) or project
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._deferred_run_settings_publication = None
+                self._set_notice(
+                    "The completed run opened, but its GUI settings could not be "
+                    f"published ({type(exc).__name__}).",
+                    warning=True,
+                )
         self._clear_post_run_project_load_failure()
         self._pending_run_invocation = None
         self._pending_project_name = ""
@@ -3963,6 +4089,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._edit_history_model = None
         self._render_override_reset_model = None
         self._selected_history_edit_id = ""
+        self._history_head_record_id = ""
         self._glossary_model = None
         self._parent_geometry_unavailable_reason = (
             "Select a parent to edit geometry"
@@ -4086,8 +4213,57 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
     def _project_load_finished(self) -> None:
         self.hub.open_button.setEnabled(True)
         self.hub.recover_button.setEnabled(True)
+        self._retry_deferred_run_settings_after_project_load()
         self._refresh_target_text_editor()
         self._refresh_run_presentation()
+
+    def _retry_deferred_run_settings_after_project_load(self) -> None:
+        publication = self._deferred_run_settings_publication
+        if publication is None:
+            self._deferred_run_settings_retry_count = 0
+            self._deferred_run_settings_retry_timer.stop()
+            return
+        try:
+            updated = self._retry_completed_run_settings_publication()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._deferred_run_settings_publication = None
+            self._deferred_run_settings_retry_count = 0
+            self._deferred_run_settings_retry_timer.stop()
+            self._set_notice(
+                "The completed run opened, but its GUI settings could not be "
+                f"published ({type(exc).__name__}).",
+                warning=True,
+            )
+            return
+        if self._deferred_run_settings_publication is not None:
+            self._deferred_run_settings_retry_count += 1
+            if self._deferred_run_settings_retry_count < 20:
+                self._deferred_run_settings_retry_timer.start()
+                return
+            self._deferred_run_settings_publication = None
+            self._deferred_run_settings_retry_timer.stop()
+            self._set_notice(
+                "The completed run is saved, but its GUI settings are still "
+                "waiting for the project checkpoint to close.",
+                warning=True,
+            )
+            return
+
+        self._deferred_run_settings_retry_count = 0
+        self._deferred_run_settings_retry_timer.stop()
+        if (
+            updated is not None
+            and self._project_path
+            and os.path.normcase(os.path.abspath(self._project_path))
+            == os.path.normcase(publication.project_path)
+        ):
+            self._project = updated
+            self._rebind_project_settings(updated)
+            self._refresh_pending_run_summary()
+            self._refresh_runtime()
+            self._refresh_navigation()
+            self._refresh_run_presentation()
+            self._refresh_activity()
 
     def _rebind_project_settings(self, project: Mapping[str, Any]) -> None:
         from app.io.project import read_project_settings
@@ -4095,6 +4271,11 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         state = read_project_settings(project)
         self._project_module_configs = state.module_configs
         self._last_run_snapshot = state.last_run_snapshot
+        self._runtime_model.replace_snapshot(
+            build_runtime_snapshot(state.last_run_snapshot)
+            if state.last_run_snapshot is not None
+            else None
+        )
         draft = SettingsDraft(
             application=self._settings_model.draft.application,
             project=state.project_config,
@@ -4513,6 +4694,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             ("structural", "add_user_parent"): "Add Parent · Added",
             ("source_text", "replace"): "Source text · Replaced",
             ("source_text", "restore_automatic"): "Source text · Restored",
+            ("source_text", "restore_selected_revision"): (
+                "Source text · Restored selected model OCR"
+            ),
             ("source_text", "select_revision"): (
                 "Source text · Selected model OCR revision"
             ),
@@ -5043,6 +5227,17 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
 
     def select_page(self, page_id: str) -> None:
         requested_page_id = str(page_id or "").strip()
+        retained_inspector_scroll: tuple[
+            QtWidgets.QScrollArea,
+            int,
+        ] | None = None
+        if requested_page_id and requested_page_id == self._selected_page_id:
+            current_inspector = self.editor.inspector_tabs.currentWidget()
+            if isinstance(current_inspector, QtWidgets.QScrollArea):
+                retained_inspector_scroll = (
+                    current_inspector,
+                    current_inspector.verticalScrollBar().value(),
+                )
         if (
             self._manual_cleanup_modal_active()
             and requested_page_id != self._selected_page_id
@@ -5265,6 +5460,19 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         )
         history = edit_history + artifact_history
         edit_record_ids = tuple(item.record_id for item in page.edit_history)
+        history_head_id, history_head_target_id = self._history_head_selection(
+            page.edit_history
+        )
+        if history_head_id != self._history_head_record_id:
+            self._history_head_record_id = history_head_id
+            self._selected_history_edit_id = history_head_target_id
+            active_history_model = self._edit_history_model
+            if (
+                active_history_model is None
+                or active_history_model.state.selection.target_edit_id
+                != history_head_target_id
+            ):
+                self._edit_history_model = None
         if self._selected_history_edit_id not in edit_record_ids:
             self._selected_history_edit_id = ""
             self._edit_history_model = None
@@ -5298,6 +5506,19 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._bind_selected_history_record()
         self.select_parent(self._selected_parent_id)
         self._refresh_activity()
+        if retained_inspector_scroll is not None:
+            inspector, scroll_value = retained_inspector_scroll
+
+            def restore_inspector_scroll() -> None:
+                try:
+                    if self.editor.inspector_tabs.currentWidget() is inspector:
+                        scroll_bar = inspector.verticalScrollBar()
+                        scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
+                except RuntimeError:
+                    return
+
+            restore_inspector_scroll()
+            QtCore.QTimer.singleShot(0, restore_inspector_scroll)
 
     def select_parent(self, parent_id: str) -> None:
         parent_id = str(parent_id).strip()
@@ -5501,7 +5722,55 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 workflow_area_bbox=workflow_area_bbox,
                 stage_summary=stage_summary,
             )
-            self._source_text_model = None
+            try:
+                source_revision_base = source_text_revision_base_for_parent(
+                    effective
+                )
+            except (TypeError, ValueError):
+                source_revision_base = None
+            if (
+                self._project_path
+                and not effective.excluded
+                and source_revision_base is not None
+                and isinstance(effective.source_text, str)
+            ):
+                source_selection = SourceTextSelection(
+                    project_path=self._project_path,
+                    page_id=self._selected_page_id,
+                    parent_id=parent_id,
+                    automatic_source_text=None,
+                    effective_source_text=effective.source_text,
+                    source_authority=effective.source_authority,
+                    effective_page_fingerprint=(
+                        page.effective.effective_fingerprint
+                    ),
+                    revision_base=source_revision_base,
+                )
+                if self._source_text_model is None:
+                    self._source_text_model = SourceTextEditorModel(
+                        source_selection
+                    )
+                else:
+                    source_state = self._source_text_model.state
+                    same_source_target = bool(
+                        source_state.selection.project_path
+                        == source_selection.project_path
+                        and source_state.selection.page_id
+                        == source_selection.page_id
+                        and source_state.selection.parent_id
+                        == source_selection.parent_id
+                    )
+                    if not same_source_target:
+                        self._source_text_model = SourceTextEditorModel(
+                            source_selection
+                        )
+                    elif (
+                        source_state.selection != source_selection
+                        and not source_state.busy
+                    ):
+                        self._source_text_model.rebind(source_selection)
+            else:
+                self._source_text_model = None
             self._parent_membership_model = None
             self._parent_geometry_model = None
             self._writing_mode_model = None
@@ -8543,6 +8812,22 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 for code in item.issue_codes
             )
         )
+
+    @staticmethod
+    def _history_head_selection(history: tuple[Any, ...]) -> tuple[str, str]:
+        if not history:
+            return "", ""
+        head = history[-1]
+        head_id = str(head.record_id or "").strip()
+        reversible_ids = {
+            str(item.record_id or "").strip()
+            for item in history
+            if not item.is_control
+        }
+        target_id = str(
+            head.target_id if head.is_control else head.record_id
+        ).strip()
+        return head_id, target_id if target_id in reversible_ids else ""
 
     def _history_selection_for_reference(
         self,
@@ -12027,13 +12312,17 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             return
         try:
+            invocation = (
+                self._revision_run_invocation(
+                    self._last_run_snapshot,
+                    project_path=self._project_path,
+                )
+                if self._last_run_snapshot is not None
+                else self._current_run_invocation()
+            )
             compiled = self._settings_model.preview_run(
                 project_id=metadata.project_id,
-                invocation=RunInvocation(
-                    import_dir="",
-                    export_dir="",
-                    json_path=self._project_path,
-                ),
+                invocation=invocation,
             )
             selection = ocr_revision_selection_from_projection(
                 self._projection,
@@ -12122,10 +12411,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
             compiled = self._settings_model.preview_run(
                 project_id=metadata.project_id,
-                invocation=RunInvocation(
-                    import_dir="",
-                    export_dir="",
-                    json_path=self._project_path,
+                invocation=self._revision_run_invocation(
+                    run_settings_snapshot,
+                    project_path=self._project_path,
                 ),
             )
             if (
@@ -14439,9 +14727,20 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         command: SourceTextWorkerCommand,
     ) -> bool:
         expected_payload = (
-            {"text": command.text}
+            {
+                "text": command.text,
+                **(
+                    {"revision_base": command.revision_base.to_dict()}
+                    if command.revision_base is not None
+                    else {}
+                ),
+            }
             if command.operation.value == "replace"
-            else {}
+            else (
+                {"revision_base": command.revision_base.to_dict()}
+                if command.revision_base is not None
+                else {}
+            )
         )
         return bool(
             edit.domain is EditDomain.SOURCE_TEXT
@@ -14948,8 +15247,8 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 restore_enabled=False,
                 status_text=(
                     "Source text editing is unavailable for this selected user "
-                    "parent. The selected model OCR revision is authoritative; "
-                    "use Rerun OCR or History explicitly."
+                    "parent until a selected OCR revision is available. Run OCR "
+                    "or restore its OCR selection in History."
                     if selected_user_parent
                     else "Select a parent to edit source text"
                 ),
@@ -15058,6 +15357,11 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                     state.selection.parent_id,
                     "source_text",
                 )
+            ),
+            restore_label=(
+                "Restore Selected Model OCR"
+                if state.selection.revision_base is not None
+                else "Restore Automatic"
             ),
         )
 
@@ -21875,6 +22179,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         self._selected_page_id = selected_page
         self._selected_parent_id = selected_parent
         self._selected_history_edit_id = selected_history
+        self._history_head_record_id = self._history_head_selection(
+            value.projection.page(selected_page).edit_history
+        )[0]
         self.select_page(selected_page)
         self._refresh_navigation()
         self._refresh_run_presentation()
@@ -23421,10 +23728,14 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 and glossary_state.phase is not GlossaryEditorPhase.STALE
             )
         )
-        pending_start_ready, pending_start_reason = (
+        run_settings_ready, run_settings_reason = (
             self._pending_run_start_gate()
             if self._pending_run_invocation is not None
-            else (False, "")
+            else (
+                self._compiled_run_start_gate()
+                if self._projection is not None and has_pages
+                else (False, "")
+            )
         )
         current_admission = self._current_resource_admission_report()
         admission_start_reason = (
@@ -23435,7 +23746,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         )
         pending_candidate_start = bool(
             self._pending_run_invocation is not None
-            and pending_start_ready
+            and run_settings_ready
             and not busy
             and not self._manual_cleanup_modal_active()
             and not self._page_preview_active
@@ -23447,6 +23758,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         project_start = bool(
             self._projection is not None
             and has_pages
+            and run_settings_ready
             and not busy
             and not self._manual_cleanup_modal_active()
             and not self._page_preview_active
@@ -23572,7 +23884,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         start_reason = (
             "Checking the current memory budget before Start."
             if self._resource_admission_thread is not None
-            else admission_start_reason or pending_start_reason
+            else admission_start_reason or run_settings_reason
         )
         self.workspace.set_command_state(
             can_start=can_start,
@@ -23756,6 +24068,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             detail=active_detail,
             status_label=label,
             tone=tone,
+            active=bool(lifecycle is not None and lifecycle.state in _BUSY_STATES),
         )
         self._refresh_runtime()
         self._refresh_page_activity()
@@ -23926,9 +24239,11 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         )
 
     def _refresh_page_activity(self) -> None:
-        facet = self.editor.activity_dock.page_facet
+        dock = self.editor.activity_dock
+        facet = dock.page_facet
         prepared = self._prepared_source_pages.get(self._selected_page_id)
         if self._projection is None and prepared is not None:
+            dock.set_warnings(())
             facet.update_summary(
                 page_name=prepared.file_name,
                 parent="Not detected",
@@ -23945,6 +24260,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             return
         if self._projection is None or not self._selected_page_id:
+            dock.set_warnings(())
             facet.update_summary(
                 page_name="No page selected",
                 parent="—",
@@ -23974,6 +24290,23 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         if page.final_artifact_state.value == "valid":
             artifact_labels.append("Final")
         issues = page.effective.issues
+        dock.set_warnings(
+            tuple(
+                (
+                    issue.kind.value.replace("_", " ").title(),
+                    " · ".join(
+                        value
+                        for value in (
+                            str(issue.domain or "").replace("_", " ").title(),
+                            str(issue.target_id or ""),
+                        )
+                        if value
+                    ),
+                    issue.reason,
+                )
+                for issue in issues
+            )
+        )
         facet.update_summary(
             page_name=row.file_name,
             parent=(
@@ -24036,6 +24369,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                     completed_count=0,
                     recoverable=False,
                     presentation=uninspected,
+                    thumbnail_path=recent_project_thumbnail_path(path),
                 )
             )
         self._project_model.replace_rows(rows)
@@ -24113,6 +24447,7 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         if application is None:
             return
         apply_application_theme(application, options)
+        self.settings.set_effective_theme(options.theme)
         self._refresh_header_icons(options.theme)
         self.editor.canvas.set_theme(options.theme)
         self._layout_state = replace(
@@ -24535,16 +24870,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             event.ignore()
             return
-        if (
-            self._render_override_reset_model is not None
-            and self._render_override_reset_model.state.stale
-        ):
-            self._set_notice(
-                "Reload the active project before closing after a stale render-override reset.",
-                warning=True,
-            )
-            event.ignore()
-            return
         if self._project_thread is not None:
             self._set_notice(
                 "Please wait for the project to finish opening before closing.",
@@ -24573,16 +24898,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             event.ignore()
             return
-        if (
-            self._translation_revision_model is not None
-            and self._translation_revision_model.state.stale
-        ):
-            self._set_notice(
-                "Reload the active project before closing after a committed-stale translation revision.",
-                warning=True,
-            )
-            event.ignore()
-            return
         if self._ocr_revision_thread is not None:
             worker = self._ocr_revision_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -24600,16 +24915,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                     if cancelled
                     else "Wait for the OCR revision to finish publishing before closing."
                 ),
-                warning=True,
-            )
-            event.ignore()
-            return
-        if (
-            self._ocr_revision_model is not None
-            and self._ocr_revision_model.state.stale
-        ):
-            self._set_notice(
-                "Reload the active project before closing after a committed-stale OCR revision.",
                 warning=True,
             )
             event.ignore()
@@ -24707,14 +25012,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if reading_order_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "reading-order action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._merge_parent_thread is not None:
             worker = self._merge_parent_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -24730,13 +25027,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             return
         if self._merge_parent_model is not None:
             merge_state = self._merge_parent_model.state
-            if merge_state.dirty or merge_state.stale:
+            if merge_state.dirty:
                 self._set_notice(
-                    (
-                        "Reload the active project before closing after a stale Merge Parent action."
-                        if merge_state.stale
-                        else "Apply or Cancel the Merge Parent draft before closing YomiFrame."
-                    ),
+                    "Apply or Cancel the Merge Parent draft before closing YomiFrame.",
                     warning=True,
                 )
                 event.ignore()
@@ -24756,13 +25049,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             return
         if self._split_parent_model is not None:
             split_state = self._split_parent_model.state
-            if split_state.dirty or split_state.stale:
+            if split_state.dirty:
                 self._set_notice(
-                    (
-                        "Reload the active project before closing after a stale Split Parent action."
-                        if split_state.stale
-                        else "Apply or Cancel the Split Parent draft before closing YomiFrame."
-                    ),
+                    "Apply or Cancel the Split Parent draft before closing YomiFrame.",
                     warning=True,
                 )
                 event.ignore()
@@ -24828,14 +25117,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if line_height_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "line-height action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._rotation_thread is not None:
             worker = self._rotation_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -24855,14 +25136,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             if rotation_state.dirty:
                 self._set_notice(
                     "Set or Cancel the rotation draft before closing YomiFrame.",
-                    warning=True,
-                )
-                event.ignore()
-                return
-            if rotation_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "rotation action.",
                     warning=True,
                 )
                 event.ignore()
@@ -24890,14 +25163,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if render_box_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "render-box action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._font_role_thread is not None:
             worker = self._font_role_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -24917,14 +25182,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             if font_role_state.dirty:
                 self._set_notice(
                     "Set or Cancel the font-role draft before closing YomiFrame.",
-                    warning=True,
-                )
-                event.ignore()
-                return
-            if font_role_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "font-role action.",
                     warning=True,
                 )
                 event.ignore()
@@ -24952,14 +25209,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if font_weight_tier_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "font-weight action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._fill_color_thread is not None:
             worker = self._fill_color_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -24979,14 +25228,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             if fill_color_state.dirty:
                 self._set_notice(
                     "Set or Cancel the fill-color draft before closing YomiFrame.",
-                    warning=True,
-                )
-                event.ignore()
-                return
-            if fill_color_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "fill-color action.",
                     warning=True,
                 )
                 event.ignore()
@@ -25014,14 +25255,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if outline_color_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "outline-color action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._outline_width_thread is not None:
             worker = self._outline_width_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -25040,13 +25273,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             if outline_width_state.dirty:
                 self._set_notice(
                     "Set or Cancel the outline-width draft before closing YomiFrame.",
-                    warning=True,
-                )
-                event.ignore()
-                return
-            if outline_width_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale outline-width action.",
                     warning=True,
                 )
                 event.ignore()
@@ -25073,13 +25299,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if preferred_size_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale preferred-size action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._shadow_color_thread is not None:
             worker = self._shadow_color_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -25098,13 +25317,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             if shadow_color_state.dirty:
                 self._set_notice(
                     "Set or Cancel the shadow-color draft before closing YomiFrame.",
-                    warning=True,
-                )
-                event.ignore()
-                return
-            if shadow_color_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale shadow-color action.",
                     warning=True,
                 )
                 event.ignore()
@@ -25131,13 +25343,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if shadow_blur_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale shadow-blur action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._shadow_offset_thread is not None:
             worker = self._shadow_offset_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -25156,13 +25361,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             if shadow_offset_state.dirty:
                 self._set_notice(
                     "Set or Cancel the shadow-offset draft before closing YomiFrame.",
-                    warning=True,
-                )
-                event.ignore()
-                return
-            if shadow_offset_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale shadow-offset action.",
                     warning=True,
                 )
                 event.ignore()
@@ -25189,13 +25387,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if shadow_visibility_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale shadow-visibility action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._add_user_parent_thread is not None:
             worker = self._add_user_parent_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -25218,14 +25409,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 )
                 event.ignore()
                 return
-            if not add_parent_state.pending and add_parent_state.stale:
-                self._set_notice(
-                    "Reload the active project before closing after a stale "
-                    "Add Parent action.",
-                    warning=True,
-                )
-                event.ignore()
-                return
         if self._edit_history_thread is not None:
             worker = self._edit_history_worker
             cancelled = worker.request_cancel() if worker is not None else False
@@ -25240,17 +25423,9 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             )
             event.ignore()
             return
-        if (
-            self._edit_history_model is not None
-            and self._edit_history_model.state.stale
-        ):
-            self._set_notice(
-                "Reload the active project before closing after a stale "
-                "history action.",
-                warning=True,
-            )
-            event.ignore()
-            return
+        # Completed stale editor states contain no unpublished mutation. They
+        # must remain close-safe so the user can perform the reload those
+        # states require. Active workers and dirty drafts are guarded above.
         if not self._application_model.state.close_allowed:
             self._set_notice(
                 "Stop the active run before closing YomiFrame.",

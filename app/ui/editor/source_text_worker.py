@@ -217,6 +217,7 @@ class SourceTextWorker(QtCore.QObject):
                 ),
                 expected_page_head_sha256=page_head_sha256,
                 expected_global_head_sha256=global_head_sha256,
+                revision_base=self.command.revision_base,
             )
             if not self._lock_persistence():
                 raise _CancelledBeforePersistence

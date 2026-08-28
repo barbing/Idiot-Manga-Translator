@@ -43,6 +43,7 @@ from app.render.font_manager import REQUIRED_FONT_ROLES
 
 EDIT_SCHEMA_VERSION = "project_edit_v1"
 LEDGER_SCHEMA_VERSION = "project_edit_ledger_v1"
+SOURCE_TEXT_REVISION_BASE_SCHEMA_VERSION = "source_text_revision_base_v1"
 TARGET_TEXT_REVISION_BASE_SCHEMA_VERSION = "target_text_revision_base_v1"
 PARENT_SOURCE_EVIDENCE_MAPPING_SCHEMA_VERSION = (
     "parent_source_evidence_mapping_v1"
@@ -67,6 +68,83 @@ class EditDomain(str, Enum):
     REVIEW_METADATA = "review_metadata"
     GLOSSARY = "glossary"
     LEDGER_CONTROL = "_ledger_control"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceTextRevisionBaseV1:
+    """Immutable selected-model base for one user-parent source override."""
+
+    source_revision_id: str
+    selection_edit_id: str
+    artifact_sha256: str
+    source_fingerprint: str
+    hierarchy_revision_id: str
+    hierarchy_fingerprint: str
+    schema_version: str = SOURCE_TEXT_REVISION_BASE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SOURCE_TEXT_REVISION_BASE_SCHEMA_VERSION:
+            raise ValueError("unsupported source-text revision-base schema")
+        prefixes = {
+            "source_revision_id": OCR_SOURCE_REVISION_ID_PREFIX,
+            "selection_edit_id": OCR_SOURCE_SELECTION_EDIT_ID_PREFIX,
+            "hierarchy_revision_id": EFFECTIVE_HIERARCHY_REVISION_PREFIX,
+        }
+        for field_name, prefix in prefixes.items():
+            value = _require_non_empty(getattr(self, field_name), field_name)
+            if not value.startswith(prefix):
+                raise ValueError(f"{field_name} is invalid")
+            object.__setattr__(self, field_name, value)
+        for field_name in (
+            "artifact_sha256",
+            "source_fingerprint",
+            "hierarchy_fingerprint",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _require_sha256(getattr(self, field_name), field_name),
+            )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "schema_version": self.schema_version,
+            "source_revision_id": self.source_revision_id,
+            "selection_edit_id": self.selection_edit_id,
+            "artifact_sha256": self.artifact_sha256,
+            "source_fingerprint": self.source_fingerprint,
+            "hierarchy_revision_id": self.hierarchy_revision_id,
+            "hierarchy_fingerprint": self.hierarchy_fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SourceTextRevisionBaseV1":
+        if not isinstance(value, Mapping):
+            raise TypeError("source-text revision base must be a mapping")
+        expected = {
+            "schema_version",
+            "source_revision_id",
+            "selection_edit_id",
+            "artifact_sha256",
+            "source_fingerprint",
+            "hierarchy_revision_id",
+            "hierarchy_fingerprint",
+        }
+        if set(value) != expected:
+            raise ValueError("source-text revision-base fields are invalid")
+        return cls(
+            schema_version=str(value.get("schema_version") or ""),
+            source_revision_id=str(value.get("source_revision_id") or ""),
+            selection_edit_id=str(value.get("selection_edit_id") or ""),
+            artifact_sha256=str(value.get("artifact_sha256") or ""),
+            source_fingerprint=str(value.get("source_fingerprint") or ""),
+            hierarchy_revision_id=str(
+                value.get("hierarchy_revision_id") or ""
+            ),
+            hierarchy_fingerprint=str(
+                value.get("hierarchy_fingerprint") or ""
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1319,11 +1397,10 @@ def validate_edit_payload(
                 or len(set(source_parent_ids)) != 2
             ):
                 raise ValueError("source_parent_ids must contain two unique identities")
-            if (
-                any(not isinstance(value, str) or not value for value in source_root_ids)
-                or len(set(source_root_ids)) != 2
+            if any(
+                not isinstance(value, str) or not value for value in source_root_ids
             ):
-                raise ValueError("source_root_ids must contain two unique identities")
+                raise ValueError("source_root_ids must contain two non-empty identities")
             for index, fingerprint in enumerate(source_automatic_fingerprints):
                 _require_sha256(
                     fingerprint,
@@ -1525,9 +1602,15 @@ def validate_edit_payload(
 
     if domain is EditDomain.SOURCE_TEXT:
         if operation == "replace":
-            _require_exact_keys(payload, required=frozenset({"text"}))
+            _require_exact_keys(
+                payload,
+                required=frozenset({"text"}),
+                optional=frozenset({"revision_base"}),
+            )
             if not isinstance(payload.get("text"), str):
                 raise ValueError("text replacement must be a string")
+            if "revision_base" in payload:
+                SourceTextRevisionBaseV1.from_dict(payload.get("revision_base"))
         elif operation == "select_revision":
             _require_exact_keys(payload, required=frozenset({"revision_id"}))
             revision_id = _require_non_empty(
@@ -1538,6 +1621,12 @@ def validate_edit_payload(
                 raise ValueError("source revision identity is invalid")
         elif operation == "restore_automatic":
             _require_exact_keys(payload, required=frozenset())
+        elif operation == "restore_selected_revision":
+            _require_exact_keys(
+                payload,
+                required=frozenset({"revision_base"}),
+            )
+            SourceTextRevisionBaseV1.from_dict(payload.get("revision_base"))
         else:
             raise ValueError(f"unsupported source_text operation: {operation}")
         return

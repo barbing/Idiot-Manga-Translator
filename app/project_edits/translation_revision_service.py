@@ -39,7 +39,13 @@ from app.pipeline.translation_revision_contracts import (
     translation_policy_region_type,
 )
 
-from .contracts import EditDomain, EditTarget, EditTargetKind, create_project_edit
+from .contracts import (
+    EditDomain,
+    EditTarget,
+    EditTargetKind,
+    ProjectEdit,
+    create_project_edit,
+)
 from .fingerprints import canonical_sha256, project_id_for
 from .invalidation import (
     Dependency,
@@ -292,6 +298,85 @@ def _source_artifact(parent: EffectiveParentSnapshot) -> OcrSourceRevisionArtifa
     return artifact
 
 
+def _translation_policy_is_stale(
+    parent: EffectiveParentSnapshot,
+    request: ExplicitTranslationRevisionRequest,
+) -> bool:
+    """Return whether one exact current revision uses older policy inputs."""
+
+    if (
+        parent.target_authority != "translation_revision"
+        or parent.target_text is None
+        or not parent.target_revision_metadata
+    ):
+        return False
+    try:
+        artifact = TranslationRevisionArtifact.from_record(
+            dict(parent.target_revision_metadata)
+        )
+    except (TypeError, ValueError):
+        return False
+    immutable_lineage_matches = bool(
+        artifact.project_id == request.project_id
+        and artifact.page_id == request.page_id
+        and artifact.parent_id == request.parent_id
+        and artifact.root_id == request.root_id
+        and artifact.parent_authored_edit_id
+        == request.parent_authored_edit_id
+        and artifact.parent_role == request.parent_role
+        and artifact.policy_region_type == request.policy_region_type
+        and artifact.bubble_local_nested_speech
+        == request.bubble_local_nested_speech
+        and parent.target_revision_id == artifact.revision_id
+        and artifact.target_text == parent.target_text
+        and artifact.source_text == request.effective_source_text
+        and artifact.source_authority == request.effective_source_authority
+        and artifact.source_fingerprint
+        == request.effective_source_fingerprint
+        and artifact.source_revision_id == request.source_revision_id
+        and artifact.source_selection_edit_id
+        == request.source_selection_edit_id
+        and artifact.run_settings_snapshot == request.run_settings_snapshot
+        and artifact.run_settings_fingerprint
+        == request.run_settings_fingerprint
+        and artifact.provider == request.provider
+    )
+    policy_changed = bool(
+        artifact.glossary_fingerprint != request.glossary_fingerprint
+        or artifact.context_fingerprint != request.context_fingerprint
+    )
+    return bool(immutable_lineage_matches and policy_changed)
+
+
+def _require_translation_run_state(
+    parent: EffectiveParentSnapshot,
+    request: ExplicitTranslationRevisionRequest,
+) -> None:
+    requirements = tuple(
+        requirement
+        for requirement in parent.stage_requirements
+        if requirement.stage is RevisionStage.TRANSLATION
+    )
+    if len(requirements) == 1:
+        requirement = requirements[0]
+        if (
+            requirement.state is RevisionStageState.MISSING
+            and requirement.required_action
+            is RevisionRequiredAction.EXPLICIT_RUN
+        ):
+            return
+        if (
+            requirement.state is RevisionStageState.CURRENT
+            and requirement.required_action is RevisionRequiredAction.NONE
+            and _translation_policy_is_stale(parent, request)
+        ):
+            return
+    raise TranslationRevisionError(
+        TranslationRevisionErrorCode.PROJECTION_REJECTED,
+        "The selected parent has no exact translation stage state.",
+    )
+
+
 def _require_request_state(
     snapshot: ProjectEditReadSnapshot,
     request: ExplicitTranslationRevisionRequest,
@@ -362,6 +447,15 @@ def _require_request_state(
         parent.source_text,
     )
     source_artifact = _source_artifact(parent)
+    source_selection_bound = bool(
+        request.source_selection_edit_id in parent.applied_edit_ids
+        or _source_selection_is_ancestor(
+            snapshot,
+            page_id=request.page_id,
+            parent_id=request.parent_id,
+            selection_edit_id=request.source_selection_edit_id,
+        )
+    )
     if (
         parent.source_text != request.effective_source_text
         or parent.source_authority != request.effective_source_authority
@@ -370,13 +464,16 @@ def _require_request_state(
         or source_artifact.revision_id != request.source_revision_id
         or source_artifact.selection_edit_id
         != request.source_selection_edit_id
-        or source_artifact.source_text != request.effective_source_text
+        or (
+            request.effective_source_authority == "ocr_revision"
+            and source_artifact.source_text != request.effective_source_text
+        )
         or source_artifact.page_id != request.page_id
         or source_artifact.parent_id != request.parent_id
         or source_artifact.root_id != request.root_id
         or source_artifact.parent_authored_edit_id
         != request.parent_authored_edit_id
-        or request.source_selection_edit_id not in parent.applied_edit_ids
+        or not source_selection_bound
     ):
         raise TranslationRevisionError(
             TranslationRevisionErrorCode.SOURCE_MISMATCH,
@@ -388,12 +485,7 @@ def _require_request_state(
         state=RevisionStageState.CURRENT,
         action=RevisionRequiredAction.NONE,
     )
-    _require_stage(
-        parent,
-        stage=RevisionStage.TRANSLATION,
-        state=RevisionStageState.MISSING,
-        action=RevisionRequiredAction.EXPLICIT_RUN,
-    )
+    _require_translation_run_state(parent, request)
     try:
         settings_state = read_project_settings(snapshot.project)
     except (KeyError, TypeError, ValueError) as exc:
@@ -468,6 +560,55 @@ def _active_target_slot_head(
             "Target revisions have competing active selection edits.",
         )
     return heads[0].edit_id
+
+
+def _source_selection_is_ancestor(
+    snapshot: ProjectEditReadSnapshot,
+    *,
+    page_id: str,
+    parent_id: str,
+    selection_edit_id: str,
+) -> bool:
+    candidates = tuple(
+        edit
+        for edit in snapshot.ledger.active_edits(page_id=page_id)
+        if edit.domain is EditDomain.SOURCE_TEXT
+        and edit.target.kind is EditTargetKind.PARENT
+        and edit.target.parent_id == parent_id
+    )
+    if not candidates:
+        return False
+    candidate_ids = {edit.edit_id for edit in candidates}
+    superseded_ids = {
+        edit.supersedes_edit_id
+        for edit in candidates
+        if edit.supersedes_edit_id in candidate_ids
+    }
+    heads = tuple(
+        edit for edit in candidates if edit.edit_id not in superseded_ids
+    )
+    if len(heads) != 1:
+        return False
+    cursor: ProjectEdit | None = heads[0]
+    visited: set[str] = set()
+    while cursor is not None and cursor.edit_id not in visited:
+        visited.add(cursor.edit_id)
+        if cursor.edit_id == selection_edit_id:
+            return True
+        predecessor_id = cursor.supersedes_edit_id
+        if predecessor_id is None:
+            return False
+        predecessor = snapshot.ledger.get(predecessor_id)
+        if (
+            predecessor is None
+            or predecessor.is_control
+            or predecessor.page_id != page_id
+            or predecessor.domain is not EditDomain.SOURCE_TEXT
+            or predecessor.target != heads[0].target
+        ):
+            return False
+        cursor = predecessor
+    return False
 
 
 def _candidate_project_with_translation_revision(

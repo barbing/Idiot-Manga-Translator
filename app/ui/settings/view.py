@@ -37,7 +37,11 @@ from app.pipeline.status_contracts import (
     PipelineStage,
     PipelineStageEvent,
 )
-from app.ui.design_system.components import HybridComboBox
+from app.ui.design_system.components import (
+    HybridComboBox,
+    WheelSafeDoubleSpinBox,
+    WheelSafeSpinBox,
+)
 from app.ui.design_system.dialogs import HybridConfirmDialog, HybridDialog
 from app.ui.design_system.geometry import MODULE_POLICY_GEOMETRY
 from app.ui.design_system.icons import hybrid_icon
@@ -114,6 +118,7 @@ class SettingsView(QtWidgets.QWidget):
         self._pipeline_lifecycle: PipelineLifecycleEvent | None = None
         self._pipeline_stage: PipelineStageEvent | None = None
         self._project_scope_name = "No project open"
+        self._effective_theme: str | None = None
         self._provider_test_messages: dict[str, tuple[str, bool]] = {}
         self._pending_credential_deletions: list[CredentialReference] = []
         self._category_rows: dict[
@@ -378,7 +383,7 @@ class SettingsView(QtWidgets.QWidget):
             0,
             1,
         )
-        self.autosave_interval = QtWidgets.QSpinBox()
+        self.autosave_interval = WheelSafeSpinBox()
         self.autosave_interval.setRange(5, 3600)
         self.autosave_interval.setSuffix(" sec")
         self.autosave_interval.setButtonSymbols(
@@ -1049,10 +1054,10 @@ class SettingsView(QtWidgets.QWidget):
         ):
             self.provider_prompt_style.addItem(label, value)
         self.provider_context_tokens_label = QtWidgets.QLabel("Context tokens")
-        self.provider_context_tokens = QtWidgets.QSpinBox()
+        self.provider_context_tokens = WheelSafeSpinBox()
         self.provider_context_tokens.setRange(512, 32768)
         self.provider_gpu_layers_label = QtWidgets.QLabel("GPU layers")
-        self.provider_gpu_layers = QtWidgets.QSpinBox()
+        self.provider_gpu_layers = WheelSafeSpinBox()
         self.provider_gpu_layers.setRange(-1, 200)
         self.provider_gpu_layers.setSpecialValueText("Automatic")
         self.provider_gpu_layers.setAccessibleName("GGUF GPU layers")
@@ -1065,25 +1070,25 @@ class SettingsView(QtWidgets.QWidget):
             "context, or saved provider profile."
         )
         self.provider_threads_label = QtWidgets.QLabel("CPU threads")
-        self.provider_threads = QtWidgets.QSpinBox()
+        self.provider_threads = WheelSafeSpinBox()
         self.provider_threads.setRange(1, 128)
         self.provider_batch_label = QtWidgets.QLabel("Prompt batch")
-        self.provider_batch = QtWidgets.QSpinBox()
+        self.provider_batch = WheelSafeSpinBox()
         self.provider_batch.setRange(64, 4096)
         self.provider_generation_label = QtWidgets.QLabel("Generation defaults")
         self.provider_generation_label.setProperty("role", "section")
         self.provider_temperature_label = QtWidgets.QLabel("Temperature")
-        self.provider_temperature = QtWidgets.QDoubleSpinBox()
+        self.provider_temperature = WheelSafeDoubleSpinBox()
         self.provider_temperature.setRange(0.0, 2.0)
         self.provider_temperature.setDecimals(2)
         self.provider_temperature.setSingleStep(0.05)
         self.provider_top_p_label = QtWidgets.QLabel("Top P")
-        self.provider_top_p = QtWidgets.QDoubleSpinBox()
+        self.provider_top_p = WheelSafeDoubleSpinBox()
         self.provider_top_p.setRange(0.01, 1.0)
         self.provider_top_p.setDecimals(2)
         self.provider_top_p.setSingleStep(0.05)
         self.provider_max_tokens_label = QtWidgets.QLabel("Maximum output tokens")
-        self.provider_max_tokens = QtWidgets.QSpinBox()
+        self.provider_max_tokens = WheelSafeSpinBox()
         self.provider_max_tokens.setRange(0, 1_000_000)
         self.provider_max_tokens.setSpecialValueText("Provider default")
         for numeric_control in (
@@ -1651,8 +1656,7 @@ class SettingsView(QtWidgets.QWidget):
         self._profile_refreshing = True
         try:
             app = draft.application
-            self.dark_theme.setChecked(app.theme == "dark")
-            self.light_theme.setChecked(app.theme == "light")
+            self._set_theme_selection(self._effective_theme or app.theme)
             self.font_scale.setValue(app.font_scale)
             self.font_scale_value.setText(f"{app.font_scale}%")
             self._select_data(self.density, app.density)
@@ -1677,6 +1681,20 @@ class SettingsView(QtWidgets.QWidget):
             self._refresh_pending()
         finally:
             self._profile_refreshing = False
+
+    def set_effective_theme(self, theme: str) -> None:
+        """Keep the selected Appearance card aligned with the live shell."""
+
+        value = str(theme or "").strip().casefold()
+        if value not in {"dark", "light"}:
+            raise ValueError(f"unsupported effective theme: {theme!r}")
+        self._effective_theme = value
+        self._set_theme_selection(value)
+
+    def _set_theme_selection(self, theme: str) -> None:
+        value = str(theme or "").strip().casefold()
+        self.dark_theme.setChecked(value == "dark")
+        self.light_theme.setChecked(value == "light")
 
     def set_project_scope(self, project_name: str | None) -> None:
         """Present the currently loaded project in the prototype scope card."""
@@ -2276,21 +2294,43 @@ class SettingsView(QtWidgets.QWidget):
             elif profile.kind is ProviderKind.DEEPSEEK:
                 self.profile_endpoint.setPlaceholderText("https://api.deepseek.com")
                 self.profile_model.setPlaceholderText("deepseek-v4-flash")
-                self.provider_safety_title.setText(
-                    "Secret stays outside project.json"
-                )
-                self.provider_safety_detail.setText(
-                    "Only an opaque Windows credential reference is saved with this profile."
-                )
+                if (
+                    profile.credential_ref is not None
+                    and profile.credential_ref.kind
+                    is CredentialReferenceKind.ENVIRONMENT_VARIABLE
+                ):
+                    self.provider_safety_title.setText("Environment credential")
+                    self.provider_safety_detail.setText(
+                        f"{profile.credential_ref.reference} is resolved only while "
+                        "testing or starting; no secret is saved in the profile or project."
+                    )
+                else:
+                    self.provider_safety_title.setText(
+                        "Secret stays outside project.json"
+                    )
+                    self.provider_safety_detail.setText(
+                        "Only an opaque Windows credential reference is saved with this profile."
+                    )
             elif is_api:
                 self.profile_endpoint.setPlaceholderText("OpenAI-compatible API endpoint")
                 self.profile_model.setPlaceholderText("Provider model ID")
-                self.provider_safety_title.setText(
-                    "Secret stays outside project.json"
-                )
-                self.provider_safety_detail.setText(
-                    "Only an opaque Windows credential reference is saved with this profile."
-                )
+                if (
+                    profile.credential_ref is not None
+                    and profile.credential_ref.kind
+                    is CredentialReferenceKind.ENVIRONMENT_VARIABLE
+                ):
+                    self.provider_safety_title.setText("Environment credential")
+                    self.provider_safety_detail.setText(
+                        f"{profile.credential_ref.reference} is resolved only while "
+                        "testing or starting; no secret is saved in the profile or project."
+                    )
+                else:
+                    self.provider_safety_title.setText(
+                        "Secret stays outside project.json"
+                    )
+                    self.provider_safety_detail.setText(
+                        "Only an opaque Windows credential reference is saved with this profile."
+                    )
             self.profile_endpoint_field.setVisible(not is_gguf)
             self.profile_model_field.setVisible(not is_gguf)
             self.profile_path_field.setVisible(is_gguf)
@@ -2342,16 +2382,24 @@ class SettingsView(QtWidgets.QWidget):
             )
             credential = profile.credential_ref
             if supports_credentials:
-                self.credential_status.setText(
-                    "Credential reference linked"
-                    if credential is not None
-                    else "Not linked"
-                )
-                self.credential_status.setToolTip(
-                    "Test connection will verify whether the referenced credential is available"
-                    if credential is not None
-                    else "Test connection will ask for an API key"
-                )
+                if credential is None:
+                    self.credential_status.setText("Not linked")
+                    self.credential_status.setToolTip(
+                        "Test connection will ask for an API key"
+                    )
+                elif credential.kind is CredentialReferenceKind.ENVIRONMENT_VARIABLE:
+                    self.credential_status.setText(
+                        f"Environment variable: {credential.reference}"
+                    )
+                    self.credential_status.setToolTip(
+                        "The environment variable is resolved when testing or starting; "
+                        "its value is never stored in the profile"
+                    )
+                else:
+                    self.credential_status.setText("Credential reference linked")
+                    self.credential_status.setToolTip(
+                        "Test connection will verify whether the referenced credential is available"
+                    )
             else:
                 self.credential_status.setText("Not required")
                 self.credential_status.setToolTip(
@@ -3342,7 +3390,7 @@ class SettingsView(QtWidgets.QWidget):
             )
             return control
         if definition.value_type is SettingValueType.INTEGER:
-            control = QtWidgets.QSpinBox()
+            control = WheelSafeSpinBox()
             control.setButtonSymbols(
                 QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
             )
@@ -3356,7 +3404,7 @@ class SettingsView(QtWidgets.QWidget):
             )
             return control
         if definition.value_type is SettingValueType.NUMBER:
-            control = QtWidgets.QDoubleSpinBox()
+            control = WheelSafeDoubleSpinBox()
             control.setButtonSymbols(
                 QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
             )

@@ -149,6 +149,7 @@ class _RunFacet(_Facet):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__("run", "Active Run", parent)
+        self.active = False
         self.page_name = QtWidgets.QLabel("No active run")
         self.page_name.setProperty("role", "section")
         self.root.addWidget(self.page_name)
@@ -205,8 +206,10 @@ class _RunFacet(_Facet):
         detail: str,
         status_label: str,
         tone: str,
+        active: bool = False,
     ) -> None:
         value = max(0, min(100, int(percent)))
+        self.active = bool(active)
         self.page_name.setText(page_name)
         self.stage.setText(stage)
         self.parent_value.setText(parent)
@@ -442,6 +445,7 @@ class ActivityDock(QtWidgets.QWidget):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
+        self._history_entries: tuple[str, ...] = ()
         self.setObjectName("activityDock")
         self.setProperty("role", "dock")
         self.setAccessibleName("Activity Dock")
@@ -617,8 +621,47 @@ class ActivityDock(QtWidgets.QWidget):
         self._install_overview_grid(composite=True)
         self.overview_scroll.setWidget(self.overview)
         self.stack.addWidget(self.overview_scroll)
-        self.history_view = self._list_page("Project edit and artifact history")
-        self.warnings_view = self._list_page("Warnings and recovery actions")
+        self.history_view = QtWidgets.QWidget()
+        history_layout = QtWidgets.QVBoxLayout(self.history_view)
+        history_layout.setContentsMargins(14, 12, 14, 12)
+        history_layout.setSpacing(8)
+        self.history_empty = QtWidgets.QLabel(
+            "No user edit or artifact history for the selected page."
+        )
+        self.history_empty.setWordWrap(True)
+        self.history_empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.history_empty.setProperty("role", "secondary")
+        self.history_list = QtWidgets.QListWidget()
+        self.history_list.setAccessibleName("Project edit and artifact history")
+        self.history_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.history_list.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.history_list.hide()
+        history_layout.addWidget(self.history_empty, 1)
+        history_layout.addWidget(self.history_list, 1)
+        self.warnings_view = QtWidgets.QWidget()
+        warnings_layout = QtWidgets.QVBoxLayout(self.warnings_view)
+        warnings_layout.setContentsMargins(14, 12, 14, 12)
+        warnings_layout.setSpacing(8)
+        self.warnings_empty = QtWidgets.QLabel(
+            "No warnings or recovery actions for the selected page."
+        )
+        self.warnings_empty.setWordWrap(True)
+        self.warnings_empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.warnings_empty.setProperty("role", "secondary")
+        self.warnings_list = QtWidgets.QListWidget()
+        self.warnings_list.setObjectName("activityWarningsList")
+        self.warnings_list.setAccessibleName("Page warnings and recovery guidance")
+        self.warnings_list.setWordWrap(True)
+        self.warnings_list.setSpacing(4)
+        self.warnings_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.warnings_list.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.warnings_list.hide()
+        warnings_layout.addWidget(self.warnings_empty, 1)
+        warnings_layout.addWidget(self.warnings_list, 1)
         self.cleanup_view = self._list_page(
             "Manual cleanup is contextual. Open the Cleanup inspector to review it."
         )
@@ -774,7 +817,13 @@ class ActivityDock(QtWidgets.QWidget):
             f"{self.project_facet.project_name.text()}\n"
             f"{counts.get('done', 0)} / {total}"
         )
-        percent = self.run_facet.progress.value()
+        percent = (
+            self.run_facet.progress.value()
+            if self.run_facet.active
+            else round(100 * counts.get("done", 0) / total)
+            if total
+            else 0
+        )
         self.run_progress.setValue(percent)
         self.run_percent.setText(f"{percent}%")
         self.run_eta.setText(self.run_facet.eta.text())
@@ -791,16 +840,56 @@ class ActivityDock(QtWidgets.QWidget):
         self.page_status.setProperty("tone", self.page_facet.status.property("tone"))
         self.page_status.style().unpolish(self.page_status)
         self.page_status.style().polish(self.page_status)
-        review = self.page_facet.review.text().strip().casefold()
-        warning_count = 0
-        if "warning" in review:
-            try:
-                warning_count = int(review.split(maxsplit=1)[0])
-            except (TypeError, ValueError, IndexError):
-                warning_count = 1
+
+    def set_warnings(
+        self,
+        entries: Iterable[tuple[str, str, str]],
+    ) -> None:
+        normalized: list[tuple[str, str, str]] = []
+        for entry in entries:
+            if len(entry) != 3:
+                raise ValueError("warning entries must contain title, context, and detail")
+            title, context, detail = (str(value).strip() for value in entry)
+            normalized.append((title or "Warning", context, detail))
+
+        self.warnings_list.clear()
+        for title, context, detail in normalized:
+            heading = f"{title} · {context}" if context else title
+            text = "\n".join(value for value in (heading, detail) if value)
+            item = QtWidgets.QListWidgetItem(text)
+            item.setData(
+                QtCore.Qt.ItemDataRole.UserRole,
+                (title, context, detail),
+            )
+            self.warnings_list.addItem(item)
+
+        warning_count = len(normalized)
+        self.warnings_empty.setVisible(not warning_count)
+        self.warnings_list.setVisible(bool(warning_count))
         self.tab_buttons["warnings"].setText(
             f"Warnings {warning_count}" if warning_count else "Warnings"
         )
+
+    def set_history(self, entries: Iterable[str]) -> None:
+        normalized = tuple(str(entry).strip() for entry in entries)
+        if any(not entry for entry in normalized):
+            raise ValueError("history entries must be non-empty strings")
+        if normalized == self._history_entries:
+            return
+
+        self.history_list.clear()
+        for entry in normalized:
+            item = QtWidgets.QListWidgetItem(entry)
+            item.setToolTip(entry)
+            self.history_list.addItem(item)
+
+        history_count = len(normalized)
+        self.history_empty.setVisible(not history_count)
+        self.history_list.setVisible(bool(history_count))
+        self.tab_buttons["history"].setText(
+            f"History {history_count}" if history_count else "History"
+        )
+        self._history_entries = normalized
 
     @property
     def expanded(self) -> bool:

@@ -37,6 +37,7 @@ from .contracts import (
     EditTargetKind,
     ParentSourceEvidenceMappingV1,
     ProjectEdit,
+    SourceTextRevisionBaseV1,
     TargetTextRevisionBaseV1,
     canonical_render_box,
     canonical_render_fill_color,
@@ -1256,6 +1257,31 @@ def _with_current_user_parent_cleanup_coverage(
     )
 
 
+def _user_parent_requirements_after_source_override(
+    parent: EffectiveParentSnapshot,
+    *,
+    page_id: str,
+) -> tuple[ParentStageRequirement, ...]:
+    """Keep independent owner evidence while making translation explicit."""
+
+    current_stages = {
+        requirement.stage
+        for requirement in parent.stage_requirements
+        if requirement.state is RevisionStageState.CURRENT
+    }
+    return _user_parent_stage_requirements(
+        page_id=page_id,
+        parent_id=parent.parent_id,
+        source_current=True,
+        translation_current=False,
+        cleanup_current=RevisionStage.CLEANUP_BASE in current_stages,
+        source_style_current=RevisionStage.SOURCE_STYLE in current_stages,
+        render_eligibility_current=(
+            RevisionStage.RENDER_ELIGIBILITY in current_stages
+        ),
+    )
+
+
 def _snapshot_user_parent(
     edit: ProjectEdit,
     *,
@@ -1568,6 +1594,35 @@ def _target_slot_has_ancestor(
     return False
 
 
+def _source_slot_has_ancestor(
+    ledger: ProjectEditLedger,
+    descendant: ProjectEdit,
+    ancestor_edit_id: str,
+) -> bool:
+    """Follow one exact source-text supersession chain to its OCR base."""
+
+    cursor: ProjectEdit | None = descendant
+    visited: set[str] = set()
+    while cursor is not None and cursor.edit_id not in visited:
+        visited.add(cursor.edit_id)
+        if cursor.edit_id == ancestor_edit_id:
+            return True
+        predecessor_id = cursor.supersedes_edit_id
+        if predecessor_id is None:
+            return False
+        predecessor = ledger.get(predecessor_id)
+        if (
+            predecessor is None
+            or predecessor.is_control
+            or predecessor.page_id != descendant.page_id
+            or predecessor.domain is not EditDomain.SOURCE_TEXT
+            or predecessor.target != descendant.target
+        ):
+            return False
+        cursor = predecessor
+    return False
+
+
 def _target_id(edit: ProjectEdit) -> str:
     if edit.target.kind is EditTargetKind.PARENT:
         return edit.target.parent_id
@@ -1680,6 +1735,39 @@ def _source_revision_for_edit(
     return artifact
 
 
+def _source_revision_for_base(
+    artifact_index: Mapping[str, tuple[str, Mapping[str, Any]]],
+    edit: ProjectEdit,
+    revision_base: SourceTextRevisionBaseV1,
+) -> OcrSourceRevisionArtifact | None:
+    indexed = artifact_index.get(revision_base.source_revision_id)
+    if indexed is None or indexed[0] != "source_revisions":
+        return None
+    try:
+        artifact = OcrSourceRevisionArtifact.from_record(indexed[1])
+    except (TypeError, ValueError):
+        return None
+    if (
+        artifact.revision_id != revision_base.source_revision_id
+        or artifact.page_id != edit.page_id
+        or artifact.parent_id != edit.target.parent_id
+        or artifact.selection_edit_id != revision_base.selection_edit_id
+        or canonical_sha256(artifact.to_record())
+        != revision_base.artifact_sha256
+        or effective_source_fingerprint(
+            artifact.parent_id,
+            artifact.source_text,
+        )
+        != revision_base.source_fingerprint
+        or artifact.hierarchy_revision_id
+        != revision_base.hierarchy_revision_id
+        or artifact.hierarchy_fingerprint
+        != revision_base.hierarchy_fingerprint
+    ):
+        return None
+    return artifact
+
+
 def _translation_revision_for_edit(
     artifact_index: Mapping[str, tuple[str, Mapping[str, Any]]],
     edit: ProjectEdit,
@@ -1757,6 +1845,35 @@ def target_text_revision_base_for_parent(
         source_fingerprint=artifact.source_fingerprint,
         source_revision_id=artifact.source_revision_id,
         source_selection_edit_id=artifact.source_selection_edit_id,
+        hierarchy_revision_id=artifact.hierarchy_revision_id,
+        hierarchy_fingerprint=artifact.hierarchy_fingerprint,
+    )
+
+
+def source_text_revision_base_for_parent(
+    parent: EffectiveParentSnapshot,
+) -> SourceTextRevisionBaseV1 | None:
+    """Return the immutable OCR base retained by one source override lane."""
+
+    if not isinstance(parent, EffectiveParentSnapshot):
+        raise TypeError("parent must be an EffectiveParentSnapshot")
+    if parent.source_revision_id is None and not parent.source_revision_metadata:
+        return None
+    if parent.source_revision_id is None or not parent.source_revision_metadata:
+        raise ValueError("selected OCR revision metadata is incomplete")
+    artifact = OcrSourceRevisionArtifact.from_record(
+        dict(parent.source_revision_metadata)
+    )
+    if artifact.revision_id != parent.source_revision_id:
+        raise ValueError("selected OCR revision identity is inconsistent")
+    return SourceTextRevisionBaseV1(
+        source_revision_id=artifact.revision_id,
+        selection_edit_id=artifact.selection_edit_id,
+        artifact_sha256=canonical_sha256(artifact.to_record()),
+        source_fingerprint=effective_source_fingerprint(
+            artifact.parent_id,
+            artifact.source_text,
+        ),
         hierarchy_revision_id=artifact.hierarchy_revision_id,
         hierarchy_fingerprint=artifact.hierarchy_fingerprint,
     )
@@ -2888,8 +3005,16 @@ def project_effective_page(
     ledger: ProjectEditLedger,
     *,
     page_id: str,
+    _memo: dict[tuple[str, str], EffectivePageSnapshot] | None = None,
 ) -> EffectivePageSnapshot:
     """Project one immutable page without invoking any pipeline owner."""
+
+    if _memo is None:
+        _memo = {}
+    memo_key = (str(page_id), ledger.fingerprint())
+    cached = _memo.get(memo_key)
+    if cached is not None:
+        return cached
 
     project_id = project_id_for(project)
     if ledger.project_id and ledger.project_id != project_id:
@@ -3033,6 +3158,7 @@ def project_effective_page(
                 project,
                 predecessor_ledger,
                 page_id=edit.page_id,
+                _memo=_memo,
             )
         except (KeyError, TypeError, ValueError):
             issues.append(
@@ -3128,6 +3254,7 @@ def project_effective_page(
                 project,
                 predecessor_ledger,
                 page_id=edit.page_id,
+                _memo=_memo,
             )
         except (KeyError, TypeError, ValueError):
             issues.append(
@@ -3398,6 +3525,7 @@ def project_effective_page(
                 project,
                 predecessor_ledger,
                 page_id=edit.page_id,
+                _memo=_memo,
             )
         except (KeyError, TypeError, ValueError):
             issues.append(
@@ -3685,6 +3813,7 @@ def project_effective_page(
                     project,
                     _ledger_prefix_before_edit(ledger, edit),
                     page_id=edit.page_id,
+                    _memo=_memo,
                 )
             except (KeyError, TypeError, ValueError):
                 issues.append(
@@ -3745,6 +3874,7 @@ def project_effective_page(
                     project,
                     _ledger_prefix_before_edit(ledger, edit),
                     page_id=edit.page_id,
+                    _memo=_memo,
                 )
             except (KeyError, TypeError, ValueError):
                 issues.append(
@@ -3807,6 +3937,131 @@ def project_effective_page(
             eligible.append(edit)
             continue
         if (
+            edit.domain is EditDomain.SOURCE_TEXT
+            and edit.operation in {"replace", "restore_selected_revision"}
+            and "revision_base" in edit.payload
+            and edit.target.kind is EditTargetKind.PARENT
+        ):
+            try:
+                revision_base = SourceTextRevisionBaseV1.from_dict(
+                    edit.payload["revision_base"]
+                )
+            except (TypeError, ValueError):
+                issues.append(
+                    _issue(
+                        ProjectionIssueKind.INVALID_EFFECTIVE_VALUE,
+                        edit,
+                        "source_revision_base_is_invalid",
+                    )
+                )
+                continue
+            artifact = _source_revision_for_base(
+                artifact_index,
+                edit,
+                revision_base,
+            )
+            if artifact is None:
+                issues.append(
+                    _issue(
+                        ProjectionIssueKind.ORPHANED,
+                        edit,
+                        "source revision base artifact is unavailable",
+                    )
+                )
+                continue
+            prefix = _ledger_prefix_before_edit(ledger, edit)
+            selection_edit = prefix.get(revision_base.selection_edit_id)
+            if (
+                selection_edit is None
+                or selection_edit.domain is not EditDomain.SOURCE_TEXT
+                or selection_edit.operation != "select_revision"
+                or selection_edit.target != edit.target
+                or str(selection_edit.payload.get("revision_id") or "")
+                != revision_base.source_revision_id
+                or not _source_slot_has_ancestor(
+                    ledger,
+                    edit,
+                    revision_base.selection_edit_id,
+                )
+            ):
+                issues.append(
+                    _issue(
+                        ProjectionIssueKind.INVALID_EFFECTIVE_VALUE,
+                        edit,
+                        "source_revision_selection_ancestry_mismatch",
+                    )
+                )
+                continue
+            try:
+                predecessor = project_effective_page(
+                    project,
+                    prefix,
+                    page_id=edit.page_id,
+                    _memo=_memo,
+                )
+            except (KeyError, TypeError, ValueError):
+                issues.append(
+                    _issue(
+                        ProjectionIssueKind.INVALID_EFFECTIVE_VALUE,
+                        edit,
+                        "source_revision_predecessor_is_invalid",
+                    )
+                )
+                continue
+            predecessor_parent = next(
+                (
+                    candidate
+                    for candidate in predecessor.parents
+                    if candidate.parent_id == edit.target.parent_id
+                ),
+                None,
+            )
+            try:
+                predecessor_base = (
+                    source_text_revision_base_for_parent(predecessor_parent)
+                    if predecessor_parent is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                predecessor_base = None
+            lineage = (
+                predecessor_parent.lineage
+                if predecessor_parent is not None
+                else None
+            )
+            if (
+                predecessor_parent is None
+                or predecessor_parent.origin is not ParentOrigin.USER
+                or lineage is None
+                or artifact.root_id != predecessor_parent.root_id
+                or artifact.parent_authored_edit_id != lineage.authored_edit_id
+                or predecessor_base != revision_base
+            ):
+                issues.append(
+                    _issue(
+                        ProjectionIssueKind.INVALID_EFFECTIVE_VALUE,
+                        edit,
+                        "source_revision_user_parent_lineage_mismatch",
+                    )
+                )
+                continue
+            if (
+                edit.base_revision_id != revision_base.source_revision_id
+                or edit.base_fingerprint != revision_base.artifact_sha256
+            ):
+                issues.append(
+                    _issue(
+                        ProjectionIssueKind.STALE_EDIT_BASE,
+                        edit,
+                        "source_revision_artifact_base_mismatch",
+                        expected_fingerprint=revision_base.artifact_sha256,
+                        observed_fingerprint=edit.base_fingerprint,
+                    )
+                )
+                continue
+            eligible.append(edit)
+            continue
+        if (
             edit.domain is EditDomain.TARGET_TEXT
             and edit.operation == "select_revision"
             and edit.target.kind is EditTargetKind.PARENT
@@ -3826,6 +4081,7 @@ def project_effective_page(
                     project,
                     _ledger_prefix_before_edit(ledger, edit),
                     page_id=edit.page_id,
+                    _memo=_memo,
                 )
             except (KeyError, TypeError, ValueError):
                 issues.append(
@@ -3857,6 +4113,14 @@ def project_effective_page(
                 if predecessor_parent is not None
                 else ""
             )
+            try:
+                predecessor_source_base = (
+                    source_text_revision_base_for_parent(predecessor_parent)
+                    if predecessor_parent is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                predecessor_source_base = None
             if (
                 predecessor_parent is None
                 or predecessor_parent.origin is not ParentOrigin.USER
@@ -3880,8 +4144,9 @@ def project_effective_page(
                 or artifact.source_fingerprint != predecessor_source_fingerprint
                 or artifact.source_revision_id
                 != predecessor_parent.source_revision_id
+                or predecessor_source_base is None
                 or artifact.source_selection_edit_id
-                not in predecessor_parent.applied_edit_ids
+                != predecessor_source_base.selection_edit_id
                 or str(edit.payload.get("source_fingerprint") or "")
                 != predecessor_source_fingerprint
             ):
@@ -3934,6 +4199,7 @@ def project_effective_page(
                     project,
                     prefix,
                     page_id=edit.page_id,
+                    _memo=_memo,
                 )
             except (KeyError, TypeError, ValueError):
                 issues.append(
@@ -4108,6 +4374,7 @@ def project_effective_page(
                     project,
                     prefix,
                     page_id=edit.page_id,
+                    _memo=_memo,
                 )
             except (KeyError, TypeError, ValueError):
                 issues.append(
@@ -4160,6 +4427,12 @@ def project_effective_page(
                 edit.target.parent_id,
                 predecessor_parent.source_text,
             )
+            try:
+                predecessor_source_base = source_text_revision_base_for_parent(
+                    predecessor_parent
+                )
+            except (TypeError, ValueError):
+                predecessor_source_base = None
             if (
                 artifact.source_text != predecessor_parent.source_text
                 or artifact.source_authority
@@ -4168,8 +4441,9 @@ def project_effective_page(
                 != predecessor_source_fingerprint
                 or artifact.source_revision_id
                 != predecessor_parent.source_revision_id
+                or predecessor_source_base is None
                 or artifact.source_selection_edit_id
-                not in predecessor_parent.applied_edit_ids
+                != predecessor_source_base.selection_edit_id
                 or revision_base.source_fingerprint
                 != predecessor_source_fingerprint
             ):
@@ -4187,14 +4461,6 @@ def project_effective_page(
                 edit.base_revision_id
                 != revision_base.translation_revision_id
                 or edit.base_fingerprint != revision_base.artifact_sha256
-                or predecessor.hierarchy.revision_id
-                != revision_base.hierarchy_revision_id
-                or predecessor.hierarchy.fingerprint
-                != revision_base.hierarchy_fingerprint
-                or artifact.hierarchy_revision_id
-                != predecessor.hierarchy.revision_id
-                or artifact.hierarchy_fingerprint
-                != predecessor.hierarchy.fingerprint
             ):
                 issues.append(
                     _issue(
@@ -4246,11 +4512,39 @@ def project_effective_page(
         for edit in edits:
             if edit.domain is EditDomain.SOURCE_TEXT:
                 if edit.operation == "replace":
-                    parent = replace(
-                        parent,
-                        source_text=str(edit.payload["text"]),
-                        source_authority="user",
-                    )
+                    revision_base_value = edit.payload.get("revision_base")
+                    if revision_base_value is not None:
+                        revision_base = SourceTextRevisionBaseV1.from_dict(
+                            revision_base_value
+                        )
+                        artifact = _source_revision_for_base(
+                            artifact_index,
+                            edit,
+                            revision_base,
+                        )
+                        if artifact is None:  # eligible edits were checked above
+                            continue
+                        parent = replace(
+                            parent,
+                            source_text=str(edit.payload["text"]),
+                            source_authority="user",
+                            source_revision_id=artifact.revision_id,
+                            source_revision_metadata=_mapping_tuple(
+                                artifact.to_record()
+                            ),
+                            stage_requirements=(
+                                _user_parent_requirements_after_source_override(
+                                    parent,
+                                    page_id=page_id,
+                                )
+                            ),
+                        )
+                    else:
+                        parent = replace(
+                            parent,
+                            source_text=str(edit.payload["text"]),
+                            source_authority="user",
+                        )
                 elif edit.operation == "select_revision":
                     artifact = _source_revision_for_edit(artifact_index, edit)
                     if artifact is None:
@@ -4267,6 +4561,32 @@ def project_effective_page(
                             page_id=page_id,
                             parent_id=parent_id,
                             source_current=True,
+                        ),
+                    )
+                elif edit.operation == "restore_selected_revision":
+                    revision_base = SourceTextRevisionBaseV1.from_dict(
+                        edit.payload["revision_base"]
+                    )
+                    artifact = _source_revision_for_base(
+                        artifact_index,
+                        edit,
+                        revision_base,
+                    )
+                    if artifact is None:  # eligible edits were checked above
+                        continue
+                    parent = replace(
+                        parent,
+                        source_text=artifact.source_text,
+                        source_authority="ocr_revision",
+                        source_revision_id=artifact.revision_id,
+                        source_revision_metadata=_mapping_tuple(
+                            artifact.to_record()
+                        ),
+                        stage_requirements=(
+                            _user_parent_requirements_after_source_override(
+                                parent,
+                                page_id=page_id,
+                            )
                         ),
                     )
                 else:
@@ -4356,6 +4676,21 @@ def project_effective_page(
                 artifact = _translation_revision_for_edit(artifact_index, edit)
                 if artifact is None:
                     continue
+                if (
+                    artifact.source_text != parent.source_text
+                    or artifact.source_authority != parent.source_authority
+                    or artifact.source_fingerprint != source_fingerprint
+                ):
+                    issues.append(
+                        _issue(
+                            ProjectionIssueKind.STALE_DEPENDENCY,
+                            edit,
+                            "translation revision is historical after a source edit",
+                            expected_fingerprint=source_fingerprint,
+                            observed_fingerprint=artifact.source_fingerprint,
+                        )
+                    )
+                    continue
                 parent = replace(
                     parent,
                     target_text=artifact.target_text,
@@ -4383,6 +4718,21 @@ def project_effective_page(
                     revision_base,
                 )
                 if artifact is None:  # eligible edits were checked above
+                    continue
+                if (
+                    artifact.source_text != parent.source_text
+                    or artifact.source_authority != parent.source_authority
+                    or artifact.source_fingerprint != source_fingerprint
+                ):
+                    issues.append(
+                        _issue(
+                            ProjectionIssueKind.STALE_DEPENDENCY,
+                            edit,
+                            "restored translation revision is historical after a source edit",
+                            expected_fingerprint=source_fingerprint,
+                            observed_fingerprint=artifact.source_fingerprint,
+                        )
+                    )
                     continue
                 parent = replace(
                     parent,
@@ -4497,6 +4847,7 @@ def project_effective_page(
                 project,
                 _ledger_prefix_before_edit(ledger, edit),
                 page_id=edit.page_id,
+                _memo=_memo,
             )
         except (KeyError, TypeError, ValueError):
             issues.append(
@@ -4623,10 +4974,15 @@ def project_effective_page(
             )
             continue
         later_active_user_parent_ids = tuple(
-            add_edit.target.parent_id
-            for add_edit in valid_add_edits
-            if add_edit.target.parent_id in parent_map
-            if add_edit.target.parent_id not in authored_parent_ids
+            parent.parent_id
+            for parent in sorted(
+                parent_map.values(),
+                key=lambda candidate: (
+                    candidate.reading_order,
+                    candidate.parent_id,
+                ),
+            )
+            if parent.parent_id not in authored_parent_ids
         )
         effective_order = (*ordered_parent_ids, *later_active_user_parent_ids)
         if (
@@ -4892,6 +5248,7 @@ def project_effective_page(
                         project,
                         _ledger_prefix_before_edit(ledger, selection_edit),
                         page_id=page_id,
+                        _memo=_memo,
                     )
                     coverage_binding_valid = (
                         _user_parent_cleanup_target_matches_snapshot(
@@ -5128,9 +5485,11 @@ def project_effective_page(
         effective_fingerprint="",
         stage_requirements=effective_stage_requirements,
     )
-    return replace(
+    result = replace(
         provisional,
         effective_fingerprint=canonical_sha256(
             provisional.to_dict(include_fingerprint=False)
         ),
     )
+    _memo[memo_key] = result
+    return result

@@ -58,6 +58,7 @@ from app.project_edits.contracts import (
     CANONICAL_WRITING_MODES,
     EditDomain,
     ParentSourceEvidenceMappingV1,
+    SourceTextRevisionBaseV1,
     TargetTextRevisionBaseV1,
     canonical_render_line_height,
     canonical_render_rotation,
@@ -107,6 +108,10 @@ _SOURCE_STALE_COMMAND_CODES = frozenset(
         SourceTextCommandErrorCode.STALE_EFFECTIVE_PAGE,
         SourceTextCommandErrorCode.STALE_PAGE_HEAD,
         SourceTextCommandErrorCode.STALE_GLOBAL_HEAD,
+        SourceTextCommandErrorCode.REVISION_ID_MISMATCH,
+        SourceTextCommandErrorCode.REVISION_SELECTION_MISMATCH,
+        SourceTextCommandErrorCode.REVISION_ARTIFACT_MISMATCH,
+        SourceTextCommandErrorCode.PARENT_LINEAGE_MISMATCH,
     }
 )
 _WRITING_MODE_STALE_COMMAND_CODES = frozenset(
@@ -2229,10 +2234,11 @@ class SourceTextSelection:
     project_path: str
     page_id: str
     parent_id: str
-    automatic_source_text: str
+    automatic_source_text: str | None
     effective_source_text: str
     source_authority: str
     effective_page_fingerprint: str
+    revision_base: SourceTextRevisionBaseV1 | None = None
 
     def __post_init__(self) -> None:
         project_path = str(self.project_path or "").strip()
@@ -2249,14 +2255,29 @@ class SourceTextSelection:
             "parent_id",
             _required_identity(self.parent_id, "parent_id"),
         )
-        if not isinstance(self.automatic_source_text, str):
-            raise TypeError("automatic_source_text must be a string")
+        if self.automatic_source_text is not None and not isinstance(
+            self.automatic_source_text,
+            str,
+        ):
+            raise TypeError("automatic_source_text must be a string or None")
         if not isinstance(self.effective_source_text, str):
             raise TypeError("effective_source_text must be a string")
         authority = str(self.source_authority or "").strip()
-        if authority not in {"automatic", "user"}:
-            raise ValueError("source_authority must be automatic or user")
+        if authority not in {"automatic", "ocr_revision", "user"}:
+            raise ValueError(
+                "source_authority must be automatic, ocr_revision, or user"
+            )
         object.__setattr__(self, "source_authority", authority)
+        revision_base = self.revision_base
+        if revision_base is not None and not isinstance(
+            revision_base,
+            SourceTextRevisionBaseV1,
+        ):
+            raise TypeError("revision_base must be a SourceTextRevisionBaseV1")
+        if authority == "automatic" and revision_base is not None:
+            raise ValueError("automatic source selection must not carry revision_base")
+        if authority == "ocr_revision" and revision_base is None:
+            raise ValueError("OCR revision source selection requires revision_base")
         object.__setattr__(
             self,
             "effective_page_fingerprint",
@@ -2277,6 +2298,7 @@ class SourceTextWorkerCommand:
     operation: SourceTextOperation
     text: str
     expected_effective_page_fingerprint: str
+    revision_base: SourceTextRevisionBaseV1 | None = None
 
     def __post_init__(self) -> None:
         project_path = str(self.project_path or "").strip()
@@ -2297,8 +2319,27 @@ class SourceTextWorkerCommand:
         object.__setattr__(self, "operation", operation)
         if not isinstance(self.text, str):
             raise TypeError("text must be a string")
-        if operation is SourceTextOperation.RESTORE_AUTOMATIC and self.text != "":
-            raise ValueError("restore_automatic must not carry source text")
+        if operation in {
+            SourceTextOperation.RESTORE_AUTOMATIC,
+            SourceTextOperation.RESTORE_SELECTED_REVISION,
+        } and self.text != "":
+            raise ValueError(f"{operation.value} must not carry source text")
+        revision_base = self.revision_base
+        if revision_base is not None and not isinstance(
+            revision_base,
+            SourceTextRevisionBaseV1,
+        ):
+            raise TypeError("revision_base must be a SourceTextRevisionBaseV1")
+        if (
+            operation is SourceTextOperation.RESTORE_SELECTED_REVISION
+            and revision_base is None
+        ):
+            raise ValueError("restore_selected_revision requires revision_base")
+        if (
+            operation is SourceTextOperation.RESTORE_AUTOMATIC
+            and revision_base is not None
+        ):
+            raise ValueError("restore_automatic must not carry revision_base")
         object.__setattr__(
             self,
             "expected_effective_page_fingerprint",
@@ -2571,12 +2612,24 @@ class SourceTextEditorModel:
 
     def begin_restore(self) -> SourceTextWorkerCommand:
         if not self._state.restore_enabled:
-            raise RuntimeError("automatic source text is already effective")
+            raise RuntimeError("the source model base is already effective")
+        operation = (
+            SourceTextOperation.RESTORE_SELECTED_REVISION
+            if self._state.selection.revision_base is not None
+            else SourceTextOperation.RESTORE_AUTOMATIC
+        )
         command = self._command(
-            SourceTextOperation.RESTORE_AUTOMATIC,
+            operation,
             text="",
         )
-        self._begin(command, "Restoring automatic source text...")
+        self._begin(
+            command,
+            (
+                "Restoring selected model OCR..."
+                if operation is SourceTextOperation.RESTORE_SELECTED_REVISION
+                else "Restoring automatic source text..."
+            ),
+        )
         return command
 
     def accept_busy(
@@ -2756,6 +2809,7 @@ class SourceTextEditorModel:
             expected_effective_page_fingerprint=(
                 selection.effective_page_fingerprint
             ),
+            revision_base=selection.revision_base,
         )
 
     def _begin(self, command: SourceTextWorkerCommand, message: str) -> None:

@@ -91,7 +91,17 @@ class RenderStyleFontWeightTierCommand:
     expected_global_head_sha256: str
 
     def __post_init__(self) -> None:
-        for name in ("command_id", "project_id", "page_id", "parent_id"):
+        object.__setattr__(
+            self,
+            "command_id",
+            _required_id(self.command_id, "command_id"),
+        )
+        object.__setattr__(
+            self,
+            "project_id",
+            _required_identity(self.project_id, "project_id"),
+        )
+        for name in ("page_id", "parent_id"):
             object.__setattr__(self, name, _required_id(getattr(self, name), name))
         operation = RenderStyleFontWeightTierOperation(self.operation)
         object.__setattr__(self, "operation", operation)
@@ -133,6 +143,12 @@ def _required_id(value: Any, name: str) -> str:
     if not result or not _PATH_SAFE_ID.fullmatch(result):
         raise ValueError(f"{name} must be a path-safe identity")
     return result
+
+
+def _required_identity(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{name} must be a non-empty exact identifier")
+    return value
 
 
 def _required_sha256(value: Any, name: str) -> str:

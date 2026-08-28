@@ -16,6 +16,7 @@ from app.project_edits.manual_cleanup import (
     ManualCleanupReceipt,
     UserParentCleanupCoverageTargetV1,
 )
+from app.ui.design_system.components import WheelSafeSpinBox
 from app.ui.design_system.dialogs import HybridDialog
 from app.ui.manual_cleanup_worker import (
     ManualCleanupContextWorker,
@@ -930,16 +931,16 @@ class ManualCleanupDialog(HybridDialog):
 
         size_group = QtWidgets.QGroupBox("Mask refinement")
         size_layout = QtWidgets.QFormLayout(size_group)
-        self.brush_radius = QtWidgets.QSpinBox()
+        self.brush_radius = WheelSafeSpinBox()
         self.brush_radius.setObjectName("cleanupBrushRadius")
         self.brush_radius.setRange(1, 256)
         self.brush_radius.setValue(12)
         self.brush_radius.setSuffix(" px")
-        self.grow_spin = QtWidgets.QSpinBox()
+        self.grow_spin = WheelSafeSpinBox()
         self.grow_spin.setObjectName("cleanupGrowPixels")
         self.grow_spin.setRange(0, 64)
         self.grow_spin.setSuffix(" px")
-        self.feather_spin = QtWidgets.QSpinBox()
+        self.feather_spin = WheelSafeSpinBox()
         self.feather_spin.setObjectName("cleanupFeatherPixels")
         self.feather_spin.setRange(0, 64)
         self.feather_spin.setSuffix(" px")

@@ -10,6 +10,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from app.ui.design_system import (
     CommandButton,
     SectionHeader,
+    WheelSafeComboBox,
+    WheelSafeDoubleSpinBox,
+    WheelSafeSpinBox,
     apply_semantic_properties,
     metric_pixels,
 )
@@ -489,6 +492,12 @@ class PageEditorView(QtWidgets.QWidget):
         self._inspector_hidden_by_toolbar = False
         self._page_rail_collapsed = False
         self._icon_theme = "dark"
+        self._history_payload: tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            str,
+            tuple[str, ...],
+        ] | None = None
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -946,7 +955,7 @@ class PageEditorView(QtWidgets.QWidget):
         identity.addStretch(1)
         identity.addWidget(self.inspector_parent)
         layout.addLayout(identity)
-        self.parent_list = QtWidgets.QComboBox()
+        self.parent_list = WheelSafeComboBox()
         self.parent_list.setAccessibleName("Selected parent")
         self.parent_list.currentIndexChanged.connect(self._activate_parent)
         self.parent_list.setVisible(False)
@@ -1264,7 +1273,7 @@ class PageEditorView(QtWidgets.QWidget):
         add_parent_form.setHorizontalSpacing(metric_pixels("space-3"))
         add_parent_form.setVerticalSpacing(metric_pixels("space-2"))
 
-        self.add_user_parent_role = QtWidgets.QComboBox()
+        self.add_user_parent_role = WheelSafeComboBox()
         self.add_user_parent_role.setObjectName("addUserParentRole")
         self.add_user_parent_role.addItem("Choose role", None)
         self.add_user_parent_role.addItem("Dialogue", "speech")
@@ -1290,7 +1299,7 @@ class PageEditorView(QtWidgets.QWidget):
             ("width", "Width", 0),
             ("height", "Height", 0),
         ):
-            spin = QtWidgets.QSpinBox()
+            spin = WheelSafeSpinBox()
             spin.setObjectName(
                 "addUserParent" + field_name.title() + "SpinBox"
             )
@@ -1504,6 +1513,7 @@ class PageEditorView(QtWidgets.QWidget):
         )
         self.source_text.setPlaceholderText("Enter the exact source text")
         self.source_text.setMaximumHeight(64)
+        self.source_text.setTabChangesFocus(True)
         self.source_text.setEnabled(False)
         self.source_text.textChanged.connect(
             lambda: self.source_text_draft_changed.emit(
@@ -2018,7 +2028,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.font_role_authority.setAccessibleName("Font-role authority")
         font_role_summary.addRow("Authority", self.font_role_authority)
         font_role_layout.addLayout(font_role_summary)
-        self.font_role_choice = QtWidgets.QComboBox()
+        self.font_role_choice = WheelSafeComboBox()
         self.font_role_choice.setObjectName("fontRoleChoice")
         self.font_role_choice.setAccessibleName("Selected parent registered font role")
         self.font_role_choice.setAccessibleDescription(
@@ -2154,7 +2164,7 @@ class PageEditorView(QtWidgets.QWidget):
             "Authority", self.font_weight_tier_authority
         )
         font_weight_tier_layout.addLayout(font_weight_tier_summary)
-        self.font_weight_tier_choice = QtWidgets.QComboBox()
+        self.font_weight_tier_choice = WheelSafeComboBox()
         self.font_weight_tier_choice.setObjectName("fontWeightTierChoice")
         self.font_weight_tier_choice.setAccessibleName(
             "Selected parent registered font weight"
@@ -2537,7 +2547,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.outline_width_authority.setAccessibleName("Outline-width authority")
         outline_width_summary.addRow("Authority", self.outline_width_authority)
         outline_width_layout.addLayout(outline_width_summary)
-        self.outline_width_edit = QtWidgets.QDoubleSpinBox()
+        self.outline_width_edit = WheelSafeDoubleSpinBox()
         self.outline_width_edit.setObjectName("outlineWidthSpinBox")
         self.outline_width_edit.setRange(0.0, 128.0)
         self.outline_width_edit.setDecimals(3)
@@ -2657,7 +2667,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.preferred_size_authority.setAccessibleName("Preferred-size authority")
         preferred_size_summary.addRow("Authority", self.preferred_size_authority)
         preferred_size_layout.addLayout(preferred_size_summary)
-        self.preferred_size_edit = QtWidgets.QDoubleSpinBox()
+        self.preferred_size_edit = WheelSafeDoubleSpinBox()
         self.preferred_size_edit.setObjectName("preferredSizeSpinBox")
         self.preferred_size_edit.setRange(0.1, 2048.0)
         self.preferred_size_edit.setDecimals(3)
@@ -2896,7 +2906,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.shadow_blur_authority.setAccessibleName("Shadow-blur authority")
         shadow_blur_summary.addRow("Authority", self.shadow_blur_authority)
         shadow_blur_layout.addLayout(shadow_blur_summary)
-        self.shadow_blur_edit = QtWidgets.QDoubleSpinBox()
+        self.shadow_blur_edit = WheelSafeDoubleSpinBox()
         self.shadow_blur_edit.setObjectName("shadowBlurSpinBox")
         self.shadow_blur_edit.setRange(0.0, 64.0)
         self.shadow_blur_edit.setDecimals(3)
@@ -3019,9 +3029,9 @@ class PageEditorView(QtWidgets.QWidget):
         shadow_offset_summary.addRow("Authority", self.shadow_offset_authority)
         shadow_offset_layout.addLayout(shadow_offset_summary)
         shadow_offset_draft = QtWidgets.QFormLayout()
-        self.shadow_offset_x_edit = QtWidgets.QDoubleSpinBox()
+        self.shadow_offset_x_edit = WheelSafeDoubleSpinBox()
         self.shadow_offset_x_edit.setObjectName("shadowOffsetXSpinBox")
-        self.shadow_offset_y_edit = QtWidgets.QDoubleSpinBox()
+        self.shadow_offset_y_edit = WheelSafeDoubleSpinBox()
         self.shadow_offset_y_edit.setObjectName("shadowOffsetYSpinBox")
         for axis, control in (("X", self.shadow_offset_x_edit), ("Y", self.shadow_offset_y_edit)):
             control.setRange(-256.0, 256.0)
@@ -3698,7 +3708,7 @@ class PageEditorView(QtWidgets.QWidget):
         merge_parent_form.setRowWrapPolicy(
             QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows
         )
-        self.merge_parent_partner = QtWidgets.QComboBox()
+        self.merge_parent_partner = WheelSafeComboBox()
         self.merge_parent_partner.setObjectName("mergeParentPartner")
         self.merge_parent_partner.setAccessibleName("Merge Parent partner")
         self.merge_parent_partner.setAccessibleDescription(
@@ -3783,7 +3793,7 @@ class PageEditorView(QtWidgets.QWidget):
         split_parent_form.setRowWrapPolicy(
             QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows
         )
-        self.split_parent_orientation = QtWidgets.QComboBox()
+        self.split_parent_orientation = WheelSafeComboBox()
         self.split_parent_orientation.setObjectName("splitParentOrientation")
         self.split_parent_orientation.addItem("Choose direction", None)
         self.split_parent_orientation.addItem("Vertical (left/right)", "vertical")
@@ -3796,7 +3806,7 @@ class PageEditorView(QtWidgets.QWidget):
             self._split_parent_orientation_value_changed
         )
         split_parent_form.addRow("Direction", self.split_parent_orientation)
-        self.split_parent_offset = QtWidgets.QSpinBox()
+        self.split_parent_offset = WheelSafeSpinBox()
         self.split_parent_offset.setObjectName("splitParentOffset")
         self.split_parent_offset.setSuffix(" px")
         self.split_parent_offset.setRange(1, 1)
@@ -3896,7 +3906,7 @@ class PageEditorView(QtWidgets.QWidget):
             (("x", "X"), ("y", "Y"), ("width", "W"), ("height", "H"))
         ):
             label = QtWidgets.QLabel(label_text)
-            spin = QtWidgets.QSpinBox()
+            spin = WheelSafeSpinBox()
             spin.setObjectName(f"parentGeometry{field_name.title()}Spin")
             spin.setRange(1 if field_name in {"width", "height"} else 0, 1)
             spin.setAccessibleName(f"Parent geometry {field_name}")
@@ -3993,7 +4003,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.writing_mode_authority.setAccessibleName("Writing mode authority")
         writing_mode_summary.addRow("Authority", self.writing_mode_authority)
         writing_mode_layout.addLayout(writing_mode_summary)
-        self.writing_mode_combo = QtWidgets.QComboBox()
+        self.writing_mode_combo = WheelSafeComboBox()
         self.writing_mode_combo.setObjectName("writingModeCombo")
         self.writing_mode_combo.setAccessibleName("Selected parent writing mode")
         self.writing_mode_combo.setAccessibleDescription(
@@ -4103,7 +4113,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.line_height_authority.setAccessibleName("Line height authority")
         line_height_summary.addRow("Authority", self.line_height_authority)
         line_height_layout.addLayout(line_height_summary)
-        self.line_height_spin = QtWidgets.QDoubleSpinBox()
+        self.line_height_spin = WheelSafeDoubleSpinBox()
         self.line_height_spin.setObjectName("lineHeightSpinBox")
         self.line_height_spin.setRange(0.5, 10.0)
         self.line_height_spin.setDecimals(6)
@@ -4216,7 +4226,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.rotation_authority.setAccessibleName("Rotation authority")
         rotation_summary.addRow("Authority", self.rotation_authority)
         rotation_layout.addLayout(rotation_summary)
-        self.rotation_spin = QtWidgets.QDoubleSpinBox()
+        self.rotation_spin = WheelSafeDoubleSpinBox()
         self.rotation_spin.setObjectName("rotationSpinBox")
         self.rotation_spin.setRange(-45.0, 45.0)
         self.rotation_spin.setDecimals(6)
@@ -4333,7 +4343,7 @@ class PageEditorView(QtWidgets.QWidget):
             (("x", "X"), ("y", "Y"), ("width", "Width"), ("height", "Height"))
         ):
             caption = QtWidgets.QLabel(label)
-            spin = QtWidgets.QSpinBox()
+            spin = WheelSafeSpinBox()
             spin.setObjectName(f"renderBox{field_name.title()}SpinBox")
             spin.setRange(-100000 if field_name in {"x", "y"} else 1, 100000)
             spin.setKeyboardTracking(False)
@@ -4667,13 +4677,13 @@ class PageEditorView(QtWidgets.QWidget):
         layout.addWidget(self.cleanup_brush_size)
 
         parameter_grid = QtWidgets.QGridLayout()
-        self.cleanup_grow = QtWidgets.QSpinBox()
+        self.cleanup_grow = WheelSafeSpinBox()
         self.cleanup_grow.setObjectName("cleanupFacadeGrow")
         self.cleanup_grow.setRange(0, 24)
         self.cleanup_grow.setValue(2)
         self.cleanup_grow.setSuffix(" px")
         self.cleanup_grow.setAccessibleName("Cleanup mask grow")
-        self.cleanup_feather = QtWidgets.QSpinBox()
+        self.cleanup_feather = WheelSafeSpinBox()
         self.cleanup_feather.setObjectName("cleanupFacadeFeather")
         self.cleanup_feather.setRange(0, 16)
         self.cleanup_feather.setValue(1)
@@ -4963,7 +4973,7 @@ class PageEditorView(QtWidgets.QWidget):
         reset_help.setProperty("role", "secondary")
         reset_layout.addWidget(reset_help)
         reset_form = QtWidgets.QFormLayout()
-        self.render_override_reset_scope = QtWidgets.QComboBox()
+        self.render_override_reset_scope = WheelSafeComboBox()
         self.render_override_reset_scope.setObjectName("renderOverrideResetScope")
         self.render_override_reset_scope.setAccessibleName("Render override reset scope")
         self.render_override_reset_scope.setAccessibleDescription(
@@ -4981,7 +4991,7 @@ class PageEditorView(QtWidgets.QWidget):
             )
         )
         reset_form.addRow("Scope", self.render_override_reset_scope)
-        self.render_override_reset_fields = QtWidgets.QComboBox()
+        self.render_override_reset_fields = WheelSafeComboBox()
         self.render_override_reset_fields.setObjectName("renderOverrideResetFields")
         self.render_override_reset_fields.setAccessibleName("Render override field group")
         self.render_override_reset_fields.setAccessibleDescription(
@@ -5144,7 +5154,7 @@ class PageEditorView(QtWidgets.QWidget):
         self.render_override_reset_toggle.toggled.connect(
             self.render_override_reset_card.setVisible
         )
-        self.render_override_reset_toggle.setVisible(False)
+        self.render_override_reset_toggle.setVisible(True)
         layout.addWidget(self.render_override_reset_toggle)
         layout.addWidget(self.render_override_reset_card)
         self.set_history_editor_state(
@@ -6668,6 +6678,7 @@ class PageEditorView(QtWidgets.QWidget):
         status_text: str,
         status_tone: str = "muted",
         history_identity: str | None = None,
+        restore_label: str = "Restore Automatic",
     ) -> None:
         """Apply one immutable source-edit view-model state to the inspector."""
 
@@ -6684,6 +6695,18 @@ class PageEditorView(QtWidgets.QWidget):
         self.source_apply_button.setVisible(bool(apply_enabled))
         self.source_cancel_button.setEnabled(bool(cancel_enabled))
         self.source_cancel_button.setVisible(bool(cancel_enabled))
+        stable_restore_label = str(restore_label or "").strip()
+        if not stable_restore_label:
+            raise ValueError("restore_label is required")
+        self.source_restore_button.setText(stable_restore_label)
+        self.source_restore_button.setAccessibleName(stable_restore_label)
+        self.source_restore_button.setToolTip(
+            (
+                "Restore the immutable selected model OCR revision."
+                if stable_restore_label == "Restore Selected Model OCR"
+                else "Remove the user source override and restore automatic OCR."
+            )
+        )
         self.source_restore_button.setEnabled(bool(restore_enabled))
         self.source_restore_button.setVisible(bool(restore_enabled))
         self.source_edit_status.setText(str(status_text))
@@ -6788,7 +6811,7 @@ class PageEditorView(QtWidgets.QWidget):
         self._sync_text_provenance_detail_visibility()
         badge_text = {
             "automatic": "Automatic OCR",
-            "model": "Automatic OCR",
+            "model": "Selected model OCR",
             "user": "Your source edit",
             "unavailable": "OCR unavailable",
         }[effective_source_authority]
@@ -9222,6 +9245,10 @@ class PageEditorView(QtWidgets.QWidget):
             or any(value not in {"page", "parent"} for value in normalized_scopes)
         ):
             raise ValueError("history scopes must align as page or parent values")
+        payload = (entries, identities, selected_record_id, normalized_scopes)
+        if payload == self._history_payload:
+            return
+        self.activity_dock.set_history(entries)
         blocker = QtCore.QSignalBlocker(self.history_list)
         self.history_list.clear()
         selected_row = -1
@@ -9262,6 +9289,7 @@ class PageEditorView(QtWidgets.QWidget):
                     selected_row = self.history_list.count() - 1
         self.history_list.setCurrentRow(selected_row)
         del blocker
+        self._history_payload = payload
 
     def set_history_editor_state(
         self,

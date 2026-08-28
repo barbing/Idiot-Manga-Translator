@@ -7,13 +7,10 @@ from .components import (
     SectionHeader,
     SemanticProperties,
     StatusPill,
+    WheelSafeComboBox,
+    WheelSafeDoubleSpinBox,
+    WheelSafeSpinBox,
     apply_semantic_properties,
-)
-from .dialogs import (
-    HybridConfirmDialog,
-    HybridDialog,
-    HybridDialogHeader,
-    HybridTextInputDialog,
 )
 from .theme import (
     ThemeOptions,
@@ -24,8 +21,29 @@ from .theme import (
 
 
 def __getattr__(name: str):
-    """Load Qt-backed delegates only when a caller explicitly requests one."""
+    """Load Qt-backed widgets only when a caller explicitly requests one."""
 
+    if name in {
+        "HybridConfirmDialog",
+        "HybridDialog",
+        "HybridDialogHeader",
+        "HybridTextInputDialog",
+    }:
+        from .dialogs import (
+            HybridConfirmDialog,
+            HybridDialog,
+            HybridDialogHeader,
+            HybridTextInputDialog,
+        )
+
+        value = {
+            "HybridConfirmDialog": HybridConfirmDialog,
+            "HybridDialog": HybridDialog,
+            "HybridDialogHeader": HybridDialogHeader,
+            "HybridTextInputDialog": HybridTextInputDialog,
+        }[name]
+        globals()[name] = value
+        return value
     if name in {"PageRailDelegate", "ProjectCardDelegate"}:
         from .delegates import PageRailDelegate, ProjectCardDelegate
 
@@ -69,6 +87,9 @@ __all__ = [
     "UI_METRIC_TOKENS",
     "ThemeOptions",
     "ThemeTokens",
+    "WheelSafeComboBox",
+    "WheelSafeDoubleSpinBox",
+    "WheelSafeSpinBox",
     "apply_application_theme",
     "apply_semantic_properties",
     "build_application_stylesheet",

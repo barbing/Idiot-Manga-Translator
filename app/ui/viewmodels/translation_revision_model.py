@@ -224,9 +224,9 @@ class TranslationRevisionSelection:
             or not self.effective_source_text.strip()
         ):
             raise ValueError("effective_source_text must be non-empty")
-        if self.effective_source_authority != "ocr_revision":
+        if self.effective_source_authority not in {"ocr_revision", "user"}:
             raise ValueError(
-                "explicit translation requires selected model OCR source authority"
+                "explicit translation requires selected OCR provenance or a user-corrected OCR source"
             )
         expected_source_fingerprint = canonical_fingerprint(
             {"parent_id": self.parent_id, "text": self.effective_source_text}
@@ -344,10 +344,6 @@ class TranslationRevisionSelection:
             or artifact.source_selection_edit_id != self.source_selection_edit_id
             or artifact.run_settings_fingerprint != self.run_settings_fingerprint
             or artifact.provider != self.provider
-            or artifact.glossary_fingerprint != self.glossary_fingerprint
-            or artifact.context_fingerprint != self.context_fingerprint
-            or artifact.hierarchy_revision_id != self.hierarchy_revision_id
-            or artifact.hierarchy_fingerprint != self.hierarchy_fingerprint
         ):
             raise ValueError("selected model translation lineage is inconsistent")
         if not isinstance(self.available, bool):
@@ -388,8 +384,11 @@ class TranslationRevisionSelection:
     def translation_runnable(self) -> bool:
         value = self.translation_requirement
         return bool(
-            value.state is RevisionStageState.MISSING
-            and value.required_action is RevisionRequiredAction.EXPLICIT_RUN
+            (
+                value.state is RevisionStageState.MISSING
+                and value.required_action is RevisionRequiredAction.EXPLICIT_RUN
+            )
+            or self.translation_policy_stale
         )
 
     @property
@@ -398,6 +397,19 @@ class TranslationRevisionSelection:
         return bool(
             value.state is RevisionStageState.CURRENT
             and value.required_action is RevisionRequiredAction.NONE
+            and not self.translation_policy_stale
+        )
+
+    @property
+    def translation_policy_stale(self) -> bool:
+        artifact = self.model_translation_revision
+        return bool(
+            artifact is not None
+            and self.effective_target_authority == "translation_revision"
+            and (
+                artifact.glossary_fingerprint != self.glossary_fingerprint
+                or artifact.context_fingerprint != self.context_fingerprint
+            )
         )
 
 
@@ -1042,9 +1054,13 @@ def translation_revision_selection_from_projection(
             "Run explicit OCR before translating this user parent."
         )
     if (
-        effective.source_authority != "ocr_revision"
-        or effective.source_text != source_artifact.source_text
+        effective.source_authority not in {"ocr_revision", "user"}
+        or effective.source_text is None
         or effective.source_revision_id != source_artifact.revision_id
+        or (
+            effective.source_authority == "ocr_revision"
+            and effective.source_text != source_artifact.source_text
+        )
     ):
         raise ValueError("the selected OCR revision is not the effective source")
     provider = TranslationProviderSelection.from_run_settings_snapshot(
@@ -1084,6 +1100,14 @@ def translation_revision_selection_from_projection(
         and translation_requirement.required_action
         is RevisionRequiredAction.EXPLICIT_RUN
     )
+    translation_policy_stale = bool(
+        artifact is not None
+        and authority == "translation_revision"
+        and (
+            artifact.glossary_fingerprint != glossary_fingerprint
+            or artifact.context_fingerprint != context_fingerprint
+        )
+    )
     if run_settings_snapshot.unresolved_requirements:
         available = False
         reason = (
@@ -1093,7 +1117,7 @@ def translation_revision_selection_from_projection(
     elif not source_current:
         available = False
         reason = "The selected parent requires a current source revision first."
-    elif not translation_runnable:
+    elif not translation_runnable and not translation_policy_stale:
         available = False
         reason = (
             "Selected model translation revision is current. Later owner "
@@ -1105,7 +1129,7 @@ def translation_revision_selection_from_projection(
         available = True
         reason = ""
     source_fingerprint = canonical_fingerprint(
-        {"parent_id": effective.parent_id, "text": source_artifact.source_text}
+        {"parent_id": effective.parent_id, "text": effective.source_text}
     )
     return TranslationRevisionSelection(
         project_path=projection.metadata.project_path,
@@ -1120,8 +1144,8 @@ def translation_revision_selection_from_projection(
         effective_page_fingerprint=page.effective.effective_fingerprint,
         hierarchy_revision_id=page.effective.hierarchy.revision_id,
         hierarchy_fingerprint=page.effective.hierarchy.fingerprint,
-        effective_source_text=source_artifact.source_text,
-        effective_source_authority="ocr_revision",
+        effective_source_text=effective.source_text,
+        effective_source_authority=effective.source_authority,
         effective_source_fingerprint=source_fingerprint,
         source_revision_id=source_artifact.revision_id,
         source_selection_edit_id=source_artifact.selection_edit_id,

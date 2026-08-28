@@ -24,19 +24,29 @@ class _PageFilterProxy(QtCore.QSortFilterProxyModel):
         self._state = "all"
         self.setDynamicSortFilter(True)
 
+    def _invalidate_rows(self) -> None:
+        direction = getattr(QtCore.QSortFilterProxyModel, "Direction", None)
+        begin = getattr(self, "beginFilterChange", None)
+        end = getattr(self, "endFilterChange", None)
+        if direction is not None and callable(begin) and callable(end):
+            begin()
+            end(direction.Rows)
+            return
+        self.invalidateRowsFilter()
+
     def set_query(self, value: str) -> None:
         query = str(value or "").strip().casefold()
         if query == self._query:
             return
         self._query = query
-        self.invalidateRowsFilter()
+        self._invalidate_rows()
 
     def set_state(self, value: str) -> None:
         state = str(value or "all").strip().casefold()
         if state == self._state:
             return
         self._state = state
-        self.invalidateRowsFilter()
+        self._invalidate_rows()
 
     def filterAcceptsRow(
         self,

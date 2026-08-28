@@ -13,6 +13,9 @@ from app.ui.ui_contract import PRESENTATION_TONE_IDS
 
 
 _HYBRID_COMBO_CLASS: Any | None = None
+_WHEEL_SAFE_COMBO_CLASS: Any | None = None
+_WHEEL_SAFE_SPIN_CLASS: Any | None = None
+_WHEEL_SAFE_DOUBLE_SPIN_CLASS: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,7 +243,7 @@ def HybridComboBox(*, parent: Any = None) -> Any:
 
         from app.ui.design_system.icons import hybrid_icon
 
-        class _HybridComboBox(QtWidgets.QComboBox):
+        class _HybridComboBox(_wheel_safe_combo_class()):
             def __init__(self, widget_parent: Any = None) -> None:
                 super().__init__(widget_parent)
                 self.setProperty("hybridChevron", True)
@@ -276,6 +279,65 @@ def HybridComboBox(*, parent: Any = None) -> Any:
     return _HYBRID_COMBO_CLASS(parent)
 
 
+def _wheel_safe_combo_class() -> Any:
+    """Return a combo-box class that never changes selection from wheel input."""
+
+    global _WHEEL_SAFE_COMBO_CLASS
+    if _WHEEL_SAFE_COMBO_CLASS is None:
+        QtWidgets = _widgets()
+
+        class _WheelSafeComboBox(QtWidgets.QComboBox):
+            def wheelEvent(self, event: Any) -> None:  # noqa: N802
+                event.ignore()
+
+        _WHEEL_SAFE_COMBO_CLASS = _WheelSafeComboBox
+    return _WHEEL_SAFE_COMBO_CLASS
+
+
+def WheelSafeComboBox(*, parent: Any = None) -> Any:
+    """Create a choice control that leaves wheel input to its scroll parent."""
+
+    return _wheel_safe_combo_class()(parent)
+
+
+def _wheel_safe_spin_class(*, floating_point: bool) -> Any:
+    """Return a spin-box class that never edits values from wheel input."""
+
+    global _WHEEL_SAFE_SPIN_CLASS, _WHEEL_SAFE_DOUBLE_SPIN_CLASS
+    cached = (
+        _WHEEL_SAFE_DOUBLE_SPIN_CLASS
+        if floating_point
+        else _WHEEL_SAFE_SPIN_CLASS
+    )
+    if cached is not None:
+        return cached
+
+    QtWidgets = _widgets()
+    base = QtWidgets.QDoubleSpinBox if floating_point else QtWidgets.QSpinBox
+
+    class _WheelSafeSpinBox(base):
+        def wheelEvent(self, event: Any) -> None:  # noqa: N802
+            event.ignore()
+
+    if floating_point:
+        _WHEEL_SAFE_DOUBLE_SPIN_CLASS = _WheelSafeSpinBox
+    else:
+        _WHEEL_SAFE_SPIN_CLASS = _WheelSafeSpinBox
+    return _WheelSafeSpinBox
+
+
+def WheelSafeSpinBox(*, parent: Any = None) -> Any:
+    """Create an integer editor that ignores wheel input."""
+
+    return _wheel_safe_spin_class(floating_point=False)(parent)
+
+
+def WheelSafeDoubleSpinBox(*, parent: Any = None) -> Any:
+    """Create a decimal editor that ignores wheel input."""
+
+    return _wheel_safe_spin_class(floating_point=True)(parent)
+
+
 __all__ = [
     "CommandButton",
     "EmptyState",
@@ -283,5 +345,8 @@ __all__ = [
     "SectionHeader",
     "SemanticProperties",
     "StatusPill",
+    "WheelSafeComboBox",
+    "WheelSafeDoubleSpinBox",
+    "WheelSafeSpinBox",
     "apply_semantic_properties",
 ]
