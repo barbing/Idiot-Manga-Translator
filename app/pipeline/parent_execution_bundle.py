@@ -12,8 +12,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-PARENT_EXECUTION_BUNDLE_VERSION = "parent_execution_bundle_v1"
-PARENT_RENDER_STYLE_VERSION = "parent_render_style_v3"
+from app.pipeline.target_presentation import (
+    TargetPresentationPolicy,
+    target_presentation_policy as target_presentation_policy_for_language,
+)
+
+PARENT_EXECUTION_BUNDLE_VERSION = "parent_execution_bundle_v2"
+PARENT_RENDER_STYLE_VERSION = "parent_render_style_v4"
 PARENT_STYLE_ARBITRATOR_SOURCE = "parent_authorized_style_evidence"
 PARENT_STYLE_ARBITRATOR_PROVIDER = "ParentStyleArbitrator"
 PARENT_STYLE_RESOLUTION_STATUSES = {"complete"}
@@ -27,6 +32,9 @@ PARENT_STYLE_UNRESOLVED_FONT_SIZE_AUTHORITY = (
 PARENT_STYLE_UNRESOLVED_FONT_SIZE_POLICY = (
     "arbitrator_owned_unresolved_scale_fallback"
 )
+SOURCE_SIDE_ANCHOR_POLICY_VERSION = "source_side_anchor_v1"
+SOURCE_SIDE_ANCHOR_CENTER_TOLERANCE_RATIO = 0.02
+SOURCE_SIDE_ANCHOR_CENTER_TOLERANCE_MIN_PX = 4.0
 
 _PARENT_STYLE_WRITING_MODES = {"vertical", "horizontal"}
 _PARENT_STYLE_ALIGNMENTS = {"center", "left", "right", "start", "end"}
@@ -99,11 +107,19 @@ _PARENT_STYLE_REQUIRED_FIELDS = {
     "primary_font_role",
     "primary_font_role_status",
     "fallback_font_chain_key",
+    "target_presentation_policy",
+    "target_language",
+    "target_script",
+    "shaping_locale",
     "source_visual_cell",
+    "source_writing_mode",
+    "target_optical_reference_em_px",
+    "target_fit_start_em_px",
     "target_preferred_em_px",
     "target_preferred_em_interval_px",
     "target_face_profile_id",
     "target_em_conversion_audit",
+    "target_size_preference",
     "fill",
     "outline",
     "writing_mode",
@@ -192,6 +208,12 @@ class ParentExecutionBundle:
     cleanup_mode: str = ""
     text_area_container_id: str = ""
     text_area_container_type: str = ""
+    text_area_container_bbox: list[int] = field(default_factory=list)
+    text_area_container_polygon: list[list[float]] = field(default_factory=list)
+    text_area_oriented_frame: dict[str, Any] = field(default_factory=dict)
+    target_language: str = ""
+    target_presentation_policy: dict[str, Any] = field(default_factory=dict)
+    render_layout_domain: dict[str, Any] = field(default_factory=dict)
     confidence: float | None = None
     reason_codes: list[str] = field(default_factory=list)
     unresolved_reason: str | None = None
@@ -248,6 +270,18 @@ class ParentExecutionBundle:
             "cleanup_mode": self.cleanup_mode,
             "text_area_container_id": self.text_area_container_id,
             "text_area_container_type": self.text_area_container_type,
+            "text_area_container_bbox": list(self.text_area_container_bbox),
+            "text_area_container_polygon": _copy_jsonish(
+                self.text_area_container_polygon
+            ),
+            "text_area_oriented_frame": _copy_jsonish(
+                self.text_area_oriented_frame
+            ),
+            "target_language": self.target_language,
+            "target_presentation_policy": _copy_jsonish(
+                self.target_presentation_policy
+            ),
+            "render_layout_domain": _copy_jsonish(self.render_layout_domain),
             "confidence": self.confidence,
             "reason_codes": list(self.reason_codes),
             "unresolved_reason": self.unresolved_reason,
@@ -311,6 +345,11 @@ class ParentExecutionBundle:
             "text_area_authorization_field_origin": "parent_execution_bundle",
             "authorization_basis": "finalized_parent_execution_bundle",
             "source_stage": "parent_execution_bundle",
+            "target_language": self.target_language,
+            "target_presentation_policy": _copy_jsonish(
+                self.target_presentation_policy
+            ),
+            "render_layout_domain": _copy_jsonish(self.render_layout_domain),
             "execution_region_authority": "parent_execution_bundle",
             "execution_region_role": "parent_execution",
             "legacy_region_execution_authority": False,
@@ -320,6 +359,14 @@ class ParentExecutionBundle:
             "text_area_route_intent": route_intent,
             "container_type": container_type,
             "text_area_container_type": container_type,
+            "text_area_container_id": self.text_area_container_id,
+            "text_area_container_bbox": list(self.text_area_container_bbox),
+            "text_area_container_polygon": _copy_jsonish(
+                self.text_area_container_polygon
+            ),
+            "text_area_oriented_frame": _copy_jsonish(
+                self.text_area_oriented_frame
+            ),
             "cleanup_mode": cleanup_mode,
             "ocr_text": self.source_text,
             "source_text": self.source_text,
@@ -423,7 +470,22 @@ class ParentExecutionBundle:
                 "container_type": container_type,
                 "text_area_container_type": container_type,
                 "text_area_container_id": self.text_area_container_id,
-                "text_area_container_bbox": list(root_bbox),
+                "text_area_container_bbox": list(
+                    self.text_area_container_bbox
+                ),
+                "text_area_container_polygon": _copy_jsonish(
+                    self.text_area_container_polygon
+                ),
+                "text_area_oriented_frame": _copy_jsonish(
+                    self.text_area_oriented_frame
+                ),
+                "target_language": self.target_language,
+                "target_presentation_policy": _copy_jsonish(
+                    self.target_presentation_policy
+                ),
+                "render_layout_domain": _copy_jsonish(
+                    self.render_layout_domain
+                ),
                 "cleanup_allowed_area": list(render_allowed),
                 "allowed_cleanup_area": list(render_allowed),
                 "render_allowed_area": list(render_allowed),
@@ -497,7 +559,13 @@ def build_parent_execution_bundles(
     page_id: str,
     hierarchy_result: Any,
     regions: Sequence[Mapping[str, Any]],
+    target_presentation_policy: TargetPresentationPolicy | None = None,
 ) -> ParentExecutionBundleResult:
+    presentation_policy = (
+        target_presentation_policy
+        if isinstance(target_presentation_policy, TargetPresentationPolicy)
+        else target_presentation_policy_for_language("Simplified Chinese")
+    )
     finalized = hierarchy_result.finalized_execution_units()
     root_by_id = {
         str(getattr(root, "root_id", "") or ""): root
@@ -542,6 +610,7 @@ def build_parent_execution_bundles(
             root_by_id=root_by_id,
             parent_by_id=parent_by_id,
             region_by_id=region_by_id,
+            target_presentation_policy=presentation_policy,
         )
         result.bundles.append(bundle)
 
@@ -552,6 +621,7 @@ def build_parent_execution_bundles(
             root_by_id=root_by_id,
             parent_by_id=parent_by_id,
             region_by_id=region_by_id,
+            target_presentation_policy=presentation_policy,
         )
         result.blocked_bundles.append(bundle)
 
@@ -665,6 +735,22 @@ def parent_execution_bundles_from_audit_records(
             cleanup_mode=str(record.get("cleanup_mode") or ""),
             text_area_container_id=str(record.get("text_area_container_id") or ""),
             text_area_container_type=str(record.get("text_area_container_type") or ""),
+            text_area_container_bbox=_bbox(
+                record.get("text_area_container_bbox")
+            ),
+            text_area_container_polygon=_polygon(
+                record.get("text_area_container_polygon")
+            ),
+            text_area_oriented_frame=_copy_mapping(
+                record.get("text_area_oriented_frame")
+            ),
+            target_language=str(record.get("target_language") or ""),
+            target_presentation_policy=_copy_mapping(
+                record.get("target_presentation_policy")
+            ),
+            render_layout_domain=_copy_mapping(
+                record.get("render_layout_domain")
+            ),
             confidence=_float_or_none(record.get("confidence")),
             reason_codes=_list_strings(record.get("reason_codes")),
             unresolved_reason=record.get("unresolved_reason"),
@@ -888,6 +974,7 @@ def _bundle_from_finalized_parent(
     root_by_id: Mapping[str, Any],
     parent_by_id: Mapping[str, Any],
     region_by_id: Mapping[str, Mapping[str, Any]],
+    target_presentation_policy: TargetPresentationPolicy,
 ) -> ParentExecutionBundle:
     parent_id = str(getattr(parent, "parent_id", "") or "")
     root_id = str(getattr(parent, "root_id", "") or "")
@@ -997,6 +1084,39 @@ def _bundle_from_finalized_parent(
     source_text = str(getattr(parent, "source_text", "") or "")
     translation_required = bool(getattr(parent, "translation_required", False))
     translated_text = source_text if _is_punctuation_identity_parent(state, source_action, source_state) else ""
+    container_id = str(
+        primary_region.get("text_area_container_id")
+        or primary_render.get("text_area_container_id")
+        or ""
+    )
+    container_type = str(
+        primary_region.get("text_area_container_type")
+        or primary_render.get("text_area_container_type")
+        or _container_type_for_role(role)
+    )
+    container_bbox = _best_bbox(
+        primary_region.get("text_area_container_bbox"),
+        primary_render.get("text_area_container_bbox"),
+    )
+    container_polygon = _polygon(
+        primary_region.get("text_area_container_polygon")
+        or primary_render.get("text_area_container_polygon")
+    )
+    oriented_frame = _copy_mapping(
+        primary_region.get("text_area_oriented_frame")
+        or primary_render.get("text_area_oriented_frame")
+    )
+    render_layout_domain = _parent_render_layout_domain(
+        source_bounds=render_allowed,
+        container_id=container_id,
+        container_type=container_type,
+        container_bbox=container_bbox,
+        container_polygon=container_polygon,
+        oriented_frame=oriented_frame,
+        region=primary_region,
+        render=primary_render,
+        policy=target_presentation_policy,
+    )
     return ParentExecutionBundle(
         page_id=page_id,
         bundle_id=parent_id,
@@ -1033,22 +1153,227 @@ def _bundle_from_finalized_parent(
         semantic_class=_semantic_class_for_role(role),
         route_intent=_route_intent_for_role(role),
         cleanup_mode=_cleanup_mode_for_role(role),
-        text_area_container_id=str(
-            primary_region.get("text_area_container_id")
-            or primary_render.get("text_area_container_id")
-            or ""
+        text_area_container_id=container_id,
+        text_area_container_type=container_type,
+        text_area_container_bbox=container_bbox,
+        text_area_container_polygon=container_polygon,
+        text_area_oriented_frame=oriented_frame,
+        target_language=target_presentation_policy.target_language,
+        target_presentation_policy=(
+            target_presentation_policy.to_contract_dict()
         ),
-        text_area_container_type=str(
-            primary_region.get("text_area_container_type")
-            or primary_render.get("text_area_container_type")
-            or _container_type_for_role(role)
-        ),
+        render_layout_domain=render_layout_domain,
         confidence=_float_or_none(getattr(parent_unit, "confidence", None)),
         reason_codes=_list_strings(getattr(parent, "reason_codes", [])),
         unresolved_reason=getattr(parent, "unresolved_reason", None),
         translated_text=translated_text,
         render_style={},
     )
+
+
+def _parent_render_layout_domain(
+    *,
+    source_bounds: Sequence[Any],
+    container_id: str,
+    container_type: str,
+    container_bbox: Sequence[Any],
+    container_polygon: Sequence[Any],
+    oriented_frame: Mapping[str, Any],
+    region: Mapping[str, Any],
+    render: Mapping[str, Any],
+    policy: TargetPresentationPolicy,
+) -> dict[str, Any]:
+    source = _bbox(source_bounds)
+    container = _bbox(container_bbox)
+    polygon = _polygon(container_polygon)
+    frame = _copy_mapping(oriented_frame)
+    conflicts = _list_strings(
+        region.get("text_area_conflict_flags")
+        or render.get("text_area_conflict_flags")
+    )
+    explicit = bool(
+        region.get("text_area_authorization_explicit")
+        or render.get("text_area_authorization_explicit")
+    )
+    protected = bool(
+        region.get("text_area_must_not_mutate")
+        or render.get("text_area_must_not_mutate")
+    )
+    authorization = str(
+        region.get("text_area_semantic_authorization_state")
+        or render.get("text_area_semantic_authorization_state")
+        or ""
+    )
+    source_inside_container = _xywh_contains(container, source)
+    supported = bool(
+        source
+        and container
+        and source_inside_container
+        and container_id
+        and container_type == "speech_bubble"
+        and explicit
+        and not protected
+        and not conflicts
+        and authorization == "cleanup_translate_speech"
+    )
+    if supported:
+        source_side_anchor = {
+            "policy_version": SOURCE_SIDE_ANCHOR_POLICY_VERSION,
+            "status": "not_applicable",
+            "reason": "automatic_domain_policy_does_not_request_anchor",
+        }
+        if policy.automatic_domain_policy == (
+            "source_side_anchored_speech_container_or_source"
+        ):
+            automatic, source_side_anchor = _source_side_anchored_container_bounds(
+                source,
+                container,
+            )
+            status = "authorized_source_side_anchored_speech_container"
+            reasons = [
+                "exact_text_area_plan_speech_container",
+                "source_side_anchor_preserved",
+            ]
+        elif policy.automatic_domain_policy == (
+            "authorized_speech_container_or_source"
+        ):
+            automatic = list(container)
+            status = "authorized_speech_container"
+            reasons = ["exact_text_area_plan_speech_container"]
+        else:
+            automatic = list(source)
+            status = "authorized_speech_container"
+            reasons = ["exact_text_area_plan_speech_container"]
+        editable = list(container)
+    else:
+        automatic = list(source)
+        editable = list(source)
+        status = "conservative_source_bounds"
+        reasons = [
+            reason
+            for reason, present in (
+                ("source_bounds_missing", not source),
+                ("container_bbox_missing", not container),
+                ("source_outside_container", not source_inside_container),
+                ("container_id_missing", not container_id),
+                ("container_not_speech", container_type != "speech_bubble"),
+                ("container_authorization_not_explicit", not explicit),
+                ("container_protected", protected),
+                ("container_conflicted", bool(conflicts)),
+                (
+                    "container_not_cleanup_translate_speech",
+                    authorization != "cleanup_translate_speech",
+                ),
+            )
+            if present
+        ]
+        source_side_anchor = {
+            "policy_version": SOURCE_SIDE_ANCHOR_POLICY_VERSION,
+            "status": "not_applied",
+            "reason": "container_domain_not_supported",
+        }
+    return {
+        "contract_version": "parent_render_domain_v1",
+        "policy_id": policy.policy_id,
+        "status": status,
+        "source_bounds": list(source),
+        "automatic_bounds": automatic,
+        "editable_bounds": editable,
+        "container_id": str(container_id or ""),
+        "container_type": str(container_type or ""),
+        "container_bbox": list(container),
+        "container_polygon": _copy_jsonish(polygon),
+        "oriented_frame": _copy_jsonish(frame),
+        "container_authorization_state": authorization,
+        "container_conflict_flags": conflicts,
+        "provenance": "TextAreaPlan",
+        "reason_codes": reasons,
+        "source_side_anchor": source_side_anchor,
+    }
+
+
+def _xywh_contains(outer: Sequence[Any], inner: Sequence[Any]) -> bool:
+    outer_box = _bbox(outer)
+    inner_box = _bbox(inner)
+    if not outer_box or not inner_box:
+        return False
+    outer_x, outer_y, outer_w, outer_h = outer_box
+    inner_x, inner_y, inner_w, inner_h = inner_box
+    return bool(
+        outer_x <= inner_x
+        and outer_y <= inner_y
+        and inner_x + inner_w <= outer_x + outer_w
+        and inner_y + inner_h <= outer_y + outer_h
+    )
+
+
+def _source_side_anchored_container_bounds(
+    source: Sequence[Any],
+    container: Sequence[Any],
+) -> tuple[list[int], dict[str, Any]]:
+    """Expand vertically while preserving the source text's horizontal side.
+
+    Manga bubbles often contain tails, icons, or decorative art opposite a
+    source text column.  English may use the authorized container, but it must
+    not automatically cross that evidence-backed source-side anchor merely to
+    obtain a wider rectangle.  A small deterministic center tolerance avoids
+    treating detection noise as a meaningful side preference.
+    """
+
+    source_box = _bbox(source)
+    container_box = _bbox(container)
+    if not _xywh_contains(container_box, source_box):
+        return list(source_box), {
+            "policy_version": SOURCE_SIDE_ANCHOR_POLICY_VERSION,
+            "status": "not_applied",
+            "reason": "source_outside_container",
+        }
+    source_x, _source_y, source_w, _source_h = source_box
+    container_x, container_y, container_w, container_h = container_box
+    source_center = source_x + source_w / 2.0
+    container_center = container_x + container_w / 2.0
+    center_tolerance = max(
+        SOURCE_SIDE_ANCHOR_CENTER_TOLERANCE_MIN_PX,
+        container_w * SOURCE_SIDE_ANCHOR_CENTER_TOLERANCE_RATIO,
+    )
+    relation = "centered"
+    if source_center > container_center + center_tolerance:
+        relation = "right"
+        bounds = [
+            source_x,
+            container_y,
+            container_x + container_w - source_x,
+            container_h,
+        ]
+    elif source_center < container_center - center_tolerance:
+        relation = "left"
+        bounds = [
+            container_x,
+            container_y,
+            source_x + source_w - container_x,
+            container_h,
+        ]
+    else:
+        bounds = list(container_box)
+    return bounds, {
+        "policy_version": SOURCE_SIDE_ANCHOR_POLICY_VERSION,
+        "status": "applied",
+        "source_horizontal_relation": relation,
+        "source_center_x": round(float(source_center), 6),
+        "container_center_x": round(float(container_center), 6),
+        "center_delta_x": round(float(source_center - container_center), 6),
+        "center_tolerance_px": round(float(center_tolerance), 6),
+        "center_tolerance_ratio": (
+            SOURCE_SIDE_ANCHOR_CENTER_TOLERANCE_RATIO
+        ),
+        "center_tolerance_min_px": (
+            SOURCE_SIDE_ANCHOR_CENTER_TOLERANCE_MIN_PX
+        ),
+        "automatic_bounds": list(bounds),
+        "editable_bounds": list(container_box),
+        "translation_content_consulted": False,
+        "render_output_consulted": False,
+    }
 
 
 def _is_punctuation_identity_parent(state: str, source_action: str, source_state: str) -> bool:
@@ -1115,6 +1440,20 @@ def _sync_execution_region_from_bundle(
     record["execution_region_role"] = "parent_execution"
     record["legacy_region_execution_authority"] = False
     record["source_region_evidence_only"] = True
+    record["text_area_container_id"] = bundle.text_area_container_id
+    record["text_area_container_type"] = bundle.text_area_container_type
+    record["text_area_container_bbox"] = list(bundle.text_area_container_bbox)
+    record["text_area_container_polygon"] = _copy_jsonish(
+        bundle.text_area_container_polygon
+    )
+    record["text_area_oriented_frame"] = _copy_jsonish(
+        bundle.text_area_oriented_frame
+    )
+    record["target_language"] = bundle.target_language
+    record["target_presentation_policy"] = _copy_jsonish(
+        bundle.target_presentation_policy
+    )
+    record["render_layout_domain"] = _copy_jsonish(bundle.render_layout_domain)
     _clear_executable_style_fields(record)
     _clear_executable_style_fields(render)
     render_style = resolved_render_style_contract(bundle.render_style)
@@ -1167,6 +1506,20 @@ def _sync_execution_region_from_bundle(
     render["execution_region_role"] = "parent_execution"
     render["legacy_region_execution_authority"] = False
     render["source_region_evidence_only"] = True
+    render["text_area_container_id"] = bundle.text_area_container_id
+    render["text_area_container_type"] = bundle.text_area_container_type
+    render["text_area_container_bbox"] = list(bundle.text_area_container_bbox)
+    render["text_area_container_polygon"] = _copy_jsonish(
+        bundle.text_area_container_polygon
+    )
+    render["text_area_oriented_frame"] = _copy_jsonish(
+        bundle.text_area_oriented_frame
+    )
+    render["target_language"] = bundle.target_language
+    render["target_presentation_policy"] = _copy_jsonish(
+        bundle.target_presentation_policy
+    )
+    render["render_layout_domain"] = _copy_jsonish(bundle.render_layout_domain)
 
 
 def _validate_bundle_result(result: ParentExecutionBundleResult) -> None:
@@ -1248,9 +1601,10 @@ def _resolved_render_style_from_region(record: Mapping[str, Any]) -> dict[str, A
 
 
 def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
-    """Validate and isolate the sole executable ``parent_render_style_v3``.
+    """Validate and isolate the sole executable ``parent_render_style_v4``.
 
-    The gate deliberately accepts no v2 aliases or compatibility projection.
+    Stored v3 records receive only the conservative pixel-preserving migration
+    defined below; the gate accepts no v2 aliases or flattened projection.
     Style evidence and target realization belong to ``ParentStyleArbitrator``;
     this function only enforces the complete handoff consumed by rendering.
     """
@@ -1266,6 +1620,8 @@ def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
             status="rejected",
             reason_codes=("resolved_render_style_not_json_mapping",),
         )
+    if style.get("render_style_version") == "parent_render_style_v3":
+        style = _upgrade_legacy_render_style_v3(style)
 
     reasons: list[str] = []
     keys = {key for key in style if isinstance(key, str)}
@@ -1318,6 +1674,32 @@ def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
     if style.get("fallback_font_chain_key") != PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY:
         reasons.append("fallback_font_chain_key_invalid")
 
+    presentation = style.get("target_presentation_policy")
+    if not isinstance(presentation, Mapping):
+        reasons.append("target_presentation_policy_invalid")
+        presentation = {}
+    elif presentation.get("contract_version") != "target_presentation_policy_v1":
+        reasons.append("target_presentation_policy_invalid")
+    target_language = style.get("target_language")
+    target_script = style.get("target_script")
+    shaping_locale = style.get("shaping_locale")
+    if target_language not in {"zh-Hans", "en"}:
+        reasons.append("target_language_invalid")
+    if target_script not in {"Hani", "Latn"}:
+        reasons.append("target_script_invalid")
+    if not isinstance(shaping_locale, str) or not shaping_locale:
+        reasons.append("shaping_locale_invalid")
+    if presentation:
+        for key, actual in (
+            ("target_language", target_language),
+            ("target_script", target_script),
+            ("shaping_locale", shaping_locale),
+        ):
+            if presentation.get(key) != actual:
+                reasons.append(f"target_presentation_{key}_mismatch")
+    if style.get("source_writing_mode") not in _PARENT_STYLE_WRITING_MODES:
+        reasons.append("source_writing_mode_invalid")
+
     source_cell = style.get("source_visual_cell")
     if not isinstance(source_cell, Mapping):
         reasons.append("source_visual_cell_invalid")
@@ -1349,9 +1731,25 @@ def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
         if source_cell.get("authority") != "fallback":
             reasons.append("source_visual_cell_authority_invalid")
 
+    optical_reference_em = _finite_number(
+        style.get("target_optical_reference_em_px")
+    )
+
+
+    fit_start_em = _finite_number(style.get("target_fit_start_em_px"))
     preferred_em = _finite_number(style.get("target_preferred_em_px"))
+    if optical_reference_em is None or optical_reference_em <= 0.0:
+        reasons.append("target_optical_reference_em_invalid")
+    if fit_start_em is None or fit_start_em <= 0.0:
+        reasons.append("target_fit_start_em_invalid")
     if preferred_em is None or preferred_em <= 0.0:
         reasons.append("target_preferred_em_invalid")
+    if (
+        fit_start_em is not None
+        and preferred_em is not None
+        and abs(fit_start_em - preferred_em) > 1e-6
+    ):
+        reasons.append("target_fit_start_preferred_alias_mismatch")
     interval = style.get("target_preferred_em_interval_px")
     if not isinstance(interval, list) or len(interval) != 2:
         reasons.append("target_preferred_em_interval_invalid")
@@ -1364,12 +1762,22 @@ def validate_resolved_render_style(value: Any) -> ResolvedRenderStyleValidation:
             or high < low
             or preferred_em is None
             or not low <= preferred_em <= high
+            or optical_reference_em is None
+            or not low <= optical_reference_em <= high
         ):
             reasons.append("target_preferred_em_interval_invalid")
     if not str(style.get("target_face_profile_id") or ""):
         reasons.append("target_face_profile_id_missing")
     if not isinstance(style.get("target_em_conversion_audit"), Mapping):
         reasons.append("target_em_conversion_audit_invalid")
+    size_preference = style.get("target_size_preference")
+    if not isinstance(size_preference, Mapping):
+        reasons.append("target_size_preference_invalid")
+    else:
+        if size_preference.get("never_decrease") is not True:
+            reasons.append("target_size_preference_invalid")
+        if size_preference.get("render_admission") is not False:
+            reasons.append("target_size_preference_invalid")
 
     fill = style.get("fill")
     if not isinstance(fill, Mapping):
@@ -1478,6 +1886,84 @@ def _finite_number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _upgrade_legacy_render_style_v3(
+    style: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one stored v3 style into a pixel-preserving CJK v4 view."""
+
+    upgraded = _copy_jsonish(style)
+    if not isinstance(upgraded, dict):
+        return {}
+    preferred = _finite_number(upgraded.get("target_preferred_em_px"))
+    if preferred is None or preferred <= 0.0:
+        return upgraded
+    source_cell = upgraded.get("source_visual_cell")
+    source_mode = (
+        str(source_cell.get("writing_mode") or "")
+        if isinstance(source_cell, Mapping)
+        else ""
+    ) or str(upgraded.get("writing_mode") or "vertical")
+    presentation = {
+        "contract_version": "target_presentation_policy_v1",
+        "policy_id": "target-presentation:zh-Hans:v1",
+        "target_language": "zh-Hans",
+        "target_script": "Hani",
+        "shaping_locale": "zh-Hans",
+        "block_mode_policy": "preserve_source",
+        "optical_profile_key": "cjk",
+        "measured_fallback_size_policy": (
+            "upper_supported_non_decreasing"
+        ),
+        "automatic_domain_policy": "source_parent",
+        "editable_domain_policy": (
+            "authorized_speech_container_or_source"
+        ),
+    }
+    source_status = (
+        str(source_cell.get("status") or "unavailable")
+        if isinstance(source_cell, Mapping)
+        else "unavailable"
+    )
+    preference = {
+        "contract_version": "target_size_preference_v1",
+        "policy_id": "legacy_v3_preserved",
+        "source_scale_status": source_status,
+        "central_optical_reference_em_px": preferred,
+        "upper_supported_em_px": None,
+        "fit_start_em_px": preferred,
+        "never_decrease": True,
+        "translation_content_consulted": False,
+        "fit_output_consulted": False,
+        "geometry_consulted": False,
+        "render_admission": False,
+    }
+    audit = upgraded.get("target_em_conversion_audit")
+    audit = _copy_jsonish(audit) if isinstance(audit, Mapping) else {}
+    audit["target_presentation_policy"] = presentation
+    audit["target_size_preference"] = preference
+    audit["legacy_contract_migration"] = {
+        "status": "pixel_preserving_cjk_projection",
+        "source_version": "parent_render_style_v3",
+        "target_version": "parent_render_style_v4",
+    }
+    upgraded.update(
+        {
+            "render_style_version": "parent_render_style_v4",
+            "target_presentation_policy": presentation,
+            "target_language": "zh-Hans",
+            "target_script": "Hani",
+            "shaping_locale": "zh-Hans",
+            "source_writing_mode": source_mode,
+            "target_optical_reference_em_px": preferred,
+            "target_fit_start_em_px": preferred,
+            "target_preferred_em_px": preferred,
+            "target_em_conversion_audit": audit,
+            "target_size_preference": preference,
+        }
+    )
+    return upgraded
 
 
 def _clear_executable_style_fields(record: dict[str, Any]) -> None:
@@ -1596,6 +2082,33 @@ def _bbox(value: Any) -> list[int]:
         return [int(round(float(value[0]))), int(round(float(value[1]))), int(round(float(value[2]))), int(round(float(value[3])))]
     except Exception:
         return []
+
+
+def _polygon(value: Any) -> list[list[float]]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+    ):
+        return []
+    points: list[list[float]] = []
+    for point in value:
+        if (
+            not isinstance(point, Sequence)
+            or isinstance(point, (str, bytes, bytearray))
+            or len(point) < 2
+        ):
+            return []
+        try:
+            x = float(point[0])
+            y = float(point[1])
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(x) or not math.isfinite(y):
+            return []
+        points.append([x, y])
+    if len(points) > 1 and points[0] == points[-1]:
+        points.pop()
+    return points if len(points) >= 3 else []
 
 
 def _valid_bbox(value: Any) -> bool:

@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from app.render.typesetting_text import BreakOpportunity, classify_grapheme
 
 
-LINE_BREAK_PLANNER_VERSION = "line_break_planner_v4_ordered_evidence"
+LINE_BREAK_PLANNER_VERSION = "line_break_planner_v5_latin_comma_orphan"
 LEXICOGRAPHIC_VERTICAL_ORDER = [
     "hard_legality",
     "fit",
@@ -521,12 +521,17 @@ class LineBreakPlanner:
         line_limit = max(1, int(max_lines or 1))
         candidate_records: list[dict[str, Any]] = []
         candidates: list[tuple[tuple[Any, ...], _HorizontalPath, list[list[dict[str, Any]]], dict[str, Any]]] = []
+        segment_metric_cache: dict[
+            tuple[int, int],
+            tuple[float, int, float],
+        ] = {}
         for line_count in range(1, len(values) + 1):
             path, evaluated = _best_horizontal_path(
                 values,
                 boundary_by_split,
                 line_count=line_count,
                 max_width=width_limit,
+                segment_metric_cache=segment_metric_cache,
             )
             if path is None:
                 candidate_records.append(
@@ -632,6 +637,9 @@ class LineBreakPlanner:
             "selected_lines": selected_lines,
             "split_points": list(selected_path.breaks[:-1]),
             "line_widths": [round(_items_advance(group), 3) for group in groups],
+            "horizontal_break_quality_rules": [
+                "nonterminal_single_latin_word_comma_orphan",
+            ],
             "selected_lexicographic_key": selected_record.get("lexicographic_key", {}),
             "canonical_break_quality": selected_record.get(
                 "canonical_break_quality",
@@ -951,6 +959,10 @@ def _best_horizontal_path(
     *,
     line_count: int,
     max_width: float,
+    segment_metric_cache: dict[
+        tuple[int, int],
+        tuple[float, int, float],
+    ] | None = None,
 ) -> tuple[_HorizontalPath | None, int]:
     count = len(items)
     if line_count <= 0 or line_count > count:
@@ -988,18 +1000,35 @@ def _best_horizontal_path(
                 evaluated += 1
                 width = max(0.0, prefix[end] - prefix[start])
                 overflow = max(0.0, width - max_width)
-                segment = items[start:end]
                 confirmed_count, confirmed_rank, weak_count, weak_rank = (
                     _boundary_lexical_evidence(boundary)
                 )
                 conflict_count = _boundary_conflict_uncertainty(boundary)
-                punctuation = _horizontal_whitespace_penalty(segment)
+                metric_key = (start, end)
+                metrics = (
+                    segment_metric_cache.get(metric_key)
+                    if segment_metric_cache is not None
+                    else None
+                )
+                if metrics is None:
+                    segment = items[start:end]
+                    metrics = (
+                        _horizontal_whitespace_penalty(segment),
+                        _segment_phrase_boundary_crossing_count(segment),
+                        _segment_quality_penalty(items, start, end)
+                        + (
+                            _horizontal_latin_word_comma_orphan_penalty(
+                                segment
+                            )
+                            if end < count
+                            else 0.0
+                        ),
+                    )
+                    if segment_metric_cache is not None:
+                        segment_metric_cache[metric_key] = metrics
+                punctuation, phrase_boundary_crossings, segment_quality = metrics
                 if end < count:
                     punctuation += _break_strength_penalty(boundary)
-                phrase_boundary_crossings = (
-                    _segment_phrase_boundary_crossing_count(segment)
-                )
-                segment_quality = _segment_quality_penalty(items, start, end)
                 raggedness = max(0.0, max_width - min(max_width, width))
                 candidate = _HorizontalPath(
                     breaks=(*path.breaks, end),
@@ -1342,6 +1371,34 @@ def _horizontal_whitespace_penalty(segment: Sequence[Mapping[str, Any]]) -> floa
     if texts and texts[0].isspace():
         penalty += 2.0
     return penalty
+
+
+def _horizontal_latin_word_comma_orphan_penalty(
+    segment: Sequence[Mapping[str, Any]],
+) -> float:
+    """Prefer a peer fit over a line containing only ``LatinWord,``.
+
+    The break remains legal and fit retains higher priority. This rule only
+    resolves same-line-count quality choices when another fitting partition
+    can carry the comma-led phrase forward.
+    """
+
+    visible = [
+        item
+        for item in segment
+        if str(item.get("text") or "")
+        and not str(item.get("text") or "").isspace()
+    ]
+    if len(visible) != 2:
+        return 0.0
+    word, comma = visible
+    if (
+        str(word.get("script") or "") != "Latn"
+        or str(word.get("role") or "") != "latin_word"
+        or str(comma.get("text") or "") not in {",", "，"}
+    ):
+        return 0.0
+    return 1.0
 
 
 def _item_row_units(item: Mapping[str, Any]) -> float:

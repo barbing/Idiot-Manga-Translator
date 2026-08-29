@@ -144,6 +144,26 @@ class TypesettingEngine:
         self.lexical_segmenter = (
             lexical_segmenter or default_target_lexical_segmenter()
         )
+        self._horizontal_fit_upper_bounds: dict[
+            tuple[Any, ...],
+            list[tuple[list[int], int]],
+        ] = {}
+        self._shape_runs_cache: dict[
+            tuple[Any, ...],
+            tuple[tuple[ShapedRun, ...], tuple[RunFontResolution, ...]],
+        ] = {}
+        self._horizontal_break_plan_cache: dict[
+            tuple[Any, ...],
+            Any,
+        ] = {}
+        self._font_resolution_cache: dict[
+            tuple[Any, ...],
+            FontResolution,
+        ] = {}
+        self._font_span_expansion_cache: dict[
+            tuple[Any, ...],
+            tuple[tuple[InlineTextRun, ...], tuple[FontSpanResolution, ...]],
+        ] = {}
 
     def typeset_layer(self, plan: RenderLayerPlan) -> tuple[TypesetLayout, FitReport]:
         missing = _missing_identity(plan)
@@ -174,14 +194,22 @@ class TypesettingEngine:
                 ["invalid_resolved_render_style_font_size"],
                 hard_bounds=hard_bounds,
             )
-        resolved = self.font_manager.resolve_font(
-            plan.resolved_render_style,
-            fallback_chain_key=str(
-                plan.resolved_render_style.get("fallback_font_chain_key") or ""
-            ),
+        font_resolution_key = _font_resolution_cache_key(
+            plan,
             writing_mode=writing_mode,
-            text=plan.translated_text,
         )
+        resolved = self._font_resolution_cache.get(font_resolution_key)
+        if resolved is None:
+            resolved = self.font_manager.resolve_font(
+                plan.resolved_render_style,
+                fallback_chain_key=str(
+                    plan.resolved_render_style.get("fallback_font_chain_key")
+                    or ""
+                ),
+                writing_mode=writing_mode,
+                text=plan.translated_text,
+            )
+            self._font_resolution_cache[font_resolution_key] = resolved
         if not resolved.usable or resolved.primary_face is None:
             return self._failed(plan, "missing_font", list(resolved.issues or ["missing_font"]), hard_bounds=hard_bounds)
         face = resolved.primary_face
@@ -224,6 +252,7 @@ class TypesettingEngine:
                 logical_runs,
                 resolved,
                 writing_mode=writing_mode,
+                cache_namespace=str(plan.bundle_id or ""),
             )
         except RuntimeError as exc:
             issue = str(exc)
@@ -320,19 +349,64 @@ class TypesettingEngine:
             plan.resolved_render_style,
         )
         lexical_candidate_selection_reason = ""
-        for font_size in _font_size_candidates(
-            preferred_font_size,
-            plan.resolved_render_style,
-            self.policy,
-            target_box,
-            plan.metadata,
-        ):
+        candidate_search_start = preferred_font_size
+        fit_upper_bound_sources: list[dict[str, Any]] = []
+        fit_upper_bound_key: tuple[Any, ...] | None = None
+        if writing_mode == "horizontal":
+            fit_upper_bound_key = _horizontal_fit_upper_bound_key(
+                plan,
+                preferred_font_size=preferred_font_size,
+                hard_bounds=hard_bounds,
+            )
+            for prior_box, prior_size in self._horizontal_fit_upper_bounds.get(
+                fit_upper_bound_key,
+                [],
+            ):
+                if _box_inside(target_box, prior_box):
+                    candidate_search_start = min(
+                        candidate_search_start,
+                        int(prior_size),
+                    )
+                    fit_upper_bound_sources.append(
+                        {
+                            "verified_container_box": list(prior_box),
+                            "verified_fit_font_size": int(prior_size),
+                        }
+                    )
+        competitive_probe_size = max(
+            0,
+            _positive_rounded_int(
+                (
+                    plan.metadata.get("competitive_fit_probe_font_size")
+                    if isinstance(plan.metadata, Mapping)
+                    else None
+                )
+            ),
+        )
+        if competitive_probe_size:
+            candidate_search_start = min(
+                candidate_search_start,
+                competitive_probe_size,
+            )
+        font_size_candidates = (
+            [candidate_search_start]
+            if competitive_probe_size
+            else _font_size_candidates(
+                candidate_search_start,
+                plan.resolved_render_style,
+                self.policy,
+                target_box,
+                plan.metadata,
+            )
+        )
+        for font_size in font_size_candidates:
             shaped_runs, run_font_resolutions = self._shape_runs(
                 runs,
                 resolved,
                 font_size,
                 writing_mode,
                 font_spans_by_id,
+                cache_namespace=str(plan.bundle_id or ""),
             )
             notdef_run_ids = _visible_notdef_run_ids(shaped_runs)
             if notdef_run_ids:
@@ -382,6 +456,7 @@ class TypesettingEngine:
                     layout_intent_box,
                     font_size,
                     plan.resolved_render_style,
+                    cache_namespace=str(plan.bundle_id or ""),
                 )
             else:
                 placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_vertical(
@@ -698,6 +773,11 @@ class TypesettingEngine:
                 and lexical_candidate_selection_reason
                 == "source_preferred_interval_size_adjustment"
             )
+            else "verified_parent_box_fit_upper_bound"
+            if (
+                candidate_search_start < preferred_font_size
+                and fit_status == "fits"
+            )
             else "preferred_layout"
             if candidate_rank == 0 and fit_status == "fits"
             else "layout_fit_pressure"
@@ -705,6 +785,19 @@ class TypesettingEngine:
             else "complete_layout_scale_to_box_fallback"
         )
         full_text_placed = text_placement_complete
+        if (
+            writing_mode == "horizontal"
+            and fit_upper_bound_key is not None
+            and fit_status == "fits"
+            and full_text_placed
+            and hard_bounds_contained
+        ):
+            _remember_horizontal_fit_upper_bound(
+                self._horizontal_fit_upper_bounds,
+                fit_upper_bound_key,
+                target_box,
+                font_size,
+            )
         typesetting_candidate_quality = _typesetting_candidate_quality_summary(
             preferred_font_size=preferred_font_size,
             selected_font_size=font_size,
@@ -781,6 +874,19 @@ class TypesettingEngine:
             "open_type_metrics_by_face": open_type_metrics_by_face,
             "font_size_selection": {
                 "preferred_font_size": int(preferred_font_size),
+                "candidate_search_start": int(candidate_search_start),
+                "competitive_fit_probe_font_size": int(
+                    competitive_probe_size or 0
+                ),
+                "competitive_fit_probe_only": bool(competitive_probe_size),
+                "verified_fit_upper_bound_reused": bool(
+                    candidate_search_start < preferred_font_size
+                ),
+                "verified_fit_upper_bound_sources": fit_upper_bound_sources,
+                "skipped_larger_candidate_count": max(
+                    0,
+                    int(preferred_font_size) - int(candidate_search_start),
+                ),
                 "selected_pre_scale_font_size": int(font_size),
                 "selected_font_size": int(font_size),
                 "final_effective_font_size": float(font_size),
@@ -1069,7 +1175,20 @@ class TypesettingEngine:
         font_size: int,
         writing_mode: str,
         font_spans_by_id: Mapping[str, FontSpanResolution],
+        *,
+        cache_namespace: str,
     ) -> tuple[list[ShapedRun], list[RunFontResolution]]:
+        cache_key = _shape_runs_cache_key(
+            runs,
+            resolution,
+            font_size=font_size,
+            writing_mode=writing_mode,
+            font_spans_by_id=font_spans_by_id,
+            cache_namespace=cache_namespace,
+        )
+        cached = self._shape_runs_cache.get(cache_key)
+        if cached is not None:
+            return list(cached[0]), list(cached[1])
         shaped: list[ShapedRun] = []
         run_resolutions: list[RunFontResolution] = []
         for run in runs:
@@ -1156,7 +1275,11 @@ class TypesettingEngine:
                     shaped_run,
                 )
             shaped.append(replace(shaped_run, metadata=shaped_metadata))
-        return shaped, run_resolutions
+        self._shape_runs_cache[cache_key] = (
+            tuple(shaped),
+            tuple(run_resolutions),
+        )
+        return list(shaped), list(run_resolutions)
 
     def _expand_runs_for_font_spans(
         self,
@@ -1164,7 +1287,17 @@ class TypesettingEngine:
         resolution: FontResolution,
         *,
         writing_mode: str,
+        cache_namespace: str,
     ) -> tuple[list[InlineTextRun], list[FontSpanResolution]]:
+        cache_key = _font_span_expansion_cache_key(
+            runs,
+            resolution,
+            writing_mode=writing_mode,
+            cache_namespace=cache_namespace,
+        )
+        cached = self._font_span_expansion_cache.get(cache_key)
+        if cached is not None:
+            return list(cached[0]), list(cached[1])
         expanded: list[InlineTextRun] = []
         span_resolutions: list[FontSpanResolution] = []
         for run in runs:
@@ -1220,7 +1353,11 @@ class TypesettingEngine:
                         metadata=metadata,
                     )
                 )
-        return expanded, span_resolutions
+        self._font_span_expansion_cache[cache_key] = (
+            tuple(expanded),
+            tuple(span_resolutions),
+        )
+        return list(expanded), list(span_resolutions)
 
     def _font_span_failure(
         self,
@@ -2013,6 +2150,8 @@ class TypesettingEngine:
         box: list[int],
         font_size: int,
         style: dict[str, Any],
+        *,
+        cache_namespace: str,
     ) -> tuple[
         list[GlyphPlacement],
         list[dict[str, Any]],
@@ -2053,12 +2192,22 @@ class TypesettingEngine:
                     "shaped_run": shaped,
                 }
             )
-        break_result = self.break_planner.plan_horizontal(
+        break_cache_key = _horizontal_break_plan_cache_key(
             layout_items,
             breaks,
             max_width=float(w),
             max_lines=max_lines,
+            cache_namespace=cache_namespace,
         )
+        break_result = self._horizontal_break_plan_cache.get(break_cache_key)
+        if break_result is None:
+            break_result = self.break_planner.plan_horizontal(
+                layout_items,
+                breaks,
+                max_width=float(w),
+                max_lines=max_lines,
+            )
+            self._horizontal_break_plan_cache[break_cache_key] = break_result
         line_groups = break_result.groups
         placements: list[GlyphPlacement] = []
         issues: list[str] = list(break_result.issues)
@@ -2180,7 +2329,22 @@ def _missing_identity(plan: RenderLayerPlan) -> list[str]:
 
 
 def _font_size_from_style(style: dict[str, Any]) -> int:
-    value = style.get("target_preferred_em_px") if isinstance(style, dict) else None
+    value = (
+        style.get("target_fit_start_em_px")
+        or style.get("target_preferred_em_px")
+        if isinstance(style, dict)
+        else None
+    )
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number <= 0.0:
+        return 0
+    return max(1, int(round(number)))
+
+
+def _positive_rounded_int(value: Any) -> int:
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -2242,6 +2406,196 @@ def _font_size_candidates(
     if minimum >= preferred:
         return [preferred]
     return list(range(preferred, minimum - 1, -1))
+
+
+def _shape_runs_cache_key(
+    runs: Sequence[InlineTextRun],
+    resolution: FontResolution,
+    *,
+    font_size: int,
+    writing_mode: str,
+    font_spans_by_id: Mapping[str, FontSpanResolution],
+    cache_namespace: str,
+) -> tuple[Any, ...]:
+    return (
+        str(cache_namespace or ""),
+        int(font_size),
+        str(writing_mode or ""),
+        str(
+            resolution.primary_face.face_id
+            if resolution.primary_face is not None
+            else ""
+        ),
+        tuple(face.face_id for face in resolution.fallback_faces),
+        tuple(
+            (
+                run.run_id,
+                run.normalized_text,
+                run.role,
+                run.script,
+                run.language,
+                run.direction,
+                int(run.grapheme_start),
+                int(run.grapheme_end),
+            )
+            for run in runs
+        ),
+        tuple(
+            (
+                run_id,
+                str(
+                    span.selected_face.face_id
+                    if span.selected_face is not None
+                    else ""
+                ),
+                span.text,
+                bool(span.fallback_used),
+            )
+            for run_id, span in sorted(font_spans_by_id.items())
+        ),
+    )
+
+
+def _font_resolution_cache_key(
+    plan: RenderLayerPlan,
+    *,
+    writing_mode: str,
+) -> tuple[Any, ...]:
+    style = (
+        plan.resolved_render_style
+        if isinstance(plan.resolved_render_style, Mapping)
+        else {}
+    )
+    return (
+        str(plan.bundle_id or ""),
+        str(plan.translated_text or ""),
+        str(writing_mode or ""),
+        str(style.get("font_family_role") or ""),
+        str(style.get("font_weight_tier") or ""),
+        str(style.get("primary_font_role") or ""),
+        str(style.get("fallback_font_chain_key") or ""),
+    )
+
+
+def _font_span_expansion_cache_key(
+    runs: Sequence[InlineTextRun],
+    resolution: FontResolution,
+    *,
+    writing_mode: str,
+    cache_namespace: str,
+) -> tuple[Any, ...]:
+    return (
+        str(cache_namespace or ""),
+        str(writing_mode or ""),
+        str(
+            resolution.primary_face.face_id
+            if resolution.primary_face is not None
+            else ""
+        ),
+        tuple(face.face_id for face in resolution.fallback_faces),
+        tuple(
+            (
+                run.run_id,
+                run.normalized_text,
+                run.original_text,
+                run.role,
+                run.script,
+                run.language,
+                run.direction,
+                int(run.grapheme_start),
+                int(run.grapheme_end),
+                tuple(run.token_ids),
+            )
+            for run in runs
+        ),
+    )
+
+
+def _horizontal_break_plan_cache_key(
+    items: Sequence[Mapping[str, Any]],
+    opportunities: Sequence[BreakOpportunity],
+    *,
+    max_width: float,
+    max_lines: int,
+    cache_namespace: str,
+) -> tuple[Any, ...]:
+    return (
+        str(cache_namespace or ""),
+        round(float(max_width), 6),
+        int(max_lines),
+        tuple(
+            (
+                str(item.get("run_id") or ""),
+                str(item.get("text") or ""),
+                round(float(item.get("advance") or 0.0), 6),
+                str(item.get("role") or ""),
+                str(item.get("script") or ""),
+            )
+            for item in items
+        ),
+        tuple(
+            (
+                str(item.before_run_id),
+                str(item.after_run_id),
+                int(item.position),
+                bool(item.allowed),
+                str(item.strength),
+                str(item.reason),
+                int(item.metadata.get("confirmed_lexical_break_rank") or 0),
+                int(item.metadata.get("weak_lexical_break_rank") or 0),
+                bool(item.metadata.get("lexical_evidence_conflict")),
+                bool(item.metadata.get("lexical_boundary_conflict")),
+                str(item.metadata.get("lexical_boundary_state") or ""),
+            )
+            for item in opportunities
+        ),
+    )
+
+
+def _horizontal_fit_upper_bound_key(
+    plan: RenderLayerPlan,
+    *,
+    preferred_font_size: int,
+    hard_bounds: Sequence[int],
+) -> tuple[Any, ...]:
+    style = (
+        plan.resolved_render_style
+        if isinstance(plan.resolved_render_style, Mapping)
+        else {}
+    )
+    return (
+        str(plan.page_id or ""),
+        str(plan.bundle_id or ""),
+        str(plan.parent_id or ""),
+        str(plan.translated_text or ""),
+        "horizontal",
+        int(preferred_font_size),
+        tuple(int(value) for value in hard_bounds[:4]),
+        str(style.get("primary_font_role") or ""),
+        str(style.get("fallback_font_chain_key") or ""),
+        round(float(_line_height(style)), 6),
+        round(float(_style_outline_width(style)), 6),
+    )
+
+
+def _remember_horizontal_fit_upper_bound(
+    cache: dict[tuple[Any, ...], list[tuple[list[int], int]]],
+    key: tuple[Any, ...],
+    target_box: Sequence[int],
+    font_size: int,
+) -> None:
+    box = bbox_from_value(target_box)
+    if not box or int(font_size) <= 0:
+        return
+    entries = cache.setdefault(key, [])
+    for index, (prior_box, prior_size) in enumerate(entries):
+        if list(prior_box) == list(box):
+            entries[index] = (
+                list(box),
+                min(int(prior_size), int(font_size)),
+            )
+            return
+    entries.append((list(box), int(font_size)))
 
 
 def _source_preferred_interval_floor(
@@ -2380,7 +2734,12 @@ def _normalize_mode(value: Any) -> str:
 
 def _language_hint(plan: RenderLayerPlan) -> str:
     style = plan.resolved_render_style if isinstance(plan.resolved_render_style, dict) else {}
-    return str(style.get("language") or style.get("target_language") or "zh")
+    return str(
+        style.get("shaping_locale")
+        or style.get("target_language")
+        or style.get("language")
+        or "zh"
+    )
 
 
 def _line_height(style: dict[str, Any]) -> float:

@@ -115,6 +115,21 @@ def render_layer_plan_from_parent_bundle(
     render_style = style_validation.style
     target_box, target_box_source = _target_box_from_bundle(bundle)
     hard_bounds = _hard_bounds_from_bundle(bundle, target_box)
+    render_domain = (
+        copy_jsonish(_field(bundle, "render_layout_domain", {}))
+        if isinstance(_field(bundle, "render_layout_domain", {}), Mapping)
+        else {}
+    )
+    oriented_layout_frame = (
+        copy_jsonish(_field(bundle, "text_area_oriented_frame", {}))
+        if isinstance(_field(bundle, "text_area_oriented_frame", {}), Mapping)
+        else {}
+    )
+    editable_bounds = bbox_from_value(
+        render_domain.get("editable_bounds")
+        if isinstance(render_domain, Mapping)
+        else []
+    )
     translated_text = str(_field(bundle, "translated_text") or "")
     reading_order_index = _int_field(bundle, "reading_order_index", None)
     plan_draw_order = int(reading_order_index or 0)
@@ -150,6 +165,12 @@ def render_layer_plan_from_parent_bundle(
             "render_layer_adapter_version": RENDER_LAYER_ADAPTER_VERSION,
             "render_layer_plan_version": RENDER_LAYER_PLAN_VERSION,
             "target_box_source": target_box_source,
+            "target_presentation_policy_id": str(
+                render_domain.get("policy_id") or ""
+            ),
+            "parent_render_domain": render_domain,
+            "oriented_layout_frame": oriented_layout_frame,
+            "editable_hard_bounds": editable_bounds or list(hard_bounds),
             "contract_issues": contract_issues,
             "resolved_render_style_validation": (
                 style_validation.to_audit_dict()
@@ -216,6 +237,11 @@ def _hard_bounds_from_bundle(
     bundle: Any,
     target_box: Sequence[int],
 ) -> list[int]:
+    domain = _field(bundle, "render_layout_domain", {})
+    if isinstance(domain, Mapping):
+        automatic = bbox_from_value(domain.get("automatic_bounds"))
+        if automatic:
+            return automatic
     for value in (
         _field(bundle, "render_allowed_area", []),
         _field(bundle, "parent_bbox", []),
@@ -1391,10 +1417,20 @@ def _validate_occupied_bands(
 def _clipping_region_ref(
     bundle: Any,
 ) -> dict[str, Any]:
+    domain = _field(bundle, "render_layout_domain", {})
     return {
         "cleanup_target_bbox": bbox_from_value(_field(bundle, "cleanup_target_bbox", [])),
         "root_bbox": bbox_from_value(_field(bundle, "root_bbox", [])),
         "render_allowed_area": bbox_from_value(_field(bundle, "render_allowed_area", [])),
+        "text_area_container_bbox": bbox_from_value(
+            _field(bundle, "text_area_container_bbox", [])
+        ),
+        "text_area_container_polygon": copy_jsonish(
+            _field(bundle, "text_area_container_polygon", [])
+        ),
+        "parent_render_domain": (
+            copy_jsonish(domain) if isinstance(domain, Mapping) else {}
+        ),
     }
 
 
@@ -1432,4 +1468,17 @@ def _parent_execution_bundle_ref(bundle: Any) -> dict[str, Any]:
         "source_quality_action": str(_field(bundle, "source_quality_action") or ""),
         "render_decision_id": str(_field(bundle, "render_decision_id") or ""),
         "renderer_audit_id": str(_field(bundle, "renderer_audit_id") or ""),
+        "target_language": str(_field(bundle, "target_language") or ""),
+        "target_presentation_policy": copy_jsonish(
+            _field(bundle, "target_presentation_policy", {})
+        ),
+        "render_layout_domain": copy_jsonish(
+            _field(bundle, "render_layout_domain", {})
+        ),
+        "text_area_container_polygon": copy_jsonish(
+            _field(bundle, "text_area_container_polygon", [])
+        ),
+        "text_area_oriented_frame": copy_jsonish(
+            _field(bundle, "text_area_oriented_frame", {})
+        ),
     }

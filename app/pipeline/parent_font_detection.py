@@ -50,6 +50,11 @@ from app.pipeline.parent_style_evidence import (
     SourceStyleAxisEvidence,
     build_authorized_style_observation_inputs,
 )
+from app.pipeline.oriented_layout import corroborated_rotation_residual
+from app.pipeline.target_presentation import (
+    TargetPresentationPolicy,
+    target_presentation_policy,
+)
 from app.pipeline.source_style_contracts import (
     SOURCE_FONT_SUPPORT_FLOOR_MET,
     SOURCE_FONT_SUPPORT_TRUNCATED,
@@ -66,6 +71,7 @@ from app.render.font_manager import (
     TARGET_OPTICAL_PROFILE_POLICY_ID,
     FontManager,
 )
+from app.render.parent_layer_effects import PARENT_LAYER_EFFECTS_VERSION
 
 
 FONT_COUNT = 6150
@@ -198,7 +204,9 @@ PARENT_STYLE_DECISION_AXES_V3 = (
     "shadow",
 )
 PARENT_STYLE_PEER_AXES_V3 = ("family", "weight", "source_scale")
-PARENT_RENDER_STYLE_V3_VERSION = "parent_render_style_v3"
+PARENT_RENDER_STYLE_V4_VERSION = "parent_render_style_v4"
+# Compatibility symbol for historical test/support imports. New output is v4.
+PARENT_RENDER_STYLE_V3_VERSION = PARENT_RENDER_STYLE_V4_VERSION
 PARENT_RENDER_STYLE_LEDGER_V3_VERSION = "parent_render_style_ledger_v3"
 PARENT_RENDER_STYLE_V3_TARGET_FALLBACK_EM_PX = 24.0
 PARENT_RENDER_STYLE_V3_FONT_ROLE_MATRIX = {
@@ -1152,11 +1160,19 @@ class ResolvedParentRenderStyleV3:
     primary_font_role: str
     primary_font_role_status: str
     fallback_font_chain_key: str
+    target_presentation_policy: Mapping[str, Any]
+    target_language: str
+    target_script: str
+    shaping_locale: str
     source_visual_cell: Mapping[str, Any]
+    source_writing_mode: str
+    target_optical_reference_em_px: float
+    target_fit_start_em_px: float
     target_preferred_em_px: float
     target_preferred_em_interval_px: tuple[float, float]
     target_face_profile_id: str
     target_em_conversion_audit: Mapping[str, Any]
+    target_size_preference: Mapping[str, Any]
     fill: Mapping[str, Any]
     outline: Mapping[str, Any]
     writing_mode: str
@@ -1177,12 +1193,18 @@ class ResolvedParentRenderStyleV3:
         if tuple(item.axis for item in ordered_axes) != PARENT_STYLE_DECISION_AXES_V3:
             raise ValueError("Stage 3B style must retain every Stage 2 axis once")
         low, high = tuple(float(item) for item in self.target_preferred_em_interval_px)
+        optical_reference = float(self.target_optical_reference_em_px)
+        fit_start = float(self.target_fit_start_em_px)
         preferred = float(self.target_preferred_em_px)
         if not (
             math.isfinite(low)
             and math.isfinite(high)
+            and math.isfinite(optical_reference)
+            and math.isfinite(fit_start)
             and math.isfinite(preferred)
-            and 0.0 < low <= preferred <= high
+            and 0.0 < low <= optical_reference <= high
+            and low <= fit_start <= high
+            and preferred == fit_start
         ):
             raise ValueError("Stage 3B target em values are invalid")
         object.__setattr__(self, "page_id", str(self.page_id or ""))
@@ -1199,12 +1221,20 @@ class ResolvedParentRenderStyleV3:
             "render_style_confidence",
             float(_unit_interval(self.render_style_confidence) or 0.0),
         )
+        object.__setattr__(
+            self,
+            "target_optical_reference_em_px",
+            optical_reference,
+        )
+        object.__setattr__(self, "target_fit_start_em_px", fit_start)
         object.__setattr__(self, "target_preferred_em_px", preferred)
         object.__setattr__(self, "target_preferred_em_interval_px", (low, high))
         object.__setattr__(self, "axes", ordered_axes)
         for field_name in (
             "source_visual_cell",
+            "target_presentation_policy",
             "target_em_conversion_audit",
+            "target_size_preference",
             "fill",
             "outline",
             "diagnostic_uncertainty",
@@ -1244,7 +1274,22 @@ class ResolvedParentRenderStyleV3:
             "primary_font_role": self.primary_font_role,
             "primary_font_role_status": self.primary_font_role_status,
             "fallback_font_chain_key": self.fallback_font_chain_key,
+            "target_presentation_policy": _v3_plain_json_value(
+                self.target_presentation_policy
+            ),
+            "target_language": self.target_language,
+            "target_script": self.target_script,
+            "shaping_locale": self.shaping_locale,
             "source_visual_cell": _v3_plain_json_value(self.source_visual_cell),
+            "source_writing_mode": self.source_writing_mode,
+            "target_optical_reference_em_px": round(
+                float(self.target_optical_reference_em_px),
+                6,
+            ),
+            "target_fit_start_em_px": round(
+                float(self.target_fit_start_em_px),
+                6,
+            ),
             "target_preferred_em_px": round(
                 float(self.target_preferred_em_px), 6
             ),
@@ -1255,6 +1300,9 @@ class ResolvedParentRenderStyleV3:
             "target_face_profile_id": self.target_face_profile_id,
             "target_em_conversion_audit": _v3_plain_json_value(
                 self.target_em_conversion_audit
+            ),
+            "target_size_preference": _v3_plain_json_value(
+                self.target_size_preference
             ),
             "fill": _v3_plain_json_value(self.fill),
             "outline": _v3_plain_json_value(self.outline),
@@ -1330,18 +1378,21 @@ class ParentRenderStyleLedgerV3:
         }
 
 
-def realize_parent_render_styles_v3(
+def realize_parent_render_styles_v4(
     *,
     parent_execution_bundles: Sequence[Any],
     decision_ledger: ParentStyleDecisionLedgerV3,
     font_manager: FontManager,
+    target_presentation_policy: TargetPresentationPolicy,
 ) -> ParentRenderStyleLedgerV3:
-    """Realize v3 styles without mutating bundles or activating runtime v3."""
+    """Realize v4 target styles from the immutable v3 source-decision ledger."""
 
     if not isinstance(decision_ledger, ParentStyleDecisionLedgerV3):
         raise TypeError("Stage 3B requires a ParentStyleDecisionLedgerV3")
     if not isinstance(font_manager, FontManager):
         raise TypeError("Stage 3B requires FontManager")
+    if not isinstance(target_presentation_policy, TargetPresentationPolicy):
+        raise TypeError("Stage 3B requires TargetPresentationPolicy")
     bundles_by_id: dict[str, Any] = {}
     for bundle in tuple(parent_execution_bundles or ()):
         if not bool(getattr(bundle, "render_required", False)):
@@ -1366,6 +1417,7 @@ def realize_parent_render_styles_v3(
                 decision=decision,
                 font_manager=font_manager,
                 role_inventory=inventory,
+                target_presentation_policy=target_presentation_policy,
             )
         )
     return ParentRenderStyleLedgerV3(
@@ -1373,6 +1425,24 @@ def realize_parent_render_styles_v3(
             styles=tuple(styles),
             decisions_by_id=decisions_by_id,
         )
+    )
+
+
+def realize_parent_render_styles_v3(
+    *,
+    parent_execution_bundles: Sequence[Any],
+    decision_ledger: ParentStyleDecisionLedgerV3,
+    font_manager: FontManager,
+) -> ParentRenderStyleLedgerV3:
+    """Compatibility entry for historical CJK callers."""
+
+    return realize_parent_render_styles_v4(
+        parent_execution_bundles=parent_execution_bundles,
+        decision_ledger=decision_ledger,
+        font_manager=font_manager,
+        target_presentation_policy=target_presentation_policy(
+            "Simplified Chinese"
+        ),
     )
 
 
@@ -1394,6 +1464,7 @@ def _realize_parent_render_style_v3(
     decision: ParentStyleParentDecisionV3,
     font_manager: FontManager,
     role_inventory: Mapping[str, Any],
+    target_presentation_policy: TargetPresentationPolicy,
 ) -> ResolvedParentRenderStyleV3:
     family_axis = decision.axis("family")
     weight_axis = decision.axis("weight")
@@ -1455,12 +1526,20 @@ def _realize_parent_render_style_v3(
     if face is None:
         raise ValueError(f"Stage 3B registered target face is unavailable: {primary_font_role}")
 
-    writing_mode = str(orientation_axis.value or decision.writing_mode).strip().lower()
-    if writing_mode not in {"vertical", "horizontal"}:
+    source_writing_mode = str(
+        orientation_axis.value or decision.writing_mode
+    ).strip().lower()
+    if source_writing_mode not in {"vertical", "horizontal"}:
         raise ValueError("Stage 3B writing mode is invalid")
+    writing_mode = (
+        source_writing_mode
+        if target_presentation_policy.block_mode_policy == "preserve_source"
+        else "horizontal"
+    )
     profile_resolution = font_manager.target_optical_profile(
         face,
         writing_mode,
+        profile_key=target_presentation_policy.optical_profile_key,
     )
     profile = profile_resolution.profile
     visible_ratio = float(profile.visible_ink_height_ratio)
@@ -1470,7 +1549,7 @@ def _realize_parent_render_style_v3(
     source_cell, preferred_em, preferred_interval, conversion_status = (
         _v3_target_em_from_source_scale(
             scale_axis=scale_axis,
-            writing_mode=writing_mode,
+            writing_mode=source_writing_mode,
             target_visible_ink_height_ratio=visible_ratio,
         )
     )
@@ -1494,6 +1573,7 @@ def _realize_parent_render_style_v3(
         target_stem_to_ink_ratio=float(profile.stem_to_ink_ratio),
         target_profile_policy_id=str(profile.profile_policy_id),
     )
+    optical_reference_em = float(preferred_em)
     fill_value = dict(fill_axis.value) if isinstance(fill_axis.value, Mapping) else {}
     outline_value = (
         dict(outline_axis.value) if isinstance(outline_axis.value, Mapping) else {}
@@ -1572,6 +1652,9 @@ def _realize_parent_render_style_v3(
         "target_face_profile_id": profile.profile_id,
         "target_profile_selection": selection_audit,
         "target_profile_metrics": profile_audit,
+        "target_presentation_policy": (
+            target_presentation_policy.to_contract_dict()
+        ),
         "source_optical_realization": source_optical_bridge_audit,
         "target_outline_realization": {
             "policy_version": (
@@ -1623,6 +1706,20 @@ def _realize_parent_render_style_v3(
             "local_source_scale_below_direct_confidence_after_peer_reconciliation"
         )
 
+    fit_start_em, size_preference = _target_size_preference_v1(
+        source_cell=source_cell,
+        source_scale_status=scale_axis.status,
+        optical_reference_em=optical_reference_em,
+        target_visible_ink_height_ratio=visible_ratio,
+        policy=target_presentation_policy,
+    )
+    preferred_interval = (
+        min(preferred_interval[0], optical_reference_em, fit_start_em),
+        max(preferred_interval[1], optical_reference_em, fit_start_em),
+    )
+    preferred_em = fit_start_em
+    conversion_audit["target_size_preference"] = size_preference
+
     target_visible_ink_height = preferred_em * visible_ratio
     readability = {
         "status": "diagnostic_only",
@@ -1645,11 +1742,7 @@ def _realize_parent_render_style_v3(
             round(preferred_interval[1], 6),
         ],
     }
-    effects = {
-        axis_name: _v3_plain_json_value(effect.value)
-        for axis_name in ("rotation", "shadow")
-        if (effect := decision.axis(axis_name)).value is not None
-    }
+    effects = _v3_parent_layer_effects_contract(decision)
     confidence_axes = tuple(
         decision.axis(axis)
         for axis in (
@@ -1679,11 +1772,21 @@ def _realize_parent_render_style_v3(
         primary_font_role=primary_font_role,
         primary_font_role_status=primary_font_role_status,
         fallback_font_chain_key=PARENT_STYLE_DEFAULT_FALLBACK_FONT_CHAIN_KEY,
+        target_presentation_policy=(
+            target_presentation_policy.to_contract_dict()
+        ),
+        target_language=target_presentation_policy.target_language,
+        target_script=target_presentation_policy.target_script,
+        shaping_locale=target_presentation_policy.shaping_locale,
         source_visual_cell=source_cell,
+        source_writing_mode=source_writing_mode,
+        target_optical_reference_em_px=optical_reference_em,
+        target_fit_start_em_px=fit_start_em,
         target_preferred_em_px=preferred_em,
         target_preferred_em_interval_px=preferred_interval,
         target_face_profile_id=profile.profile_id,
         target_em_conversion_audit=conversion_audit,
+        target_size_preference=size_preference,
         fill=fill,
         outline=outline,
         writing_mode=writing_mode,
@@ -1694,6 +1797,32 @@ def _realize_parent_render_style_v3(
         readability_diagnostic=readability,
         parent_layer_effects=effects,
     )
+
+
+def _v3_parent_layer_effects_contract(
+    decision: ParentStyleParentDecisionV3,
+) -> dict[str, Any]:
+    """Project resolved axes into the sole strict compositor carrier."""
+
+    axes = {
+        axis_name: decision.axis(axis_name)
+        for axis_name in ("rotation", "shadow")
+    }
+    if all(item.value is None for item in axes.values()):
+        return {}
+    carrier: dict[str, Any] = {
+        "contract_version": PARENT_LAYER_EFFECTS_VERSION,
+    }
+    for axis_name, axis in axes.items():
+        carrier[axis_name] = (
+            {
+                "availability": "resolved",
+                **_v3_plain_json_value(axis.value),
+            }
+            if isinstance(axis.value, Mapping)
+            else {"availability": "unavailable"}
+        )
+    return carrier
 
 
 def _v3_target_outline_reference(
@@ -2154,6 +2283,62 @@ def _v3_target_em_from_source_scale(
     )
 
 
+def _target_size_preference_v1(
+    *,
+    source_cell: Mapping[str, Any],
+    source_scale_status: str,
+    optical_reference_em: float,
+    target_visible_ink_height_ratio: float,
+    policy: TargetPresentationPolicy,
+) -> tuple[float, dict[str, Any]]:
+    """Return the sole target fit-start preference without fit admission.
+
+    This pure rule is also used by locked legacy-style replay so validation can
+    preserve every already-standardized paint/effect field while exercising
+    the same production size policy.
+    """
+
+    central = float(optical_reference_em)
+    visible_ratio = float(target_visible_ink_height_ratio)
+    if (
+        not math.isfinite(central)
+        or central <= 0.0
+        or not math.isfinite(visible_ratio)
+        or visible_ratio <= 0.0
+    ):
+        raise ValueError("target size preference inputs are invalid")
+    status = str(source_scale_status or "")
+    upper_supported_em: float | None = None
+    fit_start_em = central
+    if (
+        status == "fallback"
+        and source_cell.get("status") == "fallback"
+        and source_cell.get("p80_px") is not None
+    ):
+        upper_supported_em = float(source_cell["p80_px"]) / visible_ratio
+        if not math.isfinite(upper_supported_em) or upper_supported_em <= 0.0:
+            raise ValueError("target size preference upper support is invalid")
+        fit_start_em = max(central, upper_supported_em)
+    preference = {
+        "contract_version": "target_size_preference_v1",
+        "policy_id": policy.measured_fallback_size_policy,
+        "source_scale_status": status,
+        "central_optical_reference_em_px": round(central, 6),
+        "upper_supported_em_px": (
+            round(upper_supported_em, 6)
+            if upper_supported_em is not None
+            else None
+        ),
+        "fit_start_em_px": round(fit_start_em, 6),
+        "never_decrease": True,
+        "translation_content_consulted": False,
+        "fit_output_consulted": False,
+        "geometry_consulted": False,
+        "render_admission": False,
+    }
+    return fit_start_em, preference
+
+
 def resolve_parent_style_decision_ledger_v3(
     *,
     parent_execution_bundles: Sequence[Any],
@@ -2369,10 +2554,18 @@ def _v3_collect_parent_facts(context: Mapping[str, Any]) -> dict[str, Any]:
     )
     if weight is not None:
         direct["weight"] = weight
-    for axis in ("rotation", "shadow"):
-        effect = _v3_direct_effect(axis, records.get(axis))
-        if effect is not None:
-            direct[axis] = effect
+    rotation = _v3_direct_effect("rotation", records.get("rotation"))
+    if rotation is None:
+        rotation = _v3_orientation_normalized_rotation(
+            bundle=bundle,
+            record=records.get("rotation"),
+            orientation=orientation,
+        )
+    if rotation is not None:
+        direct["rotation"] = rotation
+    shadow = _v3_direct_effect("shadow", records.get("shadow"))
+    if shadow is not None:
+        direct["shadow"] = shadow
 
     weight_measurement_reliable = bool(
         weight_fact is not None
@@ -3128,6 +3321,66 @@ def _v3_direct_effect(
         confidence=record.confidence,
         provenance=record.provenance,
         reason_codes=(*record.reason_codes, f"parent_local_{axis}_decision"),
+    )
+
+
+def _v3_orientation_normalized_rotation(
+    *,
+    bundle: Any,
+    record: SourceStyleAxisEvidence | None,
+    orientation: ParentStyleAxisDecisionV3 | None,
+) -> ParentStyleAxisDecisionV3 | None:
+    """Resolve the observer's absolute axis only after writing-mode policy.
+
+    The source observer remains immutable and source-only.  This policy step
+    is intentionally local to ParentStyleArbitrator because it is the first
+    owner that has both a reliable writing mode and the exact TextAreaPlan
+    speech-container frame transported by ParentExecutionBundle.
+    """
+
+    if (
+        record is None
+        or record.status != "unavailable"
+        or orientation is None
+        or orientation.status != "direct"
+    ):
+        return None
+    decision = corroborated_rotation_residual(
+        source_axis_support=record.support,
+        source_reason_codes=record.reason_codes,
+        oriented_frame=getattr(bundle, "text_area_oriented_frame", {}),
+        writing_mode=str(orientation.value or ""),
+        orientation_confidence=orientation.confidence,
+    )
+    if decision.get("status") != "supported":
+        return None
+    value, validation_reasons = _validated_perceptual_axis_value(
+        "rotation",
+        decision.get("value"),
+    )
+    confidence = _unit_interval(decision.get("confidence"))
+    if value is None or validation_reasons or confidence is None:
+        return None
+    return _v3_axis_decision(
+        axis="rotation",
+        value=value,
+        status="direct",
+        confidence=confidence,
+        provenance=(
+            "parent_style_arbitrator_v3:"
+            "orientation_normalized_exact_text_area_frame"
+        ),
+        reason_codes=(
+            *record.reason_codes,
+            *tuple(decision.get("reason_codes") or ()),
+        ),
+        peer_support={
+            "local_geometry_corroboration": decision,
+            "peer_evidence_used": False,
+            "translation_content_consulted": False,
+            "target_fit_consulted": False,
+            "render_output_consulted": False,
+        },
     )
 
 
@@ -7939,7 +8192,11 @@ def activate_parent_render_style_ledger_v3(
     evidence: Sequence[StyleEvidence],
     style_ledger: ParentRenderStyleLedgerV3,
 ) -> ParentStyleArbitrationResult:
-    """Publish one fully realized v3 ledger as an all-or-nothing bundle step."""
+    """Publish one fully realized v4 style ledger atomically.
+
+    The function name is retained for callers bound to the v3 source-decision
+    ledger; the executable style contract is v4.
+    """
 
     if not isinstance(style_ledger, ParentRenderStyleLedgerV3):
         raise TypeError("Stage 3C requires a ParentRenderStyleLedgerV3")
@@ -7963,7 +8220,7 @@ def activate_parent_render_style_ledger_v3(
         validation = validate_resolved_render_style(style)
         if not validation.accepted:
             raise ValueError(
-                "Stage 3C rejected a realized v3 style: "
+                "Stage 3C rejected a realized v4 style: "
                 f"{bundle_id}:{','.join(validation.reason_codes)}"
             )
         style_snapshot = _plain_json_mapping_snapshot(validation.style)

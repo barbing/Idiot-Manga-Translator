@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from app.render.typesetting_text import (
@@ -270,6 +271,7 @@ def _normalize_direction(direction: str, writing_mode: str) -> str:
     return "ltr"
 
 
+@lru_cache(maxsize=256)
 def _canonical_font_path(path: str) -> str:
     value = str(path or "").strip()
     if not value:

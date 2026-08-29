@@ -782,8 +782,20 @@ def automatic_render_box(
 def automatic_render_hard_bounds(
     parent: Mapping[str, Any],
 ) -> tuple[int, int, int, int] | None:
-    """Return the adapter-equivalent immutable automatic hard bounds."""
+    """Return the evidence-backed maximum bounds for effective box edits."""
 
+    if isinstance(parent, Mapping):
+        domain = parent.get("render_layout_domain")
+        if isinstance(domain, Mapping):
+            editable = bbox_from_value(domain.get("editable_bounds") or ())
+            if editable:
+                try:
+                    return canonical_render_box(
+                        editable,
+                        field_name="automatic.render_layout_domain.editable_bounds",
+                    )
+                except (TypeError, ValueError):
+                    return None
     return automatic_render_box(parent)
 
 

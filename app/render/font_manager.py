@@ -70,6 +70,33 @@ TARGET_OPTICAL_PROFILE_POLICY_ID = (
     f"{TARGET_OPTICAL_PROFILE_POLICY_VERSION}:"
     f"{_target_optical_policy_digest.hexdigest()}"
 )
+LATIN_TARGET_OPTICAL_PROFILE_POLICY_VERSION = (
+    "fixed_disjoint_latin_probe_bank_v1"
+)
+LATIN_TARGET_OPTICAL_PROFILE_PROBE_BANK = (
+    ("latin_uppercase_single", "ABCDEFGHJKLMNPRSTUVWXYZ"),
+    ("latin_lowercase_single", "abcdefghijklmnopqrstuvwxyz"),
+    ("latin_digits_single", "0123456789"),
+)
+_latin_target_optical_policy_digest = hashlib.sha256()
+for _latin_target_optical_policy_part in (
+    TARGET_OPTICAL_PROFILE_VERSION,
+    LATIN_TARGET_OPTICAL_PROFILE_POLICY_VERSION,
+    TARGET_OPTICAL_PROFILE_AGGREGATION,
+    str(TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX),
+    *(
+        f"{probe_id}\x00{text}"
+        for probe_id, text in LATIN_TARGET_OPTICAL_PROFILE_PROBE_BANK
+    ),
+):
+    _latin_target_optical_policy_digest.update(
+        str(_latin_target_optical_policy_part).encode("utf-8")
+    )
+    _latin_target_optical_policy_digest.update(b"\x00")
+LATIN_TARGET_OPTICAL_PROFILE_POLICY_ID = (
+    f"{LATIN_TARGET_OPTICAL_PROFILE_POLICY_VERSION}:"
+    f"{_latin_target_optical_policy_digest.hexdigest()}"
+)
 DEFAULT_FALLBACK_CHAIN = "cjk-sc"
 
 SYMBOL_FALLBACK_CHARS = ("☆", "★", "♡", "❤", "♪")
@@ -1203,6 +1230,8 @@ class FontManager:
         self,
         face: FontFace,
         writing_mode: str,
+        *,
+        profile_key: str = "cjk",
     ) -> TargetFontOpticalProfileResolution:
         """Measure one fixed registered-face profile at the reference em.
 
@@ -1219,10 +1248,31 @@ class FontManager:
         ):
             raise FontManagerError("target optical profile requires a registered Noto CJK SC face")
         mode = _normalize_optical_writing_mode(writing_mode)
+        normalized_profile_key = str(profile_key or "").strip().lower()
+        if normalized_profile_key == "cjk":
+            profile_policy_id = TARGET_OPTICAL_PROFILE_POLICY_ID
+            evidence_source = "fixed_disjoint_cjk_probe_bank"
+            measurement_source = (
+                "fixed_disjoint_cjk_probe_bank_median_of_probe_medians_"
+                "pillow_raster_opencv_distance_transform"
+            )
+            padded_measurement = False
+        elif normalized_profile_key == "latin":
+            profile_policy_id = LATIN_TARGET_OPTICAL_PROFILE_POLICY_ID
+            evidence_source = "fixed_disjoint_latin_probe_bank"
+            measurement_source = (
+                "fixed_disjoint_latin_probe_bank_median_of_probe_medians_"
+                "pillow_raster_padded_opencv_distance_transform"
+            )
+            padded_measurement = True
+        else:
+            raise FontManagerError(
+                f"unsupported target optical profile key: {profile_key!r}"
+            )
         font_sha256 = self._font_file_sha256(registered.path)
         key = (
             font_sha256,
-            TARGET_OPTICAL_PROFILE_POLICY_ID,
+            profile_policy_id,
             mode,
         )
         cached = self._target_optical_profile_cache.get(key)
@@ -1232,16 +1282,17 @@ class FontManager:
                 selection=TargetOpticalGlyphSelection(
                     glyph_set=cached.glyph_set,
                     glyph_set_sha256=cached.glyph_set_sha256,
-                    evidence_source="fixed_disjoint_cjk_probe_bank",
+                    evidence_source=evidence_source,
                     fallback_probe_used=False,
                 ),
                 profile=cached,
             )
         self._cache_misses["target_optical_profile"] += 1
 
-        probe_glyph_sets = _fixed_optical_probe_glyph_sets(
-            self,
-            registered,
+        probe_glyph_sets = (
+            _fixed_optical_probe_glyph_sets(self, registered)
+            if normalized_profile_key == "cjk"
+            else _fixed_latin_optical_probe_glyph_sets(self, registered)
         )
         glyph_set = tuple(
             sorted(
@@ -1260,7 +1311,7 @@ class FontManager:
         selection = TargetOpticalGlyphSelection(
             glyph_set=glyph_set,
             glyph_set_sha256=glyph_set_sha256,
-            evidence_source="fixed_disjoint_cjk_probe_bank",
+            evidence_source=evidence_source,
             fallback_probe_used=False,
         )
         font = self.load_font(registered, TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX)
@@ -1270,6 +1321,7 @@ class FontManager:
                     font,
                     glyph,
                     writing_mode=mode,
+                    pad_boundary=padded_measurement,
                 )
                 for glyph in probe_glyphs
             )
@@ -1326,7 +1378,7 @@ class FontManager:
                     TARGET_OPTICAL_PROFILE_VERSION,
                     registered.face_id,
                     font_sha256,
-                    TARGET_OPTICAL_PROFILE_POLICY_ID,
+                    profile_policy_id,
                     mode,
                 )
             ).encode("utf-8")
@@ -1336,7 +1388,7 @@ class FontManager:
             face_id=registered.face_id,
             font_path=registered.path,
             font_sha256=font_sha256,
-            profile_policy_id=TARGET_OPTICAL_PROFILE_POLICY_ID,
+            profile_policy_id=profile_policy_id,
             reference_em_px=TARGET_OPTICAL_PROFILE_REFERENCE_EM_PX,
             writing_mode=mode,
             probe_ids=tuple(
@@ -1355,10 +1407,7 @@ class FontManager:
                 float(stem_to_ink_ratio), 8
             ),
             ink_coverage_ratio=round(float(ink_coverage_ratio), 8),
-            measurement_source=(
-                "fixed_disjoint_cjk_probe_bank_median_of_probe_medians_"
-                "pillow_raster_opencv_distance_transform"
-            ),
+            measurement_source=measurement_source,
         )
         self._target_optical_profile_cache[key] = profile
         return TargetFontOpticalProfileResolution(
@@ -1706,6 +1755,27 @@ def _fixed_optical_probe_glyph_sets(
     return tuple(probes)
 
 
+def _fixed_latin_optical_probe_glyph_sets(
+    manager: FontManager,
+    face: FontFace,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    probes: list[tuple[str, tuple[str, ...]]] = []
+    for probe_id, text in LATIN_TARGET_OPTICAL_PROFILE_PROBE_BANK:
+        glyph_set = tuple(
+            cluster
+            for cluster in strict_grapheme_clusters(text)
+            if cluster
+            and manager.coverage_for_text(face, cluster).supports_text
+        )
+        if not glyph_set:
+            raise FontManagerError(
+                "registered target face lacks fixed Latin optical probe "
+                f"support: {probe_id}"
+            )
+        probes.append((probe_id, glyph_set))
+    return tuple(probes)
+
+
 def _is_cjk_codepoint(char: str) -> bool:
     codepoint = ord(char)
     return any(
@@ -1741,6 +1811,7 @@ def _measure_optical_glyph(
     glyph: str,
     *,
     writing_mode: str,
+    pad_boundary: bool = False,
 ) -> dict[str, float]:
     try:
         import cv2
@@ -1765,7 +1836,12 @@ def _measure_optical_glyph(
         dtype=np.uint8,
     )
     visible_ink_height_px = float(ink.shape[0])
-    distance = cv2.distanceTransform(ink, cv2.DIST_L2, 5)
+    distance_input = (
+        np.pad(ink, ((1, 1), (1, 1)), mode="constant", constant_values=0)
+        if pad_boundary
+        else ink
+    )
+    distance = cv2.distanceTransform(distance_input, cv2.DIST_L2, 5)
     positive = distance[distance > 0.0]
     if positive.size <= 0:
         raise FontManagerError(f"target optical glyph has no measurable stem: {glyph!r}")

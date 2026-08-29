@@ -428,10 +428,23 @@ def _visual_slot_scored_result(
         original_plan,
         speech_visual_center=speech_visual_center,
     )
+    verified_containers: list[dict[str, Any]] = []
+    competitively_pruned: list[dict[str, Any]] = []
     for candidate_record in candidates:
         box = _bbox_from_value(candidate_record.get("box"))
         if not box:
             continue
+        containing_sizes = [
+            float(item.get("selected_font_size") or 0.0)
+            for item in verified_containers
+            if _box_inside_tolerant(
+                box,
+                item.get("box") or [],
+                tolerance=0,
+            )
+        ]
+        competitive_floor = max(containing_sizes, default=0.0)
+        successful_sizes: list[float] = []
         for alignment in alignment_candidates:
             candidate_plan = _plan_with_visual_slot_box(
                 shape_plan,
@@ -439,7 +452,52 @@ def _visual_slot_scored_result(
                 source=str(candidate_record.get("source") or "candidate"),
                 alignment=alignment,
             )
+            if competitive_floor > 0.0:
+                candidate_metadata = copy_jsonish(candidate_plan.metadata)
+                candidate_metadata["competitive_fit_probe_font_size"] = int(
+                    round(competitive_floor)
+                )
+                candidate_metadata["competitive_fit_probe_policy"] = (
+                    "contained_slot_cannot_beat_verified_font_size"
+                )
+                candidate_plan = replace(
+                    candidate_plan,
+                    metadata=candidate_metadata,
+                )
             layout, report = typesetting_engine.typeset_layer(candidate_plan)
+            if competitive_floor > 0.0 and not (
+                bool(report.full_text_placed)
+                and str(report.fit_status or "") == "fits"
+                and bool(report.hard_bounds_contained)
+                and bool(layout.text_placement_complete)
+                and bool(layout.hard_bounds_contained)
+                and float(layout.selected_font_size or 0.0)
+                >= competitive_floor
+            ):
+                competitively_pruned.append(
+                    {
+                        "source": str(
+                            candidate_record.get("source") or "candidate"
+                        ),
+                        "box": list(box),
+                        "alignment_policy": str(
+                            alignment.get("policy") or "target_box_center"
+                        ),
+                        "verified_containing_font_size": round(
+                            float(competitive_floor),
+                            6,
+                        ),
+                        "probe_fit_status": str(report.fit_status or ""),
+                        "probe_full_text_placed": bool(
+                            report.full_text_placed
+                        ),
+                        "reason": (
+                            "contained_candidate_cannot_match_verified_"
+                            "typography_size"
+                        ),
+                    }
+                )
+                continue
             typesetting_quality = typesetting_engine.candidate_quality_summary(
                 candidate_plan,
                 layout,
@@ -480,6 +538,14 @@ def _visual_slot_scored_result(
                         **score_meta,
                     },
                 )
+            )
+            successful_sizes.append(float(layout.selected_font_size or 0.0))
+        if successful_sizes:
+            verified_containers.append(
+                {
+                    "box": list(box),
+                    "selected_font_size": max(successful_sizes),
+                }
             )
 
     if not scored:
@@ -525,6 +591,8 @@ def _visual_slot_scored_result(
         "selected_box": list(selected_plan.target_box),
         "selected_score": selected_meta.get("score"),
         "candidate_count": len(scored),
+        "competitive_pruned_candidate_count": len(competitively_pruned),
+        "competitive_pruned_candidates": competitively_pruned,
         "alignment_anchor_kind": canonical_alignment_kind,
         "alignment_anchor_center": copy_jsonish(canonical_alignment_center),
         "speech_component_box": copy_jsonish(audit.get("component_box")),

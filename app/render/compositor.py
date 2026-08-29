@@ -11,6 +11,9 @@ import os
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
+import cv2
+import numpy as np
+
 from app.render.font_manager import FontManager
 from app.render.glyph_rasterizer import (
     GLYPH_RASTER_AUTHORITY,
@@ -40,6 +43,12 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 RENDERER_COMPOSITOR_VERSION = "renderer_compositor_stage5_v6"
 PARENT_LAYER_COMPOSITION_VERSION = "isolated_parent_layer_atomic_effects_v4"
+ORIENTATION_NORMALIZED_ROTATION_PROVENANCE = (
+    "parent_style_arbitrator_v3:"
+    "orientation_normalized_exact_text_area_frame"
+)
+ORIENTED_SPEECH_POLYGON_GUARD_PX = 3
+ORIENTED_SPEECH_MAX_TRANSLATION_PX = 64
 
 
 AlphaSurfaceStats = tuple[tuple[int, int, int, int] | None, int]
@@ -1182,6 +1191,410 @@ def _degraded_parent_effect_audit(
     }
 
 
+def _oriented_speech_polygon_translation(
+    alpha,
+    plan: RenderLayerPlan,
+) -> dict[str, Any]:
+    """Choose one bounded integer translation for an automatic rotation.
+
+    This is a compositor-local raster-safety step.  It never changes text,
+    font, layout, or the immutable automatic rotation decision.  It is
+    available only for the orientation-normalized automatic path with an exact
+    TextAreaPlan speech polygon; user effect overrides and legacy records are
+    deliberately ineligible.
+    """
+
+    base: dict[str, Any] = {
+        "contract_version": "oriented_speech_polygon_placement_v1",
+        "status": "ineligible",
+        "accepted": False,
+        "translation": [0, 0],
+        "reason_codes": [],
+        "polygon_guard_px": ORIENTED_SPEECH_POLYGON_GUARD_PX,
+        "maximum_translation_px": ORIENTED_SPEECH_MAX_TRANSLATION_PX,
+        "outside_alpha_sum_before": 0,
+        "outside_alpha_sum_after": 0,
+        "outside_alpha_pixel_count_before": 0,
+        "outside_alpha_pixel_count_after": 0,
+        "alpha_bounds_before": [],
+        "alpha_bounds_after": [],
+        "container_bbox": [],
+        "polygon_sha256": "",
+        "translation_content_consulted": False,
+        "target_fit_consulted": False,
+        "render_output_consulted": True,
+    }
+
+    def unavailable(status: str, *reasons: str) -> dict[str, Any]:
+        result = dict(base)
+        result["status"] = status
+        result["reason_codes"] = _unique_strings(reasons)
+        return result
+
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    effective = metadata.get("effective_render_plan")
+    authorities = (
+        effective.get("field_authority")
+        if isinstance(effective, Mapping)
+        and isinstance(effective.get("field_authority"), Mapping)
+        else {}
+    )
+    if authorities.get("resolved_render_style.parent_layer_effects") == "user":
+        return unavailable("ineligible", "user_effect_override")
+    style = (
+        plan.resolved_render_style
+        if isinstance(plan.resolved_render_style, Mapping)
+        else {}
+    )
+    axis_authority = style.get("axis_authority")
+    rotation_authority = (
+        axis_authority.get("rotation")
+        if isinstance(axis_authority, Mapping)
+        and isinstance(axis_authority.get("rotation"), Mapping)
+        else {}
+    )
+    if (
+        rotation_authority.get("status") != "direct"
+        or str(rotation_authority.get("provenance") or "")
+        != ORIENTATION_NORMALIZED_ROTATION_PROVENANCE
+    ):
+        return unavailable(
+            "ineligible",
+            "rotation_not_automatic_orientation_normalized",
+        )
+    frame = metadata.get("oriented_layout_frame")
+    if not isinstance(frame, Mapping):
+        return unavailable("ineligible", "oriented_layout_frame_missing")
+    polygon_sha256 = str(frame.get("polygon_sha256") or "")
+    if (
+        frame.get("contract_version") != "oriented_layout_frame_v1"
+        or frame.get("status") != "supported"
+        or frame.get("container_type") != "speech_bubble"
+        or len(polygon_sha256) != 64
+    ):
+        return unavailable("ineligible", "oriented_layout_frame_unavailable")
+    clipping = (
+        plan.clipping_region_ref
+        if isinstance(plan.clipping_region_ref, Mapping)
+        else {}
+    )
+    polygon = _point_sequence(clipping.get("text_area_container_polygon"))
+    frame_polygon = _point_sequence(frame.get("polygon"))
+    if len(polygon) < 3 or polygon != frame_polygon:
+        return unavailable(
+            "ineligible",
+            "oriented_speech_polygon_identity_mismatch",
+        )
+    domain = clipping.get("parent_render_domain")
+    domain = domain if isinstance(domain, Mapping) else {}
+    container = _xywh_int(
+        domain.get("container_bbox")
+        or clipping.get("text_area_container_bbox")
+    )
+    if not container:
+        return unavailable("ineligible", "oriented_container_bbox_missing")
+    alpha_bounds_raw = alpha.getbbox() if alpha is not None else None
+    if not alpha_bounds_raw:
+        return unavailable("rejected", "oriented_parent_alpha_empty")
+    alpha_bounds = [int(item) for item in alpha_bounds_raw]
+    container_x, container_y, container_width, container_height = container
+    container_right = container_x + container_width
+    container_bottom = container_y + container_height
+    alpha_left, alpha_top, alpha_right, alpha_bottom = alpha_bounds
+    min_dx = max(
+        container_x - alpha_left,
+        -ORIENTED_SPEECH_MAX_TRANSLATION_PX,
+    )
+    max_dx = min(
+        container_right - alpha_right,
+        ORIENTED_SPEECH_MAX_TRANSLATION_PX,
+    )
+    min_dy = max(
+        container_y - alpha_top,
+        -ORIENTED_SPEECH_MAX_TRANSLATION_PX,
+    )
+    max_dy = min(
+        container_bottom - alpha_bottom,
+        ORIENTED_SPEECH_MAX_TRANSLATION_PX,
+    )
+    if min_dx > max_dx or min_dy > max_dy:
+        result = unavailable(
+            "rejected",
+            "oriented_parent_alpha_cannot_fit_container_bbox",
+        )
+        result.update(
+            {
+                "alpha_bounds_before": alpha_bounds,
+                "container_bbox": list(container),
+                "polygon_sha256": polygon_sha256,
+            }
+        )
+        return result
+
+    polygon_mask = Image.new("L", (container_width, container_height), 0)
+    local_polygon = [
+        (float(x) - container_x, float(y) - container_y)
+        for x, y in polygon
+    ]
+    ImageDraw.Draw(polygon_mask).polygon(local_polygon, fill=255)
+    if ORIENTED_SPEECH_POLYGON_GUARD_PX > 0:
+        if ImageFilter is None:
+            return unavailable(
+                "rejected",
+                "oriented_polygon_guard_backend_unavailable",
+            )
+        polygon_mask = polygon_mask.filter(
+            ImageFilter.MaxFilter(
+                ORIENTED_SPEECH_POLYGON_GUARD_PX * 2 + 1
+            )
+        )
+    polygon_array = np.asarray(polygon_mask, dtype=np.uint8) > 0
+    alpha_crop = np.asarray(
+        alpha.crop(tuple(alpha_bounds)),
+        dtype=np.uint16,
+    )
+    yy, xx = np.nonzero(alpha_crop)
+    if not len(xx):
+        return unavailable("rejected", "oriented_parent_alpha_empty")
+    weights = alpha_crop[yy, xx].astype(np.uint64)
+    total_alpha = int(weights.sum(dtype=np.uint64))
+    base_x = alpha_left - container_x
+    base_y = alpha_top - container_y
+
+    def score(dx: int, dy: int) -> tuple[int, int]:
+        inside = polygon_array[base_y + yy + dy, base_x + xx + dx]
+        outside = ~inside
+        return (
+            int(weights[outside].sum(dtype=np.uint64)),
+            int(np.count_nonzero(outside)),
+        )
+
+    before_sum, before_count = (
+        score(0, 0)
+        if min_dx <= 0 <= max_dx and min_dy <= 0 <= max_dy
+        else (total_alpha, int(len(xx)))
+    )
+    if before_sum == 0:
+        result = dict(base)
+        result.update(
+            {
+                "status": "resolved",
+                "accepted": True,
+                "translation": [0, 0],
+                "reason_codes": [
+                    "automatic_rotation_contained_by_exact_speech_polygon"
+                ],
+                "outside_alpha_sum_before": 0,
+                "outside_alpha_sum_after": 0,
+                "outside_alpha_pixel_count_before": 0,
+                "outside_alpha_pixel_count_after": 0,
+                "alpha_bounds_before": alpha_bounds,
+                "alpha_bounds_after": alpha_bounds,
+                "container_bbox": list(container),
+                "polygon_sha256": polygon_sha256,
+                "candidate_translation_count": 1,
+                "selection_policy": (
+                    "already_contained_exact_zero_translation_v1"
+                ),
+            }
+        )
+        return result
+
+    count_overlap = cv2.matchTemplate(
+        polygon_array.astype(np.float32),
+        (alpha_crop > 0).astype(np.float32),
+        cv2.TM_CCORR,
+    )
+    local_x_values = np.arange(
+        base_x + int(min_dx),
+        base_x + int(max_dx) + 1,
+        dtype=np.int32,
+    )
+    local_y_values = np.arange(
+        base_y + int(min_dy),
+        base_y + int(max_dy) + 1,
+        dtype=np.int32,
+    )
+    overlap_count = count_overlap[
+        local_y_values[:, None],
+        local_x_values[None, :],
+    ]
+    outside_counts = np.maximum(
+        0,
+        int(len(xx)) - np.rint(overlap_count).astype(np.int64),
+    )
+    dy_grid, dx_grid = np.meshgrid(
+        np.arange(int(min_dy), int(max_dy) + 1, dtype=np.int32),
+        np.arange(int(min_dx), int(max_dx) + 1, dtype=np.int32),
+        indexing="ij",
+    )
+    flat_order = np.lexsort(
+        (
+            dx_grid.ravel(),
+            dy_grid.ravel(),
+            np.abs(dx_grid).ravel(),
+            np.abs(dy_grid).ravel(),
+            (dx_grid * dx_grid + dy_grid * dy_grid).ravel(),
+            (np.abs(dx_grid) + np.abs(dy_grid)).ravel(),
+            outside_counts.ravel(),
+        )
+    )
+    selected = int(flat_order[0])
+    dx = int(dx_grid.ravel()[selected])
+    dy = int(dy_grid.ravel()[selected])
+    after_sum, after_count = score(dx, dy)
+    result = dict(base)
+    result.update(
+        {
+            "status": "resolved" if after_sum == 0 else "rejected",
+            "accepted": after_sum == 0,
+            "translation": [dx, dy] if after_sum == 0 else [0, 0],
+            "reason_codes": (
+                ["automatic_rotation_contained_by_exact_speech_polygon"]
+                if after_sum == 0
+                else ["automatic_rotation_cannot_fit_exact_speech_polygon"]
+            ),
+            "outside_alpha_sum_before": before_sum,
+            "outside_alpha_sum_after": after_sum,
+            "outside_alpha_pixel_count_before": before_count,
+            "outside_alpha_pixel_count_after": after_count,
+            "alpha_bounds_before": alpha_bounds,
+            "alpha_bounds_after": (
+                [
+                    alpha_left + dx,
+                    alpha_top + dy,
+                    alpha_right + dx,
+                    alpha_bottom + dy,
+                ]
+                if after_sum == 0
+                else alpha_bounds
+            ),
+            "container_bbox": list(container),
+            "polygon_sha256": polygon_sha256,
+            "candidate_translation_count": int(outside_counts.size),
+            "selection_policy": (
+                "minimum_outside_pixels_then_integer_distance_v1"
+            ),
+        }
+    )
+    return result
+
+
+def _translate_rgba_integer(surface, dx: int, dy: int):
+    if not dx and not dy:
+        return surface
+    translated = Image.new("RGBA", surface.size, (0, 0, 0, 0))
+    translated.alpha_composite(surface, dest=(int(dx), int(dy)))
+    return translated
+
+
+def _rotate_parent_surface_bounded(
+    surface,
+    *,
+    degrees_clockwise: float,
+    pivot: Sequence[float],
+    base_alpha_bounds: Sequence[Any],
+    predicted_bounds: Sequence[Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Rotate only the bounded parent envelope with full-page coordinates.
+
+    Integer crop origins and the adjusted pivot preserve Pillow's affine
+    sampling coordinates.  The guard covers bicubic support beyond both the
+    source alpha and the predicted rotated envelope.
+    """
+
+    page_width, page_height = [int(value) for value in surface.size]
+    boxes = []
+    for value in (base_alpha_bounds, predicted_bounds):
+        if isinstance(value, Sequence) and len(value) == 4:
+            try:
+                box = [int(round(float(item))) for item in value]
+            except (TypeError, ValueError):
+                continue
+            if box[2] > box[0] and box[3] > box[1]:
+                boxes.append(box)
+    if not boxes:
+        return surface, {
+            "status": "unavailable",
+            "reason_codes": ["bounded_rotation_envelope_missing"],
+            "crop_box": [],
+            "crop_area_px": 0,
+            "page_area_px": page_width * page_height,
+            "pixel_exact_to_full_page_reference": False,
+        }
+    base_box = boxes[0]
+    radius = max(
+        math.hypot(float(x) - float(pivot[0]), float(y) - float(pivot[1]))
+        for x, y in (
+            (base_box[0], base_box[1]),
+            (base_box[2], base_box[1]),
+            (base_box[2], base_box[3]),
+            (base_box[0], base_box[3]),
+        )
+    )
+    boxes.append(
+        [
+            int(math.floor(float(pivot[0]) - radius)),
+            int(math.floor(float(pivot[1]) - radius)),
+            int(math.ceil(float(pivot[0]) + radius)),
+            int(math.ceil(float(pivot[1]) + radius)),
+        ]
+    )
+    guard = 8
+    left = max(0, min(box[0] for box in boxes) - guard)
+    top = max(0, min(box[1] for box in boxes) - guard)
+    right = min(page_width, max(box[2] for box in boxes) + guard)
+    bottom = min(page_height, max(box[3] for box in boxes) + guard)
+    if right <= left or bottom <= top:
+        return surface, {
+            "status": "unavailable",
+            "reason_codes": ["bounded_rotation_crop_invalid"],
+            "crop_box": [],
+            "crop_area_px": 0,
+            "page_area_px": page_width * page_height,
+            "pixel_exact_to_full_page_reference": False,
+        }
+    crop_box = (left, top, right, bottom)
+    crop = surface.crop(crop_box)
+    local_pivot = (
+        float(pivot[0]) - float(left),
+        float(pivot[1]) - float(top),
+    )
+    resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC")
+    rotated_crop = (
+        crop.convert("RGBa")
+        .rotate(
+            -float(degrees_clockwise),
+            resample=resampling,
+            center=local_pivot,
+            expand=False,
+            fillcolor=(0, 0, 0, 0),
+        )
+        .convert("RGBA")
+    )
+    rotated = Image.new("RGBA", surface.size, (0, 0, 0, 0))
+    rotated.paste(rotated_crop, (left, top))
+    return rotated, {
+        "status": "bounded_crop",
+        "reason_codes": [
+            "page_coordinate_equivalent_bounded_parent_rotation"
+        ],
+        "crop_box": [left, top, right, bottom],
+        "crop_area_px": int((right - left) * (bottom - top)),
+        "page_area_px": int(page_width * page_height),
+        "area_ratio": round(
+            float((right - left) * (bottom - top))
+            / max(1.0, float(page_width * page_height)),
+            8,
+        ),
+        "sampling": "premultiplied_rgba_bicubic_expand_false",
+        "pivot_page": [float(pivot[0]), float(pivot[1])],
+        "pivot_crop": [float(local_pivot[0]), float(local_pivot[1])],
+        "source_corner_radius_px": round(float(radius), 6),
+        "pixel_exact_to_full_page_reference": True,
+    }
+
+
 def _apply_parent_layer_effects(
     page,
     parent_surface,
@@ -1203,20 +1616,25 @@ def _apply_parent_layer_effects(
     rotation_active = abs(angle) >= 1e-9
     rotated = parent_surface
     rotation_sampling = "none"
+    bounded_rotation = {
+        "status": "ineligible",
+        "reason_codes": ["rotation_inactive"],
+        "crop_box": [],
+        "crop_area_px": 0,
+        "page_area_px": int(parent_surface.size[0] * parent_surface.size[1]),
+        "pixel_exact_to_full_page_reference": True,
+    }
     if rotation_active:
-        resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC")
-        rotated = (
-            parent_surface.convert("RGBa")
-            .rotate(
-                -angle,
-                resample=resampling,
-                center=(float(pivot[0]), float(pivot[1])),
-                expand=False,
-                fillcolor=(0, 0, 0, 0),
-            )
-            .convert("RGBA")
+        rotated, bounded_rotation = _rotate_parent_surface_bounded(
+            parent_surface,
+            degrees_clockwise=angle,
+            pivot=pivot,
+            base_alpha_bounds=base_bounds,
+            predicted_bounds=_glyph_bounds(layout.measured_bounds),
         )
-        rotation_sampling = "premultiplied_rgba_bicubic_expand_false"
+        rotation_sampling = (
+            "premultiplied_rgba_bicubic_bounded_crop_expand_false"
+        )
     rotated_alpha = rotated.getchannel("A")
     rotated_stats = (
         resolved_base_stats
@@ -1280,14 +1698,96 @@ def _apply_parent_layer_effects(
     )
     final_bounds = list(final_stats[0] or ())
     final_sum = int(final_stats[1])
-    containment = _hard_bound_containment(
+    oriented_placement = (
+        _oriented_speech_polygon_translation(
+            final_surface.getchannel("A"),
+            plan,
+        )
+        if rotation_active
+        else {
+            "contract_version": "oriented_speech_polygon_placement_v1",
+            "status": "ineligible",
+            "accepted": False,
+            "translation": [0, 0],
+            "reason_codes": ["rotation_inactive"],
+        }
+    )
+    oriented_dx, oriented_dy = [
+        int(value)
+        for value in list(oriented_placement.get("translation") or [0, 0])[:2]
+    ]
+    if oriented_placement.get("status") == "resolved":
+        final_surface = _translate_rgba_integer(
+            final_surface,
+            oriented_dx,
+            oriented_dy,
+        )
+        final_stats = _surface_alpha_stats(final_surface)
+        final_bounds = list(final_stats[0] or ())
+        final_sum = int(final_stats[1])
+        rotated_bounds = _shift_xyxy(
+            rotated_bounds,
+            oriented_dx,
+            oriented_dy,
+        )
+        shadow_bounds = _shift_xyxy(
+            shadow_bounds,
+            oriented_dx,
+            oriented_dy,
+        )
+    hard_containment = _hard_bound_containment(
         page,
         final_surface,
         (0, 0),
         plan.hard_bounds or plan.target_box,
         alpha_bounds=final_bounds,
     )
+    if oriented_placement.get("status") == "resolved":
+        container_xyxy = _glyph_bounds(
+            oriented_placement.get("container_bbox")
+        )
+        page_xyxy = [0, 0, int(page.size[0]), int(page.size[1])]
+        inside_page = bool(
+            final_bounds and _xyxy_contains(page_xyxy, final_bounds)
+        )
+        inside_container = bool(
+            container_xyxy
+            and final_bounds
+            and _xyxy_contains(container_xyxy, final_bounds)
+        )
+        polygon_contained = bool(
+            oriented_placement.get("outside_alpha_sum_after") == 0
+        )
+        containment = {
+            "accepted": bool(
+                inside_page and inside_container and polygon_contained
+            ),
+            "reason": (
+                "complete_natural_ink_inside_oriented_speech_polygon"
+                if inside_page and inside_container and polygon_contained
+                else "natural_ink_crosses_oriented_speech_or_page_bounds"
+            ),
+            "parent_hard_bounds": list(
+                _glyph_bounds(plan.hard_bounds or plan.target_box)
+            ),
+            "oriented_container_bbox": list(container_xyxy),
+            "page_bounds": page_xyxy,
+            "raster_alpha_bounds": list(final_bounds),
+            "inside_page_bounds": inside_page,
+            "inside_parent_hard_bounds": bool(
+                hard_containment.get("inside_parent_hard_bounds")
+            ),
+            "inside_oriented_container_bbox": inside_container,
+            "inside_guarded_speech_polygon": polygon_contained,
+            "oriented_speech_polygon_guard_px": (
+                ORIENTED_SPEECH_POLYGON_GUARD_PX
+            ),
+        }
+    else:
+        containment = hard_containment
     predicted = _glyph_bounds(layout.measured_bounds)
+    if oriented_placement.get("status") == "resolved":
+        predicted = _shift_xyxy(predicted, oriented_dx, oriented_dy)
     predicted_contains_actual = bool(
         predicted and final_bounds and _xyxy_contains(predicted, final_bounds)
     )
@@ -1295,10 +1795,15 @@ def _apply_parent_layer_effects(
         final_bounds
         and containment.get("accepted")
         and predicted_contains_actual
+        and oriented_placement.get("status") != "rejected"
     )
     rejection_reason = ""
     if not final_bounds:
         rejection_reason = "transformed_parent_layer_alpha_empty"
+    elif oriented_placement.get("status") == "rejected":
+        rejection_reason = (
+            "orientation_normalized_rotation_exceeds_speech_polygon"
+        )
     elif not predicted_contains_actual:
         rejection_reason = "effect_raster_envelope_mismatch"
     elif not bool(containment.get("accepted")):
@@ -1313,7 +1818,12 @@ def _apply_parent_layer_effects(
         "whole_parent_transform_count": 1,
         "rotation": effects.rotation.to_audit_dict(),
         "shadow": shadow,
-        "effect_application_order": "rotate_complete_parent_then_shadow_from_rotated_alpha_then_text",
+        "effect_application_order": (
+            "rotate_complete_parent_then_shadow_from_rotated_alpha_"
+            "then_oriented_container_translate_then_text"
+            if oriented_placement.get("status") == "resolved"
+            else "rotate_complete_parent_then_shadow_from_rotated_alpha_then_text"
+        ),
         "rotation_pivot": [round(float(pivot[0]), 6), round(float(pivot[1]), 6)],
         "base_alpha_bounds": base_bounds,
         "base_alpha_sum": base_sum,
@@ -1321,12 +1831,16 @@ def _apply_parent_layer_effects(
         "rotated_alpha_sum": rotated_sum,
         "shadow_alpha_bounds": shadow_bounds,
         "shadow_alpha_sum": shadow_sum,
+        "oriented_speech_polygon_placement": copy_jsonish(
+            oriented_placement
+        ),
         "final_alpha_bounds": final_bounds,
         "final_alpha_sum": final_sum,
         "final_alpha_containment": copy_jsonish(containment),
         "predicted_envelope": list(predicted),
         "predicted_envelope_contains_actual": predicted_contains_actual,
         "rotation_sampling": rotation_sampling,
+        "bounded_rotation": copy_jsonish(bounded_rotation),
         "shadow_offset_sampling": shadow_sampling,
         "untransformed_fallback_used": False,
         "rejection_reason": rejection_reason,
@@ -1474,6 +1988,9 @@ def _parent_layer_composition_audit(
         "rotated_alpha_sum": int(application.get("rotated_alpha_sum") or alpha_sum),
         "shadow_alpha_bounds": list(application.get("shadow_alpha_bounds") or []),
         "shadow_alpha_sum": int(application.get("shadow_alpha_sum") or 0),
+        "oriented_speech_polygon_placement": copy_jsonish(
+            application.get("oriented_speech_polygon_placement") or {}
+        ),
         "final_alpha_bounds": list(application.get("final_alpha_bounds") or alpha_bounds),
         "final_alpha_sum": int(application.get("final_alpha_sum") or alpha_sum),
         "hard_bound_containment": copy_jsonish(containment),
@@ -1486,6 +2003,9 @@ def _parent_layer_composition_audit(
             application.get("predicted_envelope_contains_actual", True)
         ),
         "rotation_sampling": str(application.get("rotation_sampling") or "none"),
+        "bounded_rotation": copy_jsonish(
+            application.get("bounded_rotation") or {}
+        ),
         "shadow_offset_sampling": str(
             application.get("shadow_offset_sampling") or "none"
         ),
@@ -1852,6 +2372,16 @@ def _xyxy_contains(outer: Sequence[int], inner: Sequence[int]) -> bool:
         and int(inner[2]) <= int(outer[2])
         and int(inner[3]) <= int(outer[3])
     )
+
+
+def _shift_xyxy(value: Sequence[Any], dx: int, dy: int) -> list[int]:
+    if not isinstance(value, Sequence) or len(value) != 4:
+        return []
+    try:
+        left, top, right, bottom = [int(round(float(item))) for item in value]
+    except (TypeError, ValueError):
+        return []
+    return [left + int(dx), top + int(dy), right + int(dx), bottom + int(dy)]
 
 
 def _same_path(left: str, right: str) -> bool:

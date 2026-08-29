@@ -44,6 +44,7 @@ from app.pipeline.style_context_cache import (
     prepare_style_context_delta,
     style_context_snapshot_before,
 )
+from app.pipeline.target_presentation import target_presentation_policy
 from app.pipeline.status_contracts import (
     PipelineErrorReceipt,
     PipelineLifecycleEvent,
@@ -166,6 +167,7 @@ def resolve_parent_style_for_page(
     parent_execution_bundles: Iterable[ParentExecutionBundle],
     evidence: Iterable[Any],
     font_manager: Any,
+    presentation_policy: Any | None = None,
     style_context_snapshot: Any | None = None,
 ) -> Any:
     """Sequence the existing v3 style owners for exactly one current page."""
@@ -239,10 +241,15 @@ def resolve_parent_style_for_page(
         evidence=evidence_items,
         style_context_snapshot=style_context_snapshot,
     )
-    style_ledger = font_detection.realize_parent_render_styles_v3(
+    style_ledger = font_detection.realize_parent_render_styles_v4(
         parent_execution_bundles=render_bundles,
         decision_ledger=decision_ledger,
         font_manager=font_manager,
+        target_presentation_policy=(
+            presentation_policy
+            if presentation_policy is not None
+            else target_presentation_policy("Simplified Chinese")
+        ),
     )
     return font_detection.activate_parent_render_style_ledger_v3(
         parent_execution_bundles=render_bundles,
@@ -2930,6 +2937,9 @@ class PipelineWorker(QtCore.QThread):
                             parent_execution_bundles=parent_execution_bundles,
                             evidence=parent_style_observation.evidence,
                             font_manager=style_font_manager,
+                            presentation_policy=target_presentation_policy(
+                                self._settings.target_lang
+                            ),
                             style_context_snapshot=style_context_snapshot,
                         )
                     except Exception as exc:
@@ -8732,6 +8742,7 @@ def _process_page(
         page_id=page_id,
         hierarchy_result=text_block_hierarchy,
         regions=regions,
+        target_presentation_policy=target_presentation_policy(target_lang),
     )
     parent_execution_bundles = parent_execution_bundle_result.executable_bundles()
     if debug_context is not None:

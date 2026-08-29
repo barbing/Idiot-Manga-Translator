@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+from app.pipeline.oriented_layout import oriented_frame_from_speech_container
 from app.pipeline.status_contracts import PipelineStage, PipelineStageTechnicalError
 
 try:
@@ -6980,6 +6981,7 @@ def assign_bbox_to_text_area_plan(
     cleanup_authorization = str(container.get("cleanup_authorization") or "")
     protection_reason = str(container.get("protection_reason") or "")
     eligibility = _container_authorization_eligibility(container)
+    oriented_frame = oriented_frame_from_speech_container(container)
     return {
         "text_area_container_id": container.get("container_id"),
         "text_area_semantic_unit_id": container.get("semantic_unit_id") or container.get("container_id"),
@@ -7004,6 +7006,10 @@ def assign_bbox_to_text_area_plan(
         "text_area_fallback_reason": container.get("fallback_reason"),
         "text_area_confidence_tier": container.get("confidence_tier") or "low",
         "text_area_container_bbox": list(container.get("bbox") or []),
+        "text_area_container_polygon": list(
+            oriented_frame.get("polygon") or []
+        ),
+        "text_area_oriented_frame": oriented_frame,
         "text_area_reason_codes": list(container.get("evidence_reason_codes") or []),
         "text_area_conflict_flags": list(container.get("conflict_flags") or []),
         "text_area_pre_ocr_authority": bool(container.get("text_area_pre_ocr_authority", True)),
@@ -7122,6 +7128,8 @@ def apply_text_area_assignment_to_region(region: Dict[str, Any], assignment: Map
         "text_area_fallback_reason",
         "text_area_confidence_tier",
         "text_area_container_bbox",
+        "text_area_container_polygon",
+        "text_area_oriented_frame",
         "text_area_reason_codes",
         "text_area_conflict_flags",
         "text_area_pre_ocr_authority",

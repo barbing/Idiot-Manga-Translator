@@ -5693,13 +5693,6 @@ def _observe_additive_rotation(
             "perceptual_rotation_upright_or_italic_only_geometry"
         )
         return unavailable
-    if abs(degrees) > _ADDITIVE_ROTATION_MAX_ABS_DEGREES:
-        unavailable["support"] = support
-        unavailable["reason_codes"].append(
-            "perceptual_rotation_base_axis_or_rotation_ambiguous"
-        )
-        return unavailable
-
     eroded = cv2.erode(
         core.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
@@ -5740,6 +5733,12 @@ def _observe_additive_rotation(
         unavailable["support"] = support
         unavailable["reason_codes"].append(
             "perceptual_rotation_not_stable_under_core_erosion"
+        )
+        return unavailable
+    if abs(degrees) > _ADDITIVE_ROTATION_MAX_ABS_DEGREES:
+        unavailable["support"] = support
+        unavailable["reason_codes"].append(
+            "perceptual_rotation_base_axis_or_rotation_ambiguous"
         )
         return unavailable
 

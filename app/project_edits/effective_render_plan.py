@@ -435,6 +435,7 @@ def _apply_effective_parent(
             authorities[f"resolved_render_style.{field}"] = "user"
     if "preferred_size" in style_overrides:
         authorities["resolved_render_style.target_preferred_em_px"] = "user"
+        authorities["resolved_render_style.target_fit_start_em_px"] = "user"
     if "fill_color" in style_overrides:
         authorities["resolved_render_style.fill"] = "user"
     if {"outline_color", "outline_width"} & set(style_overrides):
@@ -467,12 +468,24 @@ def _apply_effective_parent(
         authorities["target_box"] = "user"
     if len(target_box) != 4 or target_box[2] <= 0 or target_box[3] <= 0:
         raise EffectiveRenderPlanError("effective render box is invalid")
-    if automatic_plan.hard_bounds and not _contains_xywh(
-        automatic_plan.hard_bounds,
+    box_overridden = bool(
+        {"render_box", "x", "y", "width", "height"} & set(layout_overrides)
+    )
+    editable_hard_bounds = list(
+        metadata.get("editable_hard_bounds")
+        or automatic_plan.hard_bounds
+    )
+    effective_hard_bounds = (
+        editable_hard_bounds
+        if box_overridden
+        else list(automatic_plan.hard_bounds)
+    )
+    if effective_hard_bounds and not _contains_xywh(
+        effective_hard_bounds,
         target_box,
     ):
         raise EffectiveRenderPlanError(
-            "effective render box exceeds the automatic hard bounds"
+            "effective render box exceeds the editable hard bounds"
         )
 
     writing_mode = automatic_plan.writing_mode
@@ -507,6 +520,7 @@ def _apply_effective_parent(
             automatic_plan,
             translated_text=parent.target_text,
             target_box=target_box,
+            hard_bounds=effective_hard_bounds,
             resolved_render_style=style,
             writing_mode=writing_mode,
             draw_order=(
@@ -588,6 +602,7 @@ def _apply_size_overrides(style: dict[str, Any], overrides: Mapping[str, Any]) -
                 "preferred_size must be a finite number between 0.1 and 2048.0 pixels"
             ) from exc
         style["target_preferred_em_px"] = preferred
+        style["target_fit_start_em_px"] = preferred
 
 
 def _apply_paint_overrides(style: dict[str, Any], overrides: Mapping[str, Any]) -> None:
