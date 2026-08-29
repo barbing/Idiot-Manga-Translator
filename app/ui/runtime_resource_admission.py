@@ -36,6 +36,7 @@ from app.models.resolution import (
 )
 from app.platform_services.compute import (
     ComputeCapabilitySnapshot,
+    detect_compute_capabilities,
     probe_llama_cpp_python_backend,
     probe_llama_server_backend,
     probe_mps_memory,
@@ -47,6 +48,18 @@ from app.platform_services.contracts import ComputeBackend
 
 GIB = 1024**3
 MIB = 1024**2
+
+
+def _runtime_compute_capabilities() -> ComputeCapabilitySnapshot:
+    """Discover cached compute facts including the managed Paddle runtime."""
+
+    return detect_compute_capabilities(
+        llama_override=(
+            str(os.environ.get("MT_PADDLEOCR_VL_LLAMA_SERVER") or "").strip()
+            or None
+        ),
+        llama_search_roots=(str(Path(models_root()) / "llama.cpp"),),
+    )
 
 
 class ResourceAdmissionStatus(str, Enum):
@@ -88,10 +101,13 @@ class RuntimeMemorySnapshot:
     gpu_devices: tuple[RuntimeGpuMemoryDevice, ...] = ()
     source: str = ""
     detail: str = ""
-    backend: ComputeBackend = ComputeBackend.CPU
-    onnx_backend: ComputeBackend = ComputeBackend.CPU
-    llama_server_backend: ComputeBackend = ComputeBackend.CPU
-    llama_cpp_backend: ComputeBackend = ComputeBackend.CPU
+    # ``None`` preserves legacy/synthetic snapshot semantics: accelerated
+    # callers historically represented CUDA by supplying this memory record
+    # without backend fields. Real probes always publish explicit backends.
+    backend: ComputeBackend | None = None
+    onnx_backend: ComputeBackend | None = None
+    llama_server_backend: ComputeBackend | None = None
+    llama_cpp_backend: ComputeBackend | None = None
     unified_memory: bool = False
 
     def __post_init__(self) -> None:
@@ -108,6 +124,38 @@ class RuntimeMemorySnapshot:
                 raise ValueError("available_vram_bytes is outside total VRAM")
         if any(not isinstance(item, RuntimeGpuMemoryDevice) for item in self.gpu_devices):
             raise TypeError("gpu_devices must contain RuntimeGpuMemoryDevice values")
+        inferred = ComputeBackend.MPS if self.unified_memory else ComputeBackend.CUDA
+        object.__setattr__(self, "backend", self.backend or inferred)
+        object.__setattr__(
+            self,
+            "onnx_backend",
+            self.onnx_backend
+            or (
+                ComputeBackend.COREML
+                if self.unified_memory
+                else ComputeBackend.CUDA
+            ),
+        )
+        object.__setattr__(
+            self,
+            "llama_server_backend",
+            self.llama_server_backend
+            or (
+                ComputeBackend.METAL
+                if self.unified_memory
+                else ComputeBackend.CUDA
+            ),
+        )
+        object.__setattr__(
+            self,
+            "llama_cpp_backend",
+            self.llama_cpp_backend
+            or (
+                ComputeBackend.METAL
+                if self.unified_memory
+                else ComputeBackend.CUDA
+            ),
+        )
         if not isinstance(self.backend, ComputeBackend):
             raise TypeError("backend must be ComputeBackend")
         if not isinstance(self.onnx_backend, ComputeBackend):
@@ -399,19 +447,25 @@ class RuntimeResourceAdmissionReport:
             projected = _format_bytes(self.projected_vram_bytes)
             available = _format_bytes(self.available_vram_bytes)
             reserve = _format_bytes(self.vram_reserve_bytes)
+            accelerator_prefix = (
+                ""
+                if not self.unified_memory
+                and self.accelerator_backends == (ComputeBackend.CUDA,)
+                else f"{self.accelerator_label}: "
+            )
             if self.status is ResourceAdmissionStatus.BLOCKED:
                 return auto_prefix + (
-                    f"{self.accelerator_label}: needs {projected}; "
+                    f"{accelerator_prefix}needs {projected}; "
                     f"{available} is available. "
                     "Start is blocked."
                 )
             if self.status is ResourceAdmissionStatus.RISK:
                 return auto_prefix + (
-                    f"{self.accelerator_label}: needs {projected} plus {reserve} "
+                    f"{accelerator_prefix}needs {projected} plus {reserve} "
                     f"reserve; {available} is available. Start is blocked."
                 )
             return auto_prefix + (
-                f"{self.accelerator_label}: {projected} estimated · "
+                f"{accelerator_prefix}{projected} estimated · "
                 f"{available} available · {reserve} reserved."
                 f"{warning_suffix}"
             )
@@ -601,7 +655,9 @@ class RuntimeResourceMonitorService:
         compute: ComputeCapabilitySnapshot | None = None,
     ) -> None:
         self._memory_probe = memory_probe or (
-            lambda: probe_runtime_memory(compute=compute)
+            lambda: probe_runtime_memory(
+                compute=compute or _runtime_compute_capabilities()
+            )
         )
 
     def sample(
@@ -1161,7 +1217,9 @@ class RuntimeResourceAdmissionService:
         compute: ComputeCapabilitySnapshot | None = None,
     ) -> None:
         self._memory_probe = memory_probe or (
-            lambda: probe_runtime_memory(compute=compute)
+            lambda: probe_runtime_memory(
+                compute=compute or _runtime_compute_capabilities()
+            )
         )
         self._asset_probe = asset_probe
 

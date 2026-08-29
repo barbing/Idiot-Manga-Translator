@@ -29,7 +29,7 @@ The project is aimed at practical local use. It favors deterministic routing, ex
 
 ### Requirements
 
-- Windows 10 or newer, or Apple Silicon macOS for the tested Mac source path
+- Windows 10 or newer, or Apple Silicon macOS for the source path described below
 - Git and Conda; Python 3.10 is the supported interpreter
 - Enough disk space for OCR, detection, cleanup, font, and optional local translation models
 - Optional NVIDIA CUDA on Windows; Apple acceleration uses MPS, CoreML, and Metal when each runtime supports it
@@ -53,7 +53,10 @@ Match CUDA-enabled Torch and llama.cpp builds to the installed driver/toolkit wh
 
 ### macOS Source Setup
 
-The repository-owned Mac environment installs Python 3.10, PyICU/ICU, native `llama-server`, and the direct Python dependencies. It does not download Windows CUDA archives.
+The repository-owned Mac environment installs Python 3.10, PyICU/ICU, pinned
+Conda-native `llama-server` and `llama-cpp-python` builds, and the remaining
+Python dependencies. It does not download Windows CUDA archives or compile
+llama.cpp through pip.
 
 ```bash
 git clone https://github.com/barbing/YomiFrame-LLM_Manga_Translator.git
@@ -72,12 +75,18 @@ conda env update -n manga-llm -f environments/macos.yml --prune
 
 On Apple Silicon, Torch prefers MPS, ONNX Runtime prefers CoreML, and native llama.cpp uses Metal. Paddle's `llama-server` and GGUF translation's `llama-cpp-python` extension are probed independently because they can have different build capabilities. Unsupported runtimes fall back to CPU and record the selected backend and reason. Resource admission uses the recommended Metal working set plus available unified system memory; it does not require `nvidia-smi`.
 
+The default Conda path does not require an Xcode source build. Developers who
+intentionally replace the pinned llama packages with a pip source build must
+install Xcode Command Line Tools first.
+
 ### Runtime Asset Verification
 
-The app verifies the catalog automatically after first paint, and Start stays
-blocked until every required receipt is ready. Open **Settings > Runtime
-assets** and choose **Verify all** to repeat the same model-free check manually.
-The catalog covers nine fixed families:
+The app publishes the runtime catalog after first paint without importing model
+frameworks or starting a model server. Open **Settings > Runtime assets** and
+choose **Verify all** for a model-free local check. Start blocks only when a
+current check proves that an asset selected by the compiled run is missing;
+unselected alternatives do not block, and an unchecked runtime remains owned by
+the normal fail-closed stage startup. The catalog covers nine fixed families:
 
 1. ComicTextDetector
 2. bubble detection
@@ -91,7 +100,10 @@ The catalog covers nine fixed families:
 
 Windows CPython 3.10 x64 can install the SHA-256-pinned private PyICU runtime from the versioned `runtime-dependencies-v1` release. macOS validates PyICU 2.16.2 / ICU 78.3 from the active `manga-llm` Conda environment. Runtime paths are shown using the current platform's standard application-data location.
 
-Managed model downloads remain available per catalog row. On macOS, PaddleOCR-VL downloads only the GGUF model and projector; install its native executable with `conda install -n manga-llm -c conda-forge llama.cpp` if verification reports it missing.
+Managed model downloads remain available per catalog row. On macOS,
+PaddleOCR-VL downloads only the GGUF model and projector. If its native
+executable is missing, update the pinned environment from the repository root:
+`conda env update -n manga-llm -f environments/macos.yml --prune`.
 
 ### Translation Provider Setup
 

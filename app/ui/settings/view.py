@@ -3141,7 +3141,11 @@ class SettingsView(QtWidgets.QWidget):
                         "GGUF Cross-Page Context"
                     ),
                     "cleanup.inpaint_model_id": "Inpaint Model ID",
-                    "runtime.use_gpu": "Allow acceleration",
+                    "runtime.use_gpu": (
+                        "Use GPU"
+                        if self._platform_copy.accelerator_label == "CUDA"
+                        else "Allow acceleration"
+                    ),
                 }.get(
                     definition.qualified_id,
                     definition.setting_id.replace("_", " ").title(),

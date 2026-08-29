@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Default settings."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import sys
 
 # Model URLs
 COMIC_TEXT_DETECTOR_GPU = "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt"
@@ -47,6 +48,13 @@ MANGA_OCR_FILES = [
 ]
 
 
+def default_render_font_name(sys_platform: str | None = None) -> str:
+    """Preserve the Windows fallback while using a bundled family on macOS."""
+
+    platform_name = str(sys_platform or sys.platform).strip().casefold()
+    return "Microsoft YaHei" if platform_name == "win32" else "Noto Sans CJK SC"
+
+
 @dataclass
 class AppDefaults:
     source_language: str = "Japanese"
@@ -56,7 +64,7 @@ class AppDefaults:
     json_path: str = ""
     import_dir: str = ""
     export_dir: str = ""
-    font_name: str = "Noto Sans CJK SC"
+    font_name: str = field(default_factory=default_render_font_name)
     font_detection: str = "yuzumarker"
     detector_input_size: int = 1024
     detector_engine: str = "ComicTextDetector"

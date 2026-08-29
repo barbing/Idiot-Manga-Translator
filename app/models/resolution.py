@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import sys
 from typing import Iterable, Optional
 
 from app.config.defaults import (
@@ -186,12 +185,7 @@ def resolve_llama_server_executable(
     resolved = resolve_llama_server(
         identity=identity,
         override=override,
-        search_roots=(
-            Path(sys.prefix) / "bin",
-            Path(sys.prefix) / "Library" / "bin",
-            Path(sys.prefix) / "Scripts",
-            Path(root),
-        ),
+        search_roots=(Path(root),),
     )
     return str(resolved) if resolved is not None else None
 

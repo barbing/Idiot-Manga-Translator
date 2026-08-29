@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Simple light/dark palette helpers and platform-specific UI copy."""
 from dataclasses import dataclass
+import sys
 
 from PySide6 import QtGui
 
@@ -78,10 +79,55 @@ def apply_light_palette(app) -> None:
     app.setStyleSheet(_light_stylesheet())
 
 
-def _dark_stylesheet() -> str:
-    return """
+def _platform_font_rules(*, dark: bool, sys_platform: str | None = None) -> dict[str, str]:
+    if str(sys_platform or sys.platform).strip().casefold() != "win32":
+        return {
+            "__GLOBAL_FONT_FAMILY__": "",
+            "__NAV_FONT_FAMILY__": "",
+            "__NAV_ACTIVE_FONT_FAMILY__": "",
+            "__TOOLTIP_FONT_FAMILY__": "",
+        }
+    return {
+        "__GLOBAL_FONT_FAMILY__": (
+            '  font-family: "Microsoft YaHei", "Segoe UI", sans-serif;'
+            if dark
+            else '  font-family: "Segoe UI", sans-serif;'
+        ),
+        "__NAV_FONT_FAMILY__": (
+            '  font-family: "Segoe UI";' if dark else ""
+        ),
+        "__NAV_ACTIVE_FONT_FAMILY__": (
+            '  font-family: "Microsoft YaHei", "Segoe UI";'
+            if dark
+            else '  font-family: "Segoe UI";'
+        ),
+        "__TOOLTIP_FONT_FAMILY__": (
+            '  font-family: "Microsoft YaHei", "Segoe UI";'
+            if dark
+            else ""
+        ),
+    }
+
+
+def _apply_platform_font_rules(
+    stylesheet: str,
+    *,
+    dark: bool,
+    sys_platform: str | None = None,
+) -> str:
+    for marker, rule in _platform_font_rules(
+        dark=dark,
+        sys_platform=sys_platform,
+    ).items():
+        stylesheet = stylesheet.replace(marker, rule)
+    return stylesheet
+
+
+def _dark_stylesheet(sys_platform: str | None = None) -> str:
+    stylesheet = """
 * { 
   font-size: 13px; 
+__GLOBAL_FONT_FAMILY__
 }
 QMainWindow {
   background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -227,12 +273,14 @@ QPushButton[nav="true"], QToolButton[nav="true"] {
   padding: 10px 16px;
   text-align: left;
   color: #94a3b8;
+__NAV_FONT_FAMILY__
   font-size: 14px;
 }
 QPushButton[nav="true"]:hover, QToolButton[nav="true"]:hover {
   color: #e2e8f0;
   background: rgba(51, 65, 85, 0.3);
   font-size: 14px;
+__NAV_ACTIVE_FONT_FAMILY__
 }
 QPushButton[nav="true"]:checked, QToolButton[nav="true"]:checked {
   color: #38bdf8;
@@ -241,6 +289,7 @@ QPushButton[nav="true"]:checked, QToolButton[nav="true"]:checked {
   background-color: rgba(15, 23, 42, 0.5); /* Fallback */
   font-weight: 600;
   font-size: 14px;
+__NAV_ACTIVE_FONT_FAMILY__
 }
 QProgressBar {
   border: 1px solid #334155;
@@ -294,14 +343,21 @@ QToolTip {
   color: #e2e8f0;
   border: 1px solid #334155;
   font-size: 12px;
+__TOOLTIP_FONT_FAMILY__
 }
 """
+    return _apply_platform_font_rules(
+        stylesheet,
+        dark=True,
+        sys_platform=sys_platform,
+    )
 
 
-def _light_stylesheet() -> str:
-    return """
+def _light_stylesheet(sys_platform: str | None = None) -> str:
+    stylesheet = """
 * { 
   font-size: 13px; 
+__GLOBAL_FONT_FAMILY__
 }
 QMainWindow {
   background-color: #f8fafc;
@@ -436,12 +492,14 @@ QPushButton[nav="true"], QToolButton[nav="true"] {
 QPushButton[nav="true"]:hover, QToolButton[nav="true"]:hover {
   background-color: #e2e8f0;
   font-size: 14px;
+__NAV_ACTIVE_FONT_FAMILY__
 }
 QPushButton[nav="true"]:checked, QToolButton[nav="true"]:checked {
   background-color: #e2e8f0;
   color: #0ea5e9;
   font-weight: 600;
   font-size: 14px;
+__NAV_ACTIVE_FONT_FAMILY__
 }
 QProgressBar {
   border: 1px solid #cbd5e1;
@@ -467,3 +525,8 @@ QStatusBar {
   border-top: 1px solid #cbd5e1;
 }
 """
+    return _apply_platform_font_rules(
+        stylesheet,
+        dark=False,
+        sys_platform=sys_platform,
+    )

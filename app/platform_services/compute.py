@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
@@ -293,6 +294,38 @@ def resolve_llama_server(
         if _candidate_is_executable(candidate, selected):
             return candidate
 
+    def first_candidate(
+        roots: Iterable[str | os.PathLike[str]],
+    ) -> Path | None:
+        names = set(_llama_names(selected))
+        for raw_root in roots:
+            root = Path(raw_root).expanduser()
+            if not root.is_dir():
+                continue
+            candidates = [
+                candidate.resolve()
+                for candidate in root.rglob("*")
+                if candidate.name in names
+                and _candidate_is_executable(candidate, selected)
+            ]
+            if not candidates:
+                continue
+            candidates.sort(
+                key=lambda item: (
+                    "cuda" not in item.as_posix().casefold()
+                    if selected.os is OperatingSystem.WINDOWS
+                    else False,
+                    len(item.parts),
+                    item.as_posix().casefold(),
+                )
+            )
+            return candidates[0]
+        return None
+
+    managed = first_candidate(search_roots)
+    if managed is not None:
+        return managed
+
     environment_path = os.environ.get("PATH", "") if path_environment is None else path_environment
     for name in _llama_names(selected):
         resolved = shutil.which(name, path=environment_path)
@@ -310,37 +343,24 @@ def resolve_llama_server(
         if environment_roots is None
         else tuple(Path(root).expanduser() for root in environment_roots)
     )
-    roots = (*base_roots, *(Path(root).expanduser() for root in search_roots))
-    names = set(_llama_names(selected))
-    for root in roots:
-        if not root.is_dir():
-            continue
-        candidates: list[Path] = []
-        for candidate in root.rglob("*"):
-            if candidate.name in names and _candidate_is_executable(candidate, selected):
-                candidates.append(candidate.resolve())
-        if not candidates:
-            continue
-        candidates.sort(
-            key=lambda item: (
-                "cuda" not in item.as_posix().casefold()
-                if selected.os is OperatingSystem.WINDOWS
-                else False,
-                len(item.parts),
-                item.as_posix().casefold(),
-            )
-        )
-        return candidates[0]
-    return None
+    return first_candidate(base_roots)
 
 
+@lru_cache(maxsize=4)
 def detect_compute_capabilities(
     identity: PlatformIdentity | None = None,
+    *,
+    llama_override: str | None = None,
+    llama_search_roots: tuple[str, ...] = (),
 ) -> ComputeCapabilitySnapshot:
     selected = identity or PlatformIdentity.detect()
     torch_selection = select_torch_device(True)
     onnx_selection = select_onnx_providers(True)
-    llama_server = resolve_llama_server(identity=selected)
+    llama_server = resolve_llama_server(
+        identity=selected,
+        override=llama_override,
+        search_roots=llama_search_roots,
+    )
     return ComputeCapabilitySnapshot(
         torch=torch_selection,
         onnx=onnx_selection,
@@ -350,12 +370,19 @@ def detect_compute_capabilities(
     )
 
 
+def invalidate_compute_capability_cache() -> None:
+    """Refresh capability discovery after a runtime install or relink."""
+
+    detect_compute_capabilities.cache_clear()
+
+
 __all__ = [
     "ComputeCapabilitySnapshot",
     "MpsMemoryFacts",
     "OnnxProviderSelection",
     "TorchDeviceSelection",
     "detect_compute_capabilities",
+    "invalidate_compute_capability_cache",
     "llama_backend_from_device_listing",
     "llama_cpp_backend_from_capability",
     "llama_server_is_launchable",

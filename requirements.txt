@@ -25,7 +25,7 @@ tqdm>=4.41
 
 # Translation backends
 requests
-llama-cpp-python
+llama-cpp-python; sys_platform != "darwin"
 urllib3>=2,<3
 
 # Hugging Face / model download
@@ -54,6 +54,8 @@ unidic-lite>=1.0.8
 # Notes:
 # - ONNX Runtime uses the CoreML-capable package on macOS and the GPU package
 #   elsewhere; CPU remains an explicit fallback on every platform.
+# - macOS installs pinned llama.cpp and llama-cpp-python builds from Conda via
+#   environments/macos.yml; the pip source-build path is intentionally skipped.
 # - Other dependencies keep CPU-safe defaults where possible.
 # - On Windows, GPU users should usually install CUDA-enabled torch,
 #   and a GPU-capable llama-cpp-python build via conda/pip

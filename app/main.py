@@ -91,9 +91,13 @@ def configure_application_font(app: object):
     setter = getattr(app, "setFont", None)
     if not callable(setter):
         raise TypeError("application must provide setFont()")
-    font = QtGui.QFontDatabase.systemFont(
-        QtGui.QFontDatabase.SystemFont.GeneralFont
-    )
+    if sys.platform == "win32":
+        font = QtGui.QFont("Microsoft YaHei", 10)
+        font.setStyleStrategy(QtGui.QFont.StyleStrategy.PreferAntialias)
+    else:
+        font = QtGui.QFontDatabase.systemFont(
+            QtGui.QFontDatabase.SystemFont.GeneralFont
+        )
     setter(font)
     return font
 

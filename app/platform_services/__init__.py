@@ -18,6 +18,7 @@ from .compute import (
     OnnxProviderSelection,
     TorchDeviceSelection,
     detect_compute_capabilities,
+    invalidate_compute_capability_cache,
     llama_backend_from_device_listing,
     llama_cpp_backend_from_capability,
     llama_server_is_launchable,
@@ -33,6 +34,7 @@ from .runtime_assets import (
     RuntimeAssetSpec,
     RuntimeAssetTarget,
     paddle_targets,
+    required_runtime_asset_ids,
     runtime_asset_catalog,
     runtime_asset_spec,
 )
@@ -44,7 +46,7 @@ class PlatformServices:
     paths: PlatformPaths
     credential_store: CredentialStore
     credential_resolver: CredentialResolver
-    compute: ComputeCapabilitySnapshot
+    compute: ComputeCapabilitySnapshot | None
     runtime_assets: tuple[RuntimeAssetSpec, ...]
 
 
@@ -74,7 +76,7 @@ def build_platform_services(
             selected,
             keyring_backend=keyring,
         ),
-        compute=compute or detect_compute_capabilities(selected),
+        compute=compute,
         runtime_assets=runtime_asset_catalog(selected),
     )
 
@@ -97,12 +99,14 @@ __all__ = [
     "build_platform_services",
     "credential_store_label",
     "detect_compute_capabilities",
+    "invalidate_compute_capability_cache",
     "llama_backend_from_device_listing",
     "llama_cpp_backend_from_capability",
     "llama_server_is_launchable",
     "release_torch_memory",
     "qt_platform_paths",
     "paddle_targets",
+    "required_runtime_asset_ids",
     "probe_llama_cpp_python_backend",
     "probe_llama_server_backend",
     "resolve_llama_server",

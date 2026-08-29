@@ -1,7 +1,25 @@
 # -*- coding: utf-8 -*-
 """Font detection helpers."""
 from __future__ import annotations
+import sys
 from typing import Optional
+
+
+def heuristic_font_map(sys_platform: str | None = None) -> dict[str, str]:
+    platform_name = str(sys_platform or sys.platform).strip().casefold()
+    if platform_name == "win32":
+        return {
+            "thin": "SimSun",
+            "normal": "Noto Sans CJK",
+            "bold": "Microsoft YaHei",
+            "vertical": "Microsoft YaHei",
+        }
+    return {
+        "thin": "Noto Sans CJK SC",
+        "normal": "Noto Sans CJK SC",
+        "bold": "Noto Sans CJK SC",
+        "vertical": "Noto Sans CJK SC",
+    }
 
 
 class FontDetection:
@@ -20,12 +38,7 @@ class FontDetection:
 
 class _HeuristicFontDetector:
     def __init__(self) -> None:
-        self._fonts = {
-            "thin": "Noto Sans CJK SC",
-            "normal": "Noto Sans CJK SC",
-            "bold": "Noto Sans CJK SC",
-            "vertical": "Noto Sans CJK SC",
-        }
+        self._fonts = heuristic_font_map()
 
     def detect(self, image) -> Optional[str]:
         try:

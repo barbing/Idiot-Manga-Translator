@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from PySide6 import QtCore
 
@@ -11,6 +11,7 @@ from app.config.settings_contracts import DownloadState, ProviderHealth, Runtime
 from app.models.downloader import ModelDownloader
 from app.models.resolution import models_root
 from app.platform_services.contracts import PlatformIdentity
+from app.platform_services.compute import invalidate_compute_capability_cache
 from app.platform_services.runtime_assets import (
     RuntimeAssetSpec,
     runtime_asset_catalog,
@@ -26,11 +27,25 @@ from app.ui.runtime_resource_admission import (
 def runtime_assets_ready(
     status: RuntimeStatus | None,
     identity: PlatformIdentity | None = None,
+    *,
+    required_asset_ids: Iterable[str] | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
     selected = identity or PlatformIdentity.detect()
     installed = status.installed_assets if status is not None else {}
+    catalog = runtime_asset_catalog(selected)
+    catalog_ids = frozenset(spec.asset_id for spec in catalog)
+    required = (
+        catalog_ids
+        if required_asset_ids is None
+        else frozenset(str(value).strip() for value in required_asset_ids if str(value).strip())
+    )
+    unknown = required - catalog_ids
+    if unknown:
+        raise ValueError(f"unsupported required runtime assets: {sorted(unknown)}")
     missing: list[str] = []
-    for spec in runtime_asset_catalog(selected):
+    for spec in catalog:
+        if spec.asset_id not in required:
+            continue
         raw = installed.get(spec.asset_id)
         ready = (
             bool(raw.get("ready") or raw.get("installed"))
@@ -102,6 +117,8 @@ class RuntimeAssetProbeWorker(QtCore.QObject):
                     ),
                     "managed_download": spec.preparer is not None,
                 }
+            if bool(assets.get("paddle_ocr_vl", {}).get("ready")):
+                invalidate_compute_capability_cache()
 
             self.status_ready.emit(
                 RuntimeStatus(

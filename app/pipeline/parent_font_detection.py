@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -10528,6 +10529,14 @@ def yuzu_provider_chain(
     return select_onnx_providers(use_gpu, tuple(available)).providers
 
 
+def _provider_failure_reason(provider: str, suffix: str) -> str:
+    prefix = {
+        "CUDAExecutionProvider": "cuda_execution_provider",
+        "CoreMLExecutionProvider": "coreml_execution_provider",
+    }.get(str(provider), "accelerator_provider")
+    return f"{prefix}_{suffix}"
+
+
 def _load_onnx_session(model_path: str, *, use_gpu: bool) -> Any:
     key = (os.path.abspath(model_path), bool(use_gpu))
     if key in _SESSION_CACHE:
@@ -10556,8 +10565,20 @@ def _load_onnx_session(model_path: str, *, use_gpu: bool) -> Any:
     active = [str(provider) for provider in session.get_providers()]
     requested = providers[0] if providers else "CPUExecutionProvider"
     fallback_reason = selection.fallback_reason
+    if use_gpu and fallback_reason:
+        expected = (
+            "coreml_execution_provider"
+            if sys.platform == "darwin"
+            else "cuda_execution_provider"
+            if sys.platform == "win32"
+            else "accelerator_provider"
+        )
+        fallback_reason = f"{expected}_not_available"
     if active and active[0] != requested:
-        fallback_reason = f"{requested.casefold()}_initialization_failed"
+        fallback_reason = _provider_failure_reason(
+            requested,
+            "initialization_failed",
+        )
     _SESSION_PROVIDER_METADATA[key] = {
         "gpu_requested": bool(use_gpu),
         "requested_execution_provider": requested,

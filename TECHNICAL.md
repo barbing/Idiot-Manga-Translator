@@ -328,9 +328,11 @@ Glossary enforcement must not mask upstream OCR or detection failures. If a name
 Python 3.10 is the supported source interpreter on Windows and macOS. Windows
 can install `requirements.txt` in an isolated Conda environment; its platform
 marker retains `onnxruntime-gpu`. macOS uses `environments/macos.yml`, which
-installs the matching PyICU/ICU pair and native `llama-server` before installing
-the Python requirements. The Darwin requirements branch uses `onnxruntime`,
-whose available providers are inspected at runtime.
+installs the matching PyICU/ICU pair plus pinned Conda-native `llama.cpp` and
+`llama-cpp-python` packages before installing the remaining Python
+requirements. The Darwin requirements branch uses `onnxruntime` and excludes
+the pip llama binding so the default setup does not require an undeclared Xcode
+source build. Available providers are still inspected at runtime.
 
 Backend selection is capability-based and component-specific:
 
@@ -376,16 +378,19 @@ contents. The configured cleanup model id is provenance; the actual cleanup
 backend resolves to the fixed iopaint model unless a future roadmap explicitly
 changes the policy.
 
-After first paint the Settings runtime catalog automatically verifies nine
-fixed families: ComicTextDetector,
+After first paint the Settings runtime catalog presents nine fixed families
+without automatically importing model frameworks or starting a model server:
+ComicTextDetector,
 bubble evidence, PaddleOCR-VL, MangaOCR, cleanup inpainting, NER, YuzuMarker,
 the Noto CJK pack, and PyICU. The same catalog owns row copy, checker/preparer
 method names, platform remediation, and managed-download availability. On Mac,
 Paddle downloads only its model/projector and requires the native Conda
 executable; Windows retains the two CUDA archives. User-selected LLM
-translation models are not fixed catalog assets. Start fails closed until all
-nine current catalog receipts are ready; **Verify all** repeats the same
-model-free probe explicitly.
+translation models are not fixed catalog assets. **Verify all** runs the
+model-free probe explicitly. Start blocks only for a selected asset that a
+current receipt proves missing; MangaOCR, NER, or another unselected catalog
+row cannot veto the run. With no current receipt, the normal owning stage keeps
+its fail-closed model/runtime startup contract.
 
 Application preferences migrate only exact untouched historical defaults on
 macOS: `D:/Manga Projects` becomes the platform Documents project root, and

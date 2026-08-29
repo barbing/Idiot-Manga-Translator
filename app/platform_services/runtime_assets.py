@@ -122,9 +122,10 @@ def runtime_asset_catalog(
                     "Windows CUDA runtime, then verify again."
                 ),
                 OperatingSystem.MACOS: (
-                    "Install the native runtime with `conda install -n manga-llm "
-                    "-c conda-forge llama.cpp`, then use Download for the model "
-                    "files and run Verify all again."
+                    "From the repository root, run `conda env update -n "
+                    "manga-llm -f environments/macos.yml --prune`, restart "
+                    "YomiFrame, then use Download for the model files and run "
+                    "Verify all again."
                 ),
             },
         ),
@@ -207,6 +208,59 @@ def runtime_asset_spec(
     raise KeyError(f"unsupported runtime asset: {normalized}")
 
 
+def required_runtime_asset_ids(
+    pipeline_values: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Return the fixed assets required by one compiled run candidate."""
+
+    if not isinstance(pipeline_values, Mapping):
+        raise TypeError("pipeline_values must be mapping-like")
+
+    required = {
+        "bubble_detection",
+        "font_pack",
+        "pyicu",
+    }
+    detector = str(
+        pipeline_values.get("detector_engine") or "ComicTextDetector"
+    ).strip()
+    if detector.casefold() == "comictextdetector":
+        required.add("comic_text_detector")
+
+    ocr = str(
+        pipeline_values.get("ocr_engine") or "PaddleOCR-VL"
+    ).strip().casefold()
+    required.add("manga_ocr" if ocr in {"mangaocr", "manga-ocr"} else "paddle_ocr_vl")
+
+    inpaint_mode = str(
+        pipeline_values.get("inpaint_mode") or "ai"
+    ).strip().casefold()
+    if inpaint_mode not in {"off", "none", "disabled"}:
+        required.add("cleanup_inpaint")
+
+    font_detection = str(
+        pipeline_values.get("font_detection") or "yuzumarker"
+    ).strip().casefold()
+    if font_detection == "yuzumarker":
+        required.add("font_detection")
+
+    if bool(pipeline_values.get("prescan_use_ner", False)):
+        required.add("ner")
+
+    catalog_order = (
+        "comic_text_detector",
+        "bubble_detection",
+        "paddle_ocr_vl",
+        "manga_ocr",
+        "cleanup_inpaint",
+        "ner",
+        "font_detection",
+        "font_pack",
+        "pyicu",
+    )
+    return tuple(asset_id for asset_id in catalog_order if asset_id in required)
+
+
 def paddle_targets(
     identity: PlatformIdentity | None = None,
 ) -> tuple[RuntimeAssetTarget, ...]:
@@ -256,6 +310,7 @@ __all__ = [
     "RuntimeAssetSpec",
     "RuntimeAssetTarget",
     "paddle_targets",
+    "required_runtime_asset_ids",
     "runtime_asset_catalog",
     "runtime_asset_spec",
 ]

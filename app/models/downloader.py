@@ -42,7 +42,7 @@ from app.config.defaults import (
 
 import hashlib
 from dataclasses import dataclass
-from typing import Callable, Iterator, List, Mapping
+from typing import Callable, Iterator, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import tarfile
@@ -57,11 +57,9 @@ from app.models.resolution import (
     resolve_manga_ocr_system_ref,
     resolve_ner_local_dir,
     resolve_ner_system_snapshot,
-    resolve_llama_server_executable,
-    resolve_paddle_ocr_vl_mmproj_file,
-    resolve_paddle_ocr_vl_model_file,
 )
 from app.platform_services.paths import qt_platform_paths
+from app.platform_services.compute import invalidate_compute_capability_cache
 from app.platform_services.contracts import OperatingSystem, PlatformIdentity
 from app.platform_services.runtime_assets import (
     paddle_targets,
@@ -117,7 +115,6 @@ class ModelDownloader(QtCore.QObject):
         pyicu_runtime_sha256: str | None = None,
         pyicu_runtime_root: str | os.PathLike[str] | None = None,
         platform_identity: PlatformIdentity | None = None,
-        paddle_runtime_verifier: Callable[[bool], None] | None = None,
     ):
         super().__init__(parent)
         self._cancel_requested = False
@@ -139,7 +136,6 @@ class ModelDownloader(QtCore.QObject):
         if not isinstance(self._platform_identity, PlatformIdentity):
             raise TypeError("platform_identity must be PlatformIdentity")
         self._paddle_runtime_verification_required = False
-        self._paddle_runtime_verifier = paddle_runtime_verifier
         self._paddle_runtime_error = ""
 
     def _create_session(self) -> requests.Session:
@@ -684,121 +680,13 @@ class ModelDownloader(QtCore.QObject):
         return bool(resolve_ner_system_snapshot() or resolve_ner_local_dir(os.path.join(models_dir, "ner")))
 
     def check_paddle_ocr_vl(self, models_dir: str = "models") -> bool:
-        """Verify files plus one cached health/model-identity server receipt."""
+        """Verify model files and a launchable native runtime without loading it."""
 
         self._paddle_runtime_error = ""
-        if not has_paddle_ocr_vl_runtime(
+        return has_paddle_ocr_vl_runtime(
             base_dir=models_dir,
             identity=self._platform_identity,
-        ):
-            return False
-        try:
-            identity = self._paddle_readiness_identity(models_dir)
-            if self._paddle_readiness_receipt_valid(models_dir, identity):
-                return True
-            self._verify_paddle_runtime(use_gpu=True)
-            self._write_paddle_readiness_receipt(models_dir, identity)
-            return True
-        except Exception as exc:
-            self._paddle_runtime_error = (
-                "PaddleOCR-VL representative runtime verification failed "
-                f"({type(exc).__name__})."
-            )
-            return False
-
-    @staticmethod
-    def _runtime_file_identity(path: str | os.PathLike[str]) -> dict[str, object]:
-        resolved = Path(path).expanduser().resolve()
-        stat_result = resolved.stat()
-        return {
-            "path": str(resolved),
-            "size": int(stat_result.st_size),
-            "mtime_ns": int(stat_result.st_mtime_ns),
-        }
-
-    def _paddle_readiness_identity(self, models_dir: str) -> dict[str, object]:
-        model = resolve_paddle_ocr_vl_model_file(models_dir)
-        projector = resolve_paddle_ocr_vl_mmproj_file(models_dir)
-        executable = resolve_llama_server_executable(
-            models_dir,
-            identity=self._platform_identity,
         )
-        if not model or not projector or not executable:
-            raise RuntimeError("PaddleOCR-VL runtime identity is incomplete")
-        return {
-            "schema": 2,
-            "platform": self._platform_identity.os.value,
-            "architecture": self._platform_identity.architecture,
-            "model": self._runtime_file_identity(model),
-            "projector": self._runtime_file_identity(projector),
-            "executable": self._runtime_file_identity(executable),
-        }
-
-    @staticmethod
-    def _paddle_readiness_path(models_dir: str) -> Path:
-        return (
-            Path(models_dir)
-            / "paddleocr-vl-1.6-gguf"
-            / "runtime-readiness.json"
-        )
-
-    def _paddle_readiness_receipt_valid(
-        self,
-        models_dir: str,
-        identity: Mapping[str, object],
-    ) -> bool:
-        try:
-            payload = json.loads(
-                self._paddle_readiness_path(models_dir).read_text(encoding="utf-8")
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return False
-        return bool(
-            isinstance(payload, dict)
-            and payload.get("verified") is True
-            and payload.get("identity") == dict(identity)
-        )
-
-    def _verify_paddle_runtime(self, *, use_gpu: bool) -> None:
-        if self._paddle_runtime_verifier is not None:
-            self._paddle_runtime_verifier(bool(use_gpu))
-            return
-        from app.ocr.paddle_ocr_vl_engine import PaddleOcrVlEngine
-
-        engine = PaddleOcrVlEngine(use_gpu=use_gpu)
-        engine.close()
-
-    def _write_paddle_readiness_receipt(
-        self,
-        models_dir: str,
-        identity: Mapping[str, object],
-    ) -> None:
-        path = self._paddle_readiness_path(models_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle, temporary_path = tempfile.mkstemp(
-            prefix=".runtime-readiness.",
-            suffix=".tmp",
-            dir=str(path.parent),
-        )
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-                json.dump(
-                    {"verified": True, "identity": dict(identity)},
-                    stream,
-                    ensure_ascii=True,
-                    indent=2,
-                    sort_keys=True,
-                )
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, path)
-        except Exception:
-            try:
-                os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
-            raise
 
     def check_font_detection(self, models_dir: str = "models") -> bool:
         """Check if YuzuMarker font detection and local CJK fallback fonts exist."""
@@ -970,6 +858,7 @@ class ModelDownloader(QtCore.QObject):
                 ).remediation_for(self._platform_identity)
                 self.finished.emit(False, f"PaddleOCR-VL runtime is incomplete. {remediation}")
                 return
+            invalidate_compute_capability_cache()
 
         if self._cancel_requested:
             self.finished.emit(False, "Cancelled")

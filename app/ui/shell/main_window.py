@@ -47,7 +47,11 @@ from app.pipeline.status_contracts import (
     PipelineStageOutcome,
     RuntimeBackendEvent,
 )
-from app.platform_services import PlatformServices, build_platform_services
+from app.platform_services import (
+    PlatformServices,
+    build_platform_services,
+    required_runtime_asset_ids,
+)
 from app.platform_services.contracts import (
     ComputeBackend,
     OperatingSystem,
@@ -2194,7 +2198,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             "stage_outcome",
             "progress_snapshot",
             "structured_error",
-            "runtime_backend_selected",
         )
         if status is None or any(not hasattr(status, name) for name in required):
             raise TypeError("controller must expose the typed PipelineStatus signals")
@@ -2206,7 +2209,13 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
         status.stage_outcome.connect(self.accept_stage_outcome)
         status.progress_snapshot.connect(self.accept_progress)
         status.structured_error.connect(self.accept_error)
-        status.runtime_backend_selected.connect(self.accept_runtime_backend)
+        runtime_backend_selected = getattr(
+            status,
+            "runtime_backend_selected",
+            None,
+        )
+        if runtime_backend_selected is not None:
+            runtime_backend_selected.connect(self.accept_runtime_backend)
 
     @property
     def current_project_path(self) -> str:
@@ -14064,27 +14073,6 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 warning=True,
             )
             return
-        if self._runtime_probe_thread is not None:
-            self._set_notice(
-                "Wait for runtime asset verification before starting a run.",
-                warning=True,
-            )
-            return
-        assets_ready, missing_assets = runtime_assets_ready(
-            self._settings_model.runtime_status,
-            self._platform_identity,
-        )
-        if not assets_ready:
-            if self._settings_model.runtime_status is None:
-                self._start_runtime_probe()
-            else:
-                self._set_notice(
-                    "Required runtime assets are unavailable: "
-                    + ", ".join(missing_assets)
-                    + ". Open Settings > Runtime assets to repair them.",
-                    warning=True,
-                )
-            return
         if self._manual_cleanup_modal_active():
             self._set_notice(
                 "Finish or cancel cleanup coverage before starting a run.",
@@ -14116,6 +14104,10 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             ready, reason = self._pending_run_start_gate()
             if not ready:
                 self._set_notice(reason, warning=True)
+                return
+            if not self._runtime_assets_start_gate(
+                files_whitelist=self._resource_admission_requested_files
+            ):
                 return
             self._start_resource_admission(
                 files_whitelist=self._resource_admission_requested_files
@@ -14779,9 +14771,53 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
                 warning=True,
             )
             return
+        if not self._runtime_assets_start_gate(
+            files_whitelist=self._resource_admission_requested_files
+        ):
+            return
         self._start_resource_admission(
             files_whitelist=self._resource_admission_requested_files
         )
+
+    def _runtime_assets_start_gate(
+        self,
+        *,
+        files_whitelist: tuple[str, ...] = (),
+    ) -> bool:
+        runtime_status = self._settings_model.runtime_status
+        if runtime_status is None:
+            return True
+        if self._runtime_probe_thread is not None:
+            self._set_notice(
+                "Wait for runtime asset verification before starting a run.",
+                warning=True,
+            )
+            return False
+        try:
+            compilation = self.compile_pipeline_run(
+                files_whitelist=tuple(files_whitelist)
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return True
+        if not compilation.ready:
+            return True
+        required_assets = required_runtime_asset_ids(
+            compilation.snapshot.pipeline_values
+        )
+        assets_ready, missing_assets = runtime_assets_ready(
+            runtime_status,
+            self._platform_identity,
+            required_asset_ids=required_assets,
+        )
+        if assets_ready:
+            return True
+        self._set_notice(
+            "Required runtime assets are unavailable: "
+            + ", ".join(missing_assets)
+            + ". Open Settings > Runtime assets to repair them.",
+            warning=True,
+        )
+        return False
 
     @QtCore.Slot(str)
     def _set_source_text_draft(self, text: str) -> None:
@@ -25004,11 +25040,11 @@ class YomiFrameMainWindow(QtWidgets.QMainWindow):
             label="Shell ready",
             tone="ready",
             detail=(
-                "Runtime assets are checked only when their background owners "
-                "publish status. No model was loaded for first paint."
+                "Runtime assets are verified on demand. Current receipts are "
+                "checked before Start; selected owners fail closed when "
+                "unchecked. No model was loaded for first paint."
             ),
         )
-        self._start_runtime_probe()
 
     def _set_notice(self, text: str, *, warning: bool = False) -> None:
         value = str(text).strip()
