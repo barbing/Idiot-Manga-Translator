@@ -199,6 +199,16 @@ ParentExecutionBundle
 
 Rendering composes translated text after cleanup. The primary entry point for current production output is `render_parent_execution_bundles()`, which converts bundles to parent-owned execution regions and stamps renderer audit identity. It must preserve the full translated text or produce explicit evidence when text cannot fit. It should not silently drop characters, overflow unreadably, or reinterpret semantic scope.
 
+English uses `target-presentation:en:v2`. For an exact authorized speech
+container, its automatic domain is the full container shape while the source
+side/center remains an alignment prior. `RenderLayoutPlanner` converts the
+exact polygon into an ephemeral pre-effect actual/comfort row-capacity profile;
+`TypesettingEngine` performs whole-word variable-width line selection and
+per-line alignment; the existing compositor still applies the one final parent
+rotation and draw/commit transaction. Chinese retains the existing CJK path.
+Missing or conservative polygon authority falls back to the prior rectangular
+layout without pixel inference becoming semantic authority.
+
 The renderer consumes cleanup results and render-eligibility decisions. It must not generate cleanup masks, choose cleanup classes, select cleanup backends, or mutate source cleanup locally in normal operation.
 
 The renderer does not validate cleanup completeness. It consumes the supplied

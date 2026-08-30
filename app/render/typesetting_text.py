@@ -690,6 +690,8 @@ def _punctuation_sequence_at(
     if index < 0 or index >= len(records):
         return index, ""
     cluster = str(records[index].get("text") or "")
+    if cluster == "\u00ad":
+        return index + 1, "soft_hyphen"
     if cluster == ".":
         end = index
         while end < len(records) and str(records[end].get("text") or "") == ".":
@@ -792,6 +794,8 @@ def _lossless_punctuation_source_class(source: str, punctuation_kind: str) -> st
 
 
 def _punctuation_presentation_base(token: PunctuationToken) -> str:
+    if token.punctuation_kind == "soft_hyphen":
+        return token.original_text
     if token.punctuation_kind != "ellipsis":
         return token.original_text
     if token.source_class == "ascii_dot_ellipsis_sequence":
@@ -920,6 +924,7 @@ def segment_inline_runs(
     language_hint: str = "",
     punctuation_occurrences: Sequence[dict[str, Any]] | None = None,
     symbol_occurrences: Sequence[dict[str, Any]] | None = None,
+    latin_lexical_policy: bool = False,
 ) -> list[InlineTextRun]:
     if isinstance(text, str):
         tokens: list[TextToken | PunctuationToken] = build_lossless_text_tokens(text)
@@ -949,6 +954,17 @@ def segment_inline_runs(
             while index + 1 < len(tokens):
                 next_token = tokens[index + 1]
                 if isinstance(next_token, PunctuationToken):
+                    if (
+                        latin_lexical_policy
+                        and _latin_internal_joiner(
+                            tokens,
+                            index + 1,
+                            base_kind=kind,
+                        )
+                    ):
+                        group.append(next_token)
+                        index += 1
+                        continue
                     break
                 next_kind = _token_break_class(next_token)
                 if next_kind not in {kind, "format_control"}:
@@ -1055,8 +1071,62 @@ def segment_inline_runs(
     return _coalesce_format_control_runs(runs)
 
 
+_LATIN_APOSTROPHE_JOINERS = {"'", "’", "ʼ", "＇"}
+_LATIN_HYPHEN_JOINERS = {"-", "‐", "‑"}
+_LATIN_PERIOD_JOINERS = {"."}
+
+
+def _latin_internal_joiner(
+    tokens: Sequence[TextToken | PunctuationToken],
+    punctuation_index: int,
+    *,
+    base_kind: str,
+) -> bool:
+    """Return whether one punctuation token belongs inside a Latin word.
+
+    The rule is enabled only by the explicit target-presentation policy. It
+    preserves the existing lossless punctuation token and merely prevents an
+    ordinary line break inside contractions, possessives, compounds,
+    abbreviations, and decimal numbers.
+    """
+
+    values = list(tokens or [])
+    if punctuation_index <= 0 or punctuation_index + 1 >= len(values):
+        return False
+    token = values[punctuation_index]
+    if not isinstance(token, PunctuationToken):
+        return False
+    before = values[punctuation_index - 1]
+    after = values[punctuation_index + 1]
+    if isinstance(before, PunctuationToken) or isinstance(after, PunctuationToken):
+        return False
+    before_kind = _token_break_class(before)
+    after_kind = _token_break_class(after)
+    text = str(token.presentation_text or token.original_text or "")
+    if text in _LATIN_APOSTROPHE_JOINERS:
+        return bool(
+            base_kind == "latin"
+            and before_kind == "latin"
+            and after_kind == "latin"
+        )
+    if text in _LATIN_HYPHEN_JOINERS:
+        return bool(
+            base_kind in {"latin", "number"}
+            and before_kind in {"latin", "number"}
+            and after_kind in {"latin", "number"}
+        )
+    if text in _LATIN_PERIOD_JOINERS:
+        return bool(
+            (base_kind == "latin" and before_kind == after_kind == "latin")
+            or (base_kind == "number" and before_kind == after_kind == "number")
+        )
+    return False
+
+
 def _token_break_class(token: TextToken | PunctuationToken) -> str:
     if isinstance(token, PunctuationToken):
+        if token.punctuation_kind == "soft_hyphen":
+            return "soft_hyphen"
         if token.punctuation_kind in {"ellipsis", "dash", "wave"}:
             return token.punctuation_kind
         if (
@@ -1219,7 +1289,14 @@ def compute_break_opportunities(
         reason = "generic_run_boundary"
         strength = "normal"
         allowed = True
-        if after.text in CLOSE_PUNCTUATION or after.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"} and after.text[:1] in CLOSE_PUNCTUATION:
+        if after.role == "soft_hyphen":
+            reason = "manual_soft_hyphen_before_forbidden"
+            strength = "forbidden"
+            allowed = False
+        elif before.role == "soft_hyphen":
+            reason = "manual_soft_hyphen"
+            strength = "preferred"
+        elif after.text in CLOSE_PUNCTUATION or after.role in {"ellipsis_sequence", "dash_sequence", "punctuation_sequence"} and after.text[:1] in CLOSE_PUNCTUATION:
             reason = "kinsoku_rejected_before_closing_punctuation"
             strength = "forbidden"
             allowed = False

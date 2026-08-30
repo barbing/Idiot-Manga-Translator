@@ -659,6 +659,177 @@ class LineBreakPlanner:
             metadata=metadata,
         )
 
+    def plan_horizontal_bands(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        opportunities: Sequence[BreakOpportunity],
+        *,
+        line_widths: Sequence[float],
+    ) -> BreakPlanResult:
+        """Select one complete horizontal partition for fixed per-line widths.
+
+        This is the Latin shape-band path. The existing scalar-width method is
+        intentionally unchanged so non-Latin and legacy callers retain their
+        current candidate order and audit behavior.
+        """
+
+        values = [dict(item) for item in (items or [])]
+        widths = [max(1.0, float(value)) for value in (line_widths or [])]
+        boundary_candidates, boundary_by_split = _boundary_catalog(
+            values,
+            opportunities,
+        )
+        rejected = [
+            {
+                **item,
+                "rejection_reason": str(
+                    item.get("reason") or "missing_break_opportunity"
+                ),
+            }
+            for item in boundary_candidates
+            if not bool(item.get("allowed"))
+        ]
+        if not values or not widths:
+            return BreakPlanResult(
+                groups=[values],
+                boundary_candidates=boundary_candidates,
+                rejected_breaks=rejected,
+                issues=["no_legal_break_partition", "line_break_fit_failure"],
+                metadata={
+                    "line_break_planner_version": self.version,
+                    "selection_authority": "explicit_break_opportunities",
+                    "strategy": "invalid_variable_width_request",
+                    "line_widths": [round(value, 3) for value in widths],
+                    "selected_lines": len(widths),
+                },
+            )
+
+        segment_metric_cache: dict[
+            tuple[int, int],
+            tuple[float, int, float],
+        ] = {}
+        path, evaluated = _best_horizontal_band_path(
+            values,
+            boundary_by_split,
+            line_widths=widths,
+            segment_metric_cache=segment_metric_cache,
+        )
+        if path is None:
+            return BreakPlanResult(
+                groups=[values],
+                boundary_candidates=boundary_candidates,
+                rejected_breaks=rejected,
+                candidate_partitions=[
+                    {
+                        "lines": len(widths),
+                        "line_widths": [round(value, 3) for value in widths],
+                        "legal_candidate_count": int(evaluated),
+                        "selected": False,
+                        "rejection_reason": "no_complete_legal_partition",
+                    }
+                ],
+                issues=["no_legal_break_partition", "line_break_fit_failure"],
+                metadata={
+                    "line_break_planner_version": self.version,
+                    "selection_authority": "explicit_break_opportunities",
+                    "strategy": "unpartitioned_variable_width_failure",
+                    "line_widths": [round(value, 3) for value in widths],
+                    "selected_lines": len(widths),
+                },
+            )
+
+        groups = _groups_from_breaks(values, path.breaks)
+        advances = [
+            round(
+                _horizontal_band_group_advance(
+                    group,
+                    broken=index < len(groups) - 1,
+                ),
+                3,
+            )
+            for index, group in enumerate(groups)
+        ]
+        quality = _canonical_quality_record(
+            writing_mode="horizontal",
+            fit=(
+                path.width_overflow_count,
+                path.width_overflow_amount,
+                0,
+            ),
+            confirmed=(
+                path.confirmed_lexical_break_count,
+                path.confirmed_lexical_rank_loss,
+            ),
+            punctuation=path.punctuation_penalty,
+            topology=len(widths),
+            segment_quality=(
+                path.phrase_boundary_crossing_count,
+                path.segment_quality_penalty,
+            ),
+            weak=(
+                path.weak_lexical_break_count,
+                path.weak_lexical_rank_loss,
+                path.lexical_conflict_break_count,
+            ),
+            balance=path.raggedness,
+            source=0.0,
+            frontload=0.0,
+        )
+        candidate_record = {
+            "lines": len(widths),
+            "line_widths": [round(value, 3) for value in widths],
+            "line_advances": advances,
+            "split_points": list(path.breaks[:-1]),
+            "legal_candidate_count": int(evaluated),
+            "selected": True,
+            "lexicographic_key": quality,
+            "canonical_break_quality": quality,
+            "canonical_break_quality_sort_key": list(
+                _canonical_quality_record_key(quality)
+            ),
+        }
+        selected_breaks = [
+            _selected_break_record(boundary_by_split[split], split, ordinal)
+            for ordinal, split in enumerate(path.breaks[:-1])
+        ]
+        issues: list[str] = []
+        if path.width_overflow_count:
+            issues.append("line_break_fit_failure")
+            if any(
+                len(group) == 1
+                and float(group[0].get("advance") or 0.0) > widths[index]
+                for index, group in enumerate(groups)
+            ):
+                issues.append("atomic_run_overflow")
+        metadata = {
+            "line_break_planner_version": self.version,
+            "variable_width_strategy_version": (
+                "latin_horizontal_variable_width_v1"
+            ),
+            "selection_authority": "explicit_break_opportunities",
+            "strategy": (
+                "authoritative_variable_width_break_opportunity_partition"
+            ),
+            "line_widths": [round(value, 3) for value in widths],
+            "selected_lines": len(groups),
+            "selected_line_advances": advances,
+            "split_points": list(path.breaks[:-1]),
+            "selected_lexicographic_key": quality,
+            "canonical_break_quality": quality,
+            "canonical_break_quality_sort_key": list(
+                _canonical_quality_record_key(quality)
+            ),
+        }
+        return BreakPlanResult(
+            groups=groups,
+            selected_breaks=selected_breaks,
+            boundary_candidates=boundary_candidates,
+            rejected_breaks=rejected,
+            candidate_partitions=[candidate_record],
+            issues=_unique(issues),
+            metadata=metadata,
+        )
+
 
 def _boundary_catalog(
     items: Sequence[Mapping[str, Any]],
@@ -1069,6 +1240,151 @@ def _best_horizontal_path(
     return states.get((line_count, count)), evaluated
 
 
+def _best_horizontal_band_path(
+    items: Sequence[Mapping[str, Any]],
+    boundary_by_split: Mapping[int, Mapping[str, Any]],
+    *,
+    line_widths: Sequence[float],
+    segment_metric_cache: dict[
+        tuple[int, int],
+        tuple[float, int, float],
+    ] | None = None,
+) -> tuple[_HorizontalPath | None, int]:
+    """Return the best complete path for one fixed width per line."""
+
+    count = len(items)
+    widths = [max(1.0, float(value)) for value in (line_widths or [])]
+    line_count = len(widths)
+    if line_count <= 0 or line_count > count:
+        return None, 0
+    prefix = [0.0]
+    for item in items:
+        prefix.append(
+            prefix[-1] + max(0.0, float(item.get("advance") or 0.0))
+        )
+    states: dict[tuple[int, int], _HorizontalPath] = {
+        (0, 0): _HorizontalPath(
+            breaks=(),
+            width_overflow_count=0,
+            width_overflow_amount=0.0,
+            confirmed_lexical_break_count=0,
+            confirmed_lexical_rank_loss=0,
+            punctuation_penalty=0.0,
+            phrase_boundary_crossing_count=0,
+            segment_quality_penalty=0.0,
+            weak_lexical_break_count=0,
+            weak_lexical_rank_loss=0,
+            lexical_conflict_break_count=0,
+            raggedness=0.0,
+        )
+    }
+    evaluated = 0
+    for line, width_limit in enumerate(widths):
+        next_states: dict[tuple[int, int], _HorizontalPath] = {}
+        for (used, start), path in states.items():
+            if used != line:
+                continue
+            remaining_lines = line_count - line - 1
+            for end in range(start + 1, count - remaining_lines + 1):
+                boundary = boundary_by_split.get(end) if end < count else None
+                if end < count and not bool((boundary or {}).get("allowed")):
+                    continue
+                evaluated += 1
+                width = max(0.0, prefix[end] - prefix[start])
+                if (
+                    end < count
+                    and str(items[end - 1].get("role") or "")
+                    == "soft_hyphen"
+                ):
+                    width += max(
+                        0.0,
+                        float(
+                            items[end - 1].get("discretionary_advance") or 0.0
+                        ),
+                    )
+                overflow = max(0.0, width - width_limit)
+                confirmed_count, confirmed_rank, weak_count, weak_rank = (
+                    _boundary_lexical_evidence(boundary)
+                )
+                conflict_count = _boundary_conflict_uncertainty(boundary)
+                metric_key = (start, end)
+                metrics = (
+                    segment_metric_cache.get(metric_key)
+                    if segment_metric_cache is not None
+                    else None
+                )
+                if metrics is None:
+                    segment = items[start:end]
+                    metrics = (
+                        _horizontal_whitespace_penalty(segment),
+                        _segment_phrase_boundary_crossing_count(segment),
+                        _segment_quality_penalty(items, start, end)
+                        + (
+                            _horizontal_latin_word_comma_orphan_penalty(segment)
+                            if end < count
+                            else 0.0
+                        ),
+                    )
+                    if segment_metric_cache is not None:
+                        segment_metric_cache[metric_key] = metrics
+                punctuation, phrase_boundary_crossings, segment_quality = metrics
+                if line == 0 and end < count:
+                    segment_quality += (
+                        _horizontal_leading_short_word_orphan_penalty(
+                            items[start:end]
+                        )
+                    )
+                if line > 0 and end < count:
+                    segment_quality += _horizontal_nonterminal_word_orphan_penalty(
+                        items[start:end]
+                    )
+                if end < count:
+                    punctuation += _break_strength_penalty(boundary)
+                unused_ratio = max(
+                    0.0,
+                    width_limit - min(width_limit, width),
+                ) / max(1.0, width_limit)
+                candidate = _HorizontalPath(
+                    breaks=(*path.breaks, end),
+                    width_overflow_count=(
+                        path.width_overflow_count + int(overflow > 1e-9)
+                    ),
+                    width_overflow_amount=path.width_overflow_amount + overflow,
+                    confirmed_lexical_break_count=(
+                        path.confirmed_lexical_break_count + confirmed_count
+                    ),
+                    confirmed_lexical_rank_loss=(
+                        path.confirmed_lexical_rank_loss + confirmed_rank
+                    ),
+                    punctuation_penalty=path.punctuation_penalty + punctuation,
+                    phrase_boundary_crossing_count=(
+                        path.phrase_boundary_crossing_count
+                        + phrase_boundary_crossings
+                    ),
+                    segment_quality_penalty=(
+                        path.segment_quality_penalty + segment_quality
+                    ),
+                    weak_lexical_break_count=(
+                        path.weak_lexical_break_count + weak_count
+                    ),
+                    weak_lexical_rank_loss=(
+                        path.weak_lexical_rank_loss + weak_rank
+                    ),
+                    lexical_conflict_break_count=(
+                        path.lexical_conflict_break_count + conflict_count
+                    ),
+                    raggedness=path.raggedness + unused_ratio * unused_ratio,
+                )
+                key = (line + 1, end)
+                prior = next_states.get(key)
+                if prior is None or _horizontal_path_key(candidate) < _horizontal_path_key(prior):
+                    next_states[key] = candidate
+        states = next_states
+        if not states:
+            return None, evaluated
+    return states.get((line_count, count)), evaluated
+
+
 def _horizontal_path_key(path: _HorizontalPath) -> tuple[Any, ...]:
     return (
         path.width_overflow_count,
@@ -1401,6 +1717,41 @@ def _horizontal_latin_word_comma_orphan_penalty(
     return 1.0
 
 
+def _horizontal_nonterminal_word_orphan_penalty(
+    segment: Sequence[Mapping[str, Any]],
+) -> float:
+    """Penalize an interior line whose visible content has one word unit."""
+
+    word_units = [
+        item
+        for item in segment
+        if str(item.get("role") or "") in {"latin_word", "numeric_token"}
+        and str(item.get("text") or "").strip()
+    ]
+    return 2.0 if len(word_units) == 1 else 0.0
+
+
+def _horizontal_leading_short_word_orphan_penalty(
+    segment: Sequence[Mapping[str, Any]],
+) -> float:
+    """Penalize a first line made only from a one- or two-letter word."""
+
+    word_units = [
+        item
+        for item in segment
+        if str(item.get("role") or "") in {"latin_word", "numeric_token"}
+        and str(item.get("text") or "").strip()
+    ]
+    if len(word_units) != 1:
+        return 0.0
+    letters = "".join(
+        char
+        for char in str(word_units[0].get("text") or "")
+        if char.isalpha()
+    )
+    return 2.0 if 0 < len(letters) <= 2 else 0.0
+
+
 def _item_row_units(item: Mapping[str, Any]) -> float:
     try:
         return max(1.0, float(item.get("row_units", 1.0)))
@@ -1414,6 +1765,24 @@ def _items_row_units(items: Sequence[Mapping[str, Any]]) -> float:
 
 def _items_advance(items: Sequence[Mapping[str, Any]]) -> float:
     return sum(max(0.0, float(item.get("advance") or 0.0)) for item in items)
+
+
+def _horizontal_band_group_advance(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    broken: bool,
+) -> float:
+    width = _items_advance(items)
+    if (
+        broken
+        and items
+        and str(items[-1].get("role") or "") == "soft_hyphen"
+    ):
+        width += max(
+            0.0,
+            float(items[-1].get("discretionary_advance") or 0.0),
+        )
+    return width
 
 
 def _number(value: Any, default: float = 0.0) -> float:

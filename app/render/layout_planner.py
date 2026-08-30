@@ -8,18 +8,30 @@ parent identity, translation, or style resolution.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from app.render.typesetting_contracts import (
     FitReport,
+    HORIZONTAL_SHAPE_CAPACITY_PROFILE_VERSION,
+    HorizontalCapacityRow,
+    HorizontalShapeCapacityProfile,
     RenderLayerPlan,
     TypesetLayout,
     copy_jsonish,
     validated_source_text_footprint_ref,
 )
 from app.render.typesetting_engine import TypesettingEngine
+from app.render.parent_layer_effects import resolve_parent_layer_effects
+
+try:
+    from PIL import Image, ImageDraw
+except Exception:  # pragma: no cover - required by normal renderer runtime
+    Image = None
+    ImageDraw = None
 
 try:
     import numpy as np
@@ -93,6 +105,17 @@ class RenderLayoutPlanner:
         *,
         occupied_bounds: Sequence[Mapping[str, Any]],
     ) -> PlannedLayerResult:
+        if (
+            _is_latin_shape_band_layer(plan)
+            and _is_shape_aware_speech_layer(plan)
+        ):
+            latin_result = _latin_shape_band_planned_result(
+                page,
+                plan,
+                self.typesetting_engine,
+            )
+            if latin_result is not None:
+                return latin_result
         shape_plan = _shape_aware_plan(page, plan)
         return _visual_slot_scored_result(
             page,
@@ -1023,6 +1046,443 @@ def _is_shape_aware_speech_layer(plan: RenderLayerPlan) -> bool:
     if "caption" in text or "background" in text:
         return False
     return "speech" in text or "bubble" in text or str(plan.role or "").lower() == "speech"
+
+
+def _is_latin_shape_band_layer(plan: RenderLayerPlan) -> bool:
+    """Return whether one plan explicitly selects the English v2 strategy."""
+
+    style = (
+        plan.resolved_render_style
+        if isinstance(plan.resolved_render_style, Mapping)
+        else {}
+    )
+    presentation = (
+        style.get("target_presentation_policy")
+        if isinstance(style.get("target_presentation_policy"), Mapping)
+        else {}
+    )
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    policy_id = str(
+        presentation.get("policy_id")
+        or metadata.get("target_presentation_policy_id")
+        or ""
+    )
+    writing_mode = str(
+        plan.writing_mode
+        or style.get("writing_mode")
+        or ""
+    ).strip().lower()
+    return bool(
+        policy_id == "target-presentation:en:v2"
+        and str(style.get("target_script") or "") == "Latn"
+        and writing_mode == "horizontal"
+    )
+
+
+def _build_horizontal_shape_capacity_profile(
+    page,
+    plan: RenderLayerPlan,
+    candidate_box: Sequence[int],
+) -> HorizontalShapeCapacityProfile | None:
+    """Build one deterministic pre-effect capacity profile for Latin text."""
+
+    if np is None:
+        return None
+    bounds = _bbox_from_value(candidate_box)
+    if not bounds:
+        return None
+    page_box = [0, 0, int(page.size[0]), int(page.size[1])]
+    bounds = _intersect_box(bounds, page_box)
+    if not bounds:
+        return None
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    domain = (
+        metadata.get("parent_render_domain")
+        if isinstance(metadata.get("parent_render_domain"), Mapping)
+        else {}
+    )
+    frame = (
+        metadata.get("oriented_layout_frame")
+        if isinstance(metadata.get("oriented_layout_frame"), Mapping)
+        else {}
+    )
+    container_id = str(domain.get("container_id") or "")
+    exact_domain = bool(
+        str(domain.get("policy_id") or "") == "target-presentation:en:v2"
+        and str(domain.get("status") or "")
+        == "authorized_shape_safe_speech_container"
+        and str(domain.get("container_type") or "") == "speech_bubble"
+        and str(domain.get("container_authorization_state") or "")
+        == "cleanup_translate_speech"
+        and not list(domain.get("container_conflict_flags") or [])
+    )
+    if not exact_domain:
+        return None
+    polygon = []
+    source = ""
+    reason_codes: list[str] = []
+    if (
+        exact_domain
+        and str(frame.get("status") or "") == "supported"
+        and str(frame.get("coordinate_space") or "") == "page"
+        and str(frame.get("container_id") or "") == container_id
+        and str(frame.get("container_type") or "") == "speech_bubble"
+    ):
+        polygon = _capacity_polygon(frame.get("polygon"))
+        if polygon:
+            source = "exact_text_area_plan_speech_polygon"
+            reason_codes.append("exact_oriented_speech_polygon_capacity")
+    if exact_domain and not polygon:
+        polygon = _capacity_polygon(domain.get("container_polygon"))
+        if polygon:
+            source = "exact_text_area_plan_speech_polygon"
+            reason_codes.append("exact_speech_polygon_capacity")
+
+    rotation_degrees = 0.0
+    inverse_rotation_applied = False
+    if polygon:
+        effects = resolve_parent_layer_effects(plan.resolved_render_style)
+        if (
+            effects.rotation.availability == "resolved"
+            and abs(float(effects.rotation.degrees_clockwise)) >= 1e-9
+        ):
+            rotation_degrees = float(effects.rotation.degrees_clockwise)
+            pivot = _point_from_value(frame.get("center_page"))
+            if not pivot:
+                pivot = _point_from_value(metadata.get("visual_alignment_center"))
+            if not pivot:
+                pivot = _center_box(bounds)
+            polygon = [
+                _rotate_capacity_point(
+                    point,
+                    pivot,
+                    -rotation_degrees,
+                )
+                for point in polygon
+            ]
+            inverse_rotation_applied = True
+            reason_codes.append("inverse_parent_rotation_applied")
+        raw_mask = _polygon_capacity_mask(polygon, bounds)
+        if raw_mask is None or int(raw_mask.sum()) <= 0:
+            return None
+        actual_mask = _erode_component(raw_mask, 2)
+        margin = _shape_margin(plan, bounds)
+        comfort_mask = _erode_component(actual_mask, margin)
+        source_sha256 = _capacity_polygon_sha256(polygon)
+    else:
+        geometry = _speech_bubble_geometry_from_page(page, plan, bounds)
+        actual_mask = geometry.get("component")
+        comfort_mask = geometry.get("safe_mask")
+        audit = (
+            geometry.get("audit")
+            if isinstance(geometry.get("audit"), Mapping)
+            else {}
+        )
+        if (
+            not bool(audit.get("applied"))
+            or actual_mask is None
+            or int(actual_mask.sum()) <= 0
+        ):
+            return None
+        if comfort_mask is None or int(comfort_mask.sum()) <= 0:
+            comfort_mask = actual_mask
+        margin = int(audit.get("margin") or _shape_margin(plan, bounds))
+        source = "cleaned_page_speech_interior_fallback"
+        source_sha256 = _capacity_mask_sha256(actual_mask)
+        reason_codes.append("cleaned_page_speech_interior_capacity_fallback")
+
+    rows = tuple(
+        HorizontalCapacityRow(
+            y=int(bounds[1] + local_y),
+            actual_intervals=_capacity_row_intervals(
+                actual_mask,
+                local_y,
+                origin_x=bounds[0],
+            ),
+            comfort_intervals=_capacity_row_intervals(
+                comfort_mask,
+                local_y,
+                origin_x=bounds[0],
+            ),
+        )
+        for local_y in range(int(bounds[3]))
+    )
+    if not any(row.actual_intervals for row in rows):
+        return None
+    visual_center = _point_from_value(frame.get("center_page"))
+    if inverse_rotation_applied and visual_center:
+        visual_center = _rotate_capacity_point(
+            visual_center,
+            visual_center,
+            -rotation_degrees,
+        )
+    if not visual_center:
+        visual_center = _point_from_value(
+            _speech_visual_center(actual_mask, bounds).get("center")
+        )
+    if not visual_center:
+        visual_center = _center_box(bounds)
+    alignment_center = _point_from_value(metadata.get("visual_alignment_center"))
+    if not alignment_center or not _point_inside_box(alignment_center, bounds):
+        alignment_center = list(visual_center)
+    return HorizontalShapeCapacityProfile(
+        profile_version=HORIZONTAL_SHAPE_CAPACITY_PROFILE_VERSION,
+        strategy_id="latin_horizontal_shape_bands_v1",
+        source=source,
+        source_sha256=source_sha256,
+        actual_mask_sha256=_capacity_mask_sha256(actual_mask),
+        comfort_mask_sha256=_capacity_mask_sha256(comfort_mask),
+        bounds=tuple(bounds[:4]),
+        rows=rows,
+        visual_center=(float(visual_center[0]), float(visual_center[1])),
+        alignment_center=(
+            float(alignment_center[0]),
+            float(alignment_center[1]),
+        ),
+        rotation_degrees_clockwise=rotation_degrees,
+        inverse_rotation_applied=inverse_rotation_applied,
+        margin_px=margin,
+        reason_codes=tuple(reason_codes),
+    )
+
+
+def _latin_shape_band_planned_result(
+    page,
+    plan: RenderLayerPlan,
+    typesetting_engine: TypesettingEngine,
+) -> PlannedLayerResult | None:
+    page_box = [0, 0, int(page.size[0]), int(page.size[1])]
+    candidate = _latin_shape_capacity_candidate_box(plan, page_box)
+    if not candidate:
+        return None
+    profile = _build_horizontal_shape_capacity_profile(page, plan, candidate)
+    if not isinstance(profile, HorizontalShapeCapacityProfile):
+        return None
+    metadata = copy_jsonish(plan.metadata) if isinstance(plan.metadata, Mapping) else {}
+    profile_audit = profile.to_audit_dict()
+    metadata["horizontal_shape_capacity_profile"] = profile_audit
+    metadata["shape_aware_composition"] = {
+        "applied": True,
+        "source": "latin_horizontal_shape_capacity_profile",
+        "box": list(profile.bounds),
+        "margin": int(profile.margin_px),
+        "profile_digest": str(profile.profile_digest),
+        "reason_codes": list(profile.reason_codes),
+    }
+    clipping = (
+        copy_jsonish(plan.clipping_region_ref)
+        if isinstance(plan.clipping_region_ref, Mapping)
+        else {}
+    )
+    clipping["horizontal_shape_capacity_bounds"] = list(profile.bounds)
+    profile_plan = replace(
+        plan,
+        target_box=list(profile.bounds),
+        metadata=metadata,
+        clipping_region_ref=clipping,
+        horizontal_shape_capacity_profile=profile,
+    )
+    layout, report = typesetting_engine.typeset_layer(profile_plan)
+    capacity_layout = (
+        layout.metadata.get("horizontal_shape_capacity")
+        if isinstance(layout.metadata, Mapping)
+        and isinstance(layout.metadata.get("horizontal_shape_capacity"), Mapping)
+        else {}
+    )
+    final_plan = _plan_with_visual_slot_audit(
+        profile_plan,
+        {
+            "applied": True,
+            "source": "latin_shape_band_capacity_v1",
+            "selected_source": str(profile.source),
+            "selected_box": list(profile.bounds),
+            "selected_profile_digest": str(profile.profile_digest),
+            "selected_line_boxes": copy_jsonish(
+                capacity_layout.get("selected_line_boxes") or []
+            ),
+            "selected_line_widths": copy_jsonish(
+                capacity_layout.get("selected_line_widths") or []
+            ),
+            "fit_status": str(report.fit_status or ""),
+            "full_text_placed": bool(report.full_text_placed),
+            "candidate_count": int(capacity_layout.get("candidate_count") or 0),
+            "fitting_candidate_count": int(
+                capacity_layout.get("fitting_candidate_count") or 0
+            ),
+            "readability_is_render_admission": False,
+        },
+    )
+    return PlannedLayerResult(
+        plan=final_plan,
+        layout=layout,
+        fit_report=report,
+    )
+
+
+def _latin_shape_capacity_candidate_box(
+    plan: RenderLayerPlan,
+    page_box: Sequence[int],
+) -> list[int]:
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    effective = (
+        metadata.get("effective_render_plan")
+        if isinstance(metadata.get("effective_render_plan"), Mapping)
+        else {}
+    )
+    authorities = (
+        effective.get("field_authority")
+        if isinstance(effective.get("field_authority"), Mapping)
+        else {}
+    )
+    domain = (
+        metadata.get("parent_render_domain")
+        if isinstance(metadata.get("parent_render_domain"), Mapping)
+        else {}
+    )
+    values = (
+        (plan.target_box,)
+        if str(authorities.get("target_box") or "") == "user"
+        else (
+            domain.get("automatic_bounds"),
+            plan.hard_bounds,
+            plan.target_box,
+        )
+    )
+    for value in values:
+        box = _intersect_box(_bbox_from_value(value), page_box)
+        if box:
+            return box
+    return []
+
+
+def _capacity_polygon(value: Any) -> list[list[float]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    points: list[list[float]] = []
+    for item in value:
+        if isinstance(item, str):
+            parts = item.replace(",", " ").split()
+            if len(parts) < 2:
+                return []
+            raw = parts[:2]
+        elif (
+            isinstance(item, Sequence)
+            and not isinstance(item, (str, bytes, bytearray))
+            and len(item) >= 2
+        ):
+            raw = item[:2]
+        else:
+            return []
+        try:
+            point = [float(raw[0]), float(raw[1])]
+        except (TypeError, ValueError):
+            return []
+        if not all(math.isfinite(number) for number in point):
+            return []
+        points.append(point)
+    return points if len(points) >= 3 else []
+
+
+def _rotate_capacity_point(
+    point: Sequence[float],
+    pivot: Sequence[float],
+    degrees_clockwise: float,
+) -> list[float]:
+    radians = math.radians(float(degrees_clockwise))
+    cosine = math.cos(radians)
+    sine = math.sin(radians)
+    dx = float(point[0]) - float(pivot[0])
+    dy = float(point[1]) - float(pivot[1])
+    return [
+        float(pivot[0]) + cosine * dx - sine * dy,
+        float(pivot[1]) + sine * dx + cosine * dy,
+    ]
+
+
+def _polygon_capacity_mask(
+    polygon: Sequence[Sequence[float]],
+    bounds: Sequence[int],
+):
+    box = _bbox_from_value(bounds)
+    points = _capacity_polygon(polygon)
+    if np is None or not box or not points:
+        return None
+    local = [
+        (
+            int(round(float(point[0]) - float(box[0]))),
+            int(round(float(point[1]) - float(box[1]))),
+        )
+        for point in points
+    ]
+    if cv2 is not None:
+        mask = np.zeros((int(box[3]), int(box[2])), dtype="uint8")
+        cv2.fillPoly(mask, [np.asarray(local, dtype="int32")], 1)
+        return mask.astype(bool)
+    if Image is None or ImageDraw is None:
+        return None
+    image = Image.new("L", (int(box[2]), int(box[3])), 0)
+    ImageDraw.Draw(image).polygon(local, fill=255)
+    return np.asarray(image, dtype="uint8") > 0
+
+
+def _capacity_row_intervals(
+    mask,
+    local_y: int,
+    *,
+    origin_x: int,
+) -> tuple[tuple[int, int], ...]:
+    if (
+        np is None
+        or mask is None
+        or local_y < 0
+        or local_y >= int(mask.shape[0])
+    ):
+        return ()
+    xs = np.flatnonzero(mask[int(local_y)])
+    if len(xs) == 0:
+        return ()
+    intervals: list[tuple[int, int]] = []
+    start = int(xs[0])
+    prior = start
+    for raw in xs[1:]:
+        current = int(raw)
+        if current != prior + 1:
+            intervals.append((int(origin_x + start), int(origin_x + prior + 1)))
+            start = current
+        prior = current
+    intervals.append((int(origin_x + start), int(origin_x + prior + 1)))
+    return tuple(intervals)
+
+
+def _capacity_polygon_sha256(polygon: Sequence[Sequence[float]]) -> str:
+    encoded = json.dumps(
+        [
+            [round(float(point[0]), 6), round(float(point[1]), 6)]
+            for point in polygon
+        ],
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _capacity_mask_sha256(mask) -> str:
+    if np is None or mask is None:
+        return hashlib.sha256(b"").hexdigest()
+    value = np.asarray(mask, dtype="uint8")
+    header = f"{value.shape[0]}x{value.shape[1]}:".encode("ascii")
+    return hashlib.sha256(header + value.tobytes(order="C")).hexdigest()
+
+
+def _point_inside_box(point: Sequence[float], box: Sequence[int]) -> bool:
+    bbox = _bbox_from_value(box)
+    if not bbox or len(point) < 2:
+        return False
+    return bool(
+        float(bbox[0]) <= float(point[0]) <= float(bbox[0] + bbox[2])
+        and float(bbox[1]) <= float(point[1]) <= float(bbox[1] + bbox[3])
+    )
 
 
 def _shape_candidate_box(plan: RenderLayerPlan, page_box: Sequence[int]) -> list[int]:

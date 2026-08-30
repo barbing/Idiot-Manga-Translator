@@ -1205,6 +1205,9 @@ def _parent_render_layout_domain(
         or ""
     )
     source_inside_container = _xywh_contains(container, source)
+    shape_safe_latin_policy = policy.automatic_domain_policy == (
+        "shape_safe_speech_container_with_source_alignment_prior_or_source"
+    )
     supported = bool(
         source
         and container
@@ -1215,6 +1218,7 @@ def _parent_render_layout_domain(
         and not protected
         and not conflicts
         and authorization == "cleanup_translate_speech"
+        and (not shape_safe_latin_policy or bool(polygon))
     )
     if supported:
         source_side_anchor = {
@@ -1233,6 +1237,27 @@ def _parent_render_layout_domain(
             reasons = [
                 "exact_text_area_plan_speech_container",
                 "source_side_anchor_preserved",
+            ]
+        elif shape_safe_latin_policy:
+            alignment_prior_bounds, source_side_anchor = (
+                _source_side_anchored_container_bounds(
+                    source,
+                    container,
+                )
+            )
+            source_side_anchor = {
+                **source_side_anchor,
+                "capacity_role": "alignment_prior_only",
+                "alignment_prior_bounds": list(alignment_prior_bounds),
+                "automatic_bounds": list(container),
+                "editable_bounds": list(container),
+            }
+            automatic = list(container)
+            status = "authorized_shape_safe_speech_container"
+            reasons = [
+                "exact_text_area_plan_speech_container",
+                "exact_text_area_plan_speech_polygon",
+                "source_side_anchor_retained_as_alignment_prior",
             ]
         elif policy.automatic_domain_policy == (
             "authorized_speech_container_or_source"
@@ -1263,6 +1288,10 @@ def _parent_render_layout_domain(
                 (
                     "container_not_cleanup_translate_speech",
                     authorization != "cleanup_translate_speech",
+                ),
+                (
+                    "container_polygon_missing",
+                    shape_safe_latin_policy and not bool(polygon),
                 ),
             )
             if present

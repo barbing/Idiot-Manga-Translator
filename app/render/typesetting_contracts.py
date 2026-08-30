@@ -6,6 +6,9 @@ cleanup, or reinterpret parent execution identity.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -17,9 +20,188 @@ PUNCTUATION_TOKEN_VERSION = "punctuation_token_v1"
 DRAWING_PRIMITIVE_VERSION = "drawing_primitive_v1"
 TYPESET_LAYOUT_VERSION = "typeset_layout_v3"
 FIT_REPORT_VERSION = "fit_report_v2"
+HORIZONTAL_SHAPE_CAPACITY_PROFILE_VERSION = (
+    "horizontal_shape_capacity_profile_v1"
+)
 
 
 JsonDict = dict[str, Any]
+
+
+@dataclass(frozen=True, kw_only=True)
+class HorizontalCapacityRow:
+    """Actual and comfort horizontal intervals for one pre-effect page row."""
+
+    y: int
+    actual_intervals: tuple[tuple[int, int], ...] = ()
+    comfort_intervals: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "y", int(self.y))
+        object.__setattr__(
+            self,
+            "actual_intervals",
+            _validated_capacity_intervals(self.actual_intervals),
+        )
+        object.__setattr__(
+            self,
+            "comfort_intervals",
+            _validated_capacity_intervals(self.comfort_intervals),
+        )
+
+    def to_audit_dict(self) -> JsonDict:
+        return {
+            "y": int(self.y),
+            "actual_intervals": [list(item) for item in self.actual_intervals],
+            "comfort_intervals": [list(item) for item in self.comfort_intervals],
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class HorizontalShapeCapacityProfile:
+    """Ephemeral planner-to-typesetter speech-shape capacity contract."""
+
+    profile_version: str
+    strategy_id: str
+    source: str
+    source_sha256: str
+    actual_mask_sha256: str
+    comfort_mask_sha256: str
+    bounds: tuple[int, int, int, int]
+    rows: tuple[HorizontalCapacityRow, ...]
+    visual_center: tuple[float, float]
+    alignment_center: tuple[float, float]
+    rotation_degrees_clockwise: float = 0.0
+    inverse_rotation_applied: bool = False
+    margin_px: int = 0
+    reason_codes: tuple[str, ...] = ()
+    _profile_digest: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.profile_version != HORIZONTAL_SHAPE_CAPACITY_PROFILE_VERSION:
+            raise ValueError("horizontal shape capacity profile version is invalid")
+        if not str(self.strategy_id or ""):
+            raise ValueError("horizontal shape capacity strategy id is required")
+        if not str(self.source or ""):
+            raise ValueError("horizontal shape capacity source is required")
+        for name in (
+            "source_sha256",
+            "actual_mask_sha256",
+            "comfort_mask_sha256",
+        ):
+            value = str(getattr(self, name) or "")
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+                raise ValueError(f"{name} must be a SHA-256 hex digest")
+            object.__setattr__(self, name, value.lower())
+        bounds = tuple(int(value) for value in self.bounds)
+        if len(bounds) != 4 or bounds[2] <= 0 or bounds[3] <= 0:
+            raise ValueError("horizontal shape capacity bounds are invalid")
+        object.__setattr__(self, "bounds", bounds)
+        rows = tuple(self.rows or ())
+        if not rows or not all(isinstance(row, HorizontalCapacityRow) for row in rows):
+            raise ValueError("horizontal shape capacity rows are required")
+        if tuple(row.y for row in rows) != tuple(sorted({row.y for row in rows})):
+            raise ValueError("horizontal shape capacity rows must be unique and ordered")
+        object.__setattr__(self, "rows", rows)
+        for name in ("visual_center", "alignment_center"):
+            point = tuple(float(value) for value in getattr(self, name))
+            if len(point) != 2 or not all(math.isfinite(value) for value in point):
+                raise ValueError(f"{name} must contain two finite values")
+            object.__setattr__(self, name, point)
+        rotation = float(self.rotation_degrees_clockwise)
+        if not math.isfinite(rotation):
+            raise ValueError("horizontal shape capacity rotation must be finite")
+        object.__setattr__(self, "rotation_degrees_clockwise", rotation)
+        object.__setattr__(self, "margin_px", max(0, int(self.margin_px)))
+        object.__setattr__(
+            self,
+            "reason_codes",
+            tuple(str(value) for value in self.reason_codes if str(value)),
+        )
+        object.__setattr__(
+            self,
+            "_profile_digest",
+            _horizontal_shape_capacity_profile_digest(self),
+        )
+
+    @property
+    def profile_digest(self) -> str:
+        return self._profile_digest
+
+    def to_audit_dict(self) -> JsonDict:
+        actual_rows = sum(bool(row.actual_intervals) for row in self.rows)
+        comfort_rows = sum(bool(row.comfort_intervals) for row in self.rows)
+        return {
+            "profile_version": self.profile_version,
+            "strategy_id": self.strategy_id,
+            "source": self.source,
+            "source_sha256": self.source_sha256,
+            "actual_mask_sha256": self.actual_mask_sha256,
+            "comfort_mask_sha256": self.comfort_mask_sha256,
+            "profile_digest": self.profile_digest,
+            "bounds": list(self.bounds),
+            "row_count": len(self.rows),
+            "actual_row_count": int(actual_rows),
+            "comfort_row_count": int(comfort_rows),
+            "visual_center": list(self.visual_center),
+            "alignment_center": list(self.alignment_center),
+            "rotation_degrees_clockwise": round(
+                float(self.rotation_degrees_clockwise),
+                6,
+            ),
+            "inverse_rotation_applied": bool(self.inverse_rotation_applied),
+            "margin_px": int(self.margin_px),
+            "reason_codes": list(self.reason_codes),
+        }
+
+
+def _horizontal_shape_capacity_profile_digest(
+    profile: HorizontalShapeCapacityProfile,
+) -> str:
+    payload = {
+        "profile_version": profile.profile_version,
+        "strategy_id": profile.strategy_id,
+        "source": profile.source,
+        "source_sha256": profile.source_sha256,
+        "actual_mask_sha256": profile.actual_mask_sha256,
+        "comfort_mask_sha256": profile.comfort_mask_sha256,
+        "bounds": list(profile.bounds),
+        "rows": [row.to_audit_dict() for row in profile.rows],
+        "visual_center": list(profile.visual_center),
+        "alignment_center": list(profile.alignment_center),
+        "rotation_degrees_clockwise": profile.rotation_degrees_clockwise,
+        "inverse_rotation_applied": bool(profile.inverse_rotation_applied),
+        "margin_px": int(profile.margin_px),
+        "reason_codes": list(profile.reason_codes),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_capacity_intervals(
+    values: Sequence[Sequence[Any]],
+) -> tuple[tuple[int, int], ...]:
+    intervals: list[tuple[int, int]] = []
+    for value in values or ():
+        if (
+            not isinstance(value, Sequence)
+            or isinstance(value, (str, bytes, bytearray))
+            or len(value) != 2
+        ):
+            raise ValueError("horizontal capacity interval must contain two values")
+        start, end = (int(value[0]), int(value[1]))
+        if end <= start:
+            raise ValueError("horizontal capacity interval must have positive width")
+        if intervals and start < intervals[-1][1]:
+            raise ValueError("horizontal capacity intervals must be ordered and disjoint")
+        intervals.append((start, end))
+    return tuple(intervals)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -130,6 +312,10 @@ class RenderLayerPlan:
     state: str = ""
     render_required: bool = True
     metadata: JsonDict = field(default_factory=dict)
+    horizontal_shape_capacity_profile: HorizontalShapeCapacityProfile | None = field(
+        default=None,
+        repr=False,
+    )
 
     def to_audit_dict(self) -> JsonDict:
         return {

@@ -56,7 +56,7 @@ _CJK_POLICY = TargetPresentationPolicy(
 )
 
 _ENGLISH_POLICY = TargetPresentationPolicy(
-    policy_id="target-presentation:en:v1",
+    policy_id="target-presentation:en:v2",
     target_language="en",
     target_script="Latn",
     shaping_locale="en",
@@ -64,7 +64,7 @@ _ENGLISH_POLICY = TargetPresentationPolicy(
     optical_profile_key="latin",
     measured_fallback_size_policy="upper_supported_non_decreasing",
     automatic_domain_policy=(
-        "source_side_anchored_speech_container_or_source"
+        "shape_safe_speech_container_with_source_alignment_prior_or_source"
     ),
     editable_domain_policy="authorized_speech_container_or_source",
 )

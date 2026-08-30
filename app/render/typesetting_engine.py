@@ -8,6 +8,7 @@ identity.
 from __future__ import annotations
 
 import math
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_CEILING
@@ -42,9 +43,12 @@ from app.render.typesetting_contracts import (
     DrawingPrimitive,
     FitReport,
     GlyphPlacement,
+    HorizontalShapeCapacityProfile,
+    PunctuationToken,
     RenderLayerPlan,
     TypesetLayout,
     bbox_from_value,
+    copy_jsonish,
     validated_source_punctuation_geometry_ref,
     validated_source_text_footprint_ref,
 )
@@ -246,6 +250,10 @@ class TypesettingEngine:
             text_tokens,
             writing_mode=writing_mode,
             language_hint=_language_hint(plan),
+            latin_lexical_policy=_latin_target_presentation_active(
+                plan,
+                writing_mode,
+            ),
         )
         try:
             runs, font_span_resolutions = self._expand_runs_for_font_spans(
@@ -388,6 +396,92 @@ class TypesettingEngine:
                 candidate_search_start,
                 competitive_probe_size,
             )
+        capacity_profile = plan.horizontal_shape_capacity_profile
+        if (
+            writing_mode == "horizontal"
+            and isinstance(capacity_profile, HorizontalShapeCapacityProfile)
+            and _latin_target_presentation_active(plan, writing_mode)
+            and candidate_search_start > 1
+        ):
+            probe_size = int(candidate_search_start)
+            probe_shaped_runs, _probe_run_resolutions = self._shape_runs(
+                runs,
+                resolved,
+                probe_size,
+                writing_mode,
+                font_spans_by_id,
+                cache_namespace=str(plan.bundle_id or ""),
+            )
+            probe_by_run = {
+                str(item.metadata.get("run_id") or ""): item
+                for item in probe_shaped_runs
+                if str(item.metadata.get("run_id") or "")
+            }
+            atomic_advances: dict[str, float] = {}
+            for run in runs:
+                if run.role not in {"latin_word", "numeric_token"}:
+                    continue
+                shaped = probe_by_run.get(run.run_id)
+                advance = (
+                    sum(max(0.0, glyph.x_advance) for glyph in shaped.glyphs)
+                    if isinstance(shaped, ShapedRun)
+                    else 0.0
+                )
+                logical_id = _logical_run_id_for(run)
+                atomic_advances[logical_id] = (
+                    atomic_advances.get(logical_id, 0.0) + float(advance)
+                )
+            longest_atomic_advance = max(atomic_advances.values(), default=0.0)
+            probe_extent = _horizontal_line_pixel_extent(
+                probe_size,
+                _line_height(plan.resolved_render_style),
+            )
+            probe_capacity = _precompute_single_interval_band_cache(
+                capacity_profile,
+                line_pixel_extent=probe_extent,
+            )
+            maximum_band_width = max(
+                (
+                    int(interval[1]) - int(interval[0])
+                    for (row_y, extent, comfort), interval in probe_capacity.items()
+                    if row_y >= int(capacity_profile.bounds[1])
+                    and extent == probe_extent
+                    and not comfort
+                    and interval is not None
+                ),
+                default=0,
+            )
+            if (
+                longest_atomic_advance > float(maximum_band_width) > 0.0
+            ):
+                atomic_upper_bound = max(
+                    1,
+                    int(
+                        math.floor(
+                            float(probe_size)
+                            * float(maximum_band_width)
+                            / float(longest_atomic_advance)
+                        )
+                    ),
+                )
+                if atomic_upper_bound < candidate_search_start:
+                    candidate_search_start = atomic_upper_bound
+                    fit_upper_bound_sources.append(
+                        {
+                            "source": "latin_shape_atomic_word_upper_bound",
+                            "probe_font_size": int(probe_size),
+                            "longest_atomic_advance": round(
+                                float(longest_atomic_advance),
+                                6,
+                            ),
+                            "maximum_shape_band_width": int(
+                                maximum_band_width
+                            ),
+                            "verified_fit_font_size": int(
+                                atomic_upper_bound
+                            ),
+                        }
+                    )
         font_size_candidates = (
             [candidate_search_start]
             if competitive_probe_size
@@ -448,16 +542,57 @@ class TypesettingEngine:
             )
             break_quality_retry = None
             if writing_mode == "horizontal":
-                placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_horizontal(
-                    normalized,
-                    runs,
-                    shaped_runs,
-                    breaks,
-                    layout_intent_box,
-                    font_size,
-                    plan.resolved_render_style,
-                    cache_namespace=str(plan.bundle_id or ""),
-                )
+                capacity_profile = plan.horizontal_shape_capacity_profile
+                if (
+                    isinstance(
+                        capacity_profile,
+                        HorizontalShapeCapacityProfile,
+                    )
+                    and _latin_target_presentation_active(plan, writing_mode)
+                ):
+                    layout_intent_box = list(capacity_profile.bounds)
+                    box_model = {
+                        **dict(box_model),
+                        "layout_intent_box": list(layout_intent_box),
+                        "layout_intent_evidence": (
+                            "latin_horizontal_shape_capacity_profile"
+                        ),
+                        "horizontal_shape_capacity_profile": (
+                            capacity_profile.to_audit_dict()
+                        ),
+                    }
+                    reason_codes.append(
+                        "latin_horizontal_shape_capacity_profile_used"
+                    )
+                    (
+                        placements,
+                        lines,
+                        columns,
+                        measured_bounds,
+                        fit_status,
+                        fit_issues,
+                        break_plan,
+                    ) = self._layout_horizontal_shape_bands(
+                        normalized,
+                        runs,
+                        shaped_runs,
+                        breaks,
+                        capacity_profile,
+                        font_size,
+                        plan.resolved_render_style,
+                        cache_namespace=str(plan.bundle_id or ""),
+                    )
+                else:
+                    placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_horizontal(
+                        normalized,
+                        runs,
+                        shaped_runs,
+                        breaks,
+                        layout_intent_box,
+                        font_size,
+                        plan.resolved_render_style,
+                        cache_namespace=str(plan.bundle_id or ""),
+                    )
             else:
                 placements, lines, columns, measured_bounds, fit_status, fit_issues, break_plan = self._layout_vertical(
                     normalized,
@@ -684,6 +819,30 @@ class TypesettingEngine:
         if fit_status != "fits" and writing_mode == "vertical":
             fit_issues.append("writing_mode_fit_failure")
 
+        discretionary_token_ids = {
+            token_id
+            for placement in placements
+            if bool(placement.metadata.get("discretionary_hyphen_visible"))
+            for token_id in list(placement.metadata.get("token_ids") or [])
+        }
+        if discretionary_token_ids:
+            text_tokens = [
+                replace(
+                    token,
+                    presentation_text="-",
+                    presentation_codepoints=("U+002D",),
+                    render_policy="resolved_font_glyph",
+                    presentation_reason="manual_soft_hyphen_selected",
+                )
+                if isinstance(token, PunctuationToken)
+                and token.punctuation_kind == "soft_hyphen"
+                and token.token_id in discretionary_token_ids
+                else token
+                for token in text_tokens
+            ]
+            normalized = tokens_presentation_text(text_tokens)
+            reason_codes.append("manual_soft_hyphen_presentation_selected")
+
         placements, drawing_primitives = _finalize_drawing_primitives(
             placements,
             plan.resolved_render_style,
@@ -829,6 +988,9 @@ class TypesettingEngine:
             "break_opportunities": [item.to_audit_dict() for item in breaks],
             "chosen_breaks": list(break_plan.get("selected_breaks") or []),
             "break_plan": break_plan,
+            "horizontal_shape_capacity": copy_jsonish(
+                break_plan.get("horizontal_shape_capacity") or {}
+            ),
             "typesetting_candidate_quality": typesetting_candidate_quality,
             "kinsoku_adjustments": kinsoku_adjustments,
             "line_break_policy": {
@@ -2283,6 +2445,327 @@ class TypesettingEngine:
         break_plan = break_result.to_audit_dict()
         return placements, lines, [], measured, "overflow" if overflow else "fits", _unique(issues), break_plan
 
+    def _layout_horizontal_shape_bands(
+        self,
+        normalized: str,
+        runs: Sequence[InlineTextRun],
+        shaped_runs: Sequence[ShapedRun],
+        breaks: Sequence[BreakOpportunity],
+        profile: HorizontalShapeCapacityProfile,
+        font_size: int,
+        style: dict[str, Any],
+        *,
+        cache_namespace: str,
+    ) -> tuple[
+        list[GlyphPlacement],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[int],
+        str,
+        list[str],
+        dict[str, Any],
+    ]:
+        del normalized
+        x, y, w, h = [int(value) for value in profile.bounds]
+        line_height_ratio = _line_height(style)
+        line_height = max(1.0, font_size * line_height_ratio)
+        line_pixel_extent = _horizontal_line_pixel_extent(
+            font_size,
+            line_height_ratio,
+        )
+        max_lines = max(1, int(math.floor(float(h) / line_height)))
+        shaped_by_run = {
+            str(item.metadata.get("run_id") or ""): item
+            for item in shaped_runs
+            if str(item.metadata.get("run_id") or "")
+        }
+        layout_items: list[dict[str, Any]] = []
+        for run in runs:
+            shaped = shaped_by_run.get(run.run_id)
+            shaped_advance = (
+                sum(max(0.0, glyph.x_advance) for glyph in shaped.glyphs)
+                if shaped
+                else 0.0
+            )
+            discretionary_shaped_run = None
+            discretionary_advance = 0.0
+            if run.role == "soft_hyphen":
+                selected_face = (
+                    self.font_manager.face(shaped.font_face_id)
+                    if isinstance(shaped, ShapedRun)
+                    else None
+                )
+                if selected_face is not None:
+                    try:
+                        discretionary_shaped_run = self.shaper.shape_text(
+                            "-",
+                            face=selected_face,
+                            font_size=font_size,
+                            writing_mode="horizontal",
+                            language=run.language,
+                            script="Latn",
+                            direction="ltr",
+                        )
+                    except (RuntimeError, ValueError):
+                        discretionary_shaped_run = None
+                if isinstance(discretionary_shaped_run, ShapedRun):
+                    discretionary_advance = sum(
+                        max(0.0, glyph.x_advance)
+                        for glyph in discretionary_shaped_run.glyphs
+                    )
+                advance = 0.0
+            elif shaped_advance > 0.0:
+                advance = shaped_advance
+            elif run.role == "space":
+                advance = font_size * 0.35
+            else:
+                advance = font_size * len(run.text)
+            layout_items.append(
+                {
+                    "text": run.normalized_text,
+                    "run_id": run.run_id,
+                    "advance": max(0.0, float(advance)),
+                    "role": run.role,
+                    "script": run.script,
+                    "run": run,
+                    "shaped_run": shaped,
+                    "discretionary_shaped_run": discretionary_shaped_run,
+                    "discretionary_advance": max(
+                        0.0,
+                        float(discretionary_advance),
+                    ),
+                }
+            )
+        visible_item_count = sum(
+            bool(str(item.get("text") or "").strip()) for item in layout_items
+        )
+        max_lines = min(max_lines, max(1, visible_item_count), len(layout_items))
+        total_advance = sum(
+            max(0.0, float(item.get("advance") or 0.0))
+            for item in layout_items
+        )
+        maximum_profile_width = max(
+            (
+                int(end) - int(start)
+                for row in profile.rows
+                for start, end in row.actual_intervals
+            ),
+            default=1,
+        )
+        minimum_line_count = max(
+            1,
+            int(math.ceil(total_advance / max(1.0, float(maximum_profile_width)))),
+        )
+        minimum_line_count = min(minimum_line_count, max_lines)
+        alignment = _horizontal_text_alignment(style)
+        candidate_records: list[dict[str, Any]] = []
+        selected: dict[str, Any] | None = None
+        band_interval_cache = _precompute_single_interval_band_cache(
+            profile,
+            line_pixel_extent=line_pixel_extent,
+        )
+        for line_count in range(minimum_line_count, max_lines + 1):
+            line_box_candidates = _horizontal_capacity_line_box_candidates(
+                profile,
+                line_count=line_count,
+                line_height=line_height,
+                line_pixel_extent=line_pixel_extent,
+                band_interval_cache=band_interval_cache,
+            )
+            for line_boxes_record in line_box_candidates:
+                line_boxes = [list(item) for item in line_boxes_record["line_boxes"]]
+                line_widths = [float(item[2]) for item in line_boxes]
+                if sum(line_widths) + 1e-9 < total_advance:
+                    continue
+                break_cache_key = _horizontal_band_break_plan_cache_key(
+                    layout_items,
+                    breaks,
+                    line_widths=line_widths,
+                    line_boxes=line_boxes,
+                    profile_digest=profile.profile_digest,
+                    cache_namespace=cache_namespace,
+                )
+                break_result = self._horizontal_break_plan_cache.get(
+                    break_cache_key
+                )
+                if break_result is None:
+                    break_result = self.break_planner.plan_horizontal_bands(
+                        layout_items,
+                        breaks,
+                        line_widths=line_widths,
+                    )
+                    self._horizontal_break_plan_cache[break_cache_key] = break_result
+                groups = list(break_result.groups)
+                if len(groups) != len(line_boxes):
+                    continue
+                placements, lines, shaped_overrides = _place_horizontal_band_groups(
+                    groups,
+                    line_boxes=line_boxes,
+                    comfort_intervals=line_boxes_record["comfort_intervals"],
+                    font_size=font_size,
+                    alignment=alignment,
+                )
+                measured = _union_bounds([item.bbox for item in placements]) or [
+                    x,
+                    y,
+                    1,
+                    1,
+                ]
+                line_overflow = any(
+                    _horizontal_shape_band_group_advance(
+                        group,
+                        broken=index < len(groups) - 1,
+                    )
+                    > float(line_boxes[index][2]) + 1e-9
+                    for index, group in enumerate(groups)
+                )
+                fit_status = (
+                    "fits"
+                    if not break_result.issues and not line_overflow
+                    else "overflow"
+                )
+                break_plan = break_result.to_audit_dict()
+                quality = canonical_break_quality_summary(break_plan)
+                comfort_penalty = sum(
+                    max(0.0, 1.0 - float(line.get("comfort_coverage_ratio") or 0.0))
+                    for line in lines
+                )
+                measured_center = _center_of(measured)
+                center_dx = (
+                    (float(measured_center[0]) - float(profile.visual_center[0]))
+                    / max(1.0, float(w))
+                    if measured_center
+                    else 1.0
+                )
+                center_dy = (
+                    (float(measured_center[1]) - float(profile.visual_center[1]))
+                    / max(1.0, float(h))
+                    if measured_center
+                    else 1.0
+                )
+                center_distance = center_dx * center_dx + center_dy * center_dy
+                confirmed = list(
+                    quality.get("confirmed_lexical_integrity") or [0, 0]
+                )
+                segment = list(quality.get("row_unit_segment_quality") or [0, 0])
+                weak = list(quality.get("weak_lexical_evidence") or [0, 0, 0])
+                selection_key = (
+                    int(fit_status != "fits"),
+                    int(confirmed[0] if len(confirmed) > 0 else 0),
+                    int(confirmed[1] if len(confirmed) > 1 else 0),
+                    round(float(quality.get("punctuation_attachment") or 0.0), 6),
+                    round(float(comfort_penalty), 6),
+                    int(segment[0] if len(segment) > 0 else 0),
+                    round(float(segment[1] if len(segment) > 1 else 0.0), 6),
+                    int(weak[0] if len(weak) > 0 else 0),
+                    int(weak[1] if len(weak) > 1 else 0),
+                    int(weak[2] if len(weak) > 2 else 0),
+                    round(float(quality.get("optical_balance") or 0.0), 6),
+                    int(line_count),
+                    round(float(center_distance), 8),
+                    int(line_boxes_record["block_y"]),
+                    tuple(break_plan.get("split_points") or ()),
+                )
+                record = {
+                    "selection_key": selection_key,
+                    "fit_status": fit_status,
+                    "placements": placements,
+                    "lines": lines,
+                    "measured_bounds": measured,
+                    "break_plan": break_plan,
+                    "issues": list(break_result.issues),
+                    "line_boxes": line_boxes,
+                    "line_widths": line_widths,
+                    "line_count": line_count,
+                    "block_y": int(line_boxes_record["block_y"]),
+                    "comfort_penalty": round(float(comfort_penalty), 6),
+                    "center_distance": round(float(center_distance), 8),
+                    "shaped_overrides": shaped_overrides,
+                }
+                candidate_records.append(record)
+                if selected is None or selection_key < selected["selection_key"]:
+                    selected = record
+
+        if selected is None:
+            (
+                placements,
+                lines,
+                columns,
+                measured,
+                _fallback_status,
+                fallback_issues,
+                break_plan,
+            ) = self._layout_horizontal(
+                "",
+                runs,
+                shaped_runs,
+                breaks,
+                list(profile.bounds),
+                font_size,
+                style,
+                cache_namespace=cache_namespace,
+            )
+            capacity_audit = {
+                **profile.to_audit_dict(),
+                "status": "rectangular_complete_fallback",
+                "candidate_count": 0,
+                "selected_line_boxes": [],
+            }
+            break_plan = {
+                **dict(break_plan),
+                "horizontal_shape_capacity": capacity_audit,
+            }
+            return (
+                placements,
+                lines,
+                columns,
+                measured,
+                "overflow",
+                _unique(
+                    [
+                        *fallback_issues,
+                        "latin_shape_band_partition_unavailable",
+                    ]
+                ),
+                break_plan,
+            )
+
+        selected_break_plan = dict(selected["break_plan"])
+        selected_overrides = dict(selected.get("shaped_overrides") or {})
+        if selected_overrides and isinstance(shaped_runs, list):
+            for index, shaped_run in enumerate(shaped_runs):
+                run_id = str(shaped_run.metadata.get("run_id") or "")
+                replacement = selected_overrides.get(run_id)
+                if isinstance(replacement, ShapedRun):
+                    shaped_runs[index] = replacement
+        selected_break_plan["horizontal_shape_capacity"] = {
+            **profile.to_audit_dict(),
+            "status": "selected",
+            "alignment": alignment,
+            "candidate_count": len(candidate_records),
+            "fitting_candidate_count": sum(
+                str(item["fit_status"]) == "fits" for item in candidate_records
+            ),
+            "selected_line_count": int(selected["line_count"]),
+            "selected_block_y": int(selected["block_y"]),
+            "selected_line_boxes": [list(item) for item in selected["line_boxes"]],
+            "selected_line_widths": [round(float(value), 3) for value in selected["line_widths"]],
+            "selected_comfort_penalty": selected["comfort_penalty"],
+            "selected_center_distance": selected["center_distance"],
+        }
+        issues = list(selected["issues"])
+        if str(selected["fit_status"]) != "fits":
+            issues.append("layout_overflow")
+        return (
+            list(selected["placements"]),
+            list(selected["lines"]),
+            [],
+            list(selected["measured_bounds"]),
+            str(selected["fit_status"]),
+            _unique(issues),
+            selected_break_plan,
+        )
+
     def _failed(
         self,
         plan: RenderLayerPlan,
@@ -2552,6 +3035,530 @@ def _horizontal_break_plan_cache_key(
     )
 
 
+def _horizontal_band_break_plan_cache_key(
+    items: Sequence[Mapping[str, Any]],
+    opportunities: Sequence[BreakOpportunity],
+    *,
+    line_widths: Sequence[float],
+    line_boxes: Sequence[Sequence[int]],
+    profile_digest: str,
+    cache_namespace: str,
+) -> tuple[Any, ...]:
+    del line_boxes
+    return (
+        "latin_horizontal_shape_bands_v1",
+        str(cache_namespace or ""),
+        str(profile_digest or ""),
+        tuple(round(float(value), 6) for value in line_widths),
+        tuple(
+            (
+                str(item.get("run_id") or ""),
+                str(item.get("text") or ""),
+                round(float(item.get("advance") or 0.0), 6),
+                str(item.get("role") or ""),
+                str(item.get("script") or ""),
+            )
+            for item in items
+        ),
+        tuple(
+            (
+                str(item.before_run_id),
+                str(item.after_run_id),
+                int(item.position),
+                bool(item.allowed),
+                str(item.strength),
+                str(item.reason),
+            )
+            for item in opportunities
+        ),
+    )
+
+
+def _horizontal_capacity_line_box_candidates(
+    profile: HorizontalShapeCapacityProfile,
+    *,
+    line_count: int,
+    line_height: float,
+    line_pixel_extent: int,
+    band_interval_cache: dict[
+        tuple[int, int, bool],
+        tuple[int, int] | None,
+    ] | None = None,
+) -> list[dict[str, Any]]:
+    bounds = list(profile.bounds)
+    if line_count <= 0 or line_pixel_extent <= 0:
+        return []
+    row_by_y = {int(row.y): row for row in profile.rows}
+    min_y = int(bounds[1])
+    last_offset = int(round(float(line_count - 1) * float(line_height)))
+    max_y = int(bounds[1] + bounds[3] - last_offset - line_pixel_extent)
+    if max_y < min_y:
+        return []
+    step = max(1, int(line_pixel_extent) // 3)
+    block_y_candidates = set(range(min_y, max_y + 1, step))
+    block_y_candidates.update({min_y, max_y})
+    block_extent = last_offset + int(line_pixel_extent)
+    for center_y in (
+        float(profile.alignment_center[1]),
+        float(profile.visual_center[1]),
+    ):
+        centered = int(round(center_y - float(block_extent) / 2.0))
+        for delta in (-step, -1, 0, 1, step):
+            block_y_candidates.add(max(min_y, min(max_y, centered + delta)))
+    records: list[dict[str, Any]] = []
+    for block_y in sorted(block_y_candidates):
+        line_boxes: list[list[int]] = []
+        comfort_intervals: list[tuple[tuple[int, int], ...]] = []
+        actual_widths: list[int] = []
+        comfort_widths: list[int] = []
+        valid = True
+        for line_index in range(line_count):
+            line_y = int(round(float(block_y) + line_index * line_height))
+            actual = _capacity_interval_for_band(
+                row_by_y,
+                y=line_y,
+                height=line_pixel_extent,
+                center_x=float(profile.alignment_center[0]),
+                comfort=False,
+                cache=band_interval_cache,
+            )
+            if not actual:
+                valid = False
+                break
+            comfort = _capacity_interval_for_band(
+                row_by_y,
+                y=line_y,
+                height=line_pixel_extent,
+                center_x=float(profile.alignment_center[0]),
+                comfort=True,
+                cache=band_interval_cache,
+            )
+            clipped_comfort = (
+                _intersect_capacity_intervals((actual,), (comfort,))
+                if comfort
+                else ()
+            )
+            line_boxes.append(
+                [
+                    int(actual[0]),
+                    int(line_y),
+                    int(actual[1] - actual[0]),
+                    int(line_pixel_extent),
+                ]
+            )
+            comfort_intervals.append(clipped_comfort)
+            actual_widths.append(int(actual[1] - actual[0]))
+            comfort_widths.append(
+                max((end - start for start, end in clipped_comfort), default=0)
+            )
+        if not valid:
+            continue
+        block_top = min(item[1] for item in line_boxes)
+        block_bottom = max(item[1] + item[3] for item in line_boxes)
+        block_center_y = (float(block_top) + float(block_bottom)) / 2.0
+        center_distance = abs(
+            block_center_y - float(profile.alignment_center[1])
+        ) / max(1.0, float(bounds[3]))
+        records.append(
+            {
+                "block_y": int(block_y),
+                "line_boxes": line_boxes,
+                "comfort_intervals": comfort_intervals,
+                "actual_widths": actual_widths,
+                "comfort_widths": comfort_widths,
+                "actual_total": sum(actual_widths),
+                "actual_min": min(actual_widths),
+                "comfort_total": sum(comfort_widths),
+                "center_distance": round(float(center_distance), 8),
+            }
+        )
+    if len(records) <= 12:
+        return records
+    retained: dict[tuple[tuple[int, ...], ...], dict[str, Any]] = {}
+    orders = (
+        lambda item: (
+            -int(item["actual_total"]),
+            -int(item["actual_min"]),
+            float(item["center_distance"]),
+            int(item["block_y"]),
+        ),
+        lambda item: (
+            float(item["center_distance"]),
+            -int(item["actual_total"]),
+            int(item["block_y"]),
+        ),
+        lambda item: (
+            -int(item["comfort_total"]),
+            float(item["center_distance"]),
+            int(item["block_y"]),
+        ),
+    )
+    for order in orders:
+        for item in sorted(records, key=order)[:4]:
+            key = tuple(tuple(int(value) for value in box) for box in item["line_boxes"])
+            retained[key] = item
+    return sorted(
+        retained.values(),
+        key=lambda item: (
+            int(item["block_y"]),
+            tuple(tuple(box) for box in item["line_boxes"]),
+        ),
+    )
+
+
+def _precompute_single_interval_band_cache(
+    profile: HorizontalShapeCapacityProfile,
+    *,
+    line_pixel_extent: int,
+) -> dict[tuple[int, int, bool], tuple[int, int] | None]:
+    """Precompute sliding row intersections for ordinary single-span masks."""
+
+    extent = max(1, int(line_pixel_extent))
+    cache: dict[tuple[int, int, bool], tuple[int, int] | None] = {}
+    rows = list(profile.rows)
+    for comfort in (False, True):
+        sequences = [
+            tuple(row.comfort_intervals)
+            if comfort
+            else tuple(row.actual_intervals)
+            for row in rows
+        ]
+        if any(len(intervals) > 1 for intervals in sequences):
+            continue
+        starts = [
+            int(intervals[0][0]) if intervals else 0 for intervals in sequences
+        ]
+        ends = [
+            int(intervals[0][1]) if intervals else 0 for intervals in sequences
+        ]
+        valid = [bool(intervals) for intervals in sequences]
+        max_starts: deque[int] = deque()
+        min_ends: deque[int] = deque()
+        valid_count = 0
+        for index in range(len(rows)):
+            if valid[index]:
+                valid_count += 1
+            while max_starts and starts[max_starts[-1]] <= starts[index]:
+                max_starts.pop()
+            max_starts.append(index)
+            while min_ends and ends[min_ends[-1]] >= ends[index]:
+                min_ends.pop()
+            min_ends.append(index)
+            expired = index - extent
+            if expired >= 0:
+                if valid[expired]:
+                    valid_count -= 1
+                if max_starts and max_starts[0] == expired:
+                    max_starts.popleft()
+                if min_ends and min_ends[0] == expired:
+                    min_ends.popleft()
+            if index + 1 < extent:
+                continue
+            start_index = index - extent + 1
+            row_y = int(rows[start_index].y)
+            key = (row_y, extent, comfort)
+            if valid_count != extent or not max_starts or not min_ends:
+                cache[key] = None
+                continue
+            start = int(starts[max_starts[0]])
+            end = int(ends[min_ends[0]])
+            cache[key] = (start, end) if end > start else None
+    return cache
+
+
+def _capacity_interval_for_band(
+    row_by_y: Mapping[int, Any],
+    *,
+    y: int,
+    height: int,
+    center_x: float,
+    comfort: bool,
+    cache: dict[tuple[int, int, bool], tuple[int, int] | None] | None = None,
+) -> tuple[int, int] | None:
+    cache_key = (int(y), int(height), bool(comfort))
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    intervals: tuple[tuple[int, int], ...] | None = None
+    single_start: int | None = None
+    single_end: int | None = None
+    single_interval_path = True
+    for row_y in range(int(y), int(y + height)):
+        row = row_by_y.get(row_y)
+        if row is None:
+            if cache is not None:
+                cache[cache_key] = None
+            return None
+        row_intervals = (
+            tuple(row.comfort_intervals)
+            if comfort
+            else tuple(row.actual_intervals)
+        )
+        if not row_intervals:
+            if cache is not None:
+                cache[cache_key] = None
+            return None
+        if single_interval_path and len(row_intervals) == 1:
+            start, end = row_intervals[0]
+            single_start = (
+                int(start)
+                if single_start is None
+                else max(single_start, int(start))
+            )
+            single_end = (
+                int(end)
+                if single_end is None
+                else min(single_end, int(end))
+            )
+            if single_end <= single_start:
+                if cache is not None:
+                    cache[cache_key] = None
+                return None
+            continue
+        if single_interval_path:
+            intervals = (
+                ((single_start, single_end),)
+                if single_start is not None
+                and single_end is not None
+                and single_end > single_start
+                else None
+            )
+            single_interval_path = False
+        intervals = (
+            row_intervals
+            if intervals is None
+            else _intersect_capacity_intervals(intervals, row_intervals)
+        )
+        if not intervals:
+            if cache is not None:
+                cache[cache_key] = None
+            return None
+    if single_interval_path:
+        intervals = (
+            ((single_start, single_end),)
+            if single_start is not None
+            and single_end is not None
+            and single_end > single_start
+            else None
+        )
+    if not intervals:
+        if cache is not None:
+            cache[cache_key] = None
+        return None
+    selected = min(
+        intervals,
+        key=lambda item: (
+            0
+            if float(item[0]) <= float(center_x) <= float(item[1])
+            else min(abs(float(center_x) - item[0]), abs(float(center_x) - item[1])),
+            -(int(item[1]) - int(item[0])),
+            int(item[0]),
+        ),
+    )
+    if cache is not None:
+        cache[cache_key] = selected
+    return selected
+
+
+def _intersect_capacity_intervals(
+    left: Sequence[Sequence[int]],
+    right: Sequence[Sequence[int]],
+) -> tuple[tuple[int, int], ...]:
+    intersections: list[tuple[int, int]] = []
+    for left_start, left_end in left:
+        for right_start, right_end in right:
+            start = max(int(left_start), int(right_start))
+            end = min(int(left_end), int(right_end))
+            if end > start:
+                intersections.append((start, end))
+    intersections.sort()
+    return tuple(intersections)
+
+
+def _horizontal_text_alignment(style: Mapping[str, Any]) -> str:
+    value = str(dict(style or {}).get("align") or "center").strip().lower()
+    if value in {"left", "start"}:
+        return "start"
+    if value in {"right", "end"}:
+        return "end"
+    return "center"
+
+
+def _place_horizontal_band_groups(
+    groups: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    line_boxes: Sequence[Sequence[int]],
+    comfort_intervals: Sequence[Sequence[Sequence[int]]],
+    font_size: int,
+    alignment: str,
+) -> tuple[
+    list[GlyphPlacement],
+    list[dict[str, Any]],
+    dict[str, ShapedRun],
+]:
+    placements: list[GlyphPlacement] = []
+    lines: list[dict[str, Any]] = []
+    shaped_overrides: dict[str, ShapedRun] = {}
+    for line_index, group in enumerate(groups):
+        x, y, width, height = [int(value) for value in line_boxes[line_index]]
+        line_width = _horizontal_shape_band_group_advance(
+            group,
+            broken=line_index < len(groups) - 1,
+        )
+        if alignment == "end":
+            origin_x = float(x + width) - line_width
+        elif alignment == "start":
+            origin_x = float(x)
+        else:
+            origin_x = float(x) + (float(width) - line_width) / 2.0
+        cursor_x = origin_x
+        for item_index, item in enumerate(group):
+            run = item.get("run")
+            shaped = item.get("shaped_run")
+            text = str(item.get("text") or "")
+            placement_text = text
+            advance = max(0.0, float(item.get("advance") or 0.0))
+            discretionary_visible = bool(
+                line_index < len(groups) - 1
+                and item_index == len(group) - 1
+                and str(item.get("role") or "") == "soft_hyphen"
+                and isinstance(item.get("discretionary_shaped_run"), ShapedRun)
+                and float(item.get("discretionary_advance") or 0.0) > 0.0
+            )
+            if discretionary_visible:
+                discretionary = item["discretionary_shaped_run"]
+                shaped = replace(
+                    discretionary,
+                    text="-",
+                    normalized_text="-",
+                    metadata={
+                        **dict(discretionary.metadata or {}),
+                        "run_id": str(item.get("run_id") or ""),
+                        "discretionary_hyphen_visible": True,
+                        "discretionary_presentation_text": "-",
+                    },
+                )
+                shaped_overrides[str(item.get("run_id") or "")] = shaped
+                advance = max(
+                    0.0,
+                    float(item.get("discretionary_advance") or 0.0),
+                )
+                placement_text = "-"
+            px = int(round(cursor_x))
+            visible_width = int(max(1, math.ceil(max(1.0, advance))))
+            placements.append(
+                GlyphPlacement(
+                    text=placement_text,
+                    bbox=[px, int(y), visible_width, int(height)],
+                    position=[float(px), float(y)],
+                    font_family=(
+                        shaped.font_face_id if isinstance(shaped, ShapedRun) else ""
+                    ),
+                    font_size=float(font_size),
+                    advance=advance,
+                    writing_mode="horizontal",
+                    metadata={
+                        "run_id": str(item.get("run_id") or ""),
+                        **(
+                            _placement_font_span_metadata(run)
+                            if isinstance(run, InlineTextRun)
+                            else {}
+                        ),
+                        "line_index": int(line_index),
+                        "space_run": bool(
+                            isinstance(run, InlineTextRun) and run.role == "space"
+                        ),
+                        "placement_source": (
+                            "latin_shape_band_break_opportunity_partition"
+                        ),
+                        "font_face_id": (
+                            shaped.font_face_id
+                            if isinstance(shaped, ShapedRun)
+                            else ""
+                        ),
+                        "font_path": (
+                            shaped.font_path if isinstance(shaped, ShapedRun) else ""
+                        ),
+                        "font_fallback_used": bool(
+                            (shaped.metadata or {}).get("font_fallback_used")
+                        )
+                        if isinstance(shaped, ShapedRun)
+                        else False,
+                        "punctuation_occurrences": list(
+                            (run.metadata or {}).get("punctuation_occurrences")
+                            or []
+                        )
+                        if isinstance(run, InlineTextRun)
+                        else [],
+                        "symbol_occurrences": list(
+                            (run.metadata or {}).get("symbol_occurrences") or []
+                        )
+                        if isinstance(run, InlineTextRun)
+                        else [],
+                        "discretionary_hyphen_visible": discretionary_visible,
+                        "discretionary_presentation_text": (
+                            "-" if discretionary_visible else ""
+                        ),
+                        "discretionary_identity_text": (
+                            text if discretionary_visible else ""
+                        ),
+                    },
+                )
+            )
+            cursor_x += advance
+        ink_start = origin_x
+        ink_end = origin_x + line_width
+        comfort_overlap = sum(
+            max(
+                0.0,
+                min(float(end), ink_end) - max(float(start), ink_start),
+            )
+            for start, end in comfort_intervals[line_index]
+        )
+        comfort_ratio = (
+            min(1.0, comfort_overlap / line_width) if line_width > 1e-9 else 1.0
+        )
+        lines.append(
+            {
+                "line_index": int(line_index),
+                "text": "".join(str(item.get("text") or "") for item in group),
+                "writing_mode": "horizontal",
+                "run_ids": [str(item.get("run_id") or "") for item in group],
+                "measured_advance": round(float(line_width), 3),
+                "line_box": [x, y, width, height],
+                "available_width": round(float(width), 3),
+                "placement_origin_x": round(float(origin_x), 3),
+                "alignment": alignment,
+                "capacity_source": "latin_shape_band",
+                "comfort_intervals": [
+                    [int(start), int(end)]
+                    for start, end in comfort_intervals[line_index]
+                ],
+                "comfort_coverage_ratio": round(float(comfort_ratio), 6),
+            }
+        )
+    return placements, lines, shaped_overrides
+
+
+def _horizontal_shape_band_group_advance(
+    group: Sequence[Mapping[str, Any]],
+    *,
+    broken: bool,
+) -> float:
+    advance = sum(
+        max(0.0, float(item.get("advance") or 0.0)) for item in group
+    )
+    if (
+        broken
+        and group
+        and str(group[-1].get("role") or "") == "soft_hyphen"
+    ):
+        advance += max(
+            0.0,
+            float(group[-1].get("discretionary_advance") or 0.0),
+        )
+    return advance
+
+
 def _horizontal_fit_upper_bound_key(
     plan: RenderLayerPlan,
     *,
@@ -2563,7 +3570,7 @@ def _horizontal_fit_upper_bound_key(
         if isinstance(plan.resolved_render_style, Mapping)
         else {}
     )
-    return (
+    base = (
         str(plan.page_id or ""),
         str(plan.bundle_id or ""),
         str(plan.parent_id or ""),
@@ -2576,6 +3583,10 @@ def _horizontal_fit_upper_bound_key(
         round(float(_line_height(style)), 6),
         round(float(_style_outline_width(style)), 6),
     )
+    profile = plan.horizontal_shape_capacity_profile
+    if isinstance(profile, HorizontalShapeCapacityProfile):
+        return (*base, profile.profile_digest)
+    return base
 
 
 def _remember_horizontal_fit_upper_bound(
@@ -2730,6 +3741,33 @@ def _normalize_mode(value: Any) -> str:
     if text in {"horizontal", "horiz", "h", "ltr", "rtl"}:
         return "horizontal"
     return text
+
+
+def _latin_target_presentation_active(
+    plan: RenderLayerPlan,
+    writing_mode: str,
+) -> bool:
+    style = (
+        plan.resolved_render_style
+        if isinstance(plan.resolved_render_style, Mapping)
+        else {}
+    )
+    presentation = (
+        style.get("target_presentation_policy")
+        if isinstance(style.get("target_presentation_policy"), Mapping)
+        else {}
+    )
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    return bool(
+        _normalize_mode(writing_mode) == "horizontal"
+        and str(style.get("target_script") or "") == "Latn"
+        and str(
+            presentation.get("policy_id")
+            or metadata.get("target_presentation_policy_id")
+            or ""
+        )
+        == "target-presentation:en:v2"
+    )
 
 
 def _language_hint(plan: RenderLayerPlan) -> str:
