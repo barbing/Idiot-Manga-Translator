@@ -15,7 +15,7 @@
     ```
 
     This project-hosted CPython 3.10 x64 wheel contains PyICU 2.16.2, ICU4C
-    78.3, and the three application-private ICU DLLs required by the frozen
+    78.3, and the three application-bundled ICU DLLs required by the frozen
     application. The hash fragment makes `pip` reject any bytes that differ
     from the accepted release artifact.
 

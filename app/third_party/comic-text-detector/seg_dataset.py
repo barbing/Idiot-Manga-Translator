@@ -218,10 +218,6 @@ if __name__ == '__main__':
     hyp_p = r'data/train_hyp.yaml'
     with open(hyp_p, 'r', encoding='utf8') as f:
         hyp = yaml.safe_load(f.read())
-    hyp['data']['train_img_dir'] = [r'D:/neonbub/datasets/codat_manga_v3/images/train', r'D:/neonbub/datasets/ComicErased/processed']
-    hyp['data']['val_img_dir'] = [r'D:/neonbub/datasets/codat_manga_v3/images/val']
-    hyp['data']['train_mask_dir'] = r'D:/neonbub/datasets/ComicSegV2'
-    hyp['data']['val_mask_dir'] = r'D:/neonbub/datasets/ComicSegV2'
     hyp['data']['cache'] = False
 
     hyp_train, hyp_data, hyp_model, hyp_logger, hyp_resume = hyp['train'], hyp['data'], hyp['model'], hyp['logger'], hyp['resume']

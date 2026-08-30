@@ -13,8 +13,19 @@ YomiFrame separates semantic authority from pixel evidence and from downstream e
 - TextBlockHierarchy normalizes physical roots, parent text obligations, and child source evidence into a finalized graph view.
 - ParentExecutionBundle converts finalized parent obligations into the downstream execution contract.
 - CleanupMask consumes upstream authorization and foreground projection; it does not infer speech, background, SFX, art, or review semantics from local component geometry.
+- AuthorizedSourceStyleView and axis-specific StyleEvidence expose only
+  parent-authorized source pixels and measurements. ParentStyleArbitrator is the
+  sole automated resolved-style owner.
+- The page-ordered style-context cache transports qualified evidence from
+  already committed pages. It does not resolve styles and never receives user
+  overrides, rendered pixels, layout results, or cleanup judgments.
+- RenderLayerAdapter, RenderLayoutPlanner, TypesettingEngine, the shaped-glyph
+  rasterizer, parent effects, and RendererCompositor each own one downstream
+  rendering decision boundary.
 - Before parent finalization, OCR may remain review/conservation evidence without creating downstream work. Once a parent is finalized as executable, OCR, translation, cleanup, and rendering form a mandatory top-down chain and no later diagnostic can cancel that parent.
 - The normal required-stage result is valid-but-imperfect: quality limitations are retained as editable artifacts plus diagnostics. Only technical inability to produce a valid required artifact may fail; that failure is terminal and no dependent stage or later page executes.
+- The controller commits the completed page and its already prepared style-cache
+  delta atomically before emitting `page_ready`.
 
 The target default chain is:
 
@@ -23,19 +34,29 @@ BubbleDetection typed evidence
   -> TextAreaPlan semantic units
   -> scoped CTD/TextForegroundSegmentation projection
   -> component authorization map
-  -> OCR source capture
+  -> scoped OCR source capture
+  -> provisional TextBlockHierarchy parent obligations
+  -> parent-boundary OCR source capture
   -> TextBlockHierarchy finalized execution units
   -> ParentExecutionBundle
   -> parent-keyed translation assignments
   -> SourceGlyphMask
   -> CleanupJob
   -> CleanupMask
+  -> initial RenderEligibility
   -> CleanupPlan
   -> CleanupBackend
   -> CleanupResult
   -> CleanupProof
-  -> RenderEligibility
-  -> parent-bundle renderer final composition
+  -> cleanup commit and RenderEligibility diagnostic update
+  -> immutable CleanedPageBase
+  -> AuthorizedSourceStyleView and axis-specific StyleEvidence
+  -> ParentStyleArbitrator and qualified style-cache delta
+  -> RenderLayerAdapter and RenderLayerPlan
+  -> RenderLayoutPlanner and TypesettingEngine
+  -> shaped-glyph rasterization, optional effects, and RendererCompositor
+  -> atomic page/project/style-cache checkpoint
+  -> page_ready
 ```
 
 ## Stage Ownership
@@ -68,8 +89,10 @@ Provider activation is likewise application-owned. The coordinator validates a
 GGUF file, an Ollama endpoint/model, or an authenticated DeepSeek model catalog
 through a settled worker and marks the exact public profile configuration ready.
 The shell enables Start only for the selected ready profile. API credentials are
-transient during testing and portable settings retain only an opaque system
-credential reference (Windows Credential Manager or macOS Keychain). Output Defaults supplies fallback presentation; it is not
+transient during testing and portable settings retain only an opaque credential
+reference. Resolution is explicit through the native platform store (Windows
+Credential Manager or macOS Keychain) or a named environment-variable
+reference. Output Defaults supplies fallback presentation; it is not
 a renderer command and cannot override effective per-parent style evidence or
 user edits.
 
@@ -80,7 +103,13 @@ filtered, or routed; the GUI never mutates controller or pipeline internals.
 
 The controller should not turn route intent into translation authority. A region is translatable only when TextAreaPlan has explicitly marked OCR, translation, cleanup, and render eligibility as appropriate for a cleanup-translatable semantic state. Review-only OCR conservation does not create translation or cleanup authority.
 
-In the current root-parent-child architecture, the controller must promote finalized parent obligations into `ParentExecutionBundle` records before downstream execution. Translation input rebuilding, cleanup job creation, render eligibility, and renderer entry all use the parent bundle path when bundles are present. Legacy region records remain compatibility and audit records; source child regions are evidence for a parent, not independent downstream execution owners.
+In the current root-parent-child architecture, the controller promotes finalized
+parent obligations into `ParentExecutionBundle` records before downstream
+execution. Translation input rebuilding, cleanup job creation, render
+eligibility, and renderer entry use that parent-bundle path for every executable
+parent. Region-shaped records remain compatibility envelopes and audit records;
+source child regions are evidence for a parent, not independent downstream
+execution owners or a fallback execution path.
 
 GUI user topology is an application projection over those immutable records.
 `ParentSourceEvidenceMappingV1` binds exact parent/root/bundle identities,
@@ -168,7 +197,17 @@ Downstream modules must not create new execution units from child/source regions
 
 ### OCR
 
-OCR consumes TextAreaPlan-eligible parent regions and projected text areas. Some compatibility or review-conservation regions may be OCR-eligible while still blocked from translation, cleanup, and rendering. Known SFX/decorative/art regions should not enter the normal translation path unless a future feature explicitly defines SFX translation support.
+Scoped OCR first consumes TextAreaPlan-eligible projected text areas. The
+controller then builds a provisional hierarchy so the parent-boundary OCR owner
+can recognize the exact parent obligation rather than promoting detector
+fragments into downstream identity. A second hierarchy build incorporates that
+parent-owned source evidence and publishes the finalized execution units used to
+create `ParentExecutionBundle` records.
+
+Some compatibility or review-conservation regions may be OCR-eligible while
+remaining blocked from translation, cleanup, and rendering. Known
+SFX/decorative/art regions do not enter the normal translation path unless a
+future feature explicitly defines SFX translation support.
 
 OCR errors should be diagnosed separately from semantic authorization errors. If visible text was never authorized upstream, OCR cannot fix the missed region.
 
@@ -187,17 +226,59 @@ ParentExecutionBundle
   -> SourceGlyphMask
   -> CleanupJob
   -> CleanupMask
+  -> initial RenderEligibility
   -> CleanupPlan
   -> CleanupBackend
   -> CleanupResult
   -> CleanupProof
+  -> cleanup commit and RenderEligibility diagnostic update
+  -> immutable CleanedPageBase
 ```
 
 `CleanupMask` is a strict consumer. It should only erase components that upstream authorization and parent ownership made executable. Unknown, protected SFX/decorative, art, and non-text components must remain non-executable.
 
+The initial render-eligibility contract is built after SourceGlyph, cleanup-job,
+and cleanup-mask contracts and is supplied to cleanup planning. Cleanup runtime
+and the upstream image commit may append warning/diagnostic state to that same
+contract. After parent finalization those diagnostics cannot suppress a required
+parent. Successful cleanup publication produces the immutable
+`CleanedPageBase` consumed by style observation and rendering.
+
+### Source Style Observation, Arbitration, and Cache
+
+`AuthorizedSourceStyleView` binds one parent to read-only original pixels plus
+accepted component-authorized foreground and exact provenance. Style observers
+produce independent `StyleEvidence` for font identity/design, thickness, width,
+source scale, fill, outline, orientation, rotation, and shadow, with explicit
+support or abstention per axis. They do not decide the final style.
+
+`ParentStyleArbitrator` is the sole automated resolved-style owner. It produces
+one complete immutable style per parent, applies deterministic field-local
+fallbacks where evidence is unavailable, and may consume only a validated
+snapshot of qualified evidence from already committed pages. The page-ordered
+style-context cache transports that evidence and an already prepared current-page
+delta; it never resolves styles, observes future pages, or accepts rendered,
+layout, fit, cleanup, fallback, or user-edit output.
+
+User style and layout edits are projected mechanically after automated style
+resolution. They never become `StyleEvidence`, change automated arbitration, or
+become style-cache donors.
+
 ### Rendering
 
-Rendering composes translated text after cleanup. The primary entry point for current production output is `render_parent_execution_bundles()`, which converts bundles to parent-owned execution regions and stamps renderer audit identity. It must preserve the full translated text or produce explicit evidence when text cannot fit. It should not silently drop characters, overflow unreadably, or reinterpret semantic scope.
+Rendering composes translated text after cleanup and style resolution. The sole
+production facade is `render_parent_execution_bundles()`. It stamps parent audit
+identity and calls `RenderLayerAdapter` to perform a lossless one-parent-to-one-
+`RenderLayerPlan` conversion. `PageRenderExecutor` then sequences
+`RenderLayoutPlanner`, `TypesettingEngine`, `InkBoundLayoutFitter`, shaped-glyph
+rasterization, optional parent effects, and the draw/commit-only
+`RendererCompositor` against one immutable `CleanedPageBase`.
+
+This path must preserve the full translated text or fail the page transaction
+for a genuine technical construction error. It must not silently drop
+characters, reinterpret semantic scope, perform cleanup, re-resolve style, or
+commit a partial required parent. Fit/readability limitations remain diagnostics
+and user-editable quality issues rather than render-admission authority.
 
 English uses `target-presentation:en:v2`. For an exact authorized speech
 container, its automatic domain is the full container shape while the source
@@ -249,6 +330,33 @@ The renderer does not validate cleanup completeness. It consumes the supplied
 render-eligibility records remain diagnostics; they cannot suppress parent
 execution. A required layer failure fails the page transaction instead of
 committing a successful partial page.
+
+### Manual Cleanup Revisions
+
+Manual cleanup is a separate application-owned edit workflow, not an alternate
+automatic cleanup authority. `ManualCleanupService` binds an explicit typed mask
+request to one selected immutable `CleanedPageBase`, invokes the existing cleanup
+backend for Preview, and commits only after user confirmation. A successful
+commit publishes a new immutable `CleanedPageBase` revision and a typed
+`ManualCleanupReceipt`.
+
+The service never inpaints the rendered final page, claims automated
+`CleanupProof`, changes semantic authorization, or silently reapplies a preview
+to a different/stale base hash. Cancelled or stale previews do not become current
+project state.
+
+### Project Checkpoint and Page Publication
+
+After rendering, the controller prepares the completed page record and the
+already produced current-page style-cache delta. `app.io.project_checkpoint`
+owns one atomic durable commit of those opaque values, including storage framing,
+hashes, rollback, and committed-prefix recovery. It does not interpret or rerun
+pipeline, style, renderer, or GUI policy. `app.io.project` owns compatible load
+and the final full-project materialization used by review and diagnostics.
+
+The page record and style-cache delta advance together. A failed commit leaves
+the previous committed prefix loadable and terminates the run before later pages.
+The controller emits `page_ready` only after the checkpoint receipt succeeds.
 
 ## Semantic Authorization Contract
 
@@ -304,7 +412,11 @@ Current parent-bundle consumers include:
 
 Some internal APIs still accept region-shaped dictionaries. The parent execution layer handles this by producing `execution_region` records from bundles. These records are compatibility envelopes with parent identity, not a return to region-owned execution.
 
-If no parent bundles are available, the controller still has a legacy region rendering path for compatibility/failure containment. That path should not be treated as the target architecture for new work.
+There is no raw-region rendering fallback. If canonical graph output contains no
+render layers, the controller copies the valid `CleanedPageBase` through the
+explicit no-layer path. If an authorized workflow region exists without the
+required executable parent bundle, the controller raises a hierarchy/identity
+contract failure rather than rendering the region independently.
 
 ### Identity Rules
 
@@ -436,20 +548,21 @@ row cannot veto the run. With no current receipt, the normal owning stage keeps
 its fail-closed model/runtime startup contract.
 
 Application preferences migrate only exact untouched historical defaults on
-macOS: `D:/Manga Projects` becomes the platform Documents project root, and
-default Undo/Redo/Preview bindings become Command-based. Custom paths and
-shortcut values are preserved. Qt supplies the UI font; renderer defaults and
-heuristic fallbacks use the installed Noto CJK pack rather than Microsoft
-YaHei. Frameless macOS edges call Qt `startSystemResize`, while the guarded
-Windows `WM_NCHITTEST` path remains the Windows fallback.
+macOS: the legacy Windows project-root default becomes the platform Documents
+project root, and default Undo/Redo/Preview bindings become Command-based.
+Custom paths and shortcut values are preserved. Qt supplies the UI font;
+renderer defaults and heuristic fallbacks use the installed Noto CJK pack
+rather than Microsoft YaHei. Frameless macOS edges call Qt
+`startSystemResize`, while the guarded Windows `WM_NCHITTEST` path remains the
+Windows fallback.
 
-The checked-in PyInstaller/private-ICU packaging path is Windows-only. macOS is
+The checked-in PyInstaller/bundled-ICU packaging path is Windows-only. macOS is
 currently supported as a source/Conda execution path, not as a signed or
 notarized application bundle.
 
-Historical page-specific model-fusion/debug assists are not part of the
-default pipeline. They must remain disabled unless
-`MT_LEGACY_PAGE_SPECIFIC_ASSIST` and the specific diagnostic flag are both set.
+Historical page-specific model-fusion/debug assists are removed from the
+production pipeline. No environment flag may revive them as semantic,
+hierarchy, translation, cleanup, eligibility, style, or renderer authority.
 
 ## Performance Expectations
 
@@ -483,10 +596,10 @@ Syntax checks for edited Python modules:
 python -m py_compile app/pipeline/bubble_detection.py app/pipeline/text_area_plan.py app/pipeline/text_block_hierarchy.py app/pipeline/parent_execution_bundle.py app/pipeline/controller.py
 ```
 
-Contract-focused unit tests, when relevant:
+Run focused tests for the owner changed by the work and report the exact command
+and result. Do not publish or recommend a command for a test module that the
+source tree does not contain.
 
-```powershell
-python -m unittest app.tests.test_semantic_authority_contract
-```
-
-Full validation requires the task-specific visual or translation workflow described above.
+Full validation requires the task-specific contract, runtime, and visual
+workflow described above. Bare repository-wide `pytest`, syntax checks alone,
+or test counts alone do not establish release readiness.

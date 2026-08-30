@@ -17,10 +17,10 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local API credentials
+# Credentials
 api/
 
-# App outputs / local data
+# Generated application data
 output/
 *.sqlite
 logs/
@@ -28,31 +28,30 @@ logs/
 # executables
 *.exe
 
-# Local test data (not for repo)
+# Test data
 Test Manga/
 
-# Local design files
+# Design sources
 design/
 
-# Models (kept local; not tracked)
+# Models and build output
 models/
 dist/
 !app/models/
 !app/models/*.py
 
-# Private project test code
+# Tests
 app/tests/*
 !app/tests/__init__.py
 
-# Local validation workflow
+# Validation artifacts
 validation/
 
-# Repository-local test/runtime scratch
-# Durable validation evidence belongs under output/, which is already ignored.
+# Test and runtime scratch
 /.t/
 /tmp*/
 
-# Ad-hoc QA harnesses and their outputs are local validation material.
+# QA artifacts
 /qa/
 /*.yomiframe.json
 /.*.checkpoint.sqlite3*
@@ -61,10 +60,10 @@ validation/
 /cleaned_page_base/
 /style_guide.json
 
-# Local test data
+# Additional test data
 tests/
 
-# Local debug artifacts
+# Debug artifacts
 debug_artifacts/
 
 # Prototypes
@@ -72,7 +71,7 @@ prototypes/
 
 
 
-# Documentation
+# Documentation sources
 *.md
 !README.md
 !TECHNICAL.md
