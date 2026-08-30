@@ -147,7 +147,18 @@ REQUIRED_FONT_ROLES = (
     ("serif_semibold", "NotoSerifCJKsc-SemiBold.otf", "noto_serif_cjk_sc_semibold", "noto_serif_cjk_sc_bold"),
     ("serif_bold", "NotoSerifCJKsc-Bold.otf", "noto_serif_cjk_sc_bold", "noto_serif_cjk_sc_semibold"),
     ("mono_regular", "NotoSansMonoCJKsc-Regular.otf", "noto_sans_mono_cjk_sc_regular", "noto_sans_cjk_sc_regular"),
+    ("latin_sans_regular", "NotoSans[wdth,wght].ttf", "noto_sans_latin_condensed_regular", "noto_sans_cjk_sc_regular"),
+    ("latin_sans_medium", "NotoSans[wdth,wght].ttf", "noto_sans_latin_condensed_medium", "noto_sans_cjk_sc_medium"),
+    ("latin_sans_bold", "NotoSans[wdth,wght].ttf", "noto_sans_latin_condensed_bold", "noto_sans_cjk_sc_bold"),
+    ("latin_sans_black", "NotoSans[wdth,wght].ttf", "noto_sans_latin_condensed_black", "noto_sans_cjk_sc_black"),
 )
+
+LATIN_TARGET_ROLE_MAP = {
+    "sans_regular": "latin_sans_regular",
+    "sans_medium": "latin_sans_medium",
+    "sans_bold": "latin_sans_bold",
+    "sans_black": "latin_sans_black",
+}
 
 
 class FontManagerError(RuntimeError):
@@ -165,6 +176,7 @@ class FontFace:
     serif: bool = False
     monospace: bool = False
     priority: int = 100
+    variations: tuple[tuple[str, float], ...] = ()
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +190,9 @@ class FontFace:
             "serif": bool(self.serif),
             "monospace": bool(self.monospace),
             "priority": int(self.priority),
+            "variations": {
+                str(tag): float(value) for tag, value in self.variations
+            },
         }
 
 
@@ -219,6 +234,8 @@ class FontResolution:
     missing_glyphs: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     registered_role: FontRoleStatus | None = None
+    logical_role_id: str = ""
+    physical_role_id: str = ""
 
     @property
     def usable(self) -> bool:
@@ -242,6 +259,8 @@ class FontResolution:
                 if self.registered_role is not None
                 else None
             ),
+            "logical_role_id": self.logical_role_id,
+            "physical_role_id": self.physical_role_id,
         }
         return audit
 
@@ -587,10 +606,10 @@ class FontManager:
         self.base_dir = base_dir
         self._faces: dict[str, FontFace] = {}
         self._cmap_cache: dict[str, set[int]] = {}
-        self._font_cache: dict[tuple[str, int], Any] = {}
-        self._glyph_metrics_cache: dict[tuple[str, int, str], GlyphMetrics] = {}
-        self._text_metrics_cache: dict[tuple[str, int, str, str], TextMetrics] = {}
-        self._open_type_metrics_cache: dict[tuple[str, int], OpenTypeMetrics] = {}
+        self._font_cache: dict[tuple[str, str, int], Any] = {}
+        self._glyph_metrics_cache: dict[tuple[str, str, int, str], GlyphMetrics] = {}
+        self._text_metrics_cache: dict[tuple[str, str, int, str, str], TextMetrics] = {}
+        self._open_type_metrics_cache: dict[tuple[str, str, int], OpenTypeMetrics] = {}
         self._font_sha256_cache: dict[str, str] = {}
         self._target_optical_profile_cache: dict[
             tuple[str, str, str], TargetFontOpticalProfile
@@ -612,11 +631,16 @@ class FontManager:
             "cmap": 0,
         }
         self._register_noto_cjk_sc_core()
+        self._register_noto_latin_core()
         self._register_windows_fallbacks()
 
     @property
     def has_font_pack(self) -> bool:
         return model_resolution.has_noto_cjk_sc_font_pack(self.base_dir)
+
+    @property
+    def has_latin_font_pack(self) -> bool:
+        return model_resolution.has_noto_latin_font_pack(self.base_dir)
 
     def available_faces(self) -> list[FontFace]:
         return sorted(self._faces.values(), key=lambda face: (face.priority, face.face_id))
@@ -664,10 +688,15 @@ class FontManager:
     ) -> FontResolution:
         style = resolved_style if isinstance(resolved_style, Mapping) else {}
         primary_font_role = str(style.get("primary_font_role") or "").strip()
+        physical_font_role = _target_physical_font_role(
+            primary_font_role,
+            target_script=str(style.get("target_script") or ""),
+            writing_mode=writing_mode,
+        )
         role_inventory = {
             item.role_id: item for item in self.required_role_inventory()
         }
-        role_status = role_inventory.get(primary_font_role)
+        role_status = role_inventory.get(physical_font_role)
         selected = (
             self.face(role_status.selected_face_id)
             if role_status is not None and role_status.selected_face_id
@@ -688,6 +717,8 @@ class FontManager:
                 missing_glyphs=list(_unique_chars(text)),
                 issues=["registered_primary_font_role_unavailable"],
                 registered_role=role_status,
+                logical_role_id=primary_font_role,
+                physical_role_id=physical_font_role,
             )
         chain = self._fallback_chain(
             requested_family=requested_family,
@@ -710,6 +741,8 @@ class FontManager:
                 missing_glyphs=list(_unique_chars(text)),
                 issues=["missing_font_pack"],
                 registered_role=role_status,
+                logical_role_id=primary_font_role,
+                physical_role_id=physical_font_role,
             )
         missing_glyphs: list[str] = []
         if text:
@@ -731,6 +764,8 @@ class FontManager:
             missing_glyphs=missing_glyphs,
             issues=issues,
             registered_role=role_status,
+            logical_role_id=primary_font_role,
+            physical_role_id=physical_font_role,
         )
         return core_resolution
 
@@ -1067,12 +1102,13 @@ class FontManager:
         if ImageFont is None:
             raise FontManagerError("Pillow ImageFont is unavailable")
         font_size = max(1, int(size))
-        key = (face.path, font_size)
+        key = (face.face_id, face.path, font_size)
         if key in self._font_cache:
             self._cache_hits["font"] += 1
             return self._font_cache[key]
         self._cache_misses["font"] += 1
         font = ImageFont.truetype(face.path, font_size)
+        _apply_pillow_font_variations(font, face.variations)
         self._font_cache[key] = font
         return font
 
@@ -1080,7 +1116,7 @@ class FontManager:
         if face is None:
             raise FontManagerError("font face is unavailable")
         font_size = max(1, int(size))
-        key = (face.path, font_size, str(glyph or ""))
+        key = (face.face_id, face.path, font_size, str(glyph or ""))
         if key in self._glyph_metrics_cache:
             self._cache_hits["glyph_metrics"] += 1
             return self._glyph_metrics_cache[key]
@@ -1120,7 +1156,7 @@ class FontManager:
             raise FontManagerError("font face is unavailable")
         font_size = max(1, int(size))
         mode = str(writing_mode or "horizontal").strip().lower() or "horizontal"
-        key = (face.path, font_size, mode, str(text or ""))
+        key = (face.face_id, face.path, font_size, mode, str(text or ""))
         if key in self._text_metrics_cache:
             self._cache_hits["text_metrics"] += 1
             return self._text_metrics_cache[key]
@@ -1169,7 +1205,7 @@ class FontManager:
         if TTFont is None:
             raise FontManagerError("fontTools TTFont is unavailable")
         font_size = max(1, int(size))
-        key = (face.path, font_size)
+        key = (face.face_id, face.path, font_size)
         if key in self._open_type_metrics_cache:
             self._cache_hits["open_type_metrics"] += 1
             return self._open_type_metrics_cache[key]
@@ -1570,6 +1606,56 @@ class FontManager:
                 serif=serif,
                 monospace=monospace,
                 priority=priority,
+            )
+
+    def _register_noto_latin_core(self) -> None:
+        path = model_resolution.resolve_noto_latin_variable_font_file(
+            self.base_dir
+        )
+        if not path:
+            return
+        candidates = (
+            (
+                "noto_sans_latin_condensed_regular",
+                "dialogue",
+                "regular",
+                400.0,
+                70,
+            ),
+            (
+                "noto_sans_latin_condensed_medium",
+                "medium",
+                "medium",
+                500.0,
+                75,
+            ),
+            (
+                "noto_sans_latin_condensed_bold",
+                "bold",
+                "bold",
+                700.0,
+                80,
+            ),
+            (
+                "noto_sans_latin_condensed_black",
+                "heavy",
+                "black",
+                900.0,
+                85,
+            ),
+        )
+        for face_id, style_class, weight, weight_axis, priority in candidates:
+            self._faces[face_id] = FontFace(
+                face_id=face_id,
+                family="Noto Sans",
+                style_class=style_class,
+                weight=weight,
+                path=path,
+                source="noto_latin_variable_core",
+                serif=False,
+                monospace=False,
+                priority=priority,
+                variations=(("wdth", 75.0), ("wght", weight_axis)),
             )
 
     def _register_windows_fallbacks(self) -> None:
@@ -1988,6 +2074,43 @@ def _ignore_coverage_char(char: str) -> bool:
     from app.render.typesetting_text import source_char_requires_visible_glyph
 
     return not source_char_requires_visible_glyph(char)
+
+
+def _target_physical_font_role(
+    logical_role_id: str,
+    *,
+    target_script: str,
+    writing_mode: str,
+) -> str:
+    role = str(logical_role_id or "").strip()
+    if (
+        str(target_script or "").strip() == "Latn"
+        and str(writing_mode or "").strip().lower() == "horizontal"
+    ):
+        return LATIN_TARGET_ROLE_MAP.get(role, role)
+    return role
+
+
+def _apply_pillow_font_variations(
+    font: Any,
+    variations: Sequence[tuple[str, float]],
+) -> None:
+    requested = {str(tag): float(value) for tag, value in variations}
+    if not requested:
+        return
+    axes = list(font.get_variation_axes())
+    coordinates: list[float] = []
+    for axis in axes:
+        name = axis.get("name", b"")
+        if isinstance(name, bytes):
+            name = name.decode("ascii", errors="ignore")
+        normalized = str(name or "").strip().lower()
+        tag = "wght" if normalized == "weight" else "wdth" if normalized == "width" else ""
+        value = requested.get(tag, float(axis.get("default") or 0.0))
+        minimum = float(axis.get("minimum") or value)
+        maximum = float(axis.get("maximum") or value)
+        coordinates.append(max(minimum, min(maximum, float(value))))
+    font.set_variation_by_axes(coordinates)
 
 
 def default_font_manager(*, base_dir: str | None = None) -> FontManager:

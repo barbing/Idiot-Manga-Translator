@@ -58,12 +58,26 @@ class FreeTypeGlyphRasterizer:
         stroke_width: int = 0,
         position_policy: str = "harfbuzz",
     ) -> GlyphRasterResult:
-        width = max(1, int(target_size[0]))
-        height = max(1, int(target_size[1]))
+        output_width = max(1, int(target_size[0]))
+        output_height = max(1, int(target_size[1]))
+        rotate_clockwise = str(position_policy or "") == "rotated_latin_clockwise"
+        width = output_height if rotate_clockwise else output_width
+        height = output_width if rotate_clockwise else output_height
         font_face_id = str(shaped_run.get("font_face_id") or "")
         font_path = str(shaped_run.get("font_path") or "")
         font_size = max(1, int(round(_as_float(shaped_run.get("font_size"), 1.0))))
         direction = str(shaped_run.get("direction") or "")
+        shaped_metadata = (
+            shaped_run.get("metadata")
+            if isinstance(shaped_run.get("metadata"), Mapping)
+            else {}
+        )
+        font_variations = {
+            str(tag): float(value)
+            for tag, value in dict(
+                shaped_metadata.get("font_variations") or {}
+            ).items()
+        }
         features = {
             str(key): bool(value)
             for key, value in dict(shaped_run.get("features") or {}).items()
@@ -88,6 +102,8 @@ class FreeTypeGlyphRasterizer:
             "font_size": font_size,
             "direction": direction,
             "features": features,
+            "font_variations": font_variations,
+            "variation_coordinates_applied": False,
             "position_policy": str(position_policy or "harfbuzz"),
             "freetype_load_policy": "hinted_normal_gray",
             "alpha_composition_policy": "coverage_union_then_single_target_copy",
@@ -99,7 +115,9 @@ class FreeTypeGlyphRasterizer:
             "x_offsets": [],
             "y_offsets": [],
             "advances_offsets_consumed": False,
-            "target_size": [width, height],
+            "target_size": [output_width, output_height],
+            "pre_rotation_target_size": [width, height],
+            "raster_rotation_degrees_clockwise": 0,
             "ink_bounds_before_centering": [],
             "ink_bounds_in_target": [],
             "raster_clipped_to_target": False,
@@ -134,6 +152,7 @@ class FreeTypeGlyphRasterizer:
             "harfbuzz",
             "compact_vertical_sequence_preserved",
             "compact_horizontal_sequence_preserved",
+            "rotated_latin_clockwise",
         }:
             return _failure(base_audit, f"raster_position_policy_unsupported:{position_policy}")
         selected = _select_glyph_sequence(shaped_glyphs, requested)
@@ -146,7 +165,9 @@ class FreeTypeGlyphRasterizer:
 
         try:
             face = self._face(font_path)
+            _apply_freetype_variations(face, font_variations)
             face.set_pixel_sizes(0, font_size)
+            base_audit["variation_coordinates_applied"] = bool(font_variations)
         except Exception as exc:
             return _failure(base_audit, f"raster_font_load_failed:{type(exc).__name__}")
 
@@ -329,6 +350,28 @@ class FreeTypeGlyphRasterizer:
         fill_layer.putalpha(natural_fill_mask)
         layer.alpha_composite(fill_layer)
 
+        if rotate_clockwise:
+            source_natural_w = natural_w
+            source_natural_h = natural_h
+            source_offset_x, source_offset_y = composite_offset
+            layer = layer.transpose(Image.Transpose.ROTATE_270)
+            natural_w, natural_h = source_natural_h, source_natural_w
+            composite_offset = [
+                int(output_width - source_offset_y - source_natural_h),
+                int(source_offset_x),
+            ]
+            overhang = [
+                max(0, -composite_offset[0]),
+                max(0, -composite_offset[1]),
+                max(0, composite_offset[0] + natural_w - output_width),
+                max(0, composite_offset[1] + natural_h - output_height),
+            ]
+            hard_cell_fit = {
+                **hard_cell_fit,
+                "applied": any(value > 0 for value in overhang),
+            }
+            base_audit["raster_rotation_degrees_clockwise"] = 90
+
         base_audit.update(
             {
                 "status": "drawn",
@@ -340,10 +383,10 @@ class FreeTypeGlyphRasterizer:
                     ink_h,
                 ],
                 "ink_bounds_in_target": [
-                    dest_x,
-                    dest_y,
-                    dest_x + ink_w,
-                    dest_y + ink_h,
+                    composite_offset[0],
+                    composite_offset[1],
+                    composite_offset[0] + natural_w,
+                    composite_offset[1] + natural_h,
                 ],
                 "raster_clipped_to_target": False,
                 "source_alpha_sum": source_alpha_sum,
@@ -363,6 +406,23 @@ class FreeTypeGlyphRasterizer:
             face = freetype.Face(path)
             self._faces[path] = face
         return face
+
+
+def _apply_freetype_variations(
+    face: Any,
+    variations: Mapping[str, float],
+) -> None:
+    requested = {str(tag): float(value) for tag, value in variations.items()}
+    if not requested:
+        return
+    axes = tuple(face.get_variation_info().axes)
+    coordinates: list[float] = []
+    for axis in axes:
+        value = requested.get(str(axis.tag), float(axis.default))
+        coordinates.append(
+            max(float(axis.minimum), min(float(axis.maximum), float(value)))
+        )
+    face.set_var_design_coords(coordinates)
 
 
 def _select_glyph_sequence(

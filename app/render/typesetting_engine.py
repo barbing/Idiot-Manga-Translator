@@ -352,10 +352,22 @@ class TypesettingEngine:
         script_policy = _script_policy(runs, writing_mode, self.policy)
         attempts: list[dict[str, Any]] = []
         selected_attempt: dict[str, Any] | None = None
+        first_fit_attempt: dict[str, Any] | None = None
+        first_fit_font_size = 0
+        competitive_alignment_min_size = 0
+        competitive_alignment_extra_attempts = 0
+        competitive_alignment_extra_attempt_limit = 3
+        competitive_alignment_window_used = False
         source_preferred_interval_floor = _source_preferred_interval_floor(
             preferred_font_size,
             plan.resolved_render_style,
         )
+        source_supported_interval_upper_font_size: int | None = None
+        source_supported_interval_search_used = False
+        source_supported_evaluated_font_sizes: list[int] = []
+        source_supported_candidate_records: list[dict[str, Any]] = []
+        source_supported_selected = False
+        source_supported_reference_font_size = preferred_font_size
         lexical_candidate_selection_reason = ""
         candidate_search_start = preferred_font_size
         fit_upper_bound_sources: list[dict[str, Any]] = []
@@ -397,6 +409,33 @@ class TypesettingEngine:
                 competitive_probe_size,
             )
         capacity_profile = plan.horizontal_shape_capacity_profile
+        latin_atomic_display_eligible = _latin_atomic_display_policy_eligible(
+            plan,
+            runs,
+        )
+        latin_competitive_alignment = bool(
+            writing_mode == "horizontal"
+            and isinstance(capacity_profile, HorizontalShapeCapacityProfile)
+            and _latin_target_presentation_active(plan, writing_mode)
+            and not competitive_probe_size
+        )
+        if latin_competitive_alignment:
+            source_supported_interval_upper_font_size = (
+                _source_preferred_interval_ceiling(
+                    preferred_font_size,
+                    plan.resolved_render_style,
+                )
+            )
+            if (
+                source_supported_interval_upper_font_size is not None
+                and source_supported_interval_upper_font_size
+                > preferred_font_size
+            ):
+                candidate_search_start = max(
+                    int(candidate_search_start),
+                    int(source_supported_interval_upper_font_size),
+                )
+                source_supported_interval_search_used = True
         if (
             writing_mode == "horizontal"
             and isinstance(capacity_profile, HorizontalShapeCapacityProfile)
@@ -453,6 +492,7 @@ class TypesettingEngine:
             )
             if (
                 longest_atomic_advance > float(maximum_band_width) > 0.0
+                and not latin_atomic_display_eligible
             ):
                 atomic_upper_bound = max(
                     1,
@@ -482,18 +522,52 @@ class TypesettingEngine:
                             ),
                         }
                     )
-        font_size_candidates = (
-            [candidate_search_start]
-            if competitive_probe_size
-            else _font_size_candidates(
+        if competitive_probe_size:
+            font_size_candidates = [candidate_search_start]
+        elif (
+            source_supported_interval_search_used
+            and int(candidate_search_start) > preferred_font_size
+        ):
+            ordinary_candidates = _font_size_candidates(
+                preferred_font_size,
+                plan.resolved_render_style,
+                self.policy,
+                target_box,
+                plan.metadata,
+            )
+            font_size_candidates = [
+                int(candidate_search_start),
+                *[
+                    int(value)
+                    for value in ordinary_candidates
+                    if int(value) != int(candidate_search_start)
+                ],
+            ]
+        else:
+            font_size_candidates = _font_size_candidates(
                 candidate_search_start,
                 plan.resolved_render_style,
                 self.policy,
                 target_box,
                 plan.metadata,
             )
-        )
         for font_size in font_size_candidates:
+            if (
+                source_supported_interval_search_used
+                and source_supported_interval_upper_font_size is not None
+                and preferred_font_size <= int(font_size)
+                <= source_supported_interval_upper_font_size
+            ):
+                source_supported_evaluated_font_sizes.append(int(font_size))
+            if first_fit_attempt is not None:
+                if (
+                    not latin_competitive_alignment
+                    or int(font_size) < int(competitive_alignment_min_size)
+                    or competitive_alignment_extra_attempts
+                    >= competitive_alignment_extra_attempt_limit
+                ):
+                    break
+                competitive_alignment_extra_attempts += 1
             shaped_runs, run_font_resolutions = self._shape_runs(
                 runs,
                 resolved,
@@ -727,6 +801,24 @@ class TypesettingEngine:
                     )
                     base_visual_center = _center_of(base_measured_bounds)
                     measured_bounds = outward_int_xywh(parent_effect_envelope.final_bounds)
+            shape_center_quality = (
+                _horizontal_shape_center_quality(
+                    measured_center=base_visual_center,
+                    profile=capacity_profile,
+                    font_size=font_size,
+                )
+                if isinstance(capacity_profile, HorizontalShapeCapacityProfile)
+                and _latin_target_presentation_active(plan, writing_mode)
+                else {
+                    "alignment_center_distance": 0.0,
+                    "visual_center_distance": 0.0,
+                    "combined_center_distance": 0.0,
+                    "alignment_center_distance_em": 0.0,
+                    "visual_center_distance_em": 0.0,
+                    "nearest_center_distance_em": 0.0,
+                    "alignment_drift_tier": 0,
+                }
+            )
             attempt = {
                 "font_size": int(font_size),
                 "fit_status": fit_status,
@@ -769,21 +861,125 @@ class TypesettingEngine:
                 "canonical_break_quality": canonical_break_quality_summary(
                     break_plan
                 ),
+                "shape_center_quality": shape_center_quality,
             }
             attempts.append(attempt)
-            selected_attempt = attempt
             if fit_status != "fits":
+                if (
+                    first_fit_attempt is not None
+                    and (
+                        int(font_size) <= int(competitive_alignment_min_size)
+                        or competitive_alignment_extra_attempts
+                        >= competitive_alignment_extra_attempt_limit
+                    )
+                ):
+                    break
                 continue
-            lexical_candidate_selection_reason = (
-                "same_size_authorized_layout_expansion"
-                if bool(
-                    attempt["same_size_break_quality_layout_expansion_used"]
-                )
-                else "first_technical_fit"
+            if first_fit_attempt is None:
+                first_fit_attempt = attempt
+                first_fit_font_size = int(font_size)
+                if source_supported_interval_search_used:
+                    competitive_alignment_min_size = max(
+                        1,
+                        int(
+                            math.ceil(
+                                float(preferred_font_size) * 0.95
+                            )
+                        ),
+                    )
+                    competitive_alignment_extra_attempt_limit = max(
+                        3,
+                        int(first_fit_font_size)
+                        - int(competitive_alignment_min_size),
+                    )
+                else:
+                    competitive_alignment_min_size = max(
+                        1,
+                        int(math.ceil(float(font_size) * 0.95)),
+                    )
+            fitting_attempts = [
+                item for item in attempts if str(item.get("fit_status")) == "fits"
+            ]
+            selected_attempt = min(
+                fitting_attempts,
+                key=_competitive_alignment_attempt_key,
             )
-            break
+            competitive_alignment_window_used = bool(
+                latin_competitive_alignment
+                and int(font_size) < int(first_fit_font_size)
+            )
+            if not latin_competitive_alignment:
+                break
+            if (
+                int(font_size) <= int(competitive_alignment_min_size)
+                or competitive_alignment_extra_attempts
+                >= competitive_alignment_extra_attempt_limit
+            ):
+                break
+        if source_supported_interval_search_used:
+            fitting_attempts = [
+                item
+                for item in attempts
+                if str(item.get("fit_status")) == "fits"
+            ]
+            reference_attempts = [
+                item
+                for item in fitting_attempts
+                if int(item.get("font_size") or 0) <= preferred_font_size
+            ]
+            if reference_attempts:
+                reference_attempt = min(
+                    reference_attempts,
+                    key=_competitive_alignment_attempt_key,
+                )
+                source_supported_reference_font_size = int(
+                    reference_attempt.get("font_size") or preferred_font_size
+                )
+                accepted_upscale_attempts: list[dict[str, Any]] = []
+                for item in attempts:
+                    candidate_size = int(item.get("font_size") or 0)
+                    if candidate_size <= preferred_font_size:
+                        continue
+                    rejection_reasons = (
+                        _source_supported_upscale_regression_reasons(
+                            item,
+                            reference_attempt,
+                        )
+                    )
+                    accepted = not rejection_reasons
+                    source_supported_candidate_records.append(
+                        {
+                            "font_size": candidate_size,
+                            "accepted": accepted,
+                            "reason_codes": list(rejection_reasons),
+                            "raster_ink_capacity_guard_status": (
+                                _source_supported_raster_ink_capacity_guard_status(
+                                    item
+                                )
+                            ),
+                        }
+                    )
+                    if accepted:
+                        accepted_upscale_attempts.append(item)
+                if accepted_upscale_attempts:
+                    selected_attempt = min(
+                        accepted_upscale_attempts,
+                        key=_competitive_alignment_attempt_key,
+                    )
+                    source_supported_selected = True
+                else:
+                    selected_attempt = reference_attempt
         if selected_attempt is None:
             return self._failed(plan, "layout_attempt_failed", ["layout_attempt_failed"], hard_bounds=hard_bounds)
+        lexical_candidate_selection_reason = (
+            "source_supported_interval_nonregressing_upscale"
+            if source_supported_selected
+            else "competitive_alignment_window"
+            if first_fit_attempt is not None and selected_attempt is not first_fit_attempt
+            else "same_size_authorized_layout_expansion"
+            if bool(selected_attempt["same_size_break_quality_layout_expansion_used"])
+            else "first_technical_fit"
+        )
         font_size = int(selected_attempt["font_size"])
         shaped_runs = list(selected_attempt["shaped_runs"])
         placements = list(selected_attempt["placements"])
@@ -915,7 +1111,12 @@ class TypesettingEngine:
         else:
             fit_quality = "preferred"
         fit_trigger = (
-            "preferred_size_break_quality_layout_expansion"
+            "source_supported_interval_nonregressing_upscale"
+            if source_supported_selected
+            else "competitive_alignment_window"
+            if lexical_candidate_selection_reason
+            == "competitive_alignment_window"
+            else "preferred_size_break_quality_layout_expansion"
             if (
                 font_size == preferred_font_size
                 and fit_status == "fits"
@@ -1059,8 +1260,51 @@ class TypesettingEngine:
                 "text_placement_complete": text_placement_complete,
                 "hard_bounds_contained": hard_bounds_contained,
                 "scaling_used": round(final_scale, 4),
-                "fallback_used": font_size != preferred_font_size,
+                "fallback_used": font_size < preferred_font_size,
                 "candidate_count": len(attempts),
+                "first_fit_font_size": int(first_fit_font_size or font_size),
+                "competitive_alignment_min_size": int(
+                    competitive_alignment_min_size or font_size
+                ),
+                "competitive_alignment_extra_attempts": int(
+                    competitive_alignment_extra_attempts
+                ),
+                "competitive_alignment_extra_attempt_limit": int(
+                    competitive_alignment_extra_attempt_limit
+                ),
+                "competitive_alignment_window_used": bool(
+                    competitive_alignment_window_used
+                ),
+                "source_supported_interval_search_used": bool(
+                    source_supported_interval_search_used
+                ),
+                "source_supported_interval_upper_font_size": (
+                    int(source_supported_interval_upper_font_size)
+                    if source_supported_interval_upper_font_size is not None
+                    else None
+                ),
+                "source_supported_evaluated_font_sizes": list(
+                    source_supported_evaluated_font_sizes
+                ),
+                "source_supported_reference_font_size": int(
+                    source_supported_reference_font_size
+                ),
+                "source_supported_selected": bool(
+                    source_supported_selected
+                ),
+                "source_supported_candidate_records": copy_jsonish(
+                    source_supported_candidate_records
+                ),
+                "selected_alignment_drift_tier": int(
+                    selected_attempt["shape_center_quality"][
+                        "alignment_drift_tier"
+                    ]
+                ),
+                "selected_nearest_center_distance_em": float(
+                    selected_attempt["shape_center_quality"][
+                        "nearest_center_distance_em"
+                    ]
+                ),
                 "lexical_candidate_selection": {
                     "status": "selected",
                     "selection_reason": lexical_candidate_selection_reason,
@@ -1205,7 +1449,7 @@ class TypesettingEngine:
                     )
                 )
             ),
-            fallback_used=font_size != preferred_font_size,
+            fallback_used=font_size < preferred_font_size,
             scaling_used=final_scale,
             overflow_risk=not hard_bounds_contained,
             clipping_risk=not hard_bounds_contained,
@@ -2465,7 +2709,6 @@ class TypesettingEngine:
         list[str],
         dict[str, Any],
     ]:
-        del normalized
         x, y, w, h = [int(value) for value in profile.bounds]
         line_height_ratio = _line_height(style)
         line_height = max(1.0, font_size * line_height_ratio)
@@ -2479,6 +2722,14 @@ class TypesettingEngine:
             for item in shaped_runs
             if str(item.metadata.get("run_id") or "")
         }
+        maximum_profile_width = max(
+            (
+                int(end) - int(start)
+                for row in profile.rows
+                for start, end in row.actual_intervals
+            ),
+            default=1,
+        )
         layout_items: list[dict[str, Any]] = []
         for run in runs:
             shaped = shaped_by_run.get(run.run_id)
@@ -2543,14 +2794,6 @@ class TypesettingEngine:
         total_advance = sum(
             max(0.0, float(item.get("advance") or 0.0))
             for item in layout_items
-        )
-        maximum_profile_width = max(
-            (
-                int(end) - int(start)
-                for row in profile.rows
-                for start, end in row.actual_intervals
-            ),
-            default=1,
         )
         minimum_line_count = max(
             1,
@@ -2630,20 +2873,11 @@ class TypesettingEngine:
                     max(0.0, 1.0 - float(line.get("comfort_coverage_ratio") or 0.0))
                     for line in lines
                 )
-                measured_center = _center_of(measured)
-                center_dx = (
-                    (float(measured_center[0]) - float(profile.visual_center[0]))
-                    / max(1.0, float(w))
-                    if measured_center
-                    else 1.0
+                center_quality = _horizontal_shape_center_quality(
+                    measured_center=_center_of(measured),
+                    profile=profile,
+                    font_size=font_size,
                 )
-                center_dy = (
-                    (float(measured_center[1]) - float(profile.visual_center[1]))
-                    / max(1.0, float(h))
-                    if measured_center
-                    else 1.0
-                )
-                center_distance = center_dx * center_dx + center_dy * center_dy
                 confirmed = list(
                     quality.get("confirmed_lexical_integrity") or [0, 0]
                 )
@@ -2654,7 +2888,8 @@ class TypesettingEngine:
                     int(confirmed[0] if len(confirmed) > 0 else 0),
                     int(confirmed[1] if len(confirmed) > 1 else 0),
                     round(float(quality.get("punctuation_attachment") or 0.0), 6),
-                    round(float(comfort_penalty), 6),
+                    int(center_quality["alignment_drift_tier"]),
+                    0,
                     int(segment[0] if len(segment) > 0 else 0),
                     round(float(segment[1] if len(segment) > 1 else 0.0), 6),
                     int(weak[0] if len(weak) > 0 else 0),
@@ -2662,7 +2897,8 @@ class TypesettingEngine:
                     int(weak[2] if len(weak) > 2 else 0),
                     round(float(quality.get("optical_balance") or 0.0), 6),
                     int(line_count),
-                    round(float(center_distance), 8),
+                    round(float(comfort_penalty), 6),
+                    round(float(center_quality["combined_center_distance"]), 8),
                     int(line_boxes_record["block_y"]),
                     tuple(break_plan.get("split_points") or ()),
                 )
@@ -2679,12 +2915,32 @@ class TypesettingEngine:
                     "line_count": line_count,
                     "block_y": int(line_boxes_record["block_y"]),
                     "comfort_penalty": round(float(comfort_penalty), 6),
-                    "center_distance": round(float(center_distance), 8),
+                    **center_quality,
                     "shaped_overrides": shaped_overrides,
                 }
                 candidate_records.append(record)
                 if selected is None or selection_key < selected["selection_key"]:
                     selected = record
+
+        if _latin_atomic_display_policy_eligible_for_style(style, runs) and (
+            selected is None or int(selected.get("alignment_drift_tier") or 0) > 0
+        ):
+            atomic_display = self._latin_atomic_display_candidate(
+                normalized=normalized,
+                runs=runs,
+                shaped_by_run=shaped_by_run,
+                profile=profile,
+                font_size=font_size,
+                line_pixel_extent=line_pixel_extent,
+                style=style,
+            )
+            if atomic_display is not None:
+                candidate_records.append(atomic_display)
+                if (
+                    selected is None
+                    or atomic_display["selection_key"] < selected["selection_key"]
+                ):
+                    selected = atomic_display
 
         if selected is None:
             (
@@ -2733,11 +2989,19 @@ class TypesettingEngine:
         selected_break_plan = dict(selected["break_plan"])
         selected_overrides = dict(selected.get("shaped_overrides") or {})
         if selected_overrides and isinstance(shaped_runs, list):
+            consumed_override_ids: set[str] = set()
             for index, shaped_run in enumerate(shaped_runs):
                 run_id = str(shaped_run.metadata.get("run_id") or "")
                 replacement = selected_overrides.get(run_id)
                 if isinstance(replacement, ShapedRun):
                     shaped_runs[index] = replacement
+                    consumed_override_ids.add(run_id)
+            for run_id, replacement in selected_overrides.items():
+                if run_id not in consumed_override_ids and isinstance(
+                    replacement,
+                    ShapedRun,
+                ):
+                    shaped_runs.append(replacement)
         selected_break_plan["horizontal_shape_capacity"] = {
             **profile.to_audit_dict(),
             "status": "selected",
@@ -2751,7 +3015,23 @@ class TypesettingEngine:
             "selected_line_boxes": [list(item) for item in selected["line_boxes"]],
             "selected_line_widths": [round(float(value), 3) for value in selected["line_widths"]],
             "selected_comfort_penalty": selected["comfort_penalty"],
-            "selected_center_distance": selected["center_distance"],
+            "selected_center_distance": selected["visual_center_distance"],
+            "selected_alignment_center_distance": selected[
+                "alignment_center_distance"
+            ],
+            "selected_alignment_center_distance_em": selected[
+                "alignment_center_distance_em"
+            ],
+            "selected_visual_center_distance_em": selected[
+                "visual_center_distance_em"
+            ],
+            "selected_nearest_center_distance_em": selected[
+                "nearest_center_distance_em"
+            ],
+            "selected_alignment_drift_tier": selected["alignment_drift_tier"],
+            "selected_combined_center_distance": selected[
+                "combined_center_distance"
+            ],
         }
         issues = list(selected["issues"])
         if str(selected["fit_status"]) != "fits":
@@ -2765,6 +3045,271 @@ class TypesettingEngine:
             _unique(issues),
             selected_break_plan,
         )
+
+    def _latin_atomic_display_candidate(
+        self,
+        *,
+        normalized: str,
+        runs: Sequence[InlineTextRun],
+        shaped_by_run: Mapping[str, ShapedRun],
+        profile: HorizontalShapeCapacityProfile,
+        font_size: int,
+        line_pixel_extent: int,
+        style: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        visible_runs = [
+            run
+            for run in runs
+            if str(run.normalized_text or "").strip() and run.role != "space"
+        ]
+        word = next(
+            (
+                run
+                for run in visible_runs
+                if run.role == "latin_word" and run.script == "Latn"
+            ),
+            None,
+        )
+        if word is None:
+            return None
+        source_shaped = shaped_by_run.get(word.run_id)
+        if not isinstance(source_shaped, ShapedRun):
+            return None
+        face = self.font_manager.face(source_shaped.font_face_id)
+        if face is None or not self.font_manager.coverage_for_text(
+            face,
+            normalized,
+        ).supports_text:
+            return None
+        combined_run_id = f"{word.run_id}:atomic_display"
+        combined_shaped = self.shaper.shape_text(
+            normalized,
+            face=face,
+            font_size=font_size,
+            writing_mode="horizontal",
+            language=word.language,
+            script="Latn",
+            direction="ltr",
+        )
+        combined_shaped = replace(
+            combined_shaped,
+            metadata={
+                **dict(combined_shaped.metadata),
+                "run_id": combined_run_id,
+                "font_span_id": combined_run_id,
+                "logical_run_id": _logical_run_id_for(word),
+                "placement_mode": "rotated_latin_display_clockwise",
+                "latin_atomic_display": True,
+            },
+        )
+        advance = sum(
+            max(0.0, glyph.x_advance) for glyph in combined_shaped.glyphs
+        )
+        rotated_width = max(1, int(line_pixel_extent))
+        rotated_height = max(1, int(math.ceil(advance)))
+        bounds = list(profile.bounds)
+        min_y = int(bounds[1])
+        max_y = int(bounds[1] + bounds[3] - rotated_height)
+        if rotated_width > int(bounds[2]) or max_y < min_y:
+            return None
+        row_by_y = {int(row.y): row for row in profile.rows}
+        step = max(1, rotated_width // 3)
+        y_candidates = set(range(min_y, max_y + 1, step))
+        y_candidates.update({min_y, max_y})
+        for center_y in (
+            float(profile.alignment_center[1]),
+            float(profile.visual_center[1]),
+        ):
+            centered = int(round(center_y - float(rotated_height) / 2.0))
+            for delta in (-step, -1, 0, 1, step):
+                y_candidates.add(max(min_y, min(max_y, centered + delta)))
+
+        token_ids = [
+            token_id
+            for run in visible_runs
+            for token_id in run.token_ids
+        ]
+        punctuation_occurrences = [
+            dict(item)
+            for run in visible_runs
+            for item in list(run.metadata.get("punctuation_occurrences") or [])
+            if isinstance(item, Mapping)
+        ]
+        symbol_occurrences = [
+            dict(item)
+            for run in visible_runs
+            for item in list(run.metadata.get("symbol_occurrences") or [])
+            if isinstance(item, Mapping)
+        ]
+        original_text = "".join(run.original_text for run in visible_runs)
+        candidates: list[dict[str, Any]] = []
+        for candidate_y in sorted(y_candidates):
+            actual = _capacity_interval_for_band(
+                row_by_y,
+                y=int(candidate_y),
+                height=rotated_height,
+                center_x=float(profile.alignment_center[0]),
+                comfort=False,
+            )
+            if not actual or int(actual[1] - actual[0]) < rotated_width:
+                continue
+            requested_x = int(
+                round(float(profile.alignment_center[0]) - rotated_width / 2.0)
+            )
+            candidate_x = max(
+                int(actual[0]),
+                min(int(actual[1]) - rotated_width, requested_x),
+            )
+            comfort = _capacity_interval_for_band(
+                row_by_y,
+                y=int(candidate_y),
+                height=rotated_height,
+                center_x=float(profile.alignment_center[0]),
+                comfort=True,
+            )
+            comfort_overlap = (
+                max(
+                    0,
+                    min(candidate_x + rotated_width, int(comfort[1]))
+                    - max(candidate_x, int(comfort[0])),
+                )
+                if comfort
+                else 0
+            )
+            comfort_penalty = 1.0 - min(
+                1.0,
+                float(comfort_overlap) / float(rotated_width),
+            )
+            measured = [
+                candidate_x,
+                int(candidate_y),
+                rotated_width,
+                rotated_height,
+            ]
+            center_quality = _horizontal_shape_center_quality(
+                measured_center=_center_of(measured),
+                profile=profile,
+                font_size=font_size,
+            )
+            break_result = self.break_planner.plan_horizontal_bands(
+                [
+                    {
+                        "text": normalized,
+                        "run_id": combined_run_id,
+                        "advance": advance,
+                        "role": "latin_word",
+                        "script": "Latn",
+                    }
+                ],
+                [],
+                line_widths=[float(rotated_height)],
+            )
+            break_plan = break_result.to_audit_dict()
+            break_plan["latin_atomic_display"] = {
+                "contract_version": "latin_atomic_display_v1",
+                "status": "selected",
+                "selection_authority": "TypesettingEngine",
+                "source_writing_mode": "vertical",
+                "placement_mode": "rotated_latin_display_clockwise",
+                "rotation_degrees_clockwise": 90,
+                "hyphen_inserted": False,
+                "letter_stacking_used": False,
+                "logical_run_id": _logical_run_id_for(word),
+                "rotated_box": list(measured),
+            }
+            selection_key = (
+                0,
+                0,
+                0,
+                0.0,
+                int(center_quality["alignment_drift_tier"]),
+                1,
+                0,
+                0.0,
+                0,
+                0,
+                0,
+                0.0,
+                1,
+                round(float(comfort_penalty), 6),
+                round(float(center_quality["combined_center_distance"]), 8),
+                int(candidate_y),
+                (),
+            )
+            placement = GlyphPlacement(
+                text=normalized,
+                bbox=list(measured),
+                position=[float(candidate_x), float(candidate_y)],
+                font_family=combined_shaped.font_face_id,
+                font_size=float(font_size),
+                advance=float(advance),
+                writing_mode="horizontal",
+                metadata={
+                    "run_id": combined_run_id,
+                    "logical_run_id": _logical_run_id_for(word),
+                    "font_span_id": combined_run_id,
+                    "token_ids": token_ids,
+                    "original_text": original_text,
+                    "translated_start": min(
+                        int(run.translated_start) for run in visible_runs
+                    ),
+                    "translated_end": max(
+                        int(run.translated_end) for run in visible_runs
+                    ),
+                    "atomic_break": True,
+                    "line_index": 0,
+                    "space_run": False,
+                    "placement_source": "latin_atomic_display_orientation",
+                    "placement_mode": "rotated_latin_display_clockwise",
+                    "font_face_id": combined_shaped.font_face_id,
+                    "font_path": combined_shaped.font_path,
+                    "font_fallback_used": bool(
+                        combined_shaped.metadata.get("font_fallback_used")
+                    ),
+                    "punctuation_occurrences": punctuation_occurrences,
+                    "symbol_occurrences": symbol_occurrences,
+                    "raster_rotation_degrees_clockwise": 90,
+                },
+            )
+            line = {
+                "line_index": 0,
+                "text": normalized,
+                "writing_mode": "horizontal",
+                "run_ids": [combined_run_id],
+                "measured_advance": round(float(advance), 3),
+                "line_box": list(measured),
+                "available_width": float(rotated_height),
+                "placement_origin_x": float(candidate_x),
+                "alignment": _horizontal_text_alignment(style),
+                "capacity_source": "latin_atomic_display_rotation",
+                "comfort_intervals": (
+                    [[int(comfort[0]), int(comfort[1])]] if comfort else []
+                ),
+                "comfort_coverage_ratio": round(1.0 - comfort_penalty, 6),
+                "orientation_degrees_clockwise": 90,
+            }
+            candidates.append(
+                {
+                    "selection_key": selection_key,
+                    "fit_status": "fits",
+                    "placements": [placement],
+                    "lines": [line],
+                    "measured_bounds": list(measured),
+                    "break_plan": break_plan,
+                    "issues": [],
+                    "line_boxes": [list(measured)],
+                    "line_widths": [float(rotated_width)],
+                    "line_count": 1,
+                    "block_y": int(candidate_y),
+                    "comfort_penalty": round(float(comfort_penalty), 6),
+                    **center_quality,
+                    "shaped_overrides": {
+                        combined_run_id: combined_shaped,
+                    },
+                    "atomic_display_used": True,
+                }
+            )
+        return min(candidates, key=lambda item: item["selection_key"]) if candidates else None
 
     def _failed(
         self,
@@ -3029,6 +3574,18 @@ def _horizontal_break_plan_cache_key(
                 bool(item.metadata.get("lexical_evidence_conflict")),
                 bool(item.metadata.get("lexical_boundary_conflict")),
                 str(item.metadata.get("lexical_boundary_state") or ""),
+                int(
+                    item.metadata.get("english_phrase_preferred_break_rank")
+                    or 0
+                ),
+                int(item.metadata.get("english_phrase_keep_rank") or 0),
+                tuple(
+                    str(value)
+                    for value in item.metadata.get(
+                        "english_phrase_reason_codes"
+                    )
+                    or []
+                ),
             )
             for item in opportunities
         ),
@@ -3068,10 +3625,294 @@ def _horizontal_band_break_plan_cache_key(
                 bool(item.allowed),
                 str(item.strength),
                 str(item.reason),
+                int(
+                    item.metadata.get("english_phrase_preferred_break_rank")
+                    or 0
+                ),
+                int(item.metadata.get("english_phrase_keep_rank") or 0),
+                tuple(
+                    str(value)
+                    for value in item.metadata.get(
+                        "english_phrase_reason_codes"
+                    )
+                    or []
+                ),
             )
             for item in opportunities
         ),
     )
+
+
+def _horizontal_shape_center_quality(
+    *,
+    measured_center: Sequence[float] | None,
+    profile: HorizontalShapeCapacityProfile,
+    font_size: int,
+) -> dict[str, float | int]:
+    """Compare one pre-effect block center with both authorized center priors."""
+
+    if not measured_center or len(measured_center) < 2:
+        return {
+            "alignment_center_distance": 2.0,
+            "visual_center_distance": 2.0,
+            "combined_center_distance": 4.0,
+            "alignment_center_distance_em": 999.0,
+            "visual_center_distance_em": 999.0,
+            "nearest_center_distance_em": 999.0,
+            "alignment_drift_tier": 2,
+        }
+    width = max(1.0, float(profile.bounds[2]))
+    height = max(1.0, float(profile.bounds[3]))
+    em = max(1.0, float(font_size))
+
+    def metrics(center: Sequence[float]) -> tuple[float, float]:
+        dx = float(measured_center[0]) - float(center[0])
+        dy = float(measured_center[1]) - float(center[1])
+        normalized = (dx / width) ** 2 + (dy / height) ** 2
+        pixels = math.hypot(dx, dy)
+        return normalized, pixels / em
+
+    alignment_distance, alignment_em = metrics(profile.alignment_center)
+    visual_distance, visual_em = metrics(profile.visual_center)
+    nearest_em = min(alignment_em, visual_em)
+    drift_tier = 2 if nearest_em > 1.0 else 1 if nearest_em > 0.5 else 0
+    return {
+        "alignment_center_distance": round(float(alignment_distance), 8),
+        "visual_center_distance": round(float(visual_distance), 8),
+        "combined_center_distance": round(
+            float(alignment_distance + visual_distance),
+            8,
+        ),
+        "alignment_center_distance_em": round(float(alignment_em), 8),
+        "visual_center_distance_em": round(float(visual_em), 8),
+        "nearest_center_distance_em": round(float(nearest_em), 8),
+        "alignment_drift_tier": int(drift_tier),
+    }
+
+
+def _competitive_alignment_attempt_key(
+    attempt: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    quality = (
+        attempt.get("shape_center_quality")
+        if isinstance(attempt.get("shape_center_quality"), Mapping)
+        else {}
+    )
+    break_plan = (
+        attempt.get("break_plan")
+        if isinstance(attempt.get("break_plan"), Mapping)
+        else {}
+    )
+    capacity = (
+        break_plan.get("horizontal_shape_capacity")
+        if isinstance(break_plan.get("horizontal_shape_capacity"), Mapping)
+        else {}
+    )
+    canonical = (
+        attempt.get("canonical_break_quality")
+        if isinstance(attempt.get("canonical_break_quality"), Mapping)
+        else {}
+    )
+    return (
+        int(quality.get("alignment_drift_tier") or 0),
+        -int(attempt.get("font_size") or 0),
+        round(float(quality.get("combined_center_distance") or 0.0), 8),
+        round(float(capacity.get("selected_comfort_penalty") or 0.0), 6),
+        tuple(canonical_break_quality_key(break_plan)),
+    )
+
+
+_SOURCE_SUPPORTED_COMFORT_RASTER_GUARD_PX = 1.0
+
+
+def _source_supported_raster_ink_capacity_guard_status(
+    attempt: Mapping[str, Any],
+) -> str:
+    """Classify raster-backed comfort/actual-band containment evidence.
+
+    Logical advances include side bearings and can report a small comfort loss
+    even when the predicted raster occupies the eroded comfort interval. The
+    one-pixel comfort guard is limited to raster quantization. A selected
+    English phrase reflow may instead consume the comfort inset only when all
+    predicted ink retains a one-pixel guard inside the actual line band.
+    Missing evidence abstains and leaves the strict regression gate intact.
+    """
+
+    lines = [
+        dict(item)
+        for item in list(attempt.get("lines") or [])
+        if isinstance(item, Mapping)
+    ]
+    envelope = (
+        attempt.get("base_text_ink_envelope")
+        if isinstance(attempt.get("base_text_ink_envelope"), Mapping)
+        else {}
+    )
+    evidence = [
+        dict(item)
+        for item in list(envelope.get("placement_evidence") or [])
+        if isinstance(item, Mapping)
+    ]
+    if not lines or not evidence:
+        return "unavailable"
+
+    guard = float(_SOURCE_SUPPORTED_COMFORT_RASTER_GUARD_PX)
+    comfort_contained = True
+    actual_band_guarded = True
+    for line in lines:
+        line_box = list(line.get("line_box") or [])
+        comfort_intervals = [
+            list(item)
+            for item in list(line.get("comfort_intervals") or [])
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+        ]
+        if len(line_box) < 4 or not comfort_intervals:
+            return "unavailable"
+        line_top = float(line_box[1])
+        line_bottom = line_top + max(0.0, float(line_box[3]))
+        line_ink: list[tuple[float, float]] = []
+        for item in evidence:
+            bounds = list(item.get("predicted_natural_raster_bounds") or [])
+            if len(bounds) < 4:
+                continue
+            top = float(bounds[1])
+            bottom = top + max(0.0, float(bounds[3]))
+            if bottom <= line_top or top >= line_bottom:
+                continue
+            left = float(bounds[0])
+            right = left + max(0.0, float(bounds[2]))
+            line_ink.append((left, right))
+        if not line_ink:
+            return "unavailable"
+        ink_left = min(item[0] for item in line_ink)
+        ink_right = max(item[1] for item in line_ink)
+        if not any(
+            ink_left >= float(interval[0]) - guard - 1e-9
+            and ink_right <= float(interval[1]) + guard + 1e-9
+            for interval in comfort_intervals
+        ):
+            comfort_contained = False
+        actual_left = float(line_box[0]) + guard
+        actual_right = float(line_box[0]) + float(line_box[2]) - guard
+        if ink_left < actual_left - 1e-9 or ink_right > actual_right + 1e-9:
+            actual_band_guarded = False
+    if comfort_contained:
+        return "comfort_quantization_guard"
+
+    break_plan = (
+        attempt.get("break_plan")
+        if isinstance(attempt.get("break_plan"), Mapping)
+        else {}
+    )
+    selected_phrase_break = any(
+        int(
+            dict(item.get("opportunity_metadata") or {}).get(
+                "english_phrase_preferred_break_rank"
+            )
+            or 0
+        )
+        > 0
+        for item in list(break_plan.get("selected_breaks") or [])
+        if isinstance(item, Mapping)
+    )
+    if selected_phrase_break and actual_band_guarded:
+        return "phrase_reflow_actual_band_guard"
+    return "outside_capacity_guard"
+
+
+def _source_supported_upscale_regression_reasons(
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return typed quality regressions against the central/downward result."""
+
+    reasons: list[str] = []
+    if str(candidate.get("fit_status") or "") != "fits":
+        reasons.append("source_supported_candidate_does_not_fit")
+    candidate_envelope = (
+        candidate.get("base_text_ink_envelope")
+        if isinstance(candidate.get("base_text_ink_envelope"), Mapping)
+        else {}
+    )
+    if not bool(candidate_envelope.get("contained")):
+        reasons.append("source_supported_candidate_hard_containment_regression")
+
+    def break_penalty(value: Mapping[str, Any]) -> tuple[Any, ...]:
+        quality = (
+            value.get("canonical_break_quality")
+            if isinstance(value.get("canonical_break_quality"), Mapping)
+            else {}
+        )
+        confirmed = list(quality.get("confirmed_lexical_integrity") or [0, 0])
+        segment = list(quality.get("row_unit_segment_quality") or [0, 0.0])
+        weak = list(quality.get("weak_lexical_evidence") or [0, 0, 0])
+        return (
+            int(confirmed[0] if len(confirmed) > 0 else 0),
+            int(confirmed[1] if len(confirmed) > 1 else 0),
+            round(float(quality.get("punctuation_attachment") or 0.0), 6),
+            int(segment[0] if len(segment) > 0 else 0),
+            round(float(segment[1] if len(segment) > 1 else 0.0), 6),
+            int(weak[0] if len(weak) > 0 else 0),
+            int(weak[1] if len(weak) > 1 else 0),
+            int(weak[2] if len(weak) > 2 else 0),
+        )
+
+    if break_penalty(candidate) > break_penalty(reference):
+        reasons.append("source_supported_candidate_break_quality_regression")
+
+    def capacity(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        break_plan = (
+            value.get("break_plan")
+            if isinstance(value.get("break_plan"), Mapping)
+            else {}
+        )
+        return (
+            break_plan.get("horizontal_shape_capacity")
+            if isinstance(
+                break_plan.get("horizontal_shape_capacity"), Mapping
+            )
+            else {}
+        )
+
+    candidate_comfort = float(
+        capacity(candidate).get("selected_comfort_penalty") or 0.0
+    )
+    reference_comfort = float(
+        capacity(reference).get("selected_comfort_penalty") or 0.0
+    )
+    if (
+        candidate_comfort > reference_comfort + 1e-9
+        and _source_supported_raster_ink_capacity_guard_status(candidate)
+        not in {
+            "comfort_quantization_guard",
+            "phrase_reflow_actual_band_guard",
+        }
+    ):
+        reasons.append("source_supported_candidate_comfort_regression")
+
+    candidate_center = (
+        candidate.get("shape_center_quality")
+        if isinstance(candidate.get("shape_center_quality"), Mapping)
+        else {}
+    )
+    reference_center = (
+        reference.get("shape_center_quality")
+        if isinstance(reference.get("shape_center_quality"), Mapping)
+        else {}
+    )
+    if int(candidate_center.get("alignment_drift_tier") or 0) > int(
+        reference_center.get("alignment_drift_tier") or 0
+    ):
+        reasons.append("source_supported_candidate_center_tier_regression")
+    if float(candidate_center.get("combined_center_distance") or 0.0) > float(
+        reference_center.get("combined_center_distance") or 0.0
+    ) + 1e-9:
+        reasons.append("source_supported_candidate_center_distance_regression")
+    if float(candidate_center.get("nearest_center_distance_em") or 0.0) > float(
+        reference_center.get("nearest_center_distance_em") or 0.0
+    ) + 1e-9:
+        reasons.append("source_supported_candidate_nearest_center_em_regression")
+    return tuple(_unique(reasons))
 
 
 def _horizontal_capacity_line_box_candidates(
@@ -3634,6 +4475,42 @@ def _source_preferred_interval_floor(
     return max(1, min(int(preferred), rounded_lower))
 
 
+def _source_preferred_interval_ceiling(
+    preferred: int,
+    style: Mapping[str, Any] | None,
+) -> int | None:
+    """Return a validated style-owned upper candidate, never a new style fact."""
+
+    values = dict(style or {})
+    if _font_size_is_locked(values):
+        return None
+    interval = list(values.get("target_preferred_em_interval_px") or [])
+    if len(interval) < 2:
+        return None
+    try:
+        lower = float(interval[0])
+        upper = float(interval[1])
+        fit_start = float(
+            values.get("target_fit_start_em_px")
+            or values.get("target_preferred_em_px")
+            or preferred
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(lower)
+        or not math.isfinite(upper)
+        or not math.isfinite(fit_start)
+        or lower <= 0.0
+        or upper < lower
+        or fit_start < lower - 1e-9
+        or fit_start > upper + 1e-9
+    ):
+        return None
+    rounded_upper = max(1, int(math.floor(upper + 0.5)))
+    return rounded_upper if rounded_upper > int(preferred) else None
+
+
 def _selected_lexical_break_count(
     break_plan: Mapping[str, Any] | None,
     rank_field: str,
@@ -3767,6 +4644,51 @@ def _latin_target_presentation_active(
             or ""
         )
         == "target-presentation:en:v2"
+    )
+
+
+def _latin_atomic_display_policy_eligible(
+    plan: RenderLayerPlan,
+    runs: Sequence[InlineTextRun],
+) -> bool:
+    style = (
+        plan.resolved_render_style
+        if isinstance(plan.resolved_render_style, Mapping)
+        else {}
+    )
+    return _latin_atomic_display_policy_eligible_for_style(style, runs)
+
+
+def _latin_atomic_display_policy_eligible_for_style(
+    style: Mapping[str, Any],
+    runs: Sequence[InlineTextRun],
+) -> bool:
+    if str(style.get("source_writing_mode") or "").strip().lower() != "vertical":
+        return False
+    visible = [
+        run
+        for run in runs
+        if str(run.normalized_text or "").strip() and run.role != "space"
+    ]
+    words = [
+        run
+        for run in visible
+        if run.role == "latin_word" and run.script == "Latn"
+    ]
+    if len(words) != 1 or not visible or visible[0] is not words[0]:
+        return False
+    if len(grapheme_clusters(words[0].normalized_text)) < 4:
+        return False
+    return all(
+        run.role
+        in {
+            "latin_word",
+            "close_punctuation",
+            "punctuation_sequence",
+            "ellipsis_sequence",
+            "wave_sequence",
+        }
+        for run in visible
     )
 
 
@@ -4439,12 +5361,20 @@ def _placement_base_text_ink_envelope(
         if mode == "vertical_emphasis_sequence"
         else "harfbuzz"
     )
+    rotated_latin_display = mode == "rotated_latin_display_clockwise"
     core_width, core_height, evidence_status = _predicted_shaped_core_size(
         shaped,
         requested,
         position_policy=position_policy,
-        target_size=(box[2], box[3]),
+        target_size=(
+            (box[3], box[2])
+            if rotated_latin_display
+            else (box[2], box[3])
+        ),
     )
+    if rotated_latin_display:
+        core_width, core_height = core_height, core_width
+        evidence_status = f"{evidence_status}_rotated_clockwise"
     natural_width = max(1, int(core_width) + int(outline_width) * 2)
     natural_height = max(1, int(core_height) + int(outline_width) * 2)
     dest_x = int(round((float(box[2]) - float(core_width)) / 2.0))

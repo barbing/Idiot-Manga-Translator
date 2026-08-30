@@ -209,6 +209,39 @@ rotation and draw/commit transaction. Chinese retains the existing CJK path.
 Missing or conservative polygon authority falls back to the prior rectangular
 layout without pixel inference becoming semantic authority.
 
+Horizontal Latin sans roles resolve through the managed Noto Sans 2.015
+variable face at the locked condensed width axis; logical source/user role and
+weight tiers remain unchanged, and a missing Latin asset falls back to the
+bundled Noto CJK role rather than an operating-system font. Shape-band
+placement normalizes both polygon and source alignment into the pre-effect
+frame and compares a bounded near-size window so a trivial size gain cannot
+cause material center drift. A vertical-source speech parent containing one
+long Latin lexical word may use one atomic 90-degree local display orientation
+when no well-centered horizontal candidate exists; the word is never split or
+hyphenated, and the normal parent residual rotation still executes exactly
+once in the compositor.
+
+For an unlocked English/Latin shape-band parent, the typesetter may also
+compare the rounded upper endpoint of the style-owned preferred interval with
+the central/downward result. It retains that endpoint only when text completeness, lexical/punctuation
+quality, actual/comfort containment, and centering are non-regressing. When a
+selected leading-comma phrase reflow alone consumes the eroded comfort inset,
+the endpoint may remain eligible only if predicted raster ink retains a
+one-pixel guard inside every actual shape band; that exception is explicit in
+the candidate audit and does not relax hard contour containment. The
+interval cannot be expanded or searched at intermediate sizes by the renderer,
+and user-locked, CJK, legacy, and
+profile-unavailable paths remain unchanged.
+
+Automatic horizontal English break records may carry deterministic soft phrase
+evidence for a leading comma boundary and unambiguous closed-class attachment.
+The existing `LineBreakPlanner` remains the sole selector; hard fit and exact
+text remain higher authority. English preferred-break and keep ranks are used
+only inside an already fixed line-count path and are excluded from canonical
+cross-topology/cross-size quality. The evidence is same-size, locale-scoped,
+and cache-bound, and cannot change legality, add a layout attempt, or affect
+CJK, manual edits, geometry, style, effects, or composition.
+
 The renderer consumes cleanup results and render-eligibility decisions. It must not generate cleanup masks, choose cleanup classes, select cleanup backends, or mutate source cleanup locally in normal operation.
 
 The renderer does not validate cleanup completeness. It consumes the supplied

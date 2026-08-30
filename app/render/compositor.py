@@ -596,7 +596,9 @@ def _draw_glyph(
         stroke_fill=stroke_fill,
         stroke_width=stroke_width,
         position_policy=(
-            "compact_vertical_sequence_preserved"
+            "rotated_latin_clockwise"
+            if mode == "rotated_latin_display_clockwise"
+            else "compact_vertical_sequence_preserved"
             if mode == "vertical_ellipsis_sequence"
             else "compact_horizontal_sequence_preserved"
             if mode == "vertical_emphasis_sequence"

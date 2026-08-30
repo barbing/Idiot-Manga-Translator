@@ -133,6 +133,12 @@ class HarfBuzzShaper:
         hb_face = self._hb_face(face.path)
         hb_font = hb.Font(hb_face)
         hb_font.scale = (size * 64, size * 64)
+        font_variations = {
+            str(tag): float(value)
+            for tag, value in tuple(getattr(face, "variations", ()) or ())
+        }
+        if font_variations:
+            hb_font.set_variations(font_variations)
         buffer = hb.Buffer()
         buffer.add_str(text_value)
         remove_default_ignorables = getattr(
@@ -231,6 +237,8 @@ class HarfBuzzShaper:
                 "registered_font_face_id": face.face_id,
                 "registered_font_path": face.path,
                 "registered_font_source": face.source,
+                "font_variations": font_variations,
+                "variation_coordinates_applied": bool(font_variations),
                 "font_face_authority": "font_manager_registry",
                 **default_ignorable_metadata,
             },

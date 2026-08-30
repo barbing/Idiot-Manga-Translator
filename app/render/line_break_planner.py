@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from app.render.typesetting_text import BreakOpportunity, classify_grapheme
 
 
-LINE_BREAK_PLANNER_VERSION = "line_break_planner_v5_latin_comma_orphan"
+LINE_BREAK_PLANNER_VERSION = "line_break_planner_v8_scoped_english_phrase_evidence"
 LEXICOGRAPHIC_VERTICAL_ORDER = [
     "hard_legality",
     "fit",
@@ -104,6 +104,8 @@ class _HorizontalPath:
     confirmed_lexical_rank_loss: int
     punctuation_penalty: float
     phrase_boundary_crossing_count: int
+    english_phrase_boundary_crossing_rank: int
+    english_phrase_keep_break_rank: int
     segment_quality_penalty: float
     weak_lexical_break_count: int
     weak_lexical_rank_loss: int
@@ -523,7 +525,7 @@ class LineBreakPlanner:
         candidates: list[tuple[tuple[Any, ...], _HorizontalPath, list[list[dict[str, Any]]], dict[str, Any]]] = []
         segment_metric_cache: dict[
             tuple[int, int],
-            tuple[float, int, float],
+            tuple[float, int, int, float],
         ] = {}
         for line_count in range(1, len(values) + 1):
             path, evaluated = _best_horizontal_path(
@@ -638,7 +640,8 @@ class LineBreakPlanner:
             "split_points": list(selected_path.breaks[:-1]),
             "line_widths": [round(_items_advance(group), 3) for group in groups],
             "horizontal_break_quality_rules": [
-                "nonterminal_single_latin_word_comma_orphan",
+                "soft_english_phrase_boundary_evidence",
+                "evidence_aware_nonterminal_latin_comma_orphan",
             ],
             "selected_lexicographic_key": selected_record.get("lexicographic_key", {}),
             "canonical_break_quality": selected_record.get(
@@ -706,7 +709,7 @@ class LineBreakPlanner:
 
         segment_metric_cache: dict[
             tuple[int, int],
-            tuple[float, int, float],
+            tuple[float, int, int, float],
         ] = {}
         path, evaluated = _best_horizontal_band_path(
             values,
@@ -787,6 +790,12 @@ class LineBreakPlanner:
             "canonical_break_quality_sort_key": list(
                 _canonical_quality_record_key(quality)
             ),
+            "english_phrase_boundary_crossing_rank": int(
+                path.english_phrase_boundary_crossing_rank
+            ),
+            "english_phrase_keep_break_rank": int(
+                path.english_phrase_keep_break_rank
+            ),
         }
         selected_breaks = [
             _selected_break_record(boundary_by_split[split], split, ordinal)
@@ -818,6 +827,12 @@ class LineBreakPlanner:
             "canonical_break_quality": quality,
             "canonical_break_quality_sort_key": list(
                 _canonical_quality_record_key(quality)
+            ),
+            "english_phrase_boundary_crossing_rank": int(
+                path.english_phrase_boundary_crossing_rank
+            ),
+            "english_phrase_keep_break_rank": int(
+                path.english_phrase_keep_break_rank
             ),
         }
         return BreakPlanResult(
@@ -1132,7 +1147,7 @@ def _best_horizontal_path(
     max_width: float,
     segment_metric_cache: dict[
         tuple[int, int],
-        tuple[float, int, float],
+        tuple[float, int, int, float],
     ] | None = None,
 ) -> tuple[_HorizontalPath | None, int]:
     count = len(items)
@@ -1150,6 +1165,8 @@ def _best_horizontal_path(
             confirmed_lexical_rank_loss=0,
             punctuation_penalty=0.0,
             phrase_boundary_crossing_count=0,
+            english_phrase_boundary_crossing_rank=0,
+            english_phrase_keep_break_rank=0,
             segment_quality_penalty=0.0,
             weak_lexical_break_count=0,
             weak_lexical_rank_loss=0,
@@ -1174,6 +1191,9 @@ def _best_horizontal_path(
                 confirmed_count, confirmed_rank, weak_count, weak_rank = (
                     _boundary_lexical_evidence(boundary)
                 )
+                english_phrase_keep_break_rank = (
+                    _boundary_english_phrase_keep_rank(boundary)
+                )
                 conflict_count = _boundary_conflict_uncertainty(boundary)
                 metric_key = (start, end)
                 metrics = (
@@ -1186,10 +1206,16 @@ def _best_horizontal_path(
                     metrics = (
                         _horizontal_whitespace_penalty(segment),
                         _segment_phrase_boundary_crossing_count(segment),
+                        _segment_english_phrase_boundary_crossing_rank(
+                            segment,
+                            boundary_by_split=boundary_by_split,
+                            segment_start=start,
+                        ),
                         _segment_quality_penalty(items, start, end)
                         + (
                             _horizontal_latin_word_comma_orphan_penalty(
-                                segment
+                                segment,
+                                boundary=boundary,
                             )
                             if end < count
                             else 0.0
@@ -1197,7 +1223,12 @@ def _best_horizontal_path(
                     )
                     if segment_metric_cache is not None:
                         segment_metric_cache[metric_key] = metrics
-                punctuation, phrase_boundary_crossings, segment_quality = metrics
+                (
+                    punctuation,
+                    phrase_boundary_crossings,
+                    english_phrase_boundary_crossing_rank,
+                    segment_quality,
+                ) = metrics
                 if end < count:
                     punctuation += _break_strength_penalty(boundary)
                 raggedness = max(0.0, max_width - min(max_width, width))
@@ -1215,6 +1246,14 @@ def _best_horizontal_path(
                     phrase_boundary_crossing_count=(
                         path.phrase_boundary_crossing_count
                         + phrase_boundary_crossings
+                    ),
+                    english_phrase_boundary_crossing_rank=(
+                        path.english_phrase_boundary_crossing_rank
+                        + english_phrase_boundary_crossing_rank
+                    ),
+                    english_phrase_keep_break_rank=(
+                        path.english_phrase_keep_break_rank
+                        + english_phrase_keep_break_rank
                     ),
                     segment_quality_penalty=(
                         path.segment_quality_penalty + segment_quality
@@ -1247,7 +1286,7 @@ def _best_horizontal_band_path(
     line_widths: Sequence[float],
     segment_metric_cache: dict[
         tuple[int, int],
-        tuple[float, int, float],
+        tuple[float, int, int, float],
     ] | None = None,
 ) -> tuple[_HorizontalPath | None, int]:
     """Return the best complete path for one fixed width per line."""
@@ -1271,6 +1310,8 @@ def _best_horizontal_band_path(
             confirmed_lexical_rank_loss=0,
             punctuation_penalty=0.0,
             phrase_boundary_crossing_count=0,
+            english_phrase_boundary_crossing_rank=0,
+            english_phrase_keep_break_rank=0,
             segment_quality_penalty=0.0,
             weak_lexical_break_count=0,
             weak_lexical_rank_loss=0,
@@ -1306,6 +1347,9 @@ def _best_horizontal_band_path(
                 confirmed_count, confirmed_rank, weak_count, weak_rank = (
                     _boundary_lexical_evidence(boundary)
                 )
+                english_phrase_keep_break_rank = (
+                    _boundary_english_phrase_keep_rank(boundary)
+                )
                 conflict_count = _boundary_conflict_uncertainty(boundary)
                 metric_key = (start, end)
                 metrics = (
@@ -1318,16 +1362,29 @@ def _best_horizontal_band_path(
                     metrics = (
                         _horizontal_whitespace_penalty(segment),
                         _segment_phrase_boundary_crossing_count(segment),
+                        _segment_english_phrase_boundary_crossing_rank(
+                            segment,
+                            boundary_by_split=boundary_by_split,
+                            segment_start=start,
+                        ),
                         _segment_quality_penalty(items, start, end)
                         + (
-                            _horizontal_latin_word_comma_orphan_penalty(segment)
+                            _horizontal_latin_word_comma_orphan_penalty(
+                                segment,
+                                boundary=boundary,
+                            )
                             if end < count
                             else 0.0
                         ),
                     )
                     if segment_metric_cache is not None:
                         segment_metric_cache[metric_key] = metrics
-                punctuation, phrase_boundary_crossings, segment_quality = metrics
+                (
+                    punctuation,
+                    phrase_boundary_crossings,
+                    english_phrase_boundary_crossing_rank,
+                    segment_quality,
+                ) = metrics
                 if line == 0 and end < count:
                     segment_quality += (
                         _horizontal_leading_short_word_orphan_penalty(
@@ -1360,6 +1417,14 @@ def _best_horizontal_band_path(
                     phrase_boundary_crossing_count=(
                         path.phrase_boundary_crossing_count
                         + phrase_boundary_crossings
+                    ),
+                    english_phrase_boundary_crossing_rank=(
+                        path.english_phrase_boundary_crossing_rank
+                        + english_phrase_boundary_crossing_rank
+                    ),
+                    english_phrase_keep_break_rank=(
+                        path.english_phrase_keep_break_rank
+                        + english_phrase_keep_break_rank
                     ),
                     segment_quality_penalty=(
                         path.segment_quality_penalty + segment_quality
@@ -1394,6 +1459,8 @@ def _horizontal_path_key(path: _HorizontalPath) -> tuple[Any, ...]:
         round(path.punctuation_penalty, 6),
         path.phrase_boundary_crossing_count,
         round(path.segment_quality_penalty, 6),
+        path.english_phrase_boundary_crossing_rank,
+        path.english_phrase_keep_break_rank,
         path.weak_lexical_break_count,
         path.weak_lexical_rank_loss,
         path.lexical_conflict_break_count,
@@ -1487,6 +1554,39 @@ def _segment_phrase_boundary_crossing_count(
     return int(count)
 
 
+def _segment_english_phrase_boundary_crossing_rank(
+    segment: Sequence[Mapping[str, Any]],
+    *,
+    boundary_by_split: Mapping[int, Mapping[str, Any]] | None,
+    segment_start: int,
+) -> int:
+    """Return soft English evidence crossed inside one fixed topology.
+
+    The rank is deliberately excluded from canonical cross-topology and
+    cross-size quality. It can choose a better partition for an already-fixed
+    line count, but it cannot manufacture another line or indirectly shrink
+    the selected font.
+    """
+
+    if not boundary_by_split:
+        return 0
+    segment_end = int(segment_start) + len(segment)
+    return sum(
+        max(
+            0,
+            _integer(
+                dict(
+                    (boundary_by_split.get(split) or {}).get(
+                        "opportunity_metadata"
+                    )
+                    or {}
+                ).get("english_phrase_preferred_break_rank")
+            ),
+        )
+        for split in range(int(segment_start) + 1, segment_end)
+    )
+
+
 def _boundary_lexical_evidence(
     boundary: Mapping[str, Any] | None,
 ) -> tuple[int, int, int, int]:
@@ -1505,6 +1605,13 @@ def _boundary_lexical_evidence(
         int(weak_rank > 0),
         weak_rank,
     )
+
+
+def _boundary_english_phrase_keep_rank(
+    boundary: Mapping[str, Any] | None,
+) -> int:
+    metadata = dict((boundary or {}).get("opportunity_metadata") or {})
+    return max(0, _integer(metadata.get("english_phrase_keep_rank")))
 
 
 def _boundary_conflict_uncertainty(
@@ -1691,6 +1798,8 @@ def _horizontal_whitespace_penalty(segment: Sequence[Mapping[str, Any]]) -> floa
 
 def _horizontal_latin_word_comma_orphan_penalty(
     segment: Sequence[Mapping[str, Any]],
+    *,
+    boundary: Mapping[str, Any] | None = None,
 ) -> float:
     """Prefer a peer fit over a line containing only ``LatinWord,``.
 
@@ -1699,6 +1808,9 @@ def _horizontal_latin_word_comma_orphan_penalty(
     can carry the comma-led phrase forward.
     """
 
+    metadata = dict((boundary or {}).get("opportunity_metadata") or {})
+    if int(metadata.get("english_phrase_preferred_break_rank") or 0) > 0:
+        return 0.0
     visible = [
         item
         for item in segment

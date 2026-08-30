@@ -36,6 +36,14 @@ NOTO_CJK_SC_FONT_FILES = [
     "Serif/OTF/SimplifiedChinese/NotoSerifCJKsc-Bold.otf",
     "Sans/Mono/NotoSansMonoCJKsc-Regular.otf",
 ]
+NOTO_LATIN_FONT_BASE_URL = (
+    "https://notofonts.github.io/latin-greek-cyrillic/fonts/"
+    "NotoSans/googlefonts/variable-ttf"
+)
+NOTO_LATIN_FONT_FILE = "NotoSans[wdth,wght].ttf"
+NOTO_LATIN_FONT_SHA256 = (
+    "14767e0756e1bc21912f9cbd7f616884b2a8623a0e01001352c07b711d6d662d"
+)
 SIL_OFL_TEXT_URL = "https://openfontlicense.org/documents/OFL.txt"
 MANGA_OCR_BASE_URL = "https://huggingface.co/kha-white/manga-ocr-base/resolve/main/"
 MANGA_OCR_FILES = [

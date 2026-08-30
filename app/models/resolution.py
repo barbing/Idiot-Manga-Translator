@@ -11,6 +11,7 @@ from app.config.defaults import (
     MANGA_OCR_FILES,
     KITSUMED_SPEECH_BUBBLE_MODEL_FILE,
     NOTO_CJK_SC_FONT_FILES,
+    NOTO_LATIN_FONT_FILE,
     OGKALU_TEXT_BUBBLE_CONFIG_FILE,
     OGKALU_TEXT_BUBBLE_MODEL_FILE,
     PADDLE_OCR_VL_MMPROJ_FILE,
@@ -270,6 +271,21 @@ def has_noto_cjk_sc_font_pack(base_dir: Optional[str] = None) -> bool:
     directory = _noto_cjk_sc_font_dir(base_dir)
     required = [os.path.basename(path) for path in NOTO_CJK_SC_FONT_FILES]
     return all(os.path.isfile(os.path.join(directory, filename)) for filename in required)
+
+
+def noto_latin_font_dir(base_dir: Optional[str] = None) -> str:
+    return os.path.join(base_dir or models_root(), "fonts", "noto-latin-core")
+
+
+def resolve_noto_latin_variable_font_file(
+    base_dir: Optional[str] = None,
+) -> Optional[str]:
+    path = os.path.join(noto_latin_font_dir(base_dir), NOTO_LATIN_FONT_FILE)
+    return path if os.path.isfile(path) else None
+
+
+def has_noto_latin_font_pack(base_dir: Optional[str] = None) -> bool:
+    return resolve_noto_latin_variable_font_file(base_dir) is not None
 
 
 def resolve_noto_cjk_sc_font_file(

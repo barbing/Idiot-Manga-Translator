@@ -1140,6 +1140,7 @@ def _build_horizontal_shape_capacity_profile(
 
     rotation_degrees = 0.0
     inverse_rotation_applied = False
+    rotation_pivot: list[float] = []
     if polygon:
         effects = resolve_parent_layer_effects(plan.resolved_render_style)
         if (
@@ -1152,6 +1153,7 @@ def _build_horizontal_shape_capacity_profile(
                 pivot = _point_from_value(metadata.get("visual_alignment_center"))
             if not pivot:
                 pivot = _center_box(bounds)
+            rotation_pivot = list(pivot)
             polygon = [
                 _rotate_capacity_point(
                     point,
@@ -1223,6 +1225,13 @@ def _build_horizontal_shape_capacity_profile(
     if not visual_center:
         visual_center = _center_box(bounds)
     alignment_center = _point_from_value(metadata.get("visual_alignment_center"))
+    if inverse_rotation_applied and alignment_center and rotation_pivot:
+        alignment_center = _rotate_capacity_point(
+            alignment_center,
+            rotation_pivot,
+            -rotation_degrees,
+        )
+        reason_codes.append("inverse_alignment_center_applied")
     if not alignment_center or not _point_inside_box(alignment_center, bounds):
         alignment_center = list(visual_center)
     return HorizontalShapeCapacityProfile(

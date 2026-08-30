@@ -1242,6 +1242,141 @@ def _coalesce_format_control_runs(runs: Sequence[InlineTextRun]) -> list[InlineT
     return output
 
 
+_ENGLISH_PHRASE_EVIDENCE_VERSION = "english_phrase_boundary_evidence_v1"
+_ENGLISH_RIGHT_ATTACH_WORDS = frozenset({"a", "an", "the", "to"})
+_ENGLISH_SUBJECT_PRONOUNS = frozenset(
+    {"i", "you", "he", "she", "it", "we", "they"}
+)
+_ENGLISH_AUXILIARIES = frozenset(
+    {
+        "am",
+        "are",
+        "aren't",
+        "can",
+        "can't",
+        "could",
+        "couldn't",
+        "did",
+        "didn't",
+        "do",
+        "does",
+        "doesn't",
+        "don't",
+        "had",
+        "hadn't",
+        "has",
+        "hasn't",
+        "have",
+        "haven't",
+        "is",
+        "isn't",
+        "may",
+        "might",
+        "must",
+        "mustn't",
+        "shall",
+        "shan't",
+        "should",
+        "shouldn't",
+        "was",
+        "wasn't",
+        "were",
+        "weren't",
+        "will",
+        "won't",
+        "would",
+        "wouldn't",
+    }
+)
+
+
+def _english_phrase_boundary_evidence(
+    items: Sequence[InlineTextRun],
+    index: int,
+    *,
+    language_hint: str,
+) -> dict[str, Any]:
+    """Return soft English phrase ranks for one existing run boundary."""
+
+    base = {
+        "english_phrase_evidence_version": _ENGLISH_PHRASE_EVIDENCE_VERSION,
+        "english_phrase_evidence_status": "not_applicable",
+        "english_phrase_preferred_break_rank": 0,
+        "english_phrase_keep_rank": 0,
+        "english_phrase_reason_codes": [],
+    }
+    locale = str(language_hint or "").strip().lower().replace("_", "-")
+    if locale != "en" and not locale.startswith("en-"):
+        return base
+    base["english_phrase_evidence_status"] = "abstained"
+    if index <= 0 or index >= len(items):
+        return base
+    before = items[index - 1]
+    after = items[index]
+    if before.break_class != "space" or after.script != "Latn" or after.role not in {
+        "latin_word",
+        "numeric_token",
+    }:
+        return base
+
+    previous_index = index - 2
+    while previous_index >= 0 and items[previous_index].break_class == "space":
+        previous_index -= 1
+    if previous_index < 0:
+        return base
+    previous = items[previous_index]
+    reasons: list[str] = []
+    preferred_break_rank = 0
+    keep_rank = 0
+
+    if previous.text in {",", "，"}:
+        prior_word_index = previous_index - 1
+        while (
+            prior_word_index >= 0
+            and items[prior_word_index].break_class == "space"
+        ):
+            prior_word_index -= 1
+        prior_word = items[prior_word_index] if prior_word_index >= 0 else None
+        earlier_words = [
+            item
+            for item in items[: max(0, prior_word_index)]
+            if item.role in {"latin_word", "numeric_token"}
+            and item.text.strip()
+        ]
+        if (
+            prior_word is not None
+            and prior_word.script == "Latn"
+            and prior_word.role == "latin_word"
+            and not earlier_words
+        ):
+            preferred_break_rank = 2
+            reasons.append("leading_comma_phrase")
+
+    if previous.script == "Latn" and previous.role == "latin_word":
+        previous_word = previous.text.strip().casefold()
+        next_word = after.text.strip().casefold()
+        if previous_word in _ENGLISH_RIGHT_ATTACH_WORDS:
+            keep_rank = max(keep_rank, 2)
+            reasons.append(
+                "determiner_attaches_right"
+                if previous_word in {"a", "an", "the"}
+                else "infinitive_marker_attaches_right"
+            )
+        if (
+            previous_word in _ENGLISH_SUBJECT_PRONOUNS
+            and next_word in _ENGLISH_AUXILIARIES
+        ):
+            keep_rank = max(keep_rank, 1)
+            reasons.append("subject_pronoun_attaches_auxiliary")
+
+    if preferred_break_rank or keep_rank:
+        base["english_phrase_evidence_status"] = "supported"
+    base["english_phrase_preferred_break_rank"] = int(preferred_break_rank)
+    base["english_phrase_keep_rank"] = int(keep_rank)
+    base["english_phrase_reason_codes"] = list(dict.fromkeys(reasons))
+    return base
+
+
 def compute_break_opportunities(
     runs: Sequence[InlineTextRun],
     *,
@@ -1261,6 +1396,11 @@ def compute_break_opportunities(
     for index in range(1, len(items)):
         before = items[index - 1]
         after = items[index]
+        english_phrase_evidence = _english_phrase_boundary_evidence(
+            items,
+            index,
+            language_hint=language_hint,
+        )
         token_boundary = int(after.token_start)
         covering_lexical_spans = [
             span
@@ -1362,6 +1502,7 @@ def compute_break_opportunities(
                     "lexical_span_texts": [
                         span.text for span in covering_lexical_spans
                     ],
+                    **english_phrase_evidence,
                 },
             )
         )

@@ -27,6 +27,9 @@ from app.config.defaults import (
     MANGA_OCR_FILES,
     NOTO_CJK_SC_FONT_BASE_URL,
     NOTO_CJK_SC_FONT_FILES,
+    NOTO_LATIN_FONT_BASE_URL,
+    NOTO_LATIN_FONT_FILE,
+    NOTO_LATIN_FONT_SHA256,
     OGKALU_TEXT_BUBBLE_CONFIG_FILE,
     OGKALU_TEXT_BUBBLE_MODEL_FILE,
     OGKALU_TEXT_BUBBLE_REPO_ID,
@@ -53,6 +56,7 @@ from app.models.resolution import (
     has_font_style_runtime,
     has_paddle_ocr_vl_runtime,
     noto_cjk_sc_font_dir,
+    noto_latin_font_dir,
     resolve_manga_ocr_local_dir,
     resolve_manga_ocr_system_ref,
     resolve_ner_local_dir,
@@ -699,10 +703,16 @@ class ModelDownloader(QtCore.QObject):
         return has_yuzumarker_font_detection_runtime(base_dir=models_dir)
 
     def check_noto_cjk_sc_font_pack(self, models_dir: str = "models") -> bool:
-        """Check only the local Noto CJK fallback font pack."""
-        from app.models.resolution import has_noto_cjk_sc_font_pack
+        """Check the platform-neutral CJK and Latin renderer font pack."""
+        from app.models.resolution import (
+            has_noto_cjk_sc_font_pack,
+            has_noto_latin_font_pack,
+        )
 
-        return has_noto_cjk_sc_font_pack(base_dir=models_dir)
+        return bool(
+            has_noto_cjk_sc_font_pack(base_dir=models_dir)
+            and has_noto_latin_font_pack(base_dir=models_dir)
+        )
 
     def prepare_ner(self, models_dir: str):
         """Queue NER model download."""
@@ -781,7 +791,7 @@ class ModelDownloader(QtCore.QObject):
         self.prepare_noto_cjk_sc_font_pack(models_dir)
 
     def prepare_noto_cjk_sc_font_pack(self, models_dir: str):
-        """Queue only the local CJK fallback fonts shown by Runtime Assets."""
+        """Queue the local CJK fallback and condensed Latin renderer fonts."""
 
         font_dir = noto_cjk_sc_font_dir(models_dir)
         targets = []
@@ -799,6 +809,22 @@ class ModelDownloader(QtCore.QObject):
                 save_path=os.path.join(font_dir, "OFL.txt"),
                 label="Downloading SIL Open Font License text...",
             )
+        )
+        latin_dir = noto_latin_font_dir(models_dir)
+        targets.extend(
+            [
+                DownloadTarget(
+                    url=f"{NOTO_LATIN_FONT_BASE_URL}/{NOTO_LATIN_FONT_FILE}",
+                    save_path=os.path.join(latin_dir, NOTO_LATIN_FONT_FILE),
+                    label="Downloading Noto Sans variable Latin font...",
+                    sha256=NOTO_LATIN_FONT_SHA256,
+                ),
+                DownloadTarget(
+                    url=SIL_OFL_TEXT_URL,
+                    save_path=os.path.join(latin_dir, "OFL.txt"),
+                    label="Downloading Noto Sans SIL Open Font License text...",
+                ),
+            ]
         )
         self.queue_targets(targets)
 
