@@ -24,7 +24,11 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from app.platform_services.compute import TorchDeviceSelection, select_torch_device
+from app.platform_services.compute import (
+    TorchDeviceSelection,
+    load_torch_runtime,
+    select_torch_device,
+)
 from app.platform_services.contracts import ComputeBackend
 
 
@@ -88,7 +92,7 @@ class TorchScriptLamaRunner:
     """Thin, deterministic TorchScript model runner for cleanup inpainting."""
 
     def __init__(self, model_path: str | os.PathLike[str], device: str = "cpu") -> None:
-        import torch
+        torch = load_torch_runtime()
 
         path = Path(model_path).expanduser().resolve()
         if not path.is_file():
@@ -119,7 +123,7 @@ class TorchScriptLamaRunner:
         *,
         perf_timings: dict[str, Any] | None = None,
     ) -> Image.Image:
-        import torch
+        torch = load_torch_runtime()
 
         runner_started = time.perf_counter() if perf_timings is not None else 0.0
         normalize_started = time.perf_counter() if perf_timings is not None else 0.0
@@ -237,7 +241,7 @@ def _prepare_tensors(
     mask: Image.Image,
     device_name: str,
 ) -> tuple[Any, Any, LamaTensorMeta]:
-    import torch
+    torch = load_torch_runtime()
 
     image_arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
     mask_arr = np.asarray(mask.convert("L"), dtype=np.uint8)

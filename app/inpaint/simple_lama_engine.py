@@ -21,6 +21,7 @@ from app.inpaint.torchscript_lama_runner import (
     cleanup_fallback,
     resolve_lama_device_name,
 )
+from app.platform_services.compute import load_torch_runtime
 from app.pipeline.debug_runtime import (
     diagnostic_enabled,
     pipeline_diagnostic_checkpoint,
@@ -110,7 +111,7 @@ def _effective_cleanup_device(use_gpu: bool) -> tuple[str, str, str]:
 
 def _synchronize_device(device: str) -> None:
     try:
-        import torch
+        torch = load_torch_runtime()
 
         if device == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize()

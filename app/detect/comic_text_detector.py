@@ -10,6 +10,7 @@ import logging
 
 from app.platform_services.compute import (
     TorchDeviceSelection,
+    load_torch_runtime,
     release_torch_memory,
     select_torch_device,
 )
@@ -126,7 +127,7 @@ class ComicTextDetector:
         self.merge_mode = "none"
 
         try:
-            import torch
+            torch = load_torch_runtime()
         except Exception:
             torch = None
 

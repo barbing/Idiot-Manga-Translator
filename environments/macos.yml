@@ -1,6 +1,7 @@
 name: manga-llm
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
   - python=3.10
   - pip
@@ -9,4 +10,4 @@ dependencies:
   - llama.cpp=10588
   - llama-cpp-python=0.3.35
   - pip:
-      - -r requirements.txt
+      - -r ../requirements.txt

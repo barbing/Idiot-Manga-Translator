@@ -62,7 +62,9 @@ def _preload_torch() -> None:
     """
 
     try:
-        import torch  # noqa: F401
+        from app.platform_services.compute import load_torch_runtime
+
+        load_torch_runtime()
     except Exception:
         return
 

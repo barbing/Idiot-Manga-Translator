@@ -11,6 +11,7 @@ from pathlib import Path
 from app.models.resolution import models_root, resolve_manga_ocr_local_dir, resolve_manga_ocr_system_ref
 from app.platform_services.compute import (
     TorchDeviceSelection,
+    load_torch_runtime,
     release_torch_memory,
     select_torch_device,
 )
@@ -69,8 +70,7 @@ def ensure_torch_runtime_ready():
     """Prepare DLL paths and import torch before OCR model init."""
     _add_dll_search_paths()
     _preload_torch_dlls()
-    import torch
-    return torch
+    return load_torch_runtime()
 
 
 def _torch_version_tuple() -> tuple[int, int]:
@@ -176,6 +176,7 @@ def resolve_manga_ocr_model_ref() -> str | None:
 
 def create_manga_ocr_instance(use_gpu: bool):
     """Create MangaOCR instance using shared model resolution logic."""
+    ensure_torch_runtime_ready()
     try:
         from manga_ocr import MangaOcr
     except Exception as exc:
@@ -234,7 +235,7 @@ class MangaOcrEngine:
         image = self._prepare_input_image(image)
 
         try:
-            import torch
+            torch = ensure_torch_runtime_ready()
             import numpy as np
             
             # Access internal components

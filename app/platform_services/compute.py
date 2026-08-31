@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from importlib import import_module
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,9 @@ import sys
 from typing import Iterable, Sequence
 
 from .contracts import ComputeBackend, OperatingSystem, PlatformIdentity
+
+
+LLAMA_PROBE_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +60,19 @@ class ComputeCapabilitySnapshot:
         return self.onnx.backend
 
 
+def load_torch_runtime():
+    """Load macOS native runtimes in one OpenMP-compatible order."""
+
+    if sys.platform == "darwin":
+        try:
+            import_module("onnxruntime")
+        except Exception:
+            # Torch-only fallback remains available when the optional runtime
+            # provider cannot be imported.
+            pass
+    return import_module("torch")
+
+
 def select_torch_device(
     allow_acceleration: bool,
     *,
@@ -64,7 +81,7 @@ def select_torch_device(
 ) -> TorchDeviceSelection:
     if cuda is None or mps is None:
         try:
-            import torch
+            torch = load_torch_runtime()
 
             if cuda is None:
                 cuda = bool(torch.cuda.is_available())
@@ -119,7 +136,7 @@ def probe_mps_memory(torch_module=None) -> MpsMemoryFacts | None:
     try:
         torch = torch_module
         if torch is None:
-            import torch
+            torch = load_torch_runtime()
         if not (
             hasattr(torch.backends, "mps")
             and torch.backends.mps.is_available()
@@ -144,7 +161,7 @@ def release_torch_memory(
     try:
         torch = torch_module
         if torch is None:
-            import torch
+            torch = load_torch_runtime()
         if bool(torch.cuda.is_available()):
             torch.cuda.empty_cache()
             if synchronize:
@@ -192,7 +209,7 @@ def probe_llama_server_backend(
             check=False,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=LLAMA_PROBE_TIMEOUT_SECONDS,
             creationflags=creationflags,
         )
     except (OSError, subprocess.SubprocessError):
@@ -254,7 +271,7 @@ def llama_server_is_launchable(
             check=False,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=LLAMA_PROBE_TIMEOUT_SECONDS,
             creationflags=creationflags,
         )
     except (OSError, subprocess.SubprocessError):
@@ -396,6 +413,7 @@ __all__ = [
     "llama_backend_from_device_listing",
     "llama_cpp_backend_from_capability",
     "llama_server_is_launchable",
+    "load_torch_runtime",
     "probe_mps_memory",
     "probe_llama_cpp_python_backend",
     "probe_llama_server_backend",
