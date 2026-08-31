@@ -7,7 +7,6 @@ from functools import lru_cache
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 from typing import Iterable, Sequence
@@ -288,6 +287,14 @@ def resolve_llama_server(
     path_environment: str | None = None,
     environment_roots: Iterable[str | os.PathLike[str]] | None = None,
 ) -> Path | None:
+    """Resolve only explicitly trusted native runtime locations.
+
+    ``search_roots`` are application-managed trees and may contain a versioned
+    archive directory. ``environment_roots`` are exact Conda/Python binary
+    directories and never recurse. ``path_environment`` remains accepted for
+    source compatibility, but inherited PATH lookup is intentionally disabled.
+    """
+
     selected = identity or PlatformIdentity.detect()
     if override:
         candidate = Path(override).expanduser().resolve()
@@ -296,17 +303,23 @@ def resolve_llama_server(
 
     def first_candidate(
         roots: Iterable[str | os.PathLike[str]],
+        *,
+        recursive: bool,
     ) -> Path | None:
         names = set(_llama_names(selected))
         for raw_root in roots:
-            root = Path(raw_root).expanduser()
+            root = Path(raw_root).expanduser().resolve()
             if not root.is_dir():
                 continue
+            raw_candidates = root.rglob("*") if recursive else (
+                root / name for name in names
+            )
             candidates = [
                 candidate.resolve()
-                for candidate in root.rglob("*")
+                for candidate in raw_candidates
                 if candidate.name in names
                 and _candidate_is_executable(candidate, selected)
+                and candidate.resolve().is_relative_to(root)
             ]
             if not candidates:
                 continue
@@ -322,17 +335,14 @@ def resolve_llama_server(
             return candidates[0]
         return None
 
-    managed = first_candidate(search_roots)
+    managed = first_candidate(search_roots, recursive=True)
     if managed is not None:
         return managed
 
-    environment_path = os.environ.get("PATH", "") if path_environment is None else path_environment
-    for name in _llama_names(selected):
-        resolved = shutil.which(name, path=environment_path)
-        if resolved:
-            candidate = Path(resolved).resolve()
-            if _candidate_is_executable(candidate, selected):
-                return candidate
+    # Deliberately ignore PATH.  Native OCR runtimes are executable code and
+    # must come from an application-managed tree, an explicit operator
+    # override, or an exact interpreter/Conda binary directory.
+    _ = path_environment
 
     base_roots = (
         (
@@ -343,7 +353,7 @@ def resolve_llama_server(
         if environment_roots is None
         else tuple(Path(root).expanduser() for root in environment_roots)
     )
-    return first_candidate(base_roots)
+    return first_candidate(base_roots, recursive=False)
 
 
 @lru_cache(maxsize=4)

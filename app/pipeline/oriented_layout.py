@@ -21,6 +21,7 @@ ORIENTATION_NORMALIZED_ROTATION_MAX_ABS_DEGREES = 40.0
 ORIENTATION_NORMALIZED_ROTATION_MAX_EROSION_DELTA_DEGREES = 3.0
 ORIENTATION_NORMALIZED_ROTATION_MAX_FRAME_AGREEMENT_DEGREES = 4.0
 ORIENTATION_NORMALIZED_ROTATION_MIN_ORIENTATION_CONFIDENCE = 0.90
+ORIENTED_LAYOUT_MAX_POLYGON_VERTICES = 4096
 
 
 def normalize_axis_degrees(value: Any) -> float:
@@ -286,17 +287,25 @@ def oriented_frame_from_speech_container(container: Any) -> dict[str, Any]:
         return _unavailable(base, "container_conflicted")
 
     evidence = record.get("semantic_role_evidence")
-    polygons = (
-        list(evidence.get("speech_mask_polygons") or [])
+    raw_polygons = (
+        evidence.get("speech_mask_polygons")
         if isinstance(evidence, Mapping)
-        else []
+        else None
     )
+    polygons = raw_polygons if isinstance(raw_polygons, Sequence) else ()
     if len(polygons) > 1:
         return _unavailable(base, "speech_polygon_ambiguous")
     if not polygons or not isinstance(polygons[0], Mapping):
         return _unavailable(base, "speech_polygon_missing")
     polygon_record = dict(polygons[0])
-    polygon = _polygon(polygon_record.get("polygon"))
+    raw_polygon = polygon_record.get("polygon")
+    if (
+        isinstance(raw_polygon, Sequence)
+        and not isinstance(raw_polygon, (str, bytes, bytearray))
+        and len(raw_polygon) > ORIENTED_LAYOUT_MAX_POLYGON_VERTICES
+    ):
+        return _unavailable(base, "speech_polygon_vertex_budget_exceeded")
+    polygon = _polygon(raw_polygon)
     if len(polygon) < 3:
         return _unavailable(base, "speech_polygon_invalid")
 
@@ -372,6 +381,8 @@ def _polygon(value: Any) -> list[list[float]]:
         value,
         (str, bytes, bytearray),
     ):
+        return []
+    if len(value) > ORIENTED_LAYOUT_MAX_POLYGON_VERTICES:
         return []
     result: list[list[float]] = []
     for point in value:

@@ -74,7 +74,7 @@ Cross-platform behavior is composed once by the production bootstrap through
 `app.platform_services` rather than inferred from a generic `use_gpu` flag.
 `PlatformServices` binds immutable
 platform identity, standard paths, credential persistence/resolution, measured
-compute capabilities, and the nine-item runtime asset catalog. Windows selects
+compute capabilities, and the ten-item runtime asset catalog. Windows selects
 Credential Manager and CUDA-capable policies; macOS selects Keychain, MPS,
 CoreML, Metal/native llama.cpp, and unified-memory admission. CPU fallback is a
 reported backend decision, not evidence that acceleration succeeded.
@@ -292,8 +292,10 @@ layout without pixel inference becoming semantic authority.
 
 Horizontal Latin sans roles resolve through the managed Noto Sans 2.015
 variable face at the locked condensed width axis; logical source/user role and
-weight tiers remain unchanged, and a missing Latin asset falls back to the
-bundled Noto CJK role rather than an operating-system font. Shape-band
+weight tiers remain unchanged. Selected English runs require that managed
+Latin primary face at both the runtime gate and renderer boundary; once that
+primary is present, the bundled Noto CJK role remains available only as a
+coverage fallback. Shape-band
 placement normalizes both polygon and source alignment into the pre-effect
 frame and compares a bounded near-size window so a trivial size gain cannot
 cause material center drift. A vertical-source speech parent containing one
@@ -533,12 +535,14 @@ contents. The configured cleanup model id is provenance; the actual cleanup
 backend resolves to the fixed iopaint model unless a future roadmap explicitly
 changes the policy.
 
-After first paint the Settings runtime catalog presents nine fixed families
+After first paint the Settings runtime catalog presents ten fixed families
 without automatically importing model frameworks or starting a model server:
 ComicTextDetector,
 bubble evidence, PaddleOCR-VL, MangaOCR, cleanup inpainting, NER, YuzuMarker,
-the Noto CJK pack, and PyICU. The same catalog owns row copy, checker/preparer
-method names, platform remediation, and managed-download availability. On Mac,
+the Noto CJK pack, the target-scoped Noto Latin pack, and PyICU. The same
+catalog owns row copy, checker/preparer method names, platform remediation, and
+managed-download availability. Simplified Chinese requires only the CJK pack;
+English requires both because CJK remains its managed fallback. On Mac,
 Paddle downloads only its model/projector and requires the native Conda
 executable; Windows retains the two CUDA archives. User-selected LLM
 translation models are not fixed catalog assets. **Verify all** runs the

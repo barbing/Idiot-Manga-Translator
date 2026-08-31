@@ -12,6 +12,7 @@ from app.pipeline.parent_execution_bundle import (
     PARENT_EXECUTION_BUNDLE_VERSION,
     validate_resolved_render_style,
 )
+from app.pipeline.oriented_layout import ORIENTED_LAYOUT_MAX_POLYGON_VERTICES
 from app.pipeline.parent_style_evidence import (
     AUTHORIZED_SOURCE_STYLE_VIEW_VERSION,
     SOURCE_TEXT_FOOTPRINT_PROFILE_SELECTION_AUTHORITY,
@@ -102,6 +103,7 @@ def render_layer_plan_from_parent_bundle(
         raise RenderLayerContractError(
             "render_required_parent_missing_identity:" + ",".join(missing)
         )
+    _validate_oriented_geometry_budget(bundle)
 
     style_validation = validate_resolved_render_style(
         _field(bundle, "render_style", {})
@@ -194,6 +196,39 @@ def _field(source: Any, key: str, default: Any = "") -> Any:
     if isinstance(source, Mapping):
         return source.get(key, default)
     return getattr(source, key, default)
+
+
+def _validate_oriented_geometry_budget(bundle: Any) -> None:
+    domain = _field(bundle, "render_layout_domain", {})
+    domain = domain if isinstance(domain, Mapping) else {}
+    domain_frame = domain.get("oriented_frame")
+    domain_frame = domain_frame if isinstance(domain_frame, Mapping) else {}
+    frame = _field(bundle, "text_area_oriented_frame", {})
+    frame = frame if isinstance(frame, Mapping) else {}
+    for polygon in (
+        _field(bundle, "text_area_container_polygon", []),
+        domain.get("container_polygon"),
+        frame.get("polygon"),
+        domain_frame.get("polygon"),
+    ):
+        if not isinstance(polygon, Sequence) or isinstance(
+            polygon,
+            (str, bytes, bytearray),
+        ):
+            continue
+        if len(polygon) > ORIENTED_LAYOUT_MAX_POLYGON_VERTICES:
+            raise RenderLayerContractError(
+                "oriented_polygon_vertex_budget_exceeded"
+            )
+        for point in polygon:
+            if (
+                isinstance(point, Sequence)
+                and not isinstance(point, (str, bytes, bytearray))
+                and len(point) > 2
+            ):
+                raise RenderLayerContractError(
+                    "oriented_polygon_coordinate_budget_exceeded"
+                )
 
 
 def _bool_field(source: Any, key: str) -> bool:

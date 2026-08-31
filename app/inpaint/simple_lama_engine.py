@@ -117,7 +117,85 @@ def _synchronize_device(device: str) -> None:
         elif device == "mps" and torch.backends.mps.is_available():
             torch.mps.synchronize()
     except Exception:
-        return
+        # MPS synchronization is part of the recoverable execution boundary:
+        # propagate its failures so the shared controller can retry atomically
+        # on CPU. CUDA synchronization historically remained best effort, and
+        # preserving that behavior avoids turning post-inference telemetry into
+        # a Windows/Linux render failure.
+        if device == "mps":
+            raise
+
+
+def _clear_cached_lama_models() -> None:
+    clear = getattr(_load_lama_model, "cache_clear", None)
+    if callable(clear):
+        clear()
+
+
+def _run_lama_with_runtime_fallback(
+    *,
+    image,
+    mask,
+    use_gpu: bool,
+    model_path: str,
+    collect_runner_timings: bool = False,
+) -> tuple[object, dict[str, object]]:
+    """Run one fixed-model inference with one atomic MPS-to-CPU retry."""
+
+    global _CLEANUP_DEVICE_FALLBACK
+    device, requested_device, fallback_reason = _effective_cleanup_device(use_gpu)
+    total_load_ms = 0.0
+    total_inference_ms = 0.0
+
+    def attempt(candidate_device: str) -> tuple[object, dict[str, object]]:
+        nonlocal total_load_ms, total_inference_ms
+        load_started = time.perf_counter()
+        lama = _load_lama_model(candidate_device, str(model_path or ""))
+        load_ms = _perf_elapsed_ms(load_started)
+        total_load_ms += load_ms
+        runner_timings: dict[str, Any] | None = (
+            {} if collect_runner_timings else None
+        )
+        inference_started = time.perf_counter()
+        if runner_timings is None:
+            result = lama(image, mask)
+        else:
+            result = lama(image, mask, perf_timings=runner_timings)
+        _synchronize_device(candidate_device)
+        inference_ms = _perf_elapsed_ms(inference_started)
+        total_inference_ms += inference_ms
+        return result, {
+            "device": candidate_device,
+            "load_elapsed_ms": load_ms,
+            "inference_elapsed_ms": inference_ms,
+            "runner_timings": runner_timings or {},
+        }
+
+    try:
+        result, attempt_meta = attempt(device)
+        return result, {
+            **attempt_meta,
+            "requested_device": requested_device,
+            "fallback_reason": fallback_reason,
+            "total_load_elapsed_ms": round(total_load_ms, 3),
+            "total_inference_elapsed_ms": round(total_inference_ms, 3),
+        }
+    except Exception as exc:
+        if device != "mps":
+            raise
+        fallback = cleanup_fallback(exc)
+        _clear_cached_lama_models()
+        result, attempt_meta = attempt(fallback.device)
+        with _WARMUP_LOCK:
+            _CLEANUP_DEVICE_FALLBACK = fallback
+        return result, {
+            **attempt_meta,
+            "requested_device": requested_device,
+            "fallback_reason": fallback.fallback_reason,
+            "mps_failure": f"{type(exc).__name__}: {exc}",
+            "total_load_elapsed_ms": round(total_load_ms, 3),
+            "total_inference_elapsed_ms": round(total_inference_ms, 3),
+        }
 
 
 def _repo_root() -> str:
@@ -230,14 +308,14 @@ def warm_cleanup_inpaint_model(
         original_error = f"{type(exc).__name__}: {exc}"
         if device == "mps":
             fallback = cleanup_fallback(exc)
-            with _WARMUP_LOCK:
-                _CLEANUP_DEVICE_FALLBACK = fallback
-            _load_lama_model.cache_clear()
+            _clear_cached_lama_models()
             device = fallback.device
             fallback_reason = fallback.fallback_reason
             try:
                 load_elapsed_ms, infer_elapsed_ms = load_and_warm(device)
                 warm_succeeded = True
+                with _WARMUP_LOCK:
+                    _CLEANUP_DEVICE_FALLBACK = fallback
             except Exception as fallback_exc:
                 original_error = (
                     f"{original_error}; cpu_retry={type(fallback_exc).__name__}: "
@@ -360,21 +438,19 @@ def ai_inpaint_cleanup_crop(
     model_input_img = crop_img.crop((cx0, cy0, cx1, cy1))
     model_input_mask = mask_image.crop((cx0, cy0, cx1, cy1))
 
-    device, requested_device, fallback_reason = _effective_cleanup_device(use_gpu)
     model_info = resolve_cleanup_inpaint_model(model_id)
     actual_model_path = model_info.get("actual_model_path", "")
-
-    load_started = time.time()
-    lama = _load_lama_model(device, actual_model_path)
-    load_elapsed_ms = round((time.time() - load_started) * 1000.0, 3)
+    initial_device, initial_requested_device, initial_fallback_reason = (
+        _effective_cleanup_device(use_gpu)
+    )
 
     print(f"[Cleanup Inpaint] Processing local crop: {crop_w}x{crop_h}")
     _pipeline_runtime_checkpoint(
         "cleanup_ai_inpaint_crop_local",
         "start",
-        requested_device=requested_device,
-        device=device,
-        fallback_reason=fallback_reason,
+        requested_device=initial_requested_device,
+        device=initial_device,
+        fallback_reason=initial_fallback_reason,
         parent_crop_width=parent_crop_w,
         parent_crop_height=parent_crop_h,
         inner_crop_bbox=[cx0, cy0, cx1, cy1],
@@ -382,10 +458,17 @@ def ai_inpaint_cleanup_crop(
         crop_height=crop_h,
         mask_bbox=list(bbox),
     )
-    infer_started = time.time()
-    result = lama(model_input_img, model_input_mask)
-    _synchronize_device(device)
-    model_call_elapsed_ms = round((time.time() - infer_started) * 1000.0, 3)
+    result, runtime_meta = _run_lama_with_runtime_fallback(
+        image=model_input_img,
+        mask=model_input_mask,
+        use_gpu=use_gpu,
+        model_path=actual_model_path,
+    )
+    requested_device = str(runtime_meta["requested_device"])
+    device = str(runtime_meta["device"])
+    fallback_reason = str(runtime_meta["fallback_reason"])
+    load_elapsed_ms = float(runtime_meta["total_load_elapsed_ms"])
+    model_call_elapsed_ms = float(runtime_meta["total_inference_elapsed_ms"])
 
     if result.size != (crop_w, crop_h):
         print(f"[Cleanup Inpaint] Resizing crop result from {result.size} to {(crop_w, crop_h)}")
@@ -429,6 +512,7 @@ def ai_inpaint_cleanup_crop(
         "mask_bbox": list(bbox),
         "load_elapsed_ms": load_elapsed_ms,
         "model_call_elapsed_ms": model_call_elapsed_ms,
+        "mps_failure": str(runtime_meta.get("mps_failure") or ""),
         "elapsed_ms": elapsed_ms,
     }
 
@@ -447,13 +531,13 @@ def run_simple_lama_model_crop(
     the cleanup convenience wrappers above.
     """
 
-    device, _requested_device, _fallback_reason = _effective_cleanup_device(use_gpu)
-    load_started = time.time()
-    lama = _load_lama_model(device, str(model_path or ""))
-    load_time_ms = round((time.time() - load_started) * 1000.0, 3)
-    result = lama(crop_img.convert("RGB"), crop_mask.convert("L"))
-    _synchronize_device(device)
-    return result.convert("RGB"), load_time_ms
+    result, runtime_meta = _run_lama_with_runtime_fallback(
+        image=crop_img.convert("RGB"),
+        mask=crop_mask.convert("L"),
+        use_gpu=use_gpu,
+        model_path=str(model_path or ""),
+    )
+    return result.convert("RGB"), float(runtime_meta["total_load_elapsed_ms"])
 
 
 def ai_inpaint_cleanup(
@@ -510,15 +594,6 @@ def ai_inpaint_cleanup(
         perf_timings["device_fallback_reason"] = fallback_reason
         perf_timings["requested_use_gpu"] = bool(use_gpu)
 
-    model_lookup_started = time.perf_counter() if perf_timings is not None else 0.0
-    try:
-        lama = _load_lama_model(device, actual_model_path)
-    except Exception as exc:
-        print(f"[Cleanup Inpaint] Failed to load LaMa model: {exc}")
-        raise
-    if perf_timings is not None:
-        perf_timings["model_lookup_ms"] = _perf_elapsed_ms(model_lookup_started)
-
     crop_prepare_started = time.perf_counter() if perf_timings is not None else 0.0
     mask_image = Image.fromarray(dilated_mask).convert("L")
     bbox = mask_image.getbbox()
@@ -562,15 +637,27 @@ def ai_inpaint_cleanup(
         crop_width=crop_w,
         crop_height=crop_h,
     )
-    runner_timings: dict | None = {} if perf_timings is not None else None
     runner_started = time.perf_counter() if perf_timings is not None else 0.0
-    if runner_timings is None:
-        result = lama(crop_img, crop_mask)
-    else:
-        result = lama(crop_img, crop_mask, perf_timings=runner_timings)
+    result, runtime_meta = _run_lama_with_runtime_fallback(
+        image=crop_img,
+        mask=crop_mask,
+        use_gpu=use_gpu,
+        model_path=actual_model_path,
+        collect_runner_timings=perf_timings is not None,
+    )
+    requested_device = str(runtime_meta["requested_device"])
+    device = str(runtime_meta["device"])
+    fallback_reason = str(runtime_meta["fallback_reason"])
     if perf_timings is not None:
         perf_timings["runner_wall_ms"] = _perf_elapsed_ms(runner_started)
-        perf_timings["runner"] = runner_timings or {}
+        perf_timings["runner"] = dict(runtime_meta.get("runner_timings") or {})
+        perf_timings["model_lookup_ms"] = float(
+            runtime_meta["total_load_elapsed_ms"]
+        )
+        perf_timings["device"] = device
+        perf_timings["requested_device"] = requested_device
+        perf_timings["device_fallback_reason"] = fallback_reason
+        perf_timings["mps_failure"] = str(runtime_meta.get("mps_failure") or "")
 
     composite_started = time.perf_counter() if perf_timings is not None else 0.0
     if result.size != (crop_w, crop_h):

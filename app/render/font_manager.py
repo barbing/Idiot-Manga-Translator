@@ -697,6 +697,27 @@ class FontManager:
             item.role_id: item for item in self.required_role_inventory()
         }
         role_status = role_inventory.get(physical_font_role)
+        if (
+            physical_font_role in set(LATIN_TARGET_ROLE_MAP.values())
+            and (
+                role_status is None
+                or not bool(role_status.native_asset_available)
+            )
+        ):
+            return FontResolution(
+                requested_family=primary_font_role,
+                requested_weight="",
+                style_class="",
+                fallback_chain_key=fallback_chain_key,
+                writing_mode=writing_mode,
+                primary_face=None,
+                fallback_faces=[],
+                missing_glyphs=list(_unique_chars(text)),
+                issues=["missing_latin_font_pack"],
+                registered_role=role_status,
+                logical_role_id=primary_font_role,
+                physical_role_id=physical_font_role,
+            )
         selected = (
             self.face(role_status.selected_face_id)
             if role_status is not None and role_status.selected_face_id

@@ -113,6 +113,23 @@ class _HorizontalPath:
     raggedness: float
 
 
+class LineBreakResourceBudgetError(RuntimeError):
+    """Raised internally when one planner request exhausts its work budget."""
+
+
+@dataclass
+class _EvaluationBudget:
+    limit: int
+    used: int = 0
+
+    def consume(self) -> None:
+        if self.used >= self.limit:
+            raise LineBreakResourceBudgetError(
+                "line_break_resource_budget_exceeded"
+            )
+        self.used += 1
+
+
 def canonical_break_quality_key(
     break_plan: Mapping[str, Any] | None,
 ) -> tuple[Any, ...]:
@@ -284,6 +301,73 @@ def _canonical_quality_record_key(record: Mapping[str, Any]) -> tuple[Any, ...]:
 class LineBreakPlanner:
     version = LINE_BREAK_PLANNER_VERSION
 
+    def __init__(
+        self,
+        *,
+        max_items: int = 2048,
+        max_opportunities: int = 4096,
+        max_horizontal_band_evaluations: int = 200_000,
+    ) -> None:
+        limits = (
+            max_items,
+            max_opportunities,
+            max_horizontal_band_evaluations,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in limits
+        ):
+            raise ValueError("line-break resource budgets must be positive integers")
+        self.max_items = int(max_items)
+        self.max_opportunities = int(max_opportunities)
+        self.max_evaluations = int(max_horizontal_band_evaluations)
+
+    def _input_budget_failure(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        opportunities: Sequence[BreakOpportunity],
+        *,
+        strategy: str,
+    ) -> BreakPlanResult | None:
+        reason = ""
+        if len(items) > self.max_items:
+            reason = "line_break_item_budget_exceeded"
+        elif len(opportunities) > self.max_opportunities:
+            reason = "line_break_opportunity_budget_exceeded"
+        if not reason:
+            return None
+        return BreakPlanResult(
+            groups=[],
+            issues=["line_break_resource_budget_exceeded", reason],
+            metadata={
+                "line_break_planner_version": self.version,
+                "strategy": strategy,
+                "item_count": len(items),
+                "item_budget": self.max_items,
+                "opportunity_count": len(opportunities),
+                "opportunity_budget": self.max_opportunities,
+                "evaluations": 0,
+                "evaluation_budget": self.max_evaluations,
+            },
+        )
+
+    def _evaluation_budget_failure(
+        self,
+        *,
+        strategy: str,
+        budget: _EvaluationBudget,
+    ) -> BreakPlanResult:
+        return BreakPlanResult(
+            groups=[],
+            issues=["line_break_resource_budget_exceeded"],
+            metadata={
+                "line_break_planner_version": self.version,
+                "strategy": strategy,
+                "evaluations": budget.used,
+                "evaluation_budget": budget.limit,
+            },
+        )
+
     def plan_vertical(
         self,
         items: Sequence[Mapping[str, Any]],
@@ -294,6 +378,13 @@ class LineBreakPlanner:
         max_rows: int,
         profile: Mapping[str, Any] | None = None,
     ) -> BreakPlanResult:
+        budget_failure = self._input_budget_failure(
+            items,
+            opportunities,
+            strategy="vertical_resource_budget_failure",
+        )
+        if budget_failure is not None:
+            return budget_failure
         values = [dict(item) for item in (items or [])]
         boundary_candidates, boundary_by_split = _boundary_catalog(values, opportunities)
         rejected = [
@@ -328,14 +419,22 @@ class LineBreakPlanner:
         profile_value = dict(profile or {})
         candidate_records: list[dict[str, Any]] = []
         candidates: list[tuple[tuple[Any, ...], _VerticalPath, list[list[dict[str, Any]]], dict[str, Any]]] = []
+        evaluation_budget = _EvaluationBudget(self.max_evaluations)
         for columns in column_counts:
-            path, evaluated = _best_vertical_path(
-                values,
-                boundary_by_split,
-                columns=columns,
-                max_rows=row_limit,
-                profile=profile_value,
-            )
+            try:
+                path, evaluated = _best_vertical_path(
+                    values,
+                    boundary_by_split,
+                    columns=columns,
+                    max_rows=row_limit,
+                    profile=profile_value,
+                    evaluation_budget=evaluation_budget,
+                )
+            except LineBreakResourceBudgetError:
+                return self._evaluation_budget_failure(
+                    strategy="vertical_resource_budget_failure",
+                    budget=evaluation_budget,
+                )
             if path is None:
                 candidate_records.append(
                     {
@@ -497,6 +596,13 @@ class LineBreakPlanner:
         max_width: float,
         max_lines: int,
     ) -> BreakPlanResult:
+        budget_failure = self._input_budget_failure(
+            items,
+            opportunities,
+            strategy="horizontal_resource_budget_failure",
+        )
+        if budget_failure is not None:
+            return budget_failure
         values = [dict(item) for item in (items or [])]
         boundary_candidates, boundary_by_split = _boundary_catalog(values, opportunities)
         rejected = [
@@ -527,14 +633,22 @@ class LineBreakPlanner:
             tuple[int, int],
             tuple[float, int, int, float],
         ] = {}
+        evaluation_budget = _EvaluationBudget(self.max_evaluations)
         for line_count in range(1, len(values) + 1):
-            path, evaluated = _best_horizontal_path(
-                values,
-                boundary_by_split,
-                line_count=line_count,
-                max_width=width_limit,
-                segment_metric_cache=segment_metric_cache,
-            )
+            try:
+                path, evaluated = _best_horizontal_path(
+                    values,
+                    boundary_by_split,
+                    line_count=line_count,
+                    max_width=width_limit,
+                    segment_metric_cache=segment_metric_cache,
+                    evaluation_budget=evaluation_budget,
+                )
+            except LineBreakResourceBudgetError:
+                return self._evaluation_budget_failure(
+                    strategy="horizontal_resource_budget_failure",
+                    budget=evaluation_budget,
+                )
             if path is None:
                 candidate_records.append(
                     {
@@ -676,6 +790,13 @@ class LineBreakPlanner:
         current candidate order and audit behavior.
         """
 
+        budget_failure = self._input_budget_failure(
+            items,
+            opportunities,
+            strategy="horizontal_band_resource_budget_failure",
+        )
+        if budget_failure is not None:
+            return budget_failure
         values = [dict(item) for item in (items or [])]
         widths = [max(1.0, float(value)) for value in (line_widths or [])]
         boundary_candidates, boundary_by_split = _boundary_catalog(
@@ -711,12 +832,20 @@ class LineBreakPlanner:
             tuple[int, int],
             tuple[float, int, int, float],
         ] = {}
-        path, evaluated = _best_horizontal_band_path(
-            values,
-            boundary_by_split,
-            line_widths=widths,
-            segment_metric_cache=segment_metric_cache,
-        )
+        evaluation_budget = _EvaluationBudget(self.max_evaluations)
+        try:
+            path, evaluated = _best_horizontal_band_path(
+                values,
+                boundary_by_split,
+                line_widths=widths,
+                segment_metric_cache=segment_metric_cache,
+                evaluation_budget=evaluation_budget,
+            )
+        except LineBreakResourceBudgetError:
+            return self._evaluation_budget_failure(
+                strategy="horizontal_band_resource_budget_failure",
+                budget=evaluation_budget,
+            )
         if path is None:
             return BreakPlanResult(
                 groups=[values],
@@ -899,6 +1028,7 @@ def _best_vertical_path(
     columns: int,
     max_rows: int,
     profile: Mapping[str, Any],
+    evaluation_budget: _EvaluationBudget,
 ) -> tuple[_VerticalPath | None, int]:
     count = len(items)
     if columns <= 0 or columns > count:
@@ -941,6 +1071,7 @@ def _best_vertical_path(
             for end in range(min_end, max_end + 1):
                 if end < count and not bool((boundary_by_split.get(end) or {}).get("allowed")):
                     continue
+                evaluation_budget.consume()
                 evaluated += 1
                 units = max(0.0, prefix[end] - prefix[start])
                 overflow = max(0.0, units - float(max_rows))
@@ -1149,6 +1280,7 @@ def _best_horizontal_path(
         tuple[int, int],
         tuple[float, int, int, float],
     ] | None = None,
+    evaluation_budget: _EvaluationBudget,
 ) -> tuple[_HorizontalPath | None, int]:
     count = len(items)
     if line_count <= 0 or line_count > count:
@@ -1185,6 +1317,7 @@ def _best_horizontal_path(
                 boundary = boundary_by_split.get(end) if end < count else None
                 if end < count and not bool((boundary or {}).get("allowed")):
                     continue
+                evaluation_budget.consume()
                 evaluated += 1
                 width = max(0.0, prefix[end] - prefix[start])
                 overflow = max(0.0, width - max_width)
@@ -1288,6 +1421,7 @@ def _best_horizontal_band_path(
         tuple[int, int],
         tuple[float, int, int, float],
     ] | None = None,
+    evaluation_budget: _EvaluationBudget,
 ) -> tuple[_HorizontalPath | None, int]:
     """Return the best complete path for one fixed width per line."""
 
@@ -1330,6 +1464,7 @@ def _best_horizontal_band_path(
                 boundary = boundary_by_split.get(end) if end < count else None
                 if end < count and not bool((boundary or {}).get("allowed")):
                     continue
+                evaluation_budget.consume()
                 evaluated += 1
                 width = max(0.0, prefix[end] - prefix[start])
                 if (

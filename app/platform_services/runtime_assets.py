@@ -175,6 +175,15 @@ def runtime_asset_catalog(
             _download_remediation("the Noto CJK fallback font pack"),
         ),
         RuntimeAssetSpec(
+            "latin_font_pack",
+            "Noto Latin font pack",
+            "Managed variable Latin renderer font",
+            SUPPORTED_DESKTOP_PLATFORMS,
+            "check_noto_latin_font_pack",
+            "prepare_noto_latin_font_pack",
+            _download_remediation("the Noto Latin renderer font pack"),
+        ),
+        RuntimeAssetSpec(
             "pyicu",
             "PyICU line breaking",
             "PyICU 2.16.2 with ICU 78.3 strict line breaking",
@@ -247,6 +256,14 @@ def required_runtime_asset_ids(
     if bool(pipeline_values.get("prescan_use_ner", False)):
         required.add("ner")
 
+    target_language = str(
+        pipeline_values.get("target_lang")
+        or pipeline_values.get("target_language")
+        or "Simplified Chinese"
+    ).strip().casefold().replace("_", "-")
+    if target_language in {"english", "en", "en-us"}:
+        required.add("latin_font_pack")
+
     catalog_order = (
         "comic_text_detector",
         "bubble_detection",
@@ -256,6 +273,7 @@ def required_runtime_asset_ids(
         "ner",
         "font_detection",
         "font_pack",
+        "latin_font_pack",
         "pyicu",
     )
     return tuple(asset_id for asset_id in catalog_order if asset_id in required)

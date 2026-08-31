@@ -49,6 +49,8 @@ ORIENTATION_NORMALIZED_ROTATION_PROVENANCE = (
 )
 ORIENTED_SPEECH_POLYGON_GUARD_PX = 3
 ORIENTED_SPEECH_MAX_TRANSLATION_PX = 64
+ORIENTED_SPEECH_MAX_POLYGON_VERTICES = 4096
+ORIENTED_SPEECH_MAX_MASK_PIXELS = 32 * 1024 * 1024
 
 
 AlphaSurfaceStats = tuple[tuple[int, int, int, int] | None, int]
@@ -1280,8 +1282,20 @@ def _oriented_speech_polygon_translation(
         if isinstance(plan.clipping_region_ref, Mapping)
         else {}
     )
-    polygon = _point_sequence(clipping.get("text_area_container_polygon"))
-    frame_polygon = _point_sequence(frame.get("polygon"))
+    raw_polygon = clipping.get("text_area_container_polygon")
+    raw_frame_polygon = frame.get("polygon")
+    for value in (raw_polygon, raw_frame_polygon):
+        if (
+            isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes, bytearray))
+            and len(value) > ORIENTED_SPEECH_MAX_POLYGON_VERTICES
+        ):
+            return unavailable(
+                "rejected",
+                "oriented_polygon_vertex_budget_exceeded",
+            )
+    polygon = _point_sequence(raw_polygon)
+    frame_polygon = _point_sequence(raw_frame_polygon)
     if len(polygon) < 3 or polygon != frame_polygon:
         return unavailable(
             "ineligible",
@@ -1289,17 +1303,47 @@ def _oriented_speech_polygon_translation(
         )
     domain = clipping.get("parent_render_domain")
     domain = domain if isinstance(domain, Mapping) else {}
-    container = _xywh_int(
-        domain.get("container_bbox")
-        or clipping.get("text_area_container_bbox")
-    )
+    domain_container = _xywh_int(domain.get("container_bbox"))
+    clipping_container = _xywh_int(clipping.get("text_area_container_bbox"))
+    frame_container = _xywh_int(frame.get("container_bbox"))
+    supplied_containers = [
+        value
+        for value in (domain_container, clipping_container, frame_container)
+        if value
+    ]
+    if supplied_containers and any(
+        value != supplied_containers[0] for value in supplied_containers[1:]
+    ):
+        return unavailable(
+            "rejected",
+            "oriented_container_bbox_identity_mismatch",
+        )
+    container = supplied_containers[0] if supplied_containers else []
     if not container:
         return unavailable("ineligible", "oriented_container_bbox_missing")
+    container_x, container_y, container_width, container_height = container
+    if container_width * container_height > ORIENTED_SPEECH_MAX_MASK_PIXELS:
+        return unavailable("rejected", "oriented_mask_pixel_budget_exceeded")
+    page_size = getattr(alpha, "size", ()) if alpha is not None else ()
+    if (
+        not isinstance(page_size, Sequence)
+        or len(page_size) < 2
+        or int(page_size[0]) <= 0
+        or int(page_size[1]) <= 0
+    ):
+        return unavailable("rejected", "oriented_page_size_unavailable")
+    page_width, page_height = int(page_size[0]), int(page_size[1])
+    if (
+        container_x < 0
+        or container_y < 0
+        or container_x + container_width > page_width
+        or container_y + container_height > page_height
+    ):
+        return unavailable("rejected", "oriented_container_bbox_outside_page")
     alpha_bounds_raw = alpha.getbbox() if alpha is not None else None
     if not alpha_bounds_raw:
         return unavailable("rejected", "oriented_parent_alpha_empty")
     alpha_bounds = [int(item) for item in alpha_bounds_raw]
-    container_x, container_y, container_width, container_height = container
     container_right = container_x + container_width
     container_bottom = container_y + container_height
     alpha_left, alpha_top, alpha_right, alpha_bottom = alpha_bounds
@@ -1333,28 +1377,34 @@ def _oriented_speech_polygon_translation(
         )
         return result
 
-    polygon_mask = Image.new("L", (container_width, container_height), 0)
-    local_polygon = [
-        (float(x) - container_x, float(y) - container_y)
-        for x, y in polygon
-    ]
-    ImageDraw.Draw(polygon_mask).polygon(local_polygon, fill=255)
-    if ORIENTED_SPEECH_POLYGON_GUARD_PX > 0:
-        if ImageFilter is None:
-            return unavailable(
-                "rejected",
-                "oriented_polygon_guard_backend_unavailable",
+    try:
+        polygon_mask = Image.new("L", (container_width, container_height), 0)
+        local_polygon = [
+            (float(x) - container_x, float(y) - container_y)
+            for x, y in polygon
+        ]
+        ImageDraw.Draw(polygon_mask).polygon(local_polygon, fill=255)
+        if ORIENTED_SPEECH_POLYGON_GUARD_PX > 0:
+            if ImageFilter is None:
+                return unavailable(
+                    "rejected",
+                    "oriented_polygon_guard_backend_unavailable",
+                )
+            polygon_mask = polygon_mask.filter(
+                ImageFilter.MaxFilter(
+                    ORIENTED_SPEECH_POLYGON_GUARD_PX * 2 + 1
+                )
             )
-        polygon_mask = polygon_mask.filter(
-            ImageFilter.MaxFilter(
-                ORIENTED_SPEECH_POLYGON_GUARD_PX * 2 + 1
-            )
+        polygon_array = np.asarray(polygon_mask, dtype=np.uint8) > 0
+        alpha_crop = np.asarray(
+            alpha.crop(tuple(alpha_bounds)),
+            dtype=np.uint16,
         )
-    polygon_array = np.asarray(polygon_mask, dtype=np.uint8) > 0
-    alpha_crop = np.asarray(
-        alpha.crop(tuple(alpha_bounds)),
-        dtype=np.uint16,
-    )
+    except (MemoryError, OSError, ValueError, cv2.error):
+        return unavailable(
+            "rejected",
+            "oriented_polygon_placement_backend_failed",
+        )
     yy, xx = np.nonzero(alpha_crop)
     if not len(xx):
         return unavailable("rejected", "oriented_parent_alpha_empty")
@@ -1402,45 +1452,51 @@ def _oriented_speech_polygon_translation(
         )
         return result
 
-    count_overlap = cv2.matchTemplate(
-        polygon_array.astype(np.float32),
-        (alpha_crop > 0).astype(np.float32),
-        cv2.TM_CCORR,
-    )
-    local_x_values = np.arange(
-        base_x + int(min_dx),
-        base_x + int(max_dx) + 1,
-        dtype=np.int32,
-    )
-    local_y_values = np.arange(
-        base_y + int(min_dy),
-        base_y + int(max_dy) + 1,
-        dtype=np.int32,
-    )
-    overlap_count = count_overlap[
-        local_y_values[:, None],
-        local_x_values[None, :],
-    ]
-    outside_counts = np.maximum(
-        0,
-        int(len(xx)) - np.rint(overlap_count).astype(np.int64),
-    )
-    dy_grid, dx_grid = np.meshgrid(
-        np.arange(int(min_dy), int(max_dy) + 1, dtype=np.int32),
-        np.arange(int(min_dx), int(max_dx) + 1, dtype=np.int32),
-        indexing="ij",
-    )
-    flat_order = np.lexsort(
-        (
-            dx_grid.ravel(),
-            dy_grid.ravel(),
-            np.abs(dx_grid).ravel(),
-            np.abs(dy_grid).ravel(),
-            (dx_grid * dx_grid + dy_grid * dy_grid).ravel(),
-            (np.abs(dx_grid) + np.abs(dy_grid)).ravel(),
-            outside_counts.ravel(),
+    try:
+        count_overlap = cv2.matchTemplate(
+            polygon_array.astype(np.float32),
+            (alpha_crop > 0).astype(np.float32),
+            cv2.TM_CCORR,
         )
-    )
+        local_x_values = np.arange(
+            base_x + int(min_dx),
+            base_x + int(max_dx) + 1,
+            dtype=np.int32,
+        )
+        local_y_values = np.arange(
+            base_y + int(min_dy),
+            base_y + int(max_dy) + 1,
+            dtype=np.int32,
+        )
+        overlap_count = count_overlap[
+            local_y_values[:, None],
+            local_x_values[None, :],
+        ]
+        outside_counts = np.maximum(
+            0,
+            int(len(xx)) - np.rint(overlap_count).astype(np.int64),
+        )
+        dy_grid, dx_grid = np.meshgrid(
+            np.arange(int(min_dy), int(max_dy) + 1, dtype=np.int32),
+            np.arange(int(min_dx), int(max_dx) + 1, dtype=np.int32),
+            indexing="ij",
+        )
+        flat_order = np.lexsort(
+            (
+                dx_grid.ravel(),
+                dy_grid.ravel(),
+                np.abs(dx_grid).ravel(),
+                np.abs(dy_grid).ravel(),
+                (dx_grid * dx_grid + dy_grid * dy_grid).ravel(),
+                (np.abs(dx_grid) + np.abs(dy_grid)).ravel(),
+                outside_counts.ravel(),
+            )
+        )
+    except (MemoryError, IndexError, ValueError, cv2.error):
+        return unavailable(
+            "rejected",
+            "oriented_polygon_placement_backend_failed",
+        )
     selected = int(flat_order[0])
     dx = int(dx_grid.ravel()[selected])
     dy = int(dy_grid.ravel()[selected])
@@ -2467,11 +2523,10 @@ def _point_sequence(value: Any) -> list[tuple[float, float]]:
     for item in value:
         if not isinstance(item, Sequence) or isinstance(item, (str, bytes, bytearray)):
             return []
-        values = list(item)
-        if len(values) < 2:
+        if len(item) < 2:
             return []
         try:
-            point = (float(values[0]), float(values[1]))
+            point = (float(item[0]), float(item[1]))
         except (TypeError, ValueError):
             return []
         if not all(math.isfinite(number) for number in point):

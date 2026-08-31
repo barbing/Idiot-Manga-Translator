@@ -8,7 +8,7 @@ identity.
 from __future__ import annotations
 
 import math
-from collections import deque
+from collections import OrderedDict, deque
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_CEILING
@@ -113,6 +113,52 @@ BASE_TEXT_INK_ENVELOPE_VERSION = "base_text_ink_envelope_v1"
 BASE_TEXT_HINTED_DIMENSION_GUARD_PX = 1.0
 
 
+class TypesettingResourceBudgetError(RuntimeError):
+    """Raised internally before a typesetting work budget is exceeded."""
+
+
+class _BoundedLruCache(OrderedDict):
+    """Small entry-bounded LRU used only for output-neutral memoization."""
+
+    def __init__(self, max_entries: int) -> None:
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or max_entries <= 0
+        ):
+            raise ValueError("cache entry limit must be a positive integer")
+        super().__init__()
+        self.max_entries = int(max_entries)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __setitem__(self, key, value) -> None:
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        super().__setitem__(key, value)
+        while len(self) > self.max_entries:
+            oldest = next(iter(self))
+            OrderedDict.__delitem__(self, oldest)
+
+    def setdefault(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            self[key] = default
+            return default
+
+
 @dataclass(frozen=True)
 class TypesettingPolicy:
     min_font_size: int = 8
@@ -130,6 +176,41 @@ class TypesettingPolicy:
     allow_emergency_word_break: bool = True
     enable_japanese_line_break_rules: bool = True
     allow_punctuation_hanging: bool = False
+    max_translated_text_codepoints: int = 8192
+    max_grapheme_clusters: int = 4096
+    max_lossless_tokens: int = 4096
+    max_inline_runs: int = 2048
+    max_break_opportunities: int = 4096
+    max_shape_band_line_count_probes: int = 128
+    max_shape_band_block_y_probes: int = 512
+    max_shape_band_candidate_records: int = 1024
+    max_break_planner_evaluations: int = 200_000
+    max_render_font_size_px: int = 2048
+    max_font_size_candidates: int = 512
+    max_cache_entries: int = 512
+    max_fit_bounds_per_cache_key: int = 8
+
+    def __post_init__(self) -> None:
+        resource_limits = (
+            self.max_translated_text_codepoints,
+            self.max_grapheme_clusters,
+            self.max_lossless_tokens,
+            self.max_inline_runs,
+            self.max_break_opportunities,
+            self.max_shape_band_line_count_probes,
+            self.max_shape_band_block_y_probes,
+            self.max_shape_band_candidate_records,
+            self.max_break_planner_evaluations,
+            self.max_render_font_size_px,
+            self.max_font_size_candidates,
+            self.max_cache_entries,
+            self.max_fit_bounds_per_cache_key,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in resource_limits
+        ):
+            raise ValueError("typesetting resource budgets must be positive integers")
 
 
 class TypesettingEngine:
@@ -144,30 +225,36 @@ class TypesettingEngine:
         self.font_manager = font_manager or FontManager()
         self.shaper = shaper or HarfBuzzShaper(self.font_manager)
         self.policy = policy or TypesettingPolicy()
-        self.break_planner = break_planner or LineBreakPlanner()
+        self.break_planner = break_planner or LineBreakPlanner(
+            max_items=self.policy.max_inline_runs,
+            max_opportunities=self.policy.max_break_opportunities,
+            max_horizontal_band_evaluations=(
+                self.policy.max_break_planner_evaluations
+            ),
+        )
         self.lexical_segmenter = (
             lexical_segmenter or default_target_lexical_segmenter()
         )
         self._horizontal_fit_upper_bounds: dict[
             tuple[Any, ...],
             list[tuple[list[int], int]],
-        ] = {}
+        ] = _BoundedLruCache(self.policy.max_cache_entries)
         self._shape_runs_cache: dict[
             tuple[Any, ...],
             tuple[tuple[ShapedRun, ...], tuple[RunFontResolution, ...]],
-        ] = {}
+        ] = _BoundedLruCache(self.policy.max_cache_entries)
         self._horizontal_break_plan_cache: dict[
             tuple[Any, ...],
             Any,
-        ] = {}
+        ] = _BoundedLruCache(self.policy.max_cache_entries)
         self._font_resolution_cache: dict[
             tuple[Any, ...],
             FontResolution,
-        ] = {}
+        ] = _BoundedLruCache(self.policy.max_cache_entries)
         self._font_span_expansion_cache: dict[
             tuple[Any, ...],
             tuple[tuple[InlineTextRun, ...], tuple[FontSpanResolution, ...]],
-        ] = {}
+        ] = _BoundedLruCache(self.policy.max_cache_entries)
 
     def typeset_layer(self, plan: RenderLayerPlan) -> tuple[TypesetLayout, FitReport]:
         missing = _missing_identity(plan)
@@ -177,8 +264,23 @@ class TypesettingEngine:
         hard_bounds = bbox_from_value(plan.hard_bounds) or target_box
         if not target_box or not hard_bounds:
             return self._failed(plan, "missing_hard_bounds", ["missing_hard_bounds"])
-        if not str(plan.translated_text or ""):
+        translated_text = str(plan.translated_text or "")
+        if not translated_text:
             return self._failed(plan, "empty_text", ["empty_text"], hard_bounds=hard_bounds)
+        if len(translated_text) > self.policy.max_translated_text_codepoints:
+            return self._failed(
+                plan,
+                "resource_budget_exceeded",
+                ["translated_text_codepoint_budget_exceeded"],
+                hard_bounds=hard_bounds,
+            )
+        if len(grapheme_clusters(translated_text)) > self.policy.max_grapheme_clusters:
+            return self._failed(
+                plan,
+                "resource_budget_exceeded",
+                ["translated_text_grapheme_budget_exceeded"],
+                hard_bounds=hard_bounds,
+            )
 
         parent_layer_effects = resolve_parent_layer_effects(plan.resolved_render_style)
         if parent_layer_effects.status == "invalid":
@@ -217,7 +319,21 @@ class TypesettingEngine:
         if not resolved.usable or resolved.primary_face is None:
             return self._failed(plan, "missing_font", list(resolved.issues or ["missing_font"]), hard_bounds=hard_bounds)
         face = resolved.primary_face
-        identity_tokens = build_lossless_text_tokens(plan.translated_text)
+        identity_tokens = build_lossless_text_tokens(translated_text)
+        if len(identity_tokens) > self.policy.max_lossless_tokens:
+            return self._failed(
+                plan,
+                "resource_budget_exceeded",
+                ["lossless_token_budget_exceeded"],
+                hard_bounds=hard_bounds,
+            )
+        if preferred_font_size > self.policy.max_render_font_size_px:
+            return self._failed(
+                plan,
+                "resource_budget_exceeded",
+                ["render_font_size_budget_exceeded"],
+                hard_bounds=hard_bounds,
+            )
         target_lexical_segmentation = self.lexical_segmenter.segment(
             str(plan.translated_text or ""),
             identity_tokens,
@@ -255,6 +371,13 @@ class TypesettingEngine:
                 writing_mode,
             ),
         )
+        if len(logical_runs) > self.policy.max_inline_runs:
+            return self._failed(
+                plan,
+                "resource_budget_exceeded",
+                ["inline_run_budget_exceeded"],
+                hard_bounds=hard_bounds,
+            )
         try:
             runs, font_span_resolutions = self._expand_runs_for_font_spans(
                 logical_runs,
@@ -283,6 +406,17 @@ class TypesettingEngine:
         font_span_text_conserved = (
             "".join(run.normalized_text for run in runs) == normalized
         )
+        if len(runs) > self.policy.max_inline_runs:
+            return self._font_span_failure(
+                plan,
+                normalized=normalized,
+                hard_bounds=hard_bounds,
+                resolved=resolved,
+                logical_runs=logical_runs,
+                expanded_runs=runs,
+                spans=font_span_resolutions,
+                issues=["expanded_font_span_run_budget_exceeded"],
+            )
         unresolved_span_issues = _unique(
             [
                 issue
@@ -403,6 +537,17 @@ class TypesettingEngine:
                 )
             ),
         )
+        if len(breaks) > self.policy.max_break_opportunities:
+            return self._font_span_failure(
+                plan,
+                normalized=normalized,
+                hard_bounds=hard_bounds,
+                resolved=resolved,
+                logical_runs=logical_runs,
+                expanded_runs=runs,
+                spans=font_span_resolutions,
+                issues=["break_opportunity_budget_exceeded"],
+            )
         if competitive_probe_size:
             candidate_search_start = min(
                 candidate_search_start,
@@ -522,34 +667,46 @@ class TypesettingEngine:
                             ),
                         }
                     )
-        if competitive_probe_size:
-            font_size_candidates = [candidate_search_start]
-        elif (
-            source_supported_interval_search_used
-            and int(candidate_search_start) > preferred_font_size
-        ):
-            ordinary_candidates = _font_size_candidates(
-                preferred_font_size,
-                plan.resolved_render_style,
-                self.policy,
-                target_box,
-                plan.metadata,
-            )
-            font_size_candidates = [
-                int(candidate_search_start),
-                *[
-                    int(value)
-                    for value in ordinary_candidates
-                    if int(value) != int(candidate_search_start)
-                ],
-            ]
-        else:
-            font_size_candidates = _font_size_candidates(
-                candidate_search_start,
-                plan.resolved_render_style,
-                self.policy,
-                target_box,
-                plan.metadata,
+        try:
+            if competitive_probe_size:
+                font_size_candidates = [candidate_search_start]
+            elif (
+                source_supported_interval_search_used
+                and int(candidate_search_start) > preferred_font_size
+            ):
+                ordinary_candidates = _font_size_candidates(
+                    preferred_font_size,
+                    plan.resolved_render_style,
+                    self.policy,
+                    target_box,
+                    plan.metadata,
+                )
+                font_size_candidates = [
+                    int(candidate_search_start),
+                    *[
+                        int(value)
+                        for value in ordinary_candidates
+                        if int(value) != int(candidate_search_start)
+                    ],
+                ]
+            else:
+                font_size_candidates = _font_size_candidates(
+                    candidate_search_start,
+                    plan.resolved_render_style,
+                    self.policy,
+                    target_box,
+                    plan.metadata,
+                )
+        except TypesettingResourceBudgetError as exc:
+            return self._font_span_failure(
+                plan,
+                normalized=normalized,
+                hard_bounds=hard_bounds,
+                resolved=resolved,
+                logical_runs=logical_runs,
+                expanded_runs=runs,
+                spans=font_span_resolutions,
+                issues=[str(exc)],
             )
         for font_size in font_size_candidates:
             if (
@@ -1157,6 +1314,7 @@ class TypesettingEngine:
                 fit_upper_bound_key,
                 target_box,
                 font_size,
+                max_entries=self.policy.max_fit_bounds_per_cache_key,
             )
         typesetting_candidate_quality = _typesetting_candidate_quality_summary(
             preferred_font_size=preferred_font_size,
@@ -2710,6 +2868,30 @@ class TypesettingEngine:
         dict[str, Any],
     ]:
         x, y, w, h = [int(value) for value in profile.bounds]
+
+        def resource_failure(reason: str):
+            capacity_audit = {
+                **profile.to_audit_dict(),
+                "status": "resource_budget_exceeded",
+                "candidate_count": 0,
+                "selected_line_boxes": [],
+                "reason_codes": [reason],
+            }
+            return (
+                [],
+                [],
+                [],
+                [x, y, 1, 1],
+                "failed",
+                [reason],
+                {
+                    "line_break_planner_version": self.break_planner.version,
+                    "strategy": "latin_shape_band_resource_budget_failure",
+                    "issues": [reason],
+                    "horizontal_shape_capacity": capacity_audit,
+                },
+            )
+
         line_height_ratio = _line_height(style)
         line_height = max(1.0, font_size * line_height_ratio)
         line_pixel_extent = _horizontal_line_pixel_extent(
@@ -2800,6 +2982,11 @@ class TypesettingEngine:
             int(math.ceil(total_advance / max(1.0, float(maximum_profile_width)))),
         )
         minimum_line_count = min(minimum_line_count, max_lines)
+        if (
+            max_lines - minimum_line_count + 1
+            > self.policy.max_shape_band_line_count_probes
+        ):
+            return resource_failure("shape_band_line_count_probe_budget_exceeded")
         alignment = _horizontal_text_alignment(style)
         candidate_records: list[dict[str, Any]] = []
         selected: dict[str, Any] | None = None
@@ -2808,13 +2995,19 @@ class TypesettingEngine:
             line_pixel_extent=line_pixel_extent,
         )
         for line_count in range(minimum_line_count, max_lines + 1):
-            line_box_candidates = _horizontal_capacity_line_box_candidates(
-                profile,
-                line_count=line_count,
-                line_height=line_height,
-                line_pixel_extent=line_pixel_extent,
-                band_interval_cache=band_interval_cache,
-            )
+            try:
+                line_box_candidates = _horizontal_capacity_line_box_candidates(
+                    profile,
+                    line_count=line_count,
+                    line_height=line_height,
+                    line_pixel_extent=line_pixel_extent,
+                    band_interval_cache=band_interval_cache,
+                    max_block_y_probes=(
+                        self.policy.max_shape_band_block_y_probes
+                    ),
+                )
+            except TypesettingResourceBudgetError as exc:
+                return resource_failure(str(exc))
             for line_boxes_record in line_box_candidates:
                 line_boxes = [list(item) for item in line_boxes_record["line_boxes"]]
                 line_widths = [float(item[2]) for item in line_boxes]
@@ -2918,6 +3111,13 @@ class TypesettingEngine:
                     **center_quality,
                     "shaped_overrides": shaped_overrides,
                 }
+                if (
+                    len(candidate_records)
+                    >= self.policy.max_shape_band_candidate_records
+                ):
+                    return resource_failure(
+                        "shape_band_candidate_record_budget_exceeded"
+                    )
                 candidate_records.append(record)
                 if selected is None or selection_key < selected["selection_key"]:
                     selected = record
@@ -3433,6 +3633,11 @@ def _font_size_candidates(
     minimum = _minimum_fit_font_size(preferred, style, policy)
     if minimum >= preferred:
         return [preferred]
+    candidate_count = preferred - minimum + 1
+    if candidate_count > policy.max_font_size_candidates:
+        raise TypesettingResourceBudgetError(
+            "font_size_candidate_budget_exceeded"
+        )
     return list(range(preferred, minimum - 1, -1))
 
 
@@ -3925,6 +4130,7 @@ def _horizontal_capacity_line_box_candidates(
         tuple[int, int, bool],
         tuple[int, int] | None,
     ] | None = None,
+    max_block_y_probes: int | None = None,
 ) -> list[dict[str, Any]]:
     bounds = list(profile.bounds)
     if line_count <= 0 or line_pixel_extent <= 0:
@@ -3936,7 +4142,15 @@ def _horizontal_capacity_line_box_candidates(
     if max_y < min_y:
         return []
     step = max(1, int(line_pixel_extent) // 3)
-    block_y_candidates = set(range(min_y, max_y + 1, step))
+    base_candidates = range(min_y, max_y + 1, step)
+    if (
+        max_block_y_probes is not None
+        and len(base_candidates) > int(max_block_y_probes)
+    ):
+        raise TypesettingResourceBudgetError(
+            "shape_band_block_y_probe_budget_exceeded"
+        )
+    block_y_candidates = set(base_candidates)
     block_y_candidates.update({min_y, max_y})
     block_extent = last_offset + int(line_pixel_extent)
     for center_y in (
@@ -3946,6 +4160,13 @@ def _horizontal_capacity_line_box_candidates(
         centered = int(round(center_y - float(block_extent) / 2.0))
         for delta in (-step, -1, 0, 1, step):
             block_y_candidates.add(max(min_y, min(max_y, centered + delta)))
+    if (
+        max_block_y_probes is not None
+        and len(block_y_candidates) > int(max_block_y_probes)
+    ):
+        raise TypesettingResourceBudgetError(
+            "shape_band_block_y_probe_budget_exceeded"
+        )
     records: list[dict[str, Any]] = []
     for block_y in sorted(block_y_candidates):
         line_boxes: list[list[int]] = []
@@ -4435,6 +4656,8 @@ def _remember_horizontal_fit_upper_bound(
     key: tuple[Any, ...],
     target_box: Sequence[int],
     font_size: int,
+    *,
+    max_entries: int,
 ) -> None:
     box = bbox_from_value(target_box)
     if not box or int(font_size) <= 0:
@@ -4447,6 +4670,8 @@ def _remember_horizontal_fit_upper_bound(
                 min(int(prior_size), int(font_size)),
             )
             return
+    if len(entries) >= max(1, int(max_entries)):
+        entries.pop(0)
     entries.append((list(box), int(font_size)))
 
 

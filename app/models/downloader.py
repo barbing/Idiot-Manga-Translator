@@ -703,16 +703,16 @@ class ModelDownloader(QtCore.QObject):
         return has_yuzumarker_font_detection_runtime(base_dir=models_dir)
 
     def check_noto_cjk_sc_font_pack(self, models_dir: str = "models") -> bool:
-        """Check the platform-neutral CJK and Latin renderer font pack."""
-        from app.models.resolution import (
-            has_noto_cjk_sc_font_pack,
-            has_noto_latin_font_pack,
-        )
+        """Check only the platform-neutral CJK renderer font pack."""
+        from app.models.resolution import has_noto_cjk_sc_font_pack
 
-        return bool(
-            has_noto_cjk_sc_font_pack(base_dir=models_dir)
-            and has_noto_latin_font_pack(base_dir=models_dir)
-        )
+        return has_noto_cjk_sc_font_pack(base_dir=models_dir)
+
+    def check_noto_latin_font_pack(self, models_dir: str = "models") -> bool:
+        """Check only the managed variable Latin renderer font."""
+        from app.models.resolution import has_noto_latin_font_pack
+
+        return has_noto_latin_font_pack(base_dir=models_dir)
 
     def prepare_ner(self, models_dir: str):
         """Queue NER model download."""
@@ -791,7 +791,7 @@ class ModelDownloader(QtCore.QObject):
         self.prepare_noto_cjk_sc_font_pack(models_dir)
 
     def prepare_noto_cjk_sc_font_pack(self, models_dir: str):
-        """Queue the local CJK fallback and condensed Latin renderer fonts."""
+        """Queue only the local CJK fallback fonts."""
 
         font_dir = noto_cjk_sc_font_dir(models_dir)
         targets = []
@@ -810,8 +810,13 @@ class ModelDownloader(QtCore.QObject):
                 label="Downloading SIL Open Font License text...",
             )
         )
+        self.queue_targets(targets)
+
+    def prepare_noto_latin_font_pack(self, models_dir: str):
+        """Queue only the managed variable Latin renderer font."""
+
         latin_dir = noto_latin_font_dir(models_dir)
-        targets.extend(
+        self.queue_targets(
             [
                 DownloadTarget(
                     url=f"{NOTO_LATIN_FONT_BASE_URL}/{NOTO_LATIN_FONT_FILE}",
@@ -826,7 +831,6 @@ class ModelDownloader(QtCore.QObject):
                 ),
             ]
         )
-        self.queue_targets(targets)
 
     def _perform_ner_download(self) -> bool:
         """Execute NER download using transformers."""
