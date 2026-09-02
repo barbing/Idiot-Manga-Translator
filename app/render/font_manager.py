@@ -1926,7 +1926,13 @@ def _measure_optical_glyph(
     except Exception as exc:  # pragma: no cover - required local dependencies
         raise FontManagerError("target optical metrics require numpy and OpenCV") from exc
 
-    direction = "ttb" if writing_mode == "vertical" else None
+    # The fixed probe bank measures one upright CJK/kana glyph at a time.  Its
+    # frozen v2 policy has identical ink/advance metrics in horizontal and
+    # vertical modes; writing mode remains bound by the profile cache/id.
+    # Passing ``direction="ttb"`` asks Pillow to shape text through libraqm,
+    # which is unnecessary for these single-glyph measurements and is not
+    # available in the standard macOS wheel.
+    direction = None
     try:
         mask = font.getmask(glyph, mode="L", direction=direction)
         width, height = mask.size

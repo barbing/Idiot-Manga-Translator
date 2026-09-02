@@ -88,6 +88,9 @@ MASK_READY = "mask_ready"
 MASK_NOT_READY = "mask_not_ready"
 MASK_NOT_APPLICABLE = "mask_not_applicable"
 COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON = "component_final_mask_authority_withheld_until_projection_ready"
+COMPONENT_INELIGIBLE_CLEANUP_JOB_ASSOCIATION_EXCLUDED_REASON = (
+    "component_ineligible_cleanup_job_association_excluded"
+)
 COMPONENT_PARENT_EXECUTION_BOUNDARY_REQUIRED_REASON = "component_cleanup_authority_requires_parent_execution_boundary"
 COMPONENT_PARENT_EXECUTION_BOUNDARY_PREFERRED_REASON = "component_cleanup_authority_prefers_parent_execution_boundary"
 COMPONENT_PARENT_EXECUTION_BOUNDARY_BLOCKED_REASON = "component_cleanup_authority_blocked_by_parent_execution_boundary"
@@ -3919,46 +3922,67 @@ def _component_auth_semantic_units(candidates: Sequence[Mapping[str, Any]]) -> L
     for candidate in candidates or []:
         if not (int(candidate.get("overlap_pixels") or 0) > 0 or bool(candidate.get("centroid_inside"))):
             continue
-        key = _component_auth_semantic_unit_key(candidate)
+        normalized = dict(candidate)
+        if (
+            normalized.get("family") == "cleanup"
+            and bool(normalized.get("explicit_cleanup_authority"))
+            and not bool(normalized.get("eligible"))
+            and _component_auth_unique_jobs([normalized])
+        ):
+            normalized["cleanup_job_ids"] = []
+            normalized["reason_codes"] = _component_auth_merged_values(
+                [
+                    normalized,
+                    {
+                        "reason_codes": [
+                            COMPONENT_INELIGIBLE_CLEANUP_JOB_ASSOCIATION_EXCLUDED_REASON
+                        ]
+                    },
+                ],
+                "reason_codes",
+            )
+        key = _component_auth_semantic_unit_key(normalized)
         if not key:
             continue
         existing = units.get(key)
         if existing is None:
-            units[key] = dict(candidate)
+            units[key] = normalized
             continue
-        existing_overlap = int(existing.get("overlap_pixels") or 0)
-        candidate_overlap = int(candidate.get("overlap_pixels") or 0)
-        if candidate_overlap > existing_overlap or (
-            candidate_overlap == existing_overlap
-            and _component_auth_source_priority(str(candidate.get("source_kind") or ""))
-            > _component_auth_source_priority(str(existing.get("source_kind") or ""))
-        ):
-            merged = dict(candidate)
-            merged["cleanup_job_ids"] = sorted(
-                {
-                    str(job_id)
-                    for source in (existing, candidate)
-                    for job_id in (source.get("cleanup_job_ids") or [])
-                    if str(job_id)
-                }
-            )
-            merged["reason_codes"] = _component_auth_merged_values([existing, candidate], "reason_codes")
-            merged["conflict_flags"] = _component_auth_merged_values([existing, candidate], "conflict_flags")
-            merged["source_evidence_ids"] = _component_auth_merged_values([existing, candidate], "source_evidence_ids")
-            units[key] = merged
-        else:
-            existing["cleanup_job_ids"] = sorted(
-                {
-                    str(job_id)
-                    for source in (existing, candidate)
-                    for job_id in (source.get("cleanup_job_ids") or [])
-                    if str(job_id)
-                }
-            )
-            existing["reason_codes"] = _component_auth_merged_values([existing, candidate], "reason_codes")
-            existing["conflict_flags"] = _component_auth_merged_values([existing, candidate], "conflict_flags")
-            existing["source_evidence_ids"] = _component_auth_merged_values([existing, candidate], "source_evidence_ids")
-            existing["eligible"] = bool(existing.get("eligible") or candidate.get("eligible"))
+        existing_rank = (
+            bool(existing.get("eligible")),
+            int(existing.get("overlap_pixels") or 0),
+            _component_auth_source_priority(str(existing.get("source_kind") or "")),
+        )
+        candidate_rank = (
+            bool(normalized.get("eligible")),
+            int(normalized.get("overlap_pixels") or 0),
+            _component_auth_source_priority(str(normalized.get("source_kind") or "")),
+        )
+        merged = dict(normalized if candidate_rank > existing_rank else existing)
+        merged["cleanup_job_ids"] = sorted(
+            {
+                str(job_id)
+                for source in (existing, normalized)
+                for job_id in (source.get("cleanup_job_ids") or [])
+                if str(job_id)
+            }
+        )
+        merged["reason_codes"] = _component_auth_merged_values(
+            [existing, normalized],
+            "reason_codes",
+        )
+        merged["conflict_flags"] = _component_auth_merged_values(
+            [existing, normalized],
+            "conflict_flags",
+        )
+        merged["source_evidence_ids"] = _component_auth_merged_values(
+            [existing, normalized],
+            "source_evidence_ids",
+        )
+        merged["eligible"] = bool(
+            existing.get("eligible") or normalized.get("eligible")
+        )
+        units[key] = merged
     values = list(units.values())
     values.sort(
         key=lambda item: (
@@ -4132,7 +4156,12 @@ def _component_auth_record(
     centroid: Sequence[float],
     candidates: Sequence[Mapping[str, Any]],
 ) -> TextAreaComponentAuthorizationRecord:
-    semantic_units = _component_auth_semantic_units(candidates)
+    observed_candidates = [
+        item
+        for item in (candidates or [])
+        if int(item.get("overlap_pixels") or 0) > 0 or bool(item.get("centroid_inside"))
+    ]
+    semantic_units = _component_auth_semantic_units(observed_candidates)
     accepted_semantic_units, parent_boundary_reason_codes = _component_auth_parent_execution_boundary_filtered_units(
         semantic_units
     )
@@ -4409,8 +4438,8 @@ def _component_auth_record(
         protected_overlap_pixels=int(best_protected.get("overlap_pixels") or 0) if best_protected else 0,
         protected_overlap_ratio=round(float(best_protected.get("overlap_ratio") or 0.0), 4) if best_protected else 0.0,
         centroid=[round(float(centroid[0]), 3), round(float(centroid[1]), 3)],
-        candidate_container_ids=_component_auth_unique_ids(semantic_units, "container_id"),
-        candidate_region_ids=_component_auth_unique_ids(semantic_units, "region_id"),
+        candidate_container_ids=_component_auth_unique_ids(observed_candidates, "container_id"),
+        candidate_region_ids=_component_auth_unique_ids(observed_candidates, "region_id"),
         ambiguity_reasons=ambiguity_reasons,
         unresolved_reason_codes=reason_codes if family in {"review", "outside"} else [],
         protected_reason_codes=reason_codes if family == "protected" else [],

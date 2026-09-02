@@ -50,6 +50,7 @@ KITSUMED_CONFIDENCE_THRESHOLD = 0.30
 KITSUMED_NMS_IOU_THRESHOLD = 0.50
 KITSUMED_MASK_THRESHOLD = 0.50
 OGKALU_CONFIDENCE_THRESHOLD = 0.50
+COREML_PROVIDER_OPTIONS = {"RequireStaticInputShapes": "1"}
 
 SEMANTIC_EVIDENCE_PROVIDER_VERSION = "semantic_evidence_provider_v2"
 SEMANTIC_EVIDENCE_CONTRACT_VERSION = "semantic_authority_contract_v2"
@@ -906,10 +907,16 @@ def _create_onnx_session(
         "CPUExecutionProvider",
     )
     primary = requested[0]
+    session_providers: list[Any] = list(requested)
+    if primary == "CoreMLExecutionProvider":
+        session_providers[0] = (
+            primary,
+            dict(COREML_PROVIDER_OPTIONS),
+        )
     try:
         session = ort_runtime.InferenceSession(
             str(model_path),
-            providers=list(requested),
+            providers=session_providers,
         )
         active = [str(item) for item in session.get_providers()]
         reason = (

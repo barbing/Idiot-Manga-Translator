@@ -80,8 +80,8 @@ def _select_model_path(
     pt_path = os.path.join(effective_model_root, "comictextdetector.pt")
 
     selected = selection or select_torch_device(use_gpu)
-    if selected.backend is ComputeBackend.CUDA and os.path.isfile(pt_path):
-        logger.info(f"Selected GPU model: {pt_path}")
+    if selected.backend in {ComputeBackend.CUDA, ComputeBackend.MPS} and os.path.isfile(pt_path):
+        logger.info(f"Selected accelerated Torch model: {pt_path}")
         return pt_path
     if os.path.isfile(onnx_path):
         logger.info(f"Selected ONNX model: {onnx_path}")
@@ -89,6 +89,20 @@ def _select_model_path(
     if os.path.isfile(pt_path):
         return pt_path
     return onnx_path
+
+
+def _torch_device_for_model(
+    selection: TorchDeviceSelection,
+    model_path: str,
+    torch_available: bool,
+) -> str:
+    if (
+        selection.backend in {ComputeBackend.CUDA, ComputeBackend.MPS}
+        and torch_available
+        and str(model_path).endswith(".pt")
+    ):
+        return selection.device
+    return "cpu"
 
 
 def _bbox_to_polygon(xyxy: list) -> List[List[float]]:
@@ -145,12 +159,10 @@ class ComicTextDetector:
                 f"and place it under {model_root}."
             )
 
-        device = (
-            selection.device
-            if selection.backend is ComputeBackend.CUDA
-            and torch is not None
-            and self._model_path.endswith(".pt")
-            else "cpu"
+        device = _torch_device_for_model(
+            selection,
+            self._model_path,
+            torch is not None,
         )
         self.requested_acceleration = bool(use_gpu)
         self.selected_backend = (
