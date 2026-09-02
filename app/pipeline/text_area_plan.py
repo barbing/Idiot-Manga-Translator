@@ -88,9 +88,6 @@ MASK_READY = "mask_ready"
 MASK_NOT_READY = "mask_not_ready"
 MASK_NOT_APPLICABLE = "mask_not_applicable"
 COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON = "component_final_mask_authority_withheld_until_projection_ready"
-COMPONENT_INELIGIBLE_CLEANUP_JOB_ASSOCIATION_EXCLUDED_REASON = (
-    "component_ineligible_cleanup_job_association_excluded"
-)
 COMPONENT_PARENT_EXECUTION_BOUNDARY_REQUIRED_REASON = "component_cleanup_authority_requires_parent_execution_boundary"
 COMPONENT_PARENT_EXECUTION_BOUNDARY_PREFERRED_REASON = "component_cleanup_authority_prefers_parent_execution_boundary"
 COMPONENT_PARENT_EXECUTION_BOUNDARY_BLOCKED_REASON = "component_cleanup_authority_blocked_by_parent_execution_boundary"
@@ -3226,6 +3223,32 @@ def _component_auth_is_parent_execution_region(region: Mapping[str, Any]) -> boo
     )
 
 
+def _component_auth_binding_unit_id(
+    *,
+    source: Mapping[str, Any],
+    source_kind: str,
+    container_id: str,
+    region_id: str,
+    fallback_id: str,
+) -> str:
+    """Keep semantic-container identity separate from executable parent identity."""
+
+    if source_kind == "parent_execution_bundle":
+        return str(
+            source.get("parent_execution_bundle_id")
+            or source.get("parent_logical_text_unit_id")
+            or source.get("logical_text_block_id")
+            or region_id
+            or fallback_id
+        )
+    return str(
+        source.get("semantic_unit_id")
+        or container_id
+        or region_id
+        or fallback_id
+    )
+
+
 def _component_auth_scope(
     *,
     source: Mapping[str, Any],
@@ -3366,7 +3389,13 @@ def _component_auth_scope(
         "family": family,
         "container_id": container_id,
         "region_id": region_id,
-        "semantic_unit_id": str(source.get("semantic_unit_id") or container_id or region_id or fallback_id),
+        "semantic_unit_id": _component_auth_binding_unit_id(
+            source=source,
+            source_kind=source_kind,
+            container_id=container_id,
+            region_id=region_id,
+            fallback_id=fallback_id,
+        ),
         "semantic_kind": str(source.get("semantic_kind") or source.get("container_type") or source.get("text_area_container_type") or ""),
         "route_intent": str(source.get("route_intent") or source.get("text_area_route_intent") or source.get("intent") or ""),
         "must_not_mutate": must_not_mutate or family in {"protected", "review", "outside", "ambiguous"},
@@ -3922,67 +3951,46 @@ def _component_auth_semantic_units(candidates: Sequence[Mapping[str, Any]]) -> L
     for candidate in candidates or []:
         if not (int(candidate.get("overlap_pixels") or 0) > 0 or bool(candidate.get("centroid_inside"))):
             continue
-        normalized = dict(candidate)
-        if (
-            normalized.get("family") == "cleanup"
-            and bool(normalized.get("explicit_cleanup_authority"))
-            and not bool(normalized.get("eligible"))
-            and _component_auth_unique_jobs([normalized])
-        ):
-            normalized["cleanup_job_ids"] = []
-            normalized["reason_codes"] = _component_auth_merged_values(
-                [
-                    normalized,
-                    {
-                        "reason_codes": [
-                            COMPONENT_INELIGIBLE_CLEANUP_JOB_ASSOCIATION_EXCLUDED_REASON
-                        ]
-                    },
-                ],
-                "reason_codes",
-            )
-        key = _component_auth_semantic_unit_key(normalized)
+        key = _component_auth_semantic_unit_key(candidate)
         if not key:
             continue
         existing = units.get(key)
         if existing is None:
-            units[key] = normalized
+            units[key] = dict(candidate)
             continue
-        existing_rank = (
-            bool(existing.get("eligible")),
-            int(existing.get("overlap_pixels") or 0),
-            _component_auth_source_priority(str(existing.get("source_kind") or "")),
-        )
-        candidate_rank = (
-            bool(normalized.get("eligible")),
-            int(normalized.get("overlap_pixels") or 0),
-            _component_auth_source_priority(str(normalized.get("source_kind") or "")),
-        )
-        merged = dict(normalized if candidate_rank > existing_rank else existing)
-        merged["cleanup_job_ids"] = sorted(
-            {
-                str(job_id)
-                for source in (existing, normalized)
-                for job_id in (source.get("cleanup_job_ids") or [])
-                if str(job_id)
-            }
-        )
-        merged["reason_codes"] = _component_auth_merged_values(
-            [existing, normalized],
-            "reason_codes",
-        )
-        merged["conflict_flags"] = _component_auth_merged_values(
-            [existing, normalized],
-            "conflict_flags",
-        )
-        merged["source_evidence_ids"] = _component_auth_merged_values(
-            [existing, normalized],
-            "source_evidence_ids",
-        )
-        merged["eligible"] = bool(
-            existing.get("eligible") or normalized.get("eligible")
-        )
-        units[key] = merged
+        existing_overlap = int(existing.get("overlap_pixels") or 0)
+        candidate_overlap = int(candidate.get("overlap_pixels") or 0)
+        if candidate_overlap > existing_overlap or (
+            candidate_overlap == existing_overlap
+            and _component_auth_source_priority(str(candidate.get("source_kind") or ""))
+            > _component_auth_source_priority(str(existing.get("source_kind") or ""))
+        ):
+            merged = dict(candidate)
+            merged["cleanup_job_ids"] = sorted(
+                {
+                    str(job_id)
+                    for source in (existing, candidate)
+                    for job_id in (source.get("cleanup_job_ids") or [])
+                    if str(job_id)
+                }
+            )
+            merged["reason_codes"] = _component_auth_merged_values([existing, candidate], "reason_codes")
+            merged["conflict_flags"] = _component_auth_merged_values([existing, candidate], "conflict_flags")
+            merged["source_evidence_ids"] = _component_auth_merged_values([existing, candidate], "source_evidence_ids")
+            units[key] = merged
+        else:
+            existing["cleanup_job_ids"] = sorted(
+                {
+                    str(job_id)
+                    for source in (existing, candidate)
+                    for job_id in (source.get("cleanup_job_ids") or [])
+                    if str(job_id)
+                }
+            )
+            existing["reason_codes"] = _component_auth_merged_values([existing, candidate], "reason_codes")
+            existing["conflict_flags"] = _component_auth_merged_values([existing, candidate], "conflict_flags")
+            existing["source_evidence_ids"] = _component_auth_merged_values([existing, candidate], "source_evidence_ids")
+            existing["eligible"] = bool(existing.get("eligible") or candidate.get("eligible"))
     values = list(units.values())
     values.sort(
         key=lambda item: (
@@ -4156,12 +4164,7 @@ def _component_auth_record(
     centroid: Sequence[float],
     candidates: Sequence[Mapping[str, Any]],
 ) -> TextAreaComponentAuthorizationRecord:
-    observed_candidates = [
-        item
-        for item in (candidates or [])
-        if int(item.get("overlap_pixels") or 0) > 0 or bool(item.get("centroid_inside"))
-    ]
-    semantic_units = _component_auth_semantic_units(observed_candidates)
+    semantic_units = _component_auth_semantic_units(candidates)
     accepted_semantic_units, parent_boundary_reason_codes = _component_auth_parent_execution_boundary_filtered_units(
         semantic_units
     )
@@ -4438,8 +4441,8 @@ def _component_auth_record(
         protected_overlap_pixels=int(best_protected.get("overlap_pixels") or 0) if best_protected else 0,
         protected_overlap_ratio=round(float(best_protected.get("overlap_ratio") or 0.0), 4) if best_protected else 0.0,
         centroid=[round(float(centroid[0]), 3), round(float(centroid[1]), 3)],
-        candidate_container_ids=_component_auth_unique_ids(observed_candidates, "container_id"),
-        candidate_region_ids=_component_auth_unique_ids(observed_candidates, "region_id"),
+        candidate_container_ids=_component_auth_unique_ids(semantic_units, "container_id"),
+        candidate_region_ids=_component_auth_unique_ids(semantic_units, "region_id"),
         ambiguity_reasons=ambiguity_reasons,
         unresolved_reason_codes=reason_codes if family in {"review", "outside"} else [],
         protected_reason_codes=reason_codes if family == "protected" else [],
