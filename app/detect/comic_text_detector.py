@@ -394,12 +394,21 @@ def _mask_component_stats(mask) -> dict[str, Any]:
 
 def _block_audit_dict(blk, index: int) -> dict[str, Any]:
     xyxy = getattr(blk, "xyxy", None)
-    line_box = _lines_bounds(getattr(blk, "lines", []) or [])
+    line_polygons = [
+        polygon
+        for polygon in (
+            _normalize_line(line)
+            for line in (getattr(blk, "lines", []) or [])
+        )
+        if len(polygon) >= 3
+    ]
+    line_box = _lines_bounds(line_polygons)
     return {
         "block_index": index,
         "prob": float(getattr(blk, "prob", 1.0) or 0.0),
         "xyxy": [float(v) for v in xyxy] if xyxy is not None else [],
         "line_bbox": line_box or [],
+        "line_polygons": line_polygons,
     }
 
 

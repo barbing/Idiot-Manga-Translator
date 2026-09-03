@@ -2033,6 +2033,7 @@ class PipelineWorker(QtCore.QThread):
                         text_area_plan=text_area_plan,
                         page_region_records=cleanup_mask_region_records,
                         cleanup_jobs=cleanup_job_contract_result.jobs,
+                        parent_execution_bundles=parent_execution_bundles,
                     )
                     component_authorization_elapsed = time.time() - component_authorization_start
                     _pipeline_runtime_checkpoint(

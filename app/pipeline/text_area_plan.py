@@ -69,7 +69,8 @@ SEMANTIC_KIND_DECORATIVE = "decorative"
 SEMANTIC_KIND_ART_OR_NON_TEXT = "art_or_non_text"
 SEMANTIC_KIND_UNKNOWN = "unknown"
 
-TEXT_AREA_COMPONENT_AUTHORIZATION_MAP_VERSION = "text_area_component_authorization_map_v1"
+TEXT_AREA_COMPONENT_AUTHORIZATION_MAP_VERSION = "text_area_component_authorization_map_v2"
+PARENT_TEXT_RUN_GROUNDING_VERSION = "parent_text_run_grounding_v1"
 OGKALU_SINGLE_MODEL_AUTHORITY_CONFIDENCE = 0.85
 OGKALU_RETAINED_PAIRED_TEXT_EVIDENCE_CONFIDENCE = 0.50
 OGKALU_TEXT_FREE_BACKGROUND_ROOT_CONFIDENCE = 0.70
@@ -82,6 +83,7 @@ PROJECTION_COMPONENT_FRAGMENTED = "segmentation_component_fragmented"
 PROJECTION_COMPONENT_MERGED = "segmentation_component_merged"
 PROJECTION_AMBIGUOUS_COMPONENT = "projection_ambiguous_component"
 PROJECTION_OUTSIDE_AUTHORIZED_AREA = "projection_outside_authorized_area"
+PROJECTION_TEXT_RUN_UNMATCHED = "projection_text_run_unmatched"
 EFFECTIVE_MASK_NOT_READY = "effective_mask_not_ready"
 
 MASK_READY = "mask_ready"
@@ -91,6 +93,11 @@ COMPONENT_FINAL_MASK_AUTHORITY_WITHHELD_REASON = "component_final_mask_authority
 COMPONENT_PARENT_EXECUTION_BOUNDARY_REQUIRED_REASON = "component_cleanup_authority_requires_parent_execution_boundary"
 COMPONENT_PARENT_EXECUTION_BOUNDARY_PREFERRED_REASON = "component_cleanup_authority_prefers_parent_execution_boundary"
 COMPONENT_PARENT_EXECUTION_BOUNDARY_BLOCKED_REASON = "component_cleanup_authority_blocked_by_parent_execution_boundary"
+COMPONENT_TEXT_RUN_SUPPORTED_REASON = "parent_text_run_grounding_supported_component"
+COMPONENT_TEXT_RUN_FLOW_CONTINUATION_SUPPORTED_REASON = (
+    "parent_text_run_grounding_flow_continuation_supported_component"
+)
+COMPONENT_TEXT_RUN_UNMATCHED_REASON = "parent_text_run_grounding_unmatched_component"
 
 COMPONENT_AUTHORIZATION_STATES = {
     AUTH_CLEANUP_TRANSLATE_SPEECH,
@@ -2850,6 +2857,19 @@ class TextAreaComponentAuthorizationRecord:
     projected_label_ids: List[int] = field(default_factory=list)
     projection_overlap_pixels: int = 0
     projection_overlap_ratio: float = 0.0
+    text_run_grounding_state: str = "not_available"
+    text_run_grounding_version: str = ""
+    text_run_grounding_mode: str = ""
+    text_run_grounding_parent_id: str = ""
+    text_run_grounding_source_region_id: str = ""
+    text_run_grounding_source_line_count: int = 0
+    text_run_grounding_detector_line_count: int = 0
+    text_run_grounding_block_index: int = -1
+    text_run_grounding_orientation: str = ""
+    text_run_grounding_overlap_pixels: int = 0
+    text_run_grounding_overlap_ratio: float = 0.0
+    text_run_grounding_centroid_inside: bool = False
+    text_run_grounding_reason_codes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -2885,6 +2905,7 @@ def build_text_area_component_authorization_map(
     text_area_plan: Any = None,
     page_region_records: Sequence[Mapping[str, Any]] | None = None,
     cleanup_jobs: Sequence[Any] | None = None,
+    parent_execution_bundles: Sequence[Any] | None = None,
 ) -> TextAreaComponentAuthorizationMap:
     """Project TextAreaPlan semantic authorization onto CTD components.
 
@@ -2909,11 +2930,23 @@ def build_text_area_component_authorization_map(
                 "semantic_authority": "text_area_plan",
                 "segmentation_source": "text_foreground_segmentation",
                 "component_classification_complete": False,
+                "text_run_grounding": _component_auth_empty_text_run_grounding_summary(),
             },
         )
 
     binary = (mask > 0).astype(np.uint8)
     labels, stats, centroids = _component_auth_connected_components(binary)
+    parent_text_run_groundings, text_run_grounding_summary = (
+        _component_auth_parent_text_run_groundings(
+            text_foreground_segmentation=text_foreground_segmentation,
+            parent_execution_bundles=parent_execution_bundles or [],
+            foreground=binary,
+        )
+    )
+    cleanup_job_parent_ids = _component_auth_cleanup_job_parent_ids(
+        cleanup_jobs or [],
+        parent_text_run_groundings,
+    )
     plan_dict = _component_auth_plan_dict(text_area_plan)
     scopes = _component_auth_scopes(
         plan=plan_dict,
@@ -2955,6 +2988,13 @@ def build_text_area_component_authorization_map(
     _component_auth_apply_cleanup_obligation_area_bindings(components, cleanup_job_areas)
     _component_auth_apply_terminal_authority_guards(components)
     _component_auth_apply_side_caption_projection_guards(components)
+    _component_auth_apply_parent_text_run_grounding(
+        components=components,
+        labels=labels,
+        groundings=parent_text_run_groundings,
+        cleanup_job_parent_ids=cleanup_job_parent_ids,
+        summary=text_run_grounding_summary,
+    )
     _component_auth_assign_groups(str(page_id), components)
     state_counts: Dict[str, int] = {}
     for record in components:
@@ -2973,6 +3013,7 @@ def build_text_area_component_authorization_map(
             "component_record_count_matches_ctd": True,
             "text_area_scope_count": len(scopes),
             "cleanup_job_count": len(cleanup_jobs or []),
+            "text_run_grounding": text_run_grounding_summary,
         },
     )
 
@@ -3030,6 +3071,829 @@ def _component_auth_get_value(source: Any, key: str) -> Any:
     if isinstance(source, Mapping):
         return source.get(key)
     return getattr(source, key, None)
+
+
+def _component_auth_empty_text_run_grounding_summary() -> Dict[str, Any]:
+    return {
+        "version": PARENT_TEXT_RUN_GROUNDING_VERSION,
+        "candidate_parent_count": 0,
+        "grounded_parent_count": 0,
+        "abstained_parent_count": 0,
+        "abstention_reason_counts": {},
+        "grounding_mode_counts": {},
+        "evaluated_component_count": 0,
+        "supported_component_count": 0,
+        "flow_continuation_supported_component_count": 0,
+        "rejected_component_count": 0,
+        "support_rule": "direct_line_support_or_writing_direction_flow_continuation",
+    }
+
+
+def _component_auth_parent_text_run_groundings(
+    *,
+    text_foreground_segmentation: Any,
+    parent_execution_bundles: Sequence[Any],
+    foreground: Any,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Build high-confidence parent-local line evidence without changing topology.
+
+    Grounding is deliberately abstaining: verified parent OCR must match the
+    finalized parent text, explicit OCR line breaks must agree with one fully
+    parent-contained CTD block, and joined OCR can use only one unambiguous CTD
+    block that proves multiple physical lines. Incomplete or conflicting
+    evidence preserves the existing component authorization behavior.
+    """
+
+    summary = _component_auth_empty_text_run_grounding_summary()
+    groundings: Dict[str, Dict[str, Any]] = {}
+    if np is None or cv2 is None:
+        return groundings, summary
+    block_associations = _component_auth_get_value(
+        text_foreground_segmentation,
+        "block_associations",
+    )
+    if block_associations is None:
+        block_associations = _component_auth_get_value(
+            text_foreground_segmentation,
+            "blocks",
+        )
+    blocks = [
+        block
+        for block in (block_associations or [])
+        if isinstance(block, Mapping)
+    ]
+    for bundle in parent_execution_bundles or []:
+        if not bool(_component_auth_get_value(bundle, "cleanup_required")):
+            continue
+        if not _component_auth_bundle_is_speech(bundle):
+            continue
+        summary["candidate_parent_count"] += 1
+        parent_id = str(
+            _component_auth_get_value(bundle, "bundle_id")
+            or _component_auth_get_value(bundle, "parent_id")
+            or ""
+        )
+        if not parent_id:
+            _component_auth_record_grounding_abstention(
+                summary,
+                "parent_identity_missing",
+            )
+            continue
+        source_lines, source_candidate, source_mode, source_reason = (
+            _component_auth_verified_parent_source_lines(bundle)
+        )
+        if source_reason:
+            _component_auth_record_grounding_abstention(summary, source_reason)
+            continue
+        parent_bbox = _component_auth_bundle_bbox(bundle, foreground.shape)
+        if not parent_bbox:
+            _component_auth_record_grounding_abstention(
+                summary,
+                "parent_cleanup_bbox_missing",
+            )
+            continue
+        exact_blocks: List[Dict[str, Any]] = []
+        contained_line_counts: List[int] = []
+        for block in blocks:
+            polygons = _component_auth_block_line_polygons(block)
+            if not polygons:
+                continue
+            if not all(
+                _component_auth_polygon_inside_bbox(polygon, parent_bbox)
+                for polygon in polygons
+            ):
+                continue
+            contained_line_counts.append(len(polygons))
+            if (
+                source_mode == "verified_multiline_ocr_exact_ctd_lines"
+                and len(polygons) != len(source_lines)
+            ):
+                continue
+            if (
+                source_mode
+                == "verified_joined_ocr_single_multiline_ctd_block"
+                and len(polygons) < 2
+            ):
+                continue
+            orientations = {
+                _component_auth_line_polygon_orientation(polygon)
+                for polygon in polygons
+            }
+            if len(orientations) != 1 or "ambiguous" in orientations:
+                continue
+            if any(
+                _component_auth_polygon_foreground_pixels(foreground, polygon)
+                <= 0
+                for polygon in polygons
+            ):
+                continue
+            exact_blocks.append(
+                {
+                    "block_index": _component_auth_safe_int(
+                        block.get("block_index"),
+                        -1,
+                    ),
+                    "orientation": next(iter(orientations)),
+                    "line_polygons": polygons,
+                }
+            )
+        if len(exact_blocks) != 1:
+            if not contained_line_counts:
+                reason = "ctd_parent_line_polygons_unavailable"
+            elif (
+                not exact_blocks
+                and source_mode == "verified_multiline_ocr_exact_ctd_lines"
+            ):
+                reason = "ctd_ocr_line_count_mismatch"
+            elif not exact_blocks:
+                reason = "ctd_parent_multiline_block_unavailable"
+            else:
+                reason = "ctd_parent_line_block_ambiguous"
+            _component_auth_record_grounding_abstention(summary, reason)
+            continue
+        selected = exact_blocks[0]
+        source_region_id = str(
+            _component_auth_get_value(source_candidate, "region_id")
+            or _component_auth_get_value(
+                source_candidate,
+                "source_contract_region_id",
+            )
+            or ""
+        )
+        groundings[parent_id] = {
+            "version": PARENT_TEXT_RUN_GROUNDING_VERSION,
+            "mode": source_mode,
+            "parent_id": parent_id,
+            "source_region_id": source_region_id,
+            "source_line_count": len(source_lines),
+            "detector_line_count": len(selected["line_polygons"]),
+            "block_index": int(selected["block_index"]),
+            "orientation": str(selected["orientation"]),
+            "line_polygons": selected["line_polygons"],
+        }
+        summary["grounded_parent_count"] += 1
+        mode_counts = summary.setdefault("grounding_mode_counts", {})
+        mode_counts[source_mode] = int(mode_counts.get(source_mode) or 0) + 1
+    return groundings, summary
+
+
+def _component_auth_bundle_is_speech(bundle: Any) -> bool:
+    role = str(_component_auth_get_value(bundle, "role") or "").lower()
+    semantic_class = str(
+        _component_auth_get_value(bundle, "semantic_class") or ""
+    ).lower()
+    route_intent = str(
+        _component_auth_get_value(bundle, "route_intent") or ""
+    ).lower()
+    return bool(
+        role == "speech"
+        or "speech" in semantic_class
+        or route_intent == ROUTE_TRANSLATE_SPEECH
+    )
+
+
+def _component_auth_verified_parent_source_lines(
+    bundle: Any,
+) -> Tuple[List[str], Any | None, str, str]:
+    source_text = str(_component_auth_get_value(bundle, "source_text") or "")
+    normalized_source = _component_auth_compact_source_text(source_text)
+    if not normalized_source:
+        return [], None, "", "parent_source_text_missing"
+    raw_candidates = _component_auth_get_value(bundle, "source_candidates") or []
+    if isinstance(raw_candidates, Mapping):
+        raw_candidates = [raw_candidates]
+    contract_region_id = str(
+        _component_auth_get_value(bundle, "source_contract_region_id") or ""
+    )
+    candidates: List[Any] = []
+    seen: set[Tuple[str, str]] = set()
+    for candidate in raw_candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        if not bool(candidate.get("parent_boundary_ocr_source_contract")):
+            continue
+        raw_text = str(candidate.get("ocr_text") or "")
+        if _component_auth_compact_source_text(raw_text) != normalized_source:
+            continue
+        region_id = str(
+            candidate.get("region_id")
+            or candidate.get("source_contract_region_id")
+            or ""
+        )
+        key = (region_id, raw_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    if contract_region_id:
+        bound = [
+            candidate
+            for candidate in candidates
+            if str(
+                candidate.get("region_id")
+                or candidate.get("source_contract_region_id")
+                or ""
+            )
+            == contract_region_id
+        ]
+        if bound:
+            candidates = bound
+    if not candidates:
+        return [], None, "", "verified_parent_ocr_unavailable"
+    if len(candidates) != 1:
+        return [], None, "", "verified_parent_ocr_candidate_ambiguous"
+    selected = candidates[0]
+    raw_text = str(selected.get("ocr_text") or "")
+    normalized_newlines = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized_newlines.split("\n") if line.strip()]
+    if len(lines) >= 2 and "\n" in normalized_newlines:
+        return (
+            lines,
+            selected,
+            "verified_multiline_ocr_exact_ctd_lines",
+            "",
+        )
+    if normalized_newlines.strip():
+        return (
+            [normalized_newlines.strip()],
+            selected,
+            "verified_joined_ocr_single_multiline_ctd_block",
+            "",
+        )
+    return [], None, "", "verified_parent_ocr_unavailable"
+
+
+def _component_auth_compact_source_text(value: Any) -> str:
+    return "".join(str(value or "").split())
+
+
+def _component_auth_bundle_bbox(
+    bundle: Any,
+    mask_shape: Sequence[int],
+) -> List[int] | None:
+    shape = (int(mask_shape[0]), int(mask_shape[1]))
+    for key in (
+        "cleanup_target_bbox",
+        "parent_bbox",
+        "source_contract_bbox",
+        "render_allowed_area",
+    ):
+        bbox = _component_auth_xywh_to_xyxy(
+            _component_auth_get_value(bundle, key),
+            shape,
+        )
+        if bbox:
+            return bbox
+    return None
+
+
+def _component_auth_block_line_polygons(
+    block: Mapping[str, Any],
+) -> List[List[List[float]]]:
+    polygons: List[List[List[float]]] = []
+    for value in block.get("line_polygons") or []:
+        polygon = _component_auth_normalize_polygon(value)
+        if polygon:
+            polygons.append(polygon)
+    return polygons
+
+
+def _component_auth_normalize_polygon(value: Any) -> List[List[float]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    if len(value) == 8 and not isinstance(value[0], Sequence):
+        value = [value[index : index + 2] for index in range(0, 8, 2)]
+    points: List[List[float]] = []
+    for point in value:
+        if (
+            not isinstance(point, Sequence)
+            or isinstance(point, (str, bytes))
+            or len(point) < 2
+        ):
+            continue
+        try:
+            x = float(point[0])
+            y = float(point[1])
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        points.append([x, y])
+    return points if len(points) >= 3 else []
+
+
+def _component_auth_polygon_bbox(
+    polygon: Sequence[Sequence[float]],
+) -> Tuple[float, float, float, float] | None:
+    if not polygon:
+        return None
+    xs = [float(point[0]) for point in polygon]
+    ys = [float(point[1]) for point in polygon]
+    bbox = (min(xs), min(ys), max(xs), max(ys))
+    return bbox if bbox[2] > bbox[0] and bbox[3] > bbox[1] else None
+
+
+def _component_auth_polygon_inside_bbox(
+    polygon: Sequence[Sequence[float]],
+    bbox: Sequence[int],
+) -> bool:
+    if len(bbox) < 4:
+        return False
+    x0, y0, x1, y1 = [float(item) for item in bbox[:4]]
+    return bool(
+        polygon
+        and all(
+            x0 <= float(point[0]) <= x1
+            and y0 <= float(point[1]) <= y1
+            for point in polygon
+        )
+    )
+
+
+def _component_auth_line_polygon_orientation(
+    polygon: Sequence[Sequence[float]],
+) -> str:
+    bbox = _component_auth_polygon_bbox(polygon)
+    if bbox is None:
+        return "ambiguous"
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    if height > width:
+        return "vertical"
+    if width > height:
+        return "horizontal"
+    return "ambiguous"
+
+
+def _component_auth_polygon_foreground_pixels(
+    foreground: Any,
+    polygon: Sequence[Sequence[float]],
+) -> int:
+    if np is None or cv2 is None:
+        return 0
+    bbox = _component_auth_polygon_bbox(polygon)
+    if bbox is None:
+        return 0
+    height, width = foreground.shape[:2]
+    x0 = max(0, min(width, int(math.floor(bbox[0]))))
+    y0 = max(0, min(height, int(math.floor(bbox[1]))))
+    x1 = max(0, min(width, int(math.ceil(bbox[2])) + 1))
+    y1 = max(0, min(height, int(math.ceil(bbox[3])) + 1))
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    local_polygon = np.rint(
+        np.asarray(polygon, dtype=float) - np.asarray([x0, y0], dtype=float)
+    ).astype(np.int32)
+    local_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillPoly(local_mask, [local_polygon], 1)
+    return int(
+        np.count_nonzero(
+            (foreground[y0:y1, x0:x1] > 0)
+            & (local_mask > 0)
+        )
+    )
+
+
+def _component_auth_record_grounding_abstention(
+    summary: MutableMapping[str, Any],
+    reason: str,
+) -> None:
+    summary["abstained_parent_count"] = int(
+        summary.get("abstained_parent_count") or 0
+    ) + 1
+    counts = summary.setdefault("abstention_reason_counts", {})
+    counts[reason] = int(counts.get(reason) or 0) + 1
+
+
+def _component_auth_safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _component_auth_cleanup_job_parent_ids(
+    cleanup_jobs: Sequence[Any],
+    groundings: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, str]:
+    output: Dict[str, str] = {}
+    ambiguous: set[str] = set()
+    grounding_ids = set(str(value) for value in groundings)
+    for job in cleanup_jobs or []:
+        job_id = str(_component_auth_get_value(job, "cleanup_job_id") or "")
+        if not job_id:
+            continue
+        parent_id = str(
+            _component_auth_get_value(job, "parent_execution_bundle_id")
+            or _component_auth_get_value(job, "parent_logical_text_unit_id")
+            or ""
+        )
+        if not parent_id:
+            target_ids = _component_auth_list(
+                _component_auth_get_value(job, "target_region_ids") or []
+            )
+            matches = [value for value in target_ids if value in grounding_ids]
+            if len(matches) == 1:
+                parent_id = matches[0]
+        if parent_id not in grounding_ids:
+            continue
+        if job_id in output and output[job_id] != parent_id:
+            ambiguous.add(job_id)
+            continue
+        output[job_id] = parent_id
+    for job_id in ambiguous:
+        output.pop(job_id, None)
+    return output
+
+
+def _component_auth_apply_parent_text_run_grounding(
+    *,
+    components: Sequence[TextAreaComponentAuthorizationRecord],
+    labels: Any,
+    groundings: Mapping[str, Mapping[str, Any]],
+    cleanup_job_parent_ids: Mapping[str, str],
+    summary: MutableMapping[str, Any],
+) -> None:
+    if not groundings or labels is None:
+        return
+    unmatched_by_parent: Dict[
+        str,
+        List[TextAreaComponentAuthorizationRecord],
+    ] = {}
+    for record in components:
+        if _component_auth_family(record.authorization_state) != "cleanup":
+            continue
+        if record.mask_readiness_state != MASK_READY:
+            continue
+        if record.job_binding_state != "bound_unique":
+            continue
+        parent_id = str(
+            cleanup_job_parent_ids.get(str(record.owner_cleanup_job_id or ""))
+            or ""
+        )
+        grounding = groundings.get(parent_id)
+        if not grounding:
+            continue
+        support = _component_auth_component_text_run_support(
+            labels=labels,
+            component_label=int(record.label),
+            component_bbox=record.component_bbox,
+            component_pixel_count=int(record.component_pixel_count),
+            centroid=record.centroid,
+            line_polygons=grounding.get("line_polygons") or [],
+        )
+        summary["evaluated_component_count"] = int(
+            summary.get("evaluated_component_count") or 0
+        ) + 1
+        record.text_run_grounding_version = str(
+            grounding.get("version") or PARENT_TEXT_RUN_GROUNDING_VERSION
+        )
+        record.text_run_grounding_mode = str(grounding.get("mode") or "")
+        record.text_run_grounding_parent_id = parent_id
+        record.text_run_grounding_source_region_id = str(
+            grounding.get("source_region_id") or ""
+        )
+        record.text_run_grounding_source_line_count = int(
+            grounding.get("source_line_count") or 0
+        )
+        record.text_run_grounding_detector_line_count = int(
+            grounding.get("detector_line_count") or 0
+        )
+        record.text_run_grounding_block_index = int(
+            grounding.get("block_index")
+            if grounding.get("block_index") is not None
+            else -1
+        )
+        record.text_run_grounding_orientation = str(
+            grounding.get("orientation") or ""
+        )
+        record.text_run_grounding_overlap_pixels = int(
+            support["overlap_pixels"]
+        )
+        record.text_run_grounding_overlap_ratio = round(
+            float(support["overlap_ratio"]),
+            4,
+        )
+        record.text_run_grounding_centroid_inside = bool(
+            support["centroid_inside"]
+        )
+        if bool(support["supported"]):
+            record.text_run_grounding_state = "supported"
+            record.text_run_grounding_reason_codes = [
+                COMPONENT_TEXT_RUN_SUPPORTED_REASON
+            ]
+            if COMPONENT_TEXT_RUN_SUPPORTED_REASON not in record.reason_codes:
+                record.reason_codes.append(COMPONENT_TEXT_RUN_SUPPORTED_REASON)
+            summary["supported_component_count"] = int(
+                summary.get("supported_component_count") or 0
+            ) + 1
+            continue
+        unmatched_by_parent.setdefault(parent_id, []).append(record)
+
+    for parent_id, records in unmatched_by_parent.items():
+        continuation_ids = _component_auth_flow_continuation_component_ids(
+            records,
+            grounding=groundings[parent_id],
+        )
+        for record in records:
+            if record.component_id in continuation_ids:
+                record.text_run_grounding_state = "supported_flow_continuation"
+                record.text_run_grounding_reason_codes = [
+                    COMPONENT_TEXT_RUN_FLOW_CONTINUATION_SUPPORTED_REASON
+                ]
+                if (
+                    COMPONENT_TEXT_RUN_FLOW_CONTINUATION_SUPPORTED_REASON
+                    not in record.reason_codes
+                ):
+                    record.reason_codes.append(
+                        COMPONENT_TEXT_RUN_FLOW_CONTINUATION_SUPPORTED_REASON
+                    )
+                summary["supported_component_count"] = int(
+                    summary.get("supported_component_count") or 0
+                ) + 1
+                summary["flow_continuation_supported_component_count"] = int(
+                    summary.get("flow_continuation_supported_component_count")
+                    or 0
+                ) + 1
+                continue
+            record.text_run_grounding_state = "rejected_unmatched"
+            record.text_run_grounding_reason_codes = [
+                COMPONENT_TEXT_RUN_UNMATCHED_REASON
+            ]
+            _component_auth_set_state(
+                record,
+                AUTH_REVIEW_UNKNOWN_NOT_CLEANUP,
+                reason=COMPONENT_TEXT_RUN_UNMATCHED_REASON,
+            )
+            record.explicit_cleanup_authority = False
+            record.projection_quality_state = PROJECTION_TEXT_RUN_UNMATCHED
+            if (
+                COMPONENT_TEXT_RUN_UNMATCHED_REASON
+                not in record.projection_quality_reasons
+            ):
+                record.projection_quality_reasons.append(
+                    COMPONENT_TEXT_RUN_UNMATCHED_REASON
+                )
+            record.unresolved_reason_codes = list(record.reason_codes)
+            record.requires_visual_review = True
+            if (
+                COMPONENT_TEXT_RUN_UNMATCHED_REASON
+                not in record.authorization_warning_codes
+            ):
+                record.authorization_warning_codes.append(
+                    COMPONENT_TEXT_RUN_UNMATCHED_REASON
+                )
+            summary["rejected_component_count"] = int(
+                summary.get("rejected_component_count") or 0
+            ) + 1
+
+
+def _component_auth_component_text_run_support(
+    *,
+    labels: Any,
+    component_label: int,
+    component_bbox: Sequence[int],
+    component_pixel_count: int,
+    centroid: Sequence[float],
+    line_polygons: Sequence[Sequence[Sequence[float]]],
+) -> Dict[str, Any]:
+    if np is None or cv2 is None or len(component_bbox) < 4:
+        return {
+            "supported": False,
+            "overlap_pixels": 0,
+            "overlap_ratio": 0.0,
+            "centroid_inside": False,
+        }
+    height, width = labels.shape[:2]
+    x0 = max(0, min(width, int(component_bbox[0])))
+    y0 = max(0, min(height, int(component_bbox[1])))
+    x1 = max(0, min(width, int(component_bbox[2])))
+    y1 = max(0, min(height, int(component_bbox[3])))
+    if x1 <= x0 or y1 <= y0:
+        return {
+            "supported": False,
+            "overlap_pixels": 0,
+            "overlap_ratio": 0.0,
+            "centroid_inside": False,
+        }
+    component = labels[y0:y1, x0:x1] == int(component_label)
+    support_mask = np.zeros(component.shape, dtype=np.uint8)
+    cx = float(centroid[0]) if len(centroid) >= 2 else 0.0
+    cy = float(centroid[1]) if len(centroid) >= 2 else 0.0
+    centroid_inside = False
+    for polygon in line_polygons or []:
+        normalized = _component_auth_normalize_polygon(polygon)
+        if not normalized:
+            continue
+        polygon_bbox = _component_auth_polygon_bbox(normalized)
+        if polygon_bbox is None:
+            continue
+        if (
+            polygon_bbox[2] < x0
+            or polygon_bbox[0] > x1
+            or polygon_bbox[3] < y0
+            or polygon_bbox[1] > y1
+        ):
+            continue
+        points = np.asarray(normalized, dtype=np.float32)
+        if cv2.pointPolygonTest(points, (cx, cy), False) >= 0:
+            centroid_inside = True
+        local_points = np.rint(
+            points - np.asarray([x0, y0], dtype=np.float32)
+        ).astype(np.int32)
+        cv2.fillPoly(support_mask, [local_points], 1)
+    overlap_pixels = int(
+        np.count_nonzero(component & (support_mask > 0))
+    )
+    pixel_count = max(
+        1,
+        int(component_pixel_count),
+        int(np.count_nonzero(component)),
+    )
+    overlap_ratio = overlap_pixels / float(pixel_count)
+    return {
+        "supported": bool(
+            centroid_inside or overlap_pixels * 2 >= pixel_count
+        ),
+        "overlap_pixels": overlap_pixels,
+        "overlap_ratio": overlap_ratio,
+        "centroid_inside": centroid_inside,
+    }
+
+
+def _component_auth_flow_continuation_component_ids(
+    records: Sequence[TextAreaComponentAuthorizationRecord],
+    *,
+    grounding: Mapping[str, Any],
+) -> set[str]:
+    """Recover complete text-flow groups omitted by non-exhaustive CTD lines.
+
+    CTD line polygons are positive anchors, not an exhaustive mask. An
+    unsupported group remains text-grounded only when it forms a run in the
+    same writing direction, its center stays inside the anchored major-axis
+    span, and it occupies the existing or immediately adjacent line lattice.
+    """
+
+    orientation = str(grounding.get("orientation") or "")
+    if orientation not in {"vertical", "horizontal"}:
+        return set()
+    polygon_boxes = [
+        bbox
+        for bbox in (
+            _component_auth_polygon_bbox(
+                _component_auth_normalize_polygon(polygon)
+            )
+            for polygon in (grounding.get("line_polygons") or [])
+        )
+        if bbox is not None
+    ]
+    if len(polygon_boxes) < 2:
+        return set()
+    if orientation == "vertical":
+        line_major_start = min(box[1] for box in polygon_boxes)
+        line_major_end = max(box[3] for box in polygon_boxes)
+        line_cross_centers = sorted((box[0] + box[2]) / 2.0 for box in polygon_boxes)
+        line_cross_extents = [box[2] - box[0] for box in polygon_boxes]
+    else:
+        line_major_start = min(box[0] for box in polygon_boxes)
+        line_major_end = max(box[2] for box in polygon_boxes)
+        line_cross_centers = sorted((box[1] + box[3]) / 2.0 for box in polygon_boxes)
+        line_cross_extents = [box[3] - box[1] for box in polygon_boxes]
+    max_cross_extent = max(line_cross_extents, default=0.0)
+    if max_cross_extent <= 0.0:
+        return set()
+    lattice_gaps = [
+        right - left
+        for left, right in zip(line_cross_centers, line_cross_centers[1:])
+        if right > left
+    ]
+    adjacent_slot_distance = max(
+        max_cross_extent,
+        max(lattice_gaps, default=max_cross_extent) + max_cross_extent / 2.0,
+    )
+    valid_records = [
+        record
+        for record in records
+        if len(record.component_bbox) >= 4 and record.component_id
+    ]
+    groups = _component_auth_flow_component_groups(
+        valid_records,
+        orientation=orientation,
+        link_distance=max_cross_extent,
+    )
+    supported: set[str] = set()
+    for group in groups:
+        group_bbox = _component_auth_record_group_bbox(group)
+        if group_bbox is None:
+            continue
+        if orientation == "vertical":
+            major_start, major_end = group_bbox[1], group_bbox[3]
+            cross_start, cross_end = group_bbox[0], group_bbox[2]
+        else:
+            major_start, major_end = group_bbox[0], group_bbox[2]
+            cross_start, cross_end = group_bbox[1], group_bbox[3]
+        major_extent = major_end - major_start
+        cross_extent = cross_end - cross_start
+        if major_extent < cross_extent:
+            continue
+        if len(group) == 1 and major_extent <= max_cross_extent:
+            continue
+        major_center = (major_start + major_end) / 2.0
+        if not (line_major_start <= major_center <= line_major_end):
+            continue
+        cross_center = (cross_start + cross_end) / 2.0
+        nearest_line_distance = min(
+            abs(cross_center - center)
+            for center in line_cross_centers
+        )
+        if nearest_line_distance > adjacent_slot_distance:
+            continue
+        supported.update(record.component_id for record in group)
+    return supported
+
+
+def _component_auth_flow_component_groups(
+    records: Sequence[TextAreaComponentAuthorizationRecord],
+    *,
+    orientation: str,
+    link_distance: float,
+) -> List[List[TextAreaComponentAuthorizationRecord]]:
+    pending = list(records)
+    groups: List[List[TextAreaComponentAuthorizationRecord]] = []
+    while pending:
+        group = [pending.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            for candidate in list(pending):
+                if any(
+                    _component_auth_flow_records_are_adjacent(
+                        candidate,
+                        member,
+                        orientation=orientation,
+                        link_distance=link_distance,
+                    )
+                    for member in group
+                ):
+                    pending.remove(candidate)
+                    group.append(candidate)
+                    changed = True
+        groups.append(group)
+    return groups
+
+
+def _component_auth_flow_records_are_adjacent(
+    left: TextAreaComponentAuthorizationRecord,
+    right: TextAreaComponentAuthorizationRecord,
+    *,
+    orientation: str,
+    link_distance: float,
+) -> bool:
+    left_box = [float(value) for value in left.component_bbox[:4]]
+    right_box = [float(value) for value in right.component_bbox[:4]]
+    if orientation == "vertical":
+        left_major = (left_box[1], left_box[3])
+        right_major = (right_box[1], right_box[3])
+        left_cross = (left_box[0], left_box[2])
+        right_cross = (right_box[0], right_box[2])
+    else:
+        left_major = (left_box[0], left_box[2])
+        right_major = (right_box[0], right_box[2])
+        left_cross = (left_box[1], left_box[3])
+        right_cross = (right_box[1], right_box[3])
+    return bool(
+        _component_auth_interval_gap(left_major, right_major) <= link_distance
+        and _component_auth_interval_gap(left_cross, right_cross) <= link_distance
+    )
+
+
+def _component_auth_interval_gap(
+    left: Tuple[float, float],
+    right: Tuple[float, float],
+) -> float:
+    if left[1] < right[0]:
+        return right[0] - left[1]
+    if right[1] < left[0]:
+        return left[0] - right[1]
+    return 0.0
+
+
+def _component_auth_record_group_bbox(
+    records: Sequence[TextAreaComponentAuthorizationRecord],
+) -> Tuple[float, float, float, float] | None:
+    boxes = [
+        [float(value) for value in record.component_bbox[:4]]
+        for record in records
+        if len(record.component_bbox) >= 4
+    ]
+    if not boxes:
+        return None
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
 
 
 def _component_auth_connected_components(binary: Any) -> tuple[Any, Any, Any]:
